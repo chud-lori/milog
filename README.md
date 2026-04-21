@@ -36,6 +36,7 @@ milog daemon       # headless — fire Discord alerts, no TUI
 milog rate         # nginx-only req/min dashboard
 milog health       # 2xx/3xx/4xx/5xx totals per app
 milog top [N]      # top N source IPs (default 10)
+milog slow [N]     # top N slow endpoints by p95 (needs $request_time)
 milog stats <app>  # hourly request histogram
 milog suspects [N] [W]   # heuristic bot ranking
 milog errors       # live tail of 4xx/5xx

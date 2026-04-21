@@ -21,6 +21,10 @@ ALERT_STATE_DIR="$HOME/.cache/milog"
 P95_WARN_MS=500
 P95_CRIT_MS=1500
 
+# `milog slow` window (lines/app scanned from tail). Larger = wider history
+# but slower reads. Hour-of-traffic is a reasonable default on most sites.
+SLOW_WINDOW=1000
+
 # Optional user config — sourced if present. Can override any variable above.
 # Example:
 #     LOG_DIR="/var/log/nginx"
@@ -762,6 +766,94 @@ mode_stats() {
 }
 
 # ==============================================================================
+# MODE: slow — top N endpoints by p95 response time
+# Requires the extended (combined_timed) log format — see README.
+# Pipeline: tail -> extract (path, ms) -> sort by path -> per-path p95
+#           -> sort by p95 desc -> head N. All portable POSIX awk; no
+#           gawk-only features (asort / PROCINFO) required.
+# ==============================================================================
+mode_slow() {
+    local n="${1:-10}"
+    local window="${SLOW_WINDOW:-1000}"
+
+    # Basic arg validation — integers only, otherwise later arithmetic trips.
+    [[ "$n"      =~ ^[0-9]+$ ]] || { echo -e "${R}slow: N must be numeric${NC}" >&2; return 1; }
+    [[ "$window" =~ ^[0-9]+$ ]] || { echo -e "${R}slow: SLOW_WINDOW must be numeric${NC}" >&2; return 1; }
+
+    echo -e "\n${W}── MiLog: Top ${n} slow endpoints (window=${window} lines/app) ──${NC}\n"
+
+    local files=() name
+    for name in "${LOGS[@]}"; do
+        local f="$LOG_DIR/$name.access.log"
+        [[ -f "$f" ]] && files+=("$f")
+    done
+
+    if (( ${#files[@]} == 0 )); then
+        echo -e "${R}No log files found in ${LOG_DIR}${NC}"
+        return 1
+    fi
+
+    # Stream through two awk stages with sort in between so per-path p95 can
+    # be computed without multi-dim arrays.
+    local top_rows
+    top_rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
+        | awk '
+            $NF ~ /^[0-9]+(\.[0-9]+)?$/ && NF >= 8 {
+                path = $7
+                q = index(path, "?")
+                if (q > 0) path = substr(path, 1, q - 1)
+                if (length(path) > 0) {
+                    printf "%s\t%d\n", path, int($NF * 1000 + 0.5)
+                }
+            }' \
+        | sort -t $'\t' -k1,1 -k2,2n \
+        | awk -F'\t' '
+            function emit(   pi) {
+                if (n > 0) {
+                    pi = int((n * 95 + 99) / 100)
+                    if (pi < 1) pi = 1
+                    if (pi > n) pi = n
+                    printf "%s\t%d\t%d\n", cur, v[pi], n
+                }
+            }
+            BEGIN { cur = ""; n = 0 }
+            {
+                if ($1 != cur) {
+                    emit()
+                    cur = $1; n = 0; delete v
+                }
+                n++
+                v[n] = $2
+            }
+            END { emit() }' \
+        | sort -t $'\t' -k2,2 -rn \
+        | head -n "$n")
+
+    if [[ -z "$top_rows" ]]; then
+        echo -e "${D}No timed samples in window — is \$request_time in your log_format?${NC}"
+        echo
+        return 0
+    fi
+
+    printf "%-5s  %-9s  %7s  %s\n" "RANK" "P95"     "COUNT" "PATH"
+    printf "%-5s  %-9s  %7s  %s\n" "────" "────────" "───────" "────────────────────"
+
+    local i=1 path p95 count col
+    while IFS=$'\t' read -r path p95 count; do
+        col=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
+        # Truncate absurdly long paths so the table stays aligned. URL paths
+        # are ASCII, so ${#path} is safe for width math.
+        local display="$path"
+        if (( ${#display} > 80 )); then
+            display="${display:0:77}..."
+        fi
+        printf "#%-4d  %b%-9s${NC}  %7d  %s\n" "$i" "$col" "${p95}ms" "$count" "$display"
+        i=$((i+1))
+    done <<< "$top_rows"
+    echo
+}
+
+# ==============================================================================
 # MODE: grep
 # ==============================================================================
 mode_grep() {
@@ -1097,6 +1189,7 @@ config_show() {
     printf "  %-22s warn=%s crit=%s\n" "disk"     "$THRESH_DISK_WARN" "$THRESH_DISK_CRIT"
     printf "  %-22s 4xx=%s 5xx=%s\n"   "status thresholds" "$THRESH_4XX_WARN" "$THRESH_5XX_WARN"
     printf "  %-22s warn=%sms crit=%sms\n" "p95 response time" "$P95_WARN_MS" "$P95_CRIT_MS"
+    printf "  %-22s %s\n" "SLOW_WINDOW"   "$SLOW_WINDOW"
     printf "  %-22s webhook=%s enabled=%s cooldown=%ss\n" "discord alerts" \
         "$([[ -n "$DISCORD_WEBHOOK" ]] && echo set || echo unset)" "$ALERTS_ENABLED" "$ALERT_COOLDOWN"
 }
@@ -1136,6 +1229,7 @@ config_init() {
 # THRESH_5XX_WARN=5
 # P95_WARN_MS=500
 # P95_CRIT_MS=1500
+# SLOW_WINDOW=1000      # lines scanned per app by `milog slow`
 
 # Discord alerts — requires curl. Leave DISCORD_WEBHOOK empty to disable.
 # DISCORD_WEBHOOK="https://discord.com/api/webhooks/ID/TOKEN"
@@ -1332,6 +1426,7 @@ ${W}DASHBOARDS${NC}
 ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
   ${C}top [N]${NC}            top N source IPs  ${D}(default: 10)${NC}
+  ${C}slow [N]${NC}           top N slow endpoints by p95  ${D}(requires \$request_time)${NC}
   ${C}stats <app>${NC}        hourly request histogram
   ${C}suspects [N] [W]${NC}   heuristic bot ranking ${D}(top N=20, window=2000 lines/app)${NC}
 
@@ -1376,6 +1471,7 @@ case "${1:-}" in
     rate)     mode_rate ;;
     health)   mode_health ;;
     top)      mode_top "${2:-10}" ;;
+    slow)     mode_slow "${2:-10}" ;;
     stats)    mode_stats "${2:-}" ;;
     grep)     mode_grep "${2:-}" "${3:-.}" ;;
     errors)   mode_errors ;;
