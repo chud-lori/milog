@@ -12,7 +12,7 @@ run on a Linux VM with `/var/log/nginx/*.access.log`, no build step, no
 runtime dependencies beyond standard coreutils + awk + bash 4+.
 
 - **Entry point:** `milog.sh` (dispatched via symlink at `/usr/local/bin/milog`).
-- **User docs:** `milog.md` — install, config, usage. Keep it in sync as
+- **User docs:** `README.md` — install, config, usage. Keep it in sync as
   features land.
 - **Conventions:**
   - `set -euo pipefail` at the top — every new code path must survive this.
@@ -73,7 +73,7 @@ ALERT_STATE_DIR="$HOME/.cache/milog"
 ```
 
 Wire these into the config precedence block at the top of `milog.sh`. Add
-corresponding `milog config set` examples to `milog.md`.
+corresponding `milog config set` examples to `README.md`.
 
 ### Core helper
 
@@ -99,7 +99,7 @@ json_escape() {
 }
 ```
 
-Curl is already a reasonable assumption (milog.md's install uses curl). If
+Curl is already a reasonable assumption (README.md's install uses curl). If
 curl is missing, silently no-op — don't crash the TUI.
 
 ### Cooldown / dedup
@@ -156,8 +156,8 @@ New subcommand: `milog daemon`.
 - Runs the sampler + rule evaluator on a loop at `REFRESH` cadence.
 - No TUI, just logs decisions to stderr (quiet) and fires Discord alerts.
 - Exits cleanly on SIGTERM/SIGINT.
-- Document a systemd unit in `milog.md` (template below). Ship the template
-  content inside `milog.md` — don't create a separate unit file in the repo.
+- Document a systemd unit in `README.md` (template below). Ship the template
+  content inside `README.md` — don't create a separate unit file in the repo.
 
 ```ini
 [Unit]
@@ -195,7 +195,7 @@ Three related additions. Do them in this order.
 
 ### 2a. Response-time percentiles
 
-**Prereq:** nginx must log `$request_time`. Document in `milog.md` that the
+**Prereq:** nginx must log `$request_time`. Document in `README.md` that the
 user needs to extend their `log_format`:
 
 ```
@@ -241,7 +241,7 @@ MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 GEOIP_ENABLED=0   # off by default — requires user to download MMDB
 ```
 
-Document in `milog.md` how to get a free GeoLite2 MMDB (MaxMind account →
+Document in `README.md` how to get a free GeoLite2 MMDB (MaxMind account →
 download), where to put it, and how to auto-update (cron + `geoipupdate`
 package). Don't ship or fetch the MMDB from the script.
 
@@ -280,7 +280,7 @@ Biggest track. Adds a write path and new read modes.
 ### Storage
 
 SQLite, at `${HISTORY_DB:-$HOME/.local/share/milog/metrics.db}`. Assume
-`sqlite3` CLI is available (add to requirements in `milog.md`). Schema:
+`sqlite3` CLI is available (add to requirements in `README.md`). Schema:
 
 ```sql
 CREATE TABLE IF NOT EXISTS metrics_minute (
@@ -345,7 +345,7 @@ older than `HISTORY_RETAIN_DAYS` (default 30) from both tables.
 - Run `milog daemon` against a live log for 5 minutes; confirm rows land.
 - Confirm retention prune leaves `HISTORY_RETAIN_DAYS` of data and no more.
 - `milog replay` on an old gzipped log (`zcat | milog replay /dev/stdin`)
-  should work — document this in `milog.md`.
+  should work — document this in `README.md`.
 
 ---
 
@@ -359,7 +359,7 @@ for a few seconds).
 2. Cooldown state file + `alert_should_fire`.
 3. Wire alerts into each rule hook point (one commit per rule is fine).
 4. `milog daemon` subcommand skeleton.
-5. Document Discord setup + systemd unit in `milog.md`.
+5. Document Discord setup + systemd unit in `README.md`.
 6. Response-time parsing (detection + `percentiles` helper).
 7. Monitor p95 column + thresholds.
 8. `milog slow` mode.

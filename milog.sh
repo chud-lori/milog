@@ -9,6 +9,12 @@ LOG_DIR="/var/log/nginx"
 LOGS=("dolanan" "ethok" "finance" "ldr" "profile" "sinepil")
 REFRESH=5
 
+# Discord alerts (off by default; set DISCORD_WEBHOOK + ALERTS_ENABLED=1)
+DISCORD_WEBHOOK=""
+ALERTS_ENABLED=0
+ALERT_COOLDOWN=300
+ALERT_STATE_DIR="$HOME/.cache/milog"
+
 # Optional user config — sourced if present. Can override any variable above.
 # Example:
 #     LOG_DIR="/var/log/nginx"
@@ -58,6 +64,38 @@ R="\033[0;31m"  G="\033[0;32m"  Y="\033[0;33m"  B="\033[0;34m"
 M="\033[0;35m"  C="\033[0;36m"  W="\033[1;37m"  D="\033[0;90m"
 RBLINK="\033[0;31;5m"
 NC="\033[0m"
+
+# ==============================================================================
+# DISCORD ALERTS — helpers (no call sites yet; wired in later)
+# ==============================================================================
+
+# Escape a string for safe embedding inside a JSON string literal. Wraps the
+# result in surrounding double quotes so callers can interpolate directly.
+json_escape() {
+    local s="${1-}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '"%s"' "$s"
+}
+
+# Fire a Discord webhook embed. Silently no-ops when alerts are disabled,
+# no webhook is configured, or curl is missing. Never crashes callers —
+# on any error the TUI must keep rendering.
+#   $1 title   $2 body   $3 color_int  (decimal; default 15158332 = red)
+alert_discord() {
+    [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
+    [[ -z "${DISCORD_WEBHOOK:-}" ]]     && return 0
+    command -v curl >/dev/null 2>&1     || return 0
+    local title="$1" body="$2" color="${3:-15158332}"
+    local payload
+    payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}]}' \
+        "$(json_escape "$title")" "$(json_escape "$body")" "$color")
+    curl -sS -m 5 -H "Content-Type: application/json" \
+         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
+}
 
 # ==============================================================================
 # BOX DRAWING — single source of truth for geometry
