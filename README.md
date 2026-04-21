@@ -87,6 +87,22 @@ per app named `<name>.access.log`:
 access_log /var/log/nginx/api.access.log combined;
 ```
 
+**Optional — response-time percentiles.** To enable p50/p95/p99 rendering in
+`monitor` and the `slow` mode, extend `log_format` to append `$request_time`
+as the final field:
+
+```nginx
+log_format combined_timed '$remote_addr - $remote_user [$time_local] '
+                          '"$request" $status $body_bytes_sent '
+                          '"$http_referer" "$http_user_agent" $request_time';
+
+access_log /var/log/nginx/api.access.log combined_timed;
+```
+
+MiLog auto-detects the extra field per line; mixed formats degrade gracefully
+(lines without `$request_time` are skipped, and the UI shows `—` when no
+timed samples exist for the current minute).
+
 ### Permissions
 
 `/var/log/nginx` is usually owned by `root` or `adm`. Either run with `sudo`

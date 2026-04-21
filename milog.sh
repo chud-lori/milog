@@ -309,6 +309,37 @@ nginx_minute_counts() {
     ' "$file" 2>/dev/null
 }
 
+# Response-time percentiles for the current-minute window. Requires the
+# extended log_format that appends $request_time as the final field (see
+# README → "Response-time percentiles"). Gracefully degrades to the em-dash
+# sentinel when no numeric $request_time is present on any matching line.
+#   $1 app   $2 CUR_TIME   →   prints "p50 p95 p99" in ms, or "— — —"
+percentiles() {
+    local name="$1" cur="$2"
+    local file="$LOG_DIR/$name.access.log"
+    [[ -f "$file" ]] || { printf -- '— — —\n'; return; }
+    local sorted
+    sorted=$(awk -v t="$cur" '
+        index($0, t) && $NF ~ /^[0-9]+(\.[0-9]+)?$/ {
+            print int($NF * 1000 + 0.5)
+        }' "$file" 2>/dev/null | sort -n)
+    if [[ -z "$sorted" ]]; then
+        printf -- '— — —\n'
+        return
+    fi
+    # Ceiling-index percentile pick: idx = ceil(N*k/100), clamped to [1,N].
+    # Single awk pass over the already-sorted stream keeps us to one fork.
+    printf '%s\n' "$sorted" | awk '
+        { a[NR] = $1; n = NR }
+        END {
+            if (n == 0) { print "— — —"; exit }
+            p50 = int((n * 50 + 99) / 100); if (p50 < 1) p50 = 1; if (p50 > n) p50 = n
+            p95 = int((n * 95 + 99) / 100); if (p95 < 1) p95 = 1; if (p95 > n) p95 = n
+            p99 = int((n * 99 + 99) / 100); if (p99 < 1) p99 = 1; if (p99 > n) p99 = n
+            printf "%d %d %d\n", a[p50], a[p95], a[p99]
+        }'
+}
+
 # HTTP rule-hook — fires 4xx/5xx spike alerts. Called from both nginx_row
 # (render-mode) and mode_daemon. Cooldown gate inside alert_should_fire.
 nginx_check_http_alerts() {
