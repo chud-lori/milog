@@ -120,6 +120,29 @@ alert_should_fire() {
     return 0
 }
 
+# Classify an exploit match into a category slug used in the alert rule key.
+# Substring-based (case-insensitive via shopt) — classification only needs to
+# be good enough for grouping, not exact regex parity with the match pattern.
+_exploit_category() {
+    local line="$1" cat="other"
+    shopt -s nocasematch
+    case "$line" in
+        *'${jndi'*|*'jndi:'*|*log4j*)                                            cat=log4shell ;;
+        *union*select*|*select*from*|*'sleep('*|*'benchmark('*|*' or 1=1'*|*%27*or*) cat=sqli ;;
+        *'<script'*|*%3cscript*|*'onerror='*|*'onload='*|*'javascript:'*)        cat=xss ;;
+        *base64_decode*|*'eval('*|*'system('*|*'passthru('*|*shell_exec*)         cat=rce ;;
+        *'../'*|*%2e%2e*|*/etc/passwd*|*/etc/shadow*|*/proc/self*)               cat=traversal ;;
+        */containers/*|*/actuator/*|*/server-status*|*/console*|*/druid/*)       cat=infra ;;
+        */SDK/web*|*/cgi-bin/*|*/boaform/*|*/HNAP1*)                             cat=device ;;
+        */wp-admin*|*/wp-login*|*/wp-content/plugins*|*/xmlrpc.php*)             cat=wordpress ;;
+        */phpmyadmin*|*/pma/*|*/mysql/admin*)                                    cat=phpmyadmin ;;
+        */.env*|*/.git/*|*/.aws/*|*/.ssh/*|*/.DS_Store*|*/config.php*|*/config.json*|*/config.yml*|*/config.yaml*|*/web.config*) cat=dotfile ;;
+        *libredtail*|*nikto*|*masscan*|*zgrab*|*sqlmap*|*nuclei*|*gobuster*|*dirbuster*|*wfuzz*|*l9explore*|*l9tcpid*|*'hello, world'*|*'hello,world'*) cat=scanner ;;
+    esac
+    shopt -u nocasematch
+    printf '%s' "$cat"
+}
+
 # ==============================================================================
 # BOX DRAWING — single source of truth for geometry
 #
@@ -303,6 +326,15 @@ nginx_row() {
     [[ $c4 -ge $THRESH_4XX_WARN && -z "$alert" ]]    && alert="$R"
     [[ $count -gt $THRESH_REQ_CRIT && -z "$alert" ]] && alert="$R"
 
+    # Discord: 5xx/4xx spike rules. Gate with ALERTS_ENABLED (handled inside
+    # alert_discord). Background the webhook so the render loop never blocks.
+    if (( c5 >= THRESH_5XX_WARN )) && alert_should_fire "5xx:$name"; then
+        alert_discord "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 &
+    fi
+    if (( c4 >= THRESH_4XX_WARN )) && alert_should_fire "4xx:$name"; then
+        alert_discord "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 &
+    fi
+
     local bars_plain bars_col
     if [[ "${MILOG_HIST_ENABLED:-0}" == "1" ]]; then
         # Push current sample into ring buffer (HIST is a global assoc array).
@@ -466,14 +498,32 @@ mode_monitor() {
 
         # Nginx workers
         draw_row " NGINX WORKERS" " ${W}NGINX WORKERS${NC}"
-        local workers
+        local workers worker_count
         workers=$(ps aux 2>/dev/null | awk '/nginx: worker/{printf "  pid:%-8s  cpu:%5s%%  mem:%5s%%\n",$2,$3,$4}' | head -6)
         if [[ -z "$workers" ]]; then
+            worker_count=0
             draw_row "  (no nginx worker processes found)" "  ${D}(no nginx worker processes found)${NC}"
         else
+            worker_count=$(printf '%s\n' "$workers" | wc -l | awk '{print $1}')
             while IFS= read -r wline; do
                 draw_row "$wline" "  ${D}${wline:2}${NC}"
             done <<< "$workers"
+        fi
+
+        # Discord: system-metric rules. Each runs the cooldown gate separately
+        # so one tripping doesn't suppress another. Webhook calls are
+        # backgrounded so the render loop stays responsive.
+        if (( cpu >= THRESH_CPU_CRIT )) && alert_should_fire "cpu"; then
+            alert_discord "CPU critical" "CPU at ${cpu}% (crit=${THRESH_CPU_CRIT}%)" 15158332 &
+        fi
+        if (( mem_pct >= THRESH_MEM_CRIT )) && alert_should_fire "mem"; then
+            alert_discord "Memory critical" "MEM at ${mem_pct}% — used ${mem_used}MB of ${mem_total}MB (crit=${THRESH_MEM_CRIT}%)" 15158332 &
+        fi
+        if (( disk_pct >= THRESH_DISK_CRIT )) && alert_should_fire "disk:/"; then
+            alert_discord "Disk critical" "Disk at ${disk_pct}% on / — ${disk_used}GB of ${disk_total}GB used (crit=${THRESH_DISK_CRIT}%)" 15158332 &
+        fi
+        if (( worker_count == 0 )) && alert_should_fire "workers"; then
+            alert_discord "Nginx workers down" "Zero nginx worker processes detected on $(hostname 2>/dev/null || echo host)" 15158332 &
         fi
 
         bdr_mid
@@ -691,10 +741,17 @@ mode_probes() {
         local col="${colors[$i]}" label
         label=$(printf "%-8s" "$name")
         if [[ -f "$file" ]]; then
-            tail -F "$file" 2>/dev/null | \
-                grep --line-buffered -Ei "$pat" | \
-                awk -v col="$col" -v lbl="$label" -v nc="$NC" \
-                    '{print col"["lbl"]"nc" "$0; fflush()}' &
+            (
+                app="$name"
+                tail -F "$file" 2>/dev/null | \
+                    grep --line-buffered -Ei "$pat" | \
+                while IFS= read -r line; do
+                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$line"
+                    if alert_should_fire "probe:$app"; then
+                        alert_discord "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 &
+                    fi
+                done
+            ) &
             pids+=($!)
         fi
         (( i++ )) || true
@@ -808,10 +865,18 @@ mode_exploits() {
         local col="${colors[$i]}" label
         label=$(printf "%-8s" "$name")
         if [[ -f "$file" ]]; then
-            tail -F "$file" 2>/dev/null | \
-                grep --line-buffered -Ei "$pat" | \
-                awk -v col="$col" -v lbl="$label" -v r="$R" -v nc="$NC" \
-                    '{print col"["lbl"]"nc" "r"[EXPLOIT]"nc" "$0; fflush()}' &
+            (
+                app="$name"
+                tail -F "$file" 2>/dev/null | \
+                    grep --line-buffered -Ei "$pat" | \
+                while IFS= read -r line; do
+                    printf '%b[%s]%b %b[EXPLOIT]%b %s\n' "$col" "$label" "$NC" "$R" "$NC" "$line"
+                    cat_slug=$(_exploit_category "$line")
+                    if alert_should_fire "exploit:$app:$cat_slug"; then
+                        alert_discord "Exploit attempt: $app / $cat_slug" "\`\`\`${line:0:1800}\`\`\`" 15158332 &
+                    fi
+                done
+            ) &
             pids+=($!)
         fi
         (( i++ )) || true
