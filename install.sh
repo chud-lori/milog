@@ -5,13 +5,13 @@
 # Works two ways:
 #
 #   1) One-liner (via curl-pipe-bash) — downloads milog.sh from GitHub:
-#        curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh \
+#        curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
 #          | sudo bash
 #        curl -fsSL https://.../install.sh | sudo bash -s -- --with-history
 #
 #   2) From a clone — uses the milog.sh that sits next to this script:
-#        git clone https://github.com/chud-lori/ldr.git /opt/ldr
-#        cd /opt/ldr && sudo ./install.sh
+#        git clone https://github.com/chud-lori/milog.git /opt/milog
+#        cd /opt/milog && sudo ./install.sh
 #
 # Installs gawk + curl by default; `--with-history` adds sqlite3,
 # `--with-geoip` adds mmdblookup. Then places milog.sh at /usr/local/bin/milog.
@@ -29,7 +29,7 @@ set -euo pipefail
 # In pipe mode BASH_SOURCE[0] is empty or a pipe path — we resolve the source
 # lazily in resolve_script_src(), after we've confirmed curl is available.
 BIN_DST="${BIN_DST:-/usr/local/bin/milog}"
-SCRIPT_URL="${MILOG_SCRIPT_URL:-https://raw.githubusercontent.com/chud-lori/ldr/main/milog.sh}"
+SCRIPT_URL="${MILOG_SCRIPT_URL:-https://raw.githubusercontent.com/chud-lori/milog/main/milog.sh}"
 SCRIPT_SRC=""           # populated by resolve_script_src
 _CLEANUP_TMP=""         # set if we downloaded — trap removes on exit
 

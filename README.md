@@ -18,23 +18,23 @@ One-liner — downloads the installer, installs `gawk` + `curl` through your
 distro's package manager, then drops `milog` into `/usr/local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh | sudo bash
 ```
 
 Optional extras (pass through with `-s --`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
   | sudo bash -s -- --with-history          # also install sqlite3
-curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
   | sudo bash -s -- --with-geoip            # also install mmdblookup
 ```
 
 Or from a clone (the installer auto-detects and uses the local `milog.sh`):
 
 ```bash
-git clone https://github.com/chud-lori/ldr.git /opt/ldr
-cd /opt/ldr
+git clone https://github.com/chud-lori/milog.git /opt/milog
+cd /opt/milog
 sudo ./install.sh
 sudo ./install.sh --uninstall   # keeps ~/.config/milog/, ~/.cache/milog/
 ```
@@ -43,7 +43,7 @@ Manual single-file download (skip the installer):
 
 ```bash
 sudo curl -fLo /usr/local/bin/milog \
-  https://raw.githubusercontent.com/chud-lori/ldr/main/milog.sh
+  https://raw.githubusercontent.com/chud-lori/milog/main/milog.sh
 sudo chmod +x /usr/local/bin/milog
 ```
 
@@ -199,7 +199,7 @@ and the `.mmdb` file on disk.
 1. Install the tool — either via the installer
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh \
+   curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
      | sudo bash -s -- --with-geoip
    ```
 
@@ -235,7 +235,7 @@ top-IPs rollup.
 Install the CLI tool — via the installer,
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
   | sudo bash -s -- --with-history
 ```
 
@@ -315,5 +315,5 @@ sudo journalctl -u milog -f
 ```bash
 sudo rm /usr/local/bin/milog
 rm -rf ~/.config/milog ~/.cache/milog
-sudo rm -rf /opt/ldr   # if cloned
+sudo rm -rf /opt/milog   # if cloned
 ```
