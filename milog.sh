@@ -155,11 +155,17 @@ alert_should_fire() {
     if [[ -n "$last" ]] && (( now - last < ALERT_COOLDOWN )); then
         return 1
     fi
-    tmp="$state_file.tmp.$$"
+    # mktemp gives a unique path per process — crucial because mode_daemon
+    # has multiple backgrounded subshells (exploits + probes watchers) and
+    # bash's $$ is the parent PID, so $$-based names would collide.
+    tmp=$(mktemp "$ALERT_STATE_DIR/alerts.state.tmp.XXXXXX" 2>/dev/null) || return 1
     {
         awk -v k="$key" -F'\t' 'BEGIN{OFS="\t"} $1!=k' "$state_file" 2>/dev/null
         printf '%s\t%s\n' "$key" "$now"
-    } > "$tmp" && mv "$tmp" "$state_file"
+    } > "$tmp" && mv "$tmp" "$state_file" 2>/dev/null
+    # Cleanup if the mv lost a race — content is already in state_file from
+    # the winning process, so just drop our redundant tmp.
+    [[ -f "$tmp" ]] && rm -f "$tmp"
     return 0
 }
 
