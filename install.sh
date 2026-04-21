@@ -106,19 +106,33 @@ check_bash_version() {
 # ---- uninstall --------------------------------------------------------------
 uninstall() {
     need_root
+
+    # Stop + remove the systemd unit if it's there (installed via
+    # `milog alert on`). Silent on any failure — we're going to delete the
+    # unit file anyway.
+    if command -v systemctl >/dev/null 2>&1; then
+        if [[ -f /etc/systemd/system/milog.service ]]; then
+            info "Stopping + removing milog.service"
+            systemctl stop    milog.service 2>/dev/null || true
+            systemctl disable milog.service 2>/dev/null || true
+            rm -f /etc/systemd/system/milog.service
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
     if [[ -e "$BIN_DST" ]]; then
         info "Removing $BIN_DST"
         rm -f "$BIN_DST"
     else
         info "Nothing at $BIN_DST — already clean"
     fi
+
     cat <<EOF
 
-Uninstalled MiLog binary. Left in place (delete manually if desired):
-  ~/.config/milog/        user config
+Uninstalled MiLog binary + systemd unit. Left in place (delete manually if desired):
+  ~/.config/milog/        user config (webhook + thresholds)
   ~/.cache/milog/         alert cooldown state
   ~/.local/share/milog/   history database (if you enabled it)
-  /etc/systemd/system/milog.service   (if you wrote a unit file)
 EOF
 }
 

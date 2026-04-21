@@ -271,56 +271,43 @@ where nobody is watching a terminal.
 
 Same rules as the interactive modes — 5xx/4xx spikes, CPU/MEM/disk/worker
 critical thresholds, exploit and probe pattern hits — all wired to Discord
-webhooks with per-rule cooldown. Additionally, when `HISTORY_ENABLED=1`,
-it writes one per-minute row per app into SQLite for `milog trend` and
-`milog diff`.
+webhooks with per-rule cooldown. When `HISTORY_ENABLED=1`, it also writes
+one per-minute row per app into SQLite so `milog trend` and `milog diff`
+have data.
 
-Typical usage: one `milog daemon` running as a systemd service on each
-host, plus `milog monitor` used interactively when you want to watch the
-dashboard.
+### Run it as a service (recommended)
+
+Use the `alert on` subcommand — it installs the systemd unit, runs the
+daemon as your user, and points at your config file:
+
+```bash
+sudo milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'
+sudo milog alert on                      # webhook already in config; just enable
+```
+
+Manage it:
+
+```bash
+milog alert status         # webhook / service / recent fires
+milog alert test           # fire a Discord test embed
+sudo milog alert off       # pause — stops service + sets ALERTS_ENABLED=0
+```
+
+If the daemon can't read `/var/log/nginx/*.access.log`, either add your
+user to the `adm` group (`sudo usermod -aG adm $USER` — log out/in) or
+edit the generated `/etc/systemd/system/milog.service` to `User=root`.
 
 ### Run it in the foreground (quick test)
 
 ```bash
-milog daemon    # Ctrl-C to stop; stderr is the decision log
+milog daemon     # Ctrl-C to stop; stderr is the decision log
 ```
 
-### Run it under systemd (production)
-
-One-liner setup — runs as the invoking user, reads `$USER`'s config:
-
-```bash
-sudo tee /etc/systemd/system/milog.service >/dev/null <<EOF
-[Unit]
-Description=MiLog headless alerter
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/milog daemon
-Restart=on-failure
-User=$USER
-Environment=MILOG_CONFIG=$HOME/.config/milog/config.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now milog
-sudo systemctl status milog --no-pager
-sudo journalctl -u milog -f           # tail decision log
-```
-
-If the daemon can't read `/var/log/nginx/*.access.log`, either add the
-user to the `adm` group (`sudo usermod -aG adm $USER` — log out + in) or
-change `User=` to `root` in the unit.
-
-### Update + restart after `curl | bash`
+### Update after `curl | bash`
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh | sudo bash
-sudo systemctl restart milog
+sudo systemctl restart milog      # pick up the new binary
 ```
 
 ## Troubleshooting

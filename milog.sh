@@ -1523,11 +1523,29 @@ _alert_write_config() {
 }
 
 # Read DISCORD_WEBHOOK from a config file (strips surrounding quotes).
+# Always returns 0 and emits empty string when the config doesn't exist or
+# doesn't set the key — keeps callers simple under `set -euo pipefail`.
 _alert_read_webhook() {
     local file="$1"
-    [[ -f "$file" ]] || return 1
-    grep -E '^[[:space:]]*DISCORD_WEBHOOK=' "$file" 2>/dev/null | head -1 \
-        | sed -E 's/^[^=]*=//; s/^"//; s/"[[:space:]]*$//'
+    [[ -f "$file" ]] || return 0
+    {
+        grep -E '^[[:space:]]*DISCORD_WEBHOOK=' "$file" 2>/dev/null \
+            | head -1 \
+            | sed -E 's/^[^=]*=//; s/^"//; s/"[[:space:]]*$//'
+    } || true
+    return 0
+}
+
+# Read a simple KEY's value from the config file — same no-fail contract.
+_alert_read_key() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 0
+    {
+        grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null \
+            | head -1 \
+            | sed -E 's/^[^=]*=//; s/^"//; s/"[[:space:]]*$//'
+    } || true
+    return 0
 }
 
 # Write + enable the milog systemd unit. Caller must already be root.
@@ -1645,8 +1663,7 @@ alert_status() {
     wh=$(_alert_read_webhook "$target_config")
     if [[ -n "$wh" ]]; then wh_state="${G}set${NC}"; else wh_state="${R}unset${NC}"; fi
 
-    enabled=$(grep -E '^[[:space:]]*ALERTS_ENABLED=' "$target_config" 2>/dev/null \
-              | head -1 | sed -E 's/^[^=]*=//')
+    enabled=$(_alert_read_key "$target_config" "ALERTS_ENABLED")
     enabled="${enabled:-0}"
 
     if ! command -v systemctl >/dev/null 2>&1; then
