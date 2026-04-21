@@ -61,6 +61,9 @@ milog top [N]      # top N source IPs (default 10)
 milog slow [N]     # top N slow endpoints by p95 (needs $request_time)
 milog stats <app>  # hourly request histogram
 milog suspects [N] [W]   # heuristic bot ranking
+milog trend [app] [H]    # sparkline of req/min from history (needs sqlite3)
+milog diff               # req per app: now vs 1d ago vs 7d ago
+milog replay <file>      # summary of an archived log (.log, .gz, .bz2)
 milog errors       # live tail of 4xx/5xx
 milog exploits     # LFI/RCE/SQLi/XSS/infra-probe live tail
 milog probes       # scanner/bot traffic live tail

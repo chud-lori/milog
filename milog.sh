@@ -460,6 +460,42 @@ history_write_hour() {
     fi
 }
 
+# Delete rows older than HISTORY_RETAIN_DAYS days from both tables. One
+# sqlite3 invocation, transactional. Called once per day from the daemon.
+history_prune() {
+    [[ "$HISTORY_ENABLED" != "1" ]] && return 0
+    [[ -f "$HISTORY_DB" ]] || return 0
+    local retain="${HISTORY_RETAIN_DAYS:-30}"
+    [[ "$retain" =~ ^[0-9]+$ ]] || retain=30
+    local cutoff=$(( $(date +%s) - retain * 86400 ))
+    if sqlite3 "$HISTORY_DB" <<SQL 2>/dev/null
+BEGIN;
+DELETE FROM metrics_minute WHERE ts      < $cutoff;
+DELETE FROM top_ip_hour    WHERE ts_hour < $cutoff;
+COMMIT;
+SQL
+    then
+        _dlog "history: pruned rows older than ${retain}d (cutoff=$cutoff)"
+    else
+        _dlog "history: prune failed"
+    fi
+}
+
+# Gate for read-only history modes (trend / diff). Prints a friendly
+# message to stderr and returns 1 when sqlite3 or the DB are missing.
+_history_precheck() {
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo -e "${R}sqlite3 is not installed${NC}" >&2
+        echo -e "${D}  install with: curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh | sudo bash -s -- --with-history${NC}" >&2
+        return 1
+    fi
+    if [[ ! -f "$HISTORY_DB" ]]; then
+        echo -e "${R}No history database at $HISTORY_DB${NC}" >&2
+        echo -e "${D}  enable with: milog config set HISTORY_ENABLED 1 && milog daemon${NC}" >&2
+        return 1
+    fi
+}
+
 # ==============================================================================
 # NGINX ROW HELPERS
 # ==============================================================================
@@ -1352,12 +1388,13 @@ mode_daemon() {
     trap "$_cleanup" INT TERM
 
     # Init rollover state — start at "current" so the first write happens
-    # only once we've crossed a real minute/hour boundary, never mid-minute
-    # on start-up with partial counts.
-    local last_min last_hour now
+    # only once we've crossed a real minute/hour/day boundary, never mid-
+    # minute on start-up with partial counts.
+    local last_min last_hour last_day now
     now=$(date +%s)
     last_min=$((  now / 60   ))
     last_hour=$(( now / 3600 ))
+    last_day=$((  now / 86400 ))
 
     while :; do
         local CUR_TIME
@@ -1399,9 +1436,282 @@ mode_daemon() {
             history_write_hour "$write_hr_ts"
             last_hour=$cur_hour
         fi
+        local cur_day=$(( now / 86400 ))
+        if (( cur_day > last_day )); then
+            history_prune
+            last_day=$cur_day
+        fi
 
         sleep "$REFRESH"
     done
+}
+
+# ==============================================================================
+# MODE: trend — ASCII sparkline chart from metrics_minute history
+# Requires HISTORY_ENABLED daemon to have written the DB. Renders two rows
+# per app: req/min (green) and 4xx+5xx errors (red). Bucket-aggregates so
+# the sparkline fits the fixed 60-char width.
+# ==============================================================================
+_render_trend_one() {
+    local app="$1" since="$2" window_sec="$3" width="$4"
+
+    # SQL buckets row timestamps into exactly `width` columns across the
+    # window. Empty columns (no samples) won't appear in output — we fill
+    # them in with zeros on the shell side below.
+    local rows
+    rows=$(sqlite3 -separator $'\t' "$HISTORY_DB" <<SQL 2>/dev/null
+SELECT CAST((ts - $since) * $width / $window_sec AS INTEGER) AS col,
+       COALESCE(SUM(req), 0),
+       COALESCE(SUM(c4xx + c5xx), 0)
+FROM metrics_minute
+WHERE app = $(_sql_quote "$app") AND ts >= $since
+GROUP BY col
+ORDER BY col;
+SQL
+)
+    if [[ -z "$rows" ]]; then
+        printf "  ${D}%-10s  no data in window${NC}\n\n" "$app"
+        return
+    fi
+
+    local -a req_samples=() err_samples=()
+    local i
+    for (( i = 0; i < width; i++ )); do
+        req_samples+=(0)
+        err_samples+=(0)
+    done
+
+    local col req err
+    while IFS=$'\t' read -r col req err; do
+        [[ "$col" =~ ^[0-9]+$ ]] || continue
+        if (( col >= 0 && col < width )); then
+            req_samples[$col]="${req:-0}"
+            err_samples[$col]="${err:-0}"
+        fi
+    done <<< "$rows"
+
+    local req_spark err_spark v peak=0 total=0
+    req_spark=$(sparkline_render "${req_samples[*]}")
+    err_spark=$(sparkline_render "${err_samples[*]}")
+    for v in "${req_samples[@]}"; do (( v > peak  )) && peak=$v; done
+    for v in "${err_samples[@]}"; do total=$(( total + v )); done
+
+    printf "  ${W}%-10s${NC}  req ${G}%s${NC}  peak=%d/bucket\n" "$app" "$req_spark" "$peak"
+    printf "  %-10s  err ${R}%s${NC}  total=%d\n" "" "$err_spark" "$total"
+    echo
+}
+
+mode_trend() {
+    local app_arg="${1:-}" hours="${2:-24}"
+    [[ "$hours" =~ ^[1-9][0-9]*$ ]] \
+        || { echo -e "${R}trend: hours must be a positive integer${NC}" >&2; return 1; }
+
+    _history_precheck || return 1
+
+    local now since width=60 window_sec
+    now=$(date +%s)
+    window_sec=$(( hours * 3600 ))
+    since=$(( now - window_sec ))
+
+    local -a apps
+    if [[ -n "$app_arg" ]]; then
+        # Reject app names that can't appear in LOGS, so a typo doesn't
+        # render "no data" forever.
+        local ok=0 name
+        for name in "${LOGS[@]}"; do
+            [[ "$name" == "$app_arg" ]] && { ok=1; break; }
+        done
+        if (( ! ok )); then
+            echo -e "${R}trend: unknown app '$app_arg'${NC}  Apps: ${LOGS[*]}" >&2
+            return 1
+        fi
+        apps=("$app_arg")
+    else
+        apps=("${LOGS[@]}")
+    fi
+
+    echo -e "\n${W}── MiLog: Trend (last ${hours}h, ${width} buckets) ──${NC}\n"
+
+    local a
+    for a in "${apps[@]}"; do
+        _render_trend_one "$a" "$since" "$window_sec" "$width"
+    done
+}
+
+# ==============================================================================
+# MODE: replay — postmortem summary of one archived log file
+# Read-only: never writes history. Handles .gz / .bz2 transparently.
+# Three passes of the file: counts + date range, timings (sort + percentile),
+# top source IPs. Each pass is single-awk-per-metric — same discipline as
+# the live dashboard helpers.
+# ==============================================================================
+mode_replay() {
+    local file="${1:-}"
+    if [[ -z "$file" ]]; then
+        echo -e "${R}Usage:${NC} milog replay <log-file>" >&2
+        return 1
+    fi
+    [[ -f "$file" ]] || { echo -e "${R}Not found: $file${NC}" >&2; return 1; }
+
+    # Pick reader based on extension. Array form so no word-splitting risks
+    # when $file contains spaces.
+    local -a reader=(cat --)
+    case "$file" in
+        *.gz)
+            if   command -v gzcat >/dev/null 2>&1; then reader=(gzcat --)
+            elif command -v zcat  >/dev/null 2>&1; then reader=(zcat  --)
+            else echo -e "${R}gzcat/zcat needed for .gz files${NC}" >&2; return 1
+            fi
+            ;;
+        *.bz2)
+            command -v bzcat >/dev/null 2>&1 \
+                || { echo -e "${R}bzcat needed for .bz2 files${NC}" >&2; return 1; }
+            reader=(bzcat --)
+            ;;
+    esac
+
+    echo -e "\n${W}── MiLog: Replay — ${file} ──${NC}\n"
+
+    # Pass 1: lines, first/last timestamp, status-class tallies.
+    local summary n first last e2 e3 e4 e5
+    summary=$("${reader[@]}" "$file" 2>/dev/null | awk '
+        {
+            n++
+            if (match($0, /\[[0-9]{2}\/[A-Za-z]+\/[0-9]{4}:[0-9]{2}:[0-9]{2}/)) {
+                t = substr($0, RSTART+1, 20)
+                if (first == "") first = t
+                last = t
+            }
+            if (match($0, / [1-5][0-9][0-9] /)) {
+                cls = substr($0, RSTART+1, 1)
+                if      (cls == "2") e2++
+                else if (cls == "3") e3++
+                else if (cls == "4") e4++
+                else if (cls == "5") e5++
+            }
+        }
+        END { printf "%d\t%s\t%s\t%d\t%d\t%d\t%d\n", n+0, first, last, e2+0, e3+0, e4+0, e5+0 }')
+    IFS=$'\t' read -r n first last e2 e3 e4 e5 <<< "$summary"
+
+    if [[ -z "$n" || "$n" -eq 0 ]]; then
+        echo -e "  ${D}(empty or unreadable)${NC}\n"
+        return 0
+    fi
+
+    printf "  %-10s  %d\n"           "lines"   "$n"
+    printf "  %-10s  %s  →  %s\n"    "range"   "${first:--}" "${last:--}"
+    printf "  %-10s  2xx=%s  3xx=%s  ${Y}4xx=%s${NC}  ${R}5xx=%s${NC}\n" \
+           "status"  "$e2" "$e3" "$e4" "$e5"
+
+    # Pass 2: percentiles, only if any line has a numeric final field.
+    local sorted
+    sorted=$("${reader[@]}" "$file" 2>/dev/null \
+        | awk '$NF ~ /^[0-9]+(\.[0-9]+)?$/ { print int($NF * 1000 + 0.5) }' \
+        | sort -n)
+    if [[ -n "$sorted" ]]; then
+        local pct p50 p95 p99
+        pct=$(printf '%s\n' "$sorted" | awk '
+            { a[NR]=$1; n=NR }
+            END {
+                i50=int((n*50+99)/100); if (i50<1) i50=1; if (i50>n) i50=n
+                i95=int((n*95+99)/100); if (i95<1) i95=1; if (i95>n) i95=n
+                i99=int((n*99+99)/100); if (i99<1) i99=1; if (i99>n) i99=n
+                printf "%d %d %d\n", a[i50], a[i95], a[i99]
+            }')
+        read -r p50 p95 p99 <<< "$pct"
+        printf "  %-10s  p50=%dms  p95=%dms  p99=%dms\n" "response" "$p50" "$p95" "$p99"
+    fi
+
+    # Pass 3: top 10 source IPs.
+    echo
+    echo -e "  ${W}Top source IPs:${NC}"
+    "${reader[@]}" "$file" 2>/dev/null \
+        | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 \
+        | awk -v Y="$Y" -v R="$R" -v NC="$NC" '{
+              col = ""
+              if      (NR == 1) col = R
+              else if (NR <= 3) col = Y
+              printf "    %s#%-3d%s  %-18s  %d requests\n", col, NR, NC, $2, $1
+          }'
+    echo
+}
+
+# ==============================================================================
+# MODE: diff — hour-level comparison: now vs 1d ago vs 7d ago, per app
+# Same-hour windows against metrics_minute. Percent deltas computed in the
+# shell because bash arithmetic handles the small integer math cleanly.
+# ==============================================================================
+mode_diff() {
+    _history_precheck || return 1
+
+    local now hr_start_now
+    now=$(date +%s)
+    hr_start_now=$(( now - (now % 3600) ))
+
+    local yest_start=$((  hr_start_now - 86400     ))
+    local yest_end=$((    yest_start   + 3600      ))
+    local week_start=$((  hr_start_now - 7 * 86400 ))
+    local week_end=$((    week_start   + 3600      ))
+
+    local hr_label
+    hr_label=$(date -d "@${hr_start_now}" '+%H:00' 2>/dev/null \
+               || date -r "$hr_start_now" '+%H:00' 2>/dev/null \
+               || echo "this hour")
+
+    echo -e "\n${W}── MiLog: Hourly diff (${hr_label} vs 1d/7d ago) ──${NC}\n"
+
+    local rows
+    rows=$(sqlite3 -separator $'\t' "$HISTORY_DB" <<SQL 2>/dev/null
+SELECT app,
+       COALESCE(SUM(CASE WHEN ts >= $hr_start_now AND ts < $now      THEN req END), 0) AS now_r,
+       COALESCE(SUM(CASE WHEN ts >= $yest_start   AND ts < $yest_end THEN req END), 0) AS d1,
+       COALESCE(SUM(CASE WHEN ts >= $week_start   AND ts < $week_end THEN req END), 0) AS d7
+FROM metrics_minute
+WHERE ts >= $week_start
+GROUP BY app
+ORDER BY app;
+SQL
+)
+    if [[ -z "$rows" ]]; then
+        echo -e "  ${D}no data in the windows${NC}\n"
+        return 0
+    fi
+
+    # ASCII header labels — Δ is a 2-byte 1-column char that confuses
+    # printf byte-width formatting. Divider em-dashes are counted to match
+    # each column's VISUAL width (12/10/10/10/8/8) so rows line up.
+    printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \
+           "APP" "NOW" "1d ago" "7d ago" "d1 %" "d7 %"
+    printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \
+           "────────────" "──────────" "──────────" "──────────" "────────" "────────"
+
+    local app now_r d1 d7 d1p d7p d1_col d7_col
+    while IFS=$'\t' read -r app now_r d1 d7; do
+        now_r=${now_r:-0}; d1=${d1:-0}; d7=${d7:-0}
+        if (( d1 > 0 )); then
+            d1p=$(( (now_r - d1) * 100 / d1 ))
+            d1_col=$G
+            (( d1p <= -25 || d1p >= 50 ))  && d1_col=$Y
+            (( d1p <= -50 || d1p >= 100 )) && d1_col=$R
+            d1p="$(printf '%+d%%' "$d1p")"
+        else
+            d1p="—"; d1_col="$D"
+        fi
+        if (( d7 > 0 )); then
+            d7p=$(( (now_r - d7) * 100 / d7 ))
+            d7_col=$G
+            (( d7p <= -25 || d7p >= 50 ))  && d7_col=$Y
+            (( d7p <= -50 || d7p >= 100 )) && d7_col=$R
+            d7p="$(printf '%+d%%' "$d7p")"
+        else
+            d7p="—"; d7_col="$D"
+        fi
+        printf "  %-12s  %10d  %10d  %10d  ${d1_col}%8s${NC}  ${d7_col}%8s${NC}\n" \
+               "$app" "$now_r" "$d1" "$d7" "$d1p" "$d7p"
+    done <<< "$rows"
+    echo
+    echo -e "  ${D}(NOW is the partial current hour so far; 1d/7d are full same-hour windows)${NC}"
+    echo
 }
 
 # ==============================================================================
@@ -1715,6 +2025,9 @@ ${W}ANALYSIS${NC}
   ${C}slow [N]${NC}           top N slow endpoints by p95  ${D}(requires \$request_time)${NC}
   ${C}stats <app>${NC}        hourly request histogram
   ${C}suspects [N] [W]${NC}   heuristic bot ranking ${D}(top N=20, window=2000 lines/app)${NC}
+  ${C}trend [app] [H]${NC}    sparkline of req/min from history ${D}(default: all apps, 24h)${NC}
+  ${C}diff${NC}               per-app req: now vs 1d ago vs 7d ago
+  ${C}replay <file>${NC}      postmortem summary for one archived log file
 
 ${W}CONFIG${NC}
   ${C}config${NC}             show resolved config + path
@@ -1759,6 +2072,9 @@ case "${1:-}" in
     top)      mode_top "${2:-10}" ;;
     slow)     mode_slow "${2:-10}" ;;
     stats)    mode_stats "${2:-}" ;;
+    trend)    mode_trend "${2:-}" "${3:-24}" ;;
+    replay)   mode_replay "${2:-}" ;;
+    diff)     mode_diff ;;
     grep)     mode_grep "${2:-}" "${3:-.}" ;;
     errors)   mode_errors ;;
     exploits) mode_exploits ;;
