@@ -8,21 +8,43 @@ heuristic scanner/exploit detection, Discord alerts, headless daemon.
 
 ## Requirements
 
-Linux, bash 4+, awk (gawk recommended), coreutils, `ps`, `df`, `uptime`,
-read access to `/var/log/nginx/*.access.log`. `curl` is needed for Discord
-alerts (optional).
+Linux, bash 4+, coreutils, `ps`, `df`, `uptime`, read access to
+`/var/log/nginx/*.access.log`. Everything else (gawk, curl, optional
+sqlite3 / mmdblookup) is handled by `install.sh`.
 
 ## Install
 
+One-liner — downloads the installer, installs `gawk` + `curl` through your
+distro's package manager, then drops `milog` into `/usr/local/bin`:
+
 ```bash
-# Option A — single file
+curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh | sudo bash
+```
+
+Optional extras (pass through with `-s --`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh \
+  | sudo bash -s -- --with-history          # also install sqlite3
+curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh \
+  | sudo bash -s -- --with-geoip            # also install mmdblookup
+```
+
+Or from a clone (the installer auto-detects and uses the local `milog.sh`):
+
+```bash
+git clone https://github.com/chud-lori/ldr.git /opt/ldr
+cd /opt/ldr
+sudo ./install.sh
+sudo ./install.sh --uninstall   # keeps ~/.config/milog/, ~/.cache/milog/
+```
+
+Manual single-file download (skip the installer):
+
+```bash
 sudo curl -fLo /usr/local/bin/milog \
   https://raw.githubusercontent.com/chud-lori/ldr/main/milog.sh
 sudo chmod +x /usr/local/bin/milog
-
-# Option B — clone + symlink (easy to git pull)
-sudo git clone https://github.com/chud-lori/ldr.git /opt/ldr
-sudo ln -sf /opt/ldr/milog.sh /usr/local/bin/milog
 ```
 
 Verify: `milog help`.
@@ -77,7 +99,19 @@ milog config edit              # open $EDITOR
 ```
 
 Config file location: `$MILOG_CONFIG` (default `~/.config/milog/config.sh`).
-Useful env vars: `MILOG_LOG_DIR`, `MILOG_APPS="a b c"`, `MILOG_CONFIG`.
+One-shot env overrides (useful in systemd units or ad-hoc runs):
+
+| Env var                   | Overrides             |
+| ------------------------- | --------------------- |
+| `MILOG_CONFIG`            | Alternate config path |
+| `MILOG_LOG_DIR`           | `LOG_DIR`             |
+| `MILOG_APPS="a b c"`      | `LOGS`                |
+| `MILOG_REFRESH`           | `REFRESH`             |
+| `MILOG_DISCORD_WEBHOOK`   | `DISCORD_WEBHOOK`     |
+| `MILOG_ALERTS_ENABLED`    | `ALERTS_ENABLED`      |
+| `MILOG_ALERT_COOLDOWN`    | `ALERT_COOLDOWN`      |
+| `MILOG_GEOIP_ENABLED`     | `GEOIP_ENABLED`       |
+| `MILOG_MMDB_PATH`         | `MMDB_PATH`           |
 
 ### nginx log format
 
@@ -150,6 +184,41 @@ pattern hits. Off by default.
 
 Every rule is deduped by key inside `ALERT_COOLDOWN`. Alerts fire from both
 the interactive modes (`monitor`, `exploits`, `probes`) and from `milog daemon`.
+
+## GeoIP enrichment (optional)
+
+`milog top` and `milog suspects` can show a `COUNTRY` column using a local
+MaxMind GeoLite2 database. Off by default — requires an `mmdblookup` binary
+and the `.mmdb` file on disk.
+
+1. Install the tool — either via the installer
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh \
+     | sudo bash -s -- --with-geoip
+   ```
+
+   or directly: `sudo apt install mmdb-bin` (Debian/Ubuntu),
+   `sudo dnf install libmaxminddb` (Fedora/RHEL), or
+   `sudo pacman -S libmaxminddb` (Arch).
+
+2. Get a free `GeoLite2-Country.mmdb` from MaxMind: register at
+   <https://www.maxmind.com/en/geolite2/signup>, download the Country
+   edition, put it at `/var/lib/GeoIP/GeoLite2-Country.mmdb` (or point
+   `MMDB_PATH` elsewhere).
+
+3. Turn it on:
+
+   ```bash
+   milog config set GEOIP_ENABLED 1
+   milog config set MMDB_PATH "/var/lib/GeoIP/GeoLite2-Country.mmdb"
+   ```
+
+4. (Optional) Auto-update — install the `geoipupdate` package and run it
+   from cron. MaxMind publishes refreshed databases weekly.
+
+MiLog looks up country only after the top-N list is already aggregated, so
+`mmdblookup` runs at most N times per invocation — never per log line.
 
 ## `milog daemon` + systemd
 

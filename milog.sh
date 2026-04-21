@@ -25,6 +25,13 @@ P95_CRIT_MS=1500
 # but slower reads. Hour-of-traffic is a reasonable default on most sites.
 SLOW_WINDOW=1000
 
+# GeoIP enrichment (off by default). Requires `mmdblookup` and a MaxMind
+# GeoLite2-Country MMDB file. Enable both flags only after the MMDB is in
+# place — `milog top` and `milog suspects` add a COUNTRY column when on.
+# See README → "GeoIP enrichment".
+GEOIP_ENABLED=0
+MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
+
 # Optional user config — sourced if present. Can override any variable above.
 # Example:
 #     LOG_DIR="/var/log/nginx"
@@ -34,9 +41,18 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 # shellcheck disable=SC1090
 [[ -f "$MILOG_CONFIG" ]] && . "$MILOG_CONFIG"
 
-# Env var overrides win over the config file
-[[ -n "${MILOG_LOG_DIR:-}" ]] && LOG_DIR="$MILOG_LOG_DIR"
-[[ -n "${MILOG_APPS:-}"    ]] && read -r -a LOGS <<< "$MILOG_APPS"
+# Env var overrides win over the config file. MILOG_* prefix keeps them
+# from colliding with generic shell env. Add new knobs here when you want
+# one-shot / systemd-unit overrides; full tuning still goes through the
+# config file.
+[[ -n "${MILOG_LOG_DIR:-}"         ]] && LOG_DIR="$MILOG_LOG_DIR"
+[[ -n "${MILOG_APPS:-}"            ]] && read -r -a LOGS <<< "$MILOG_APPS"
+[[ -n "${MILOG_REFRESH:-}"         ]] && REFRESH="$MILOG_REFRESH"
+[[ -n "${MILOG_DISCORD_WEBHOOK:-}" ]] && DISCORD_WEBHOOK="$MILOG_DISCORD_WEBHOOK"
+[[ -n "${MILOG_ALERTS_ENABLED:-}"  ]] && ALERTS_ENABLED="$MILOG_ALERTS_ENABLED"
+[[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
+[[ -n "${MILOG_GEOIP_ENABLED:-}"   ]] && GEOIP_ENABLED="$MILOG_GEOIP_ENABLED"
+[[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
 
 # Auto-discover: if no apps ended up configured, glob *.access.log in LOG_DIR
 if [[ ${#LOGS[@]} -eq 0 ]]; then
@@ -354,6 +370,23 @@ percentiles() {
             p99 = int((n * 99 + 99) / 100); if (p99 < 1) p99 = 1; if (p99 > n) p99 = n
             printf "%d %d %d\n", a[p50], a[p95], a[p99]
         }'
+}
+
+# GeoIP lookup for a single IP. Returns the 2-letter ISO country code or
+# the em-dash sentinel when disabled, when the MMDB is missing, when
+# mmdblookup isn't on $PATH, or when the IP isn't in the database.
+#
+# Performance: forks mmdblookup per call. Callers MUST only invoke this on
+# already-aggregated IP sets (post uniq/awk dedup) — never per log line in
+# a live tail, where it would fork thousands of processes.
+geoip_country() {
+    [[ "${GEOIP_ENABLED:-0}" != "1" ]] && { printf -- '—'; return; }
+    [[ ! -f "$MMDB_PATH" ]]            && { printf -- '—'; return; }
+    command -v mmdblookup >/dev/null 2>&1 || { printf -- '—'; return; }
+    local out
+    out=$(mmdblookup --file "$MMDB_PATH" --ip "$1" country iso_code 2>/dev/null \
+          | awk -F'"' 'NF>=3 {print $2; exit}')
+    printf '%s' "${out:-—}"
 }
 
 # Cached p95 lookup. TIMED_APPS is a process-lifetime per-app cache:
@@ -729,17 +762,45 @@ mode_health() {
 mode_top() {
     local n="${1:-10}"
     echo -e "\n${W}── MiLog: Top ${n} IPs ──${NC}\n"
-    printf "%-5s  %-18s  %10s\n" "RANK" "IP" "REQUESTS"
-    printf "%-5s  %-18s  %10s\n" "────" "─────────────────" "────────"
+
+    local show_geo=0
+    [[ "${GEOIP_ENABLED:-0}" == "1" && -f "$MMDB_PATH" ]] && show_geo=1
+
+    if (( show_geo )); then
+        printf "%-5s  %-18s  %-7s  %10s\n" "RANK" "IP" "COUNTRY" "REQUESTS"
+        printf "%-5s  %-18s  %-7s  %10s\n" "────" "─────────────────" "───────" "────────"
+    else
+        printf "%-5s  %-18s  %10s\n" "RANK" "IP" "REQUESTS"
+        printf "%-5s  %-18s  %10s\n" "────" "─────────────────" "────────"
+    fi
+
     local tmp; tmp=$(mktemp)
+    local name
     for name in "${LOGS[@]}"; do
-        [[ -f "$LOG_DIR/$name.access.log" ]] && awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
+        [[ -f "$LOG_DIR/$name.access.log" ]] \
+            && awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
     done
-    sort "$tmp" | uniq -c | sort -rn | head -n "$n" | \
-    awk -v r="$R" -v y="$Y" -v nc="$NC" 'BEGIN{i=1}{
-        col=""; if(i==1)col=r; else if(i<=3)col=y
-        printf "%-5s  %-18s  %s%10s%s\n","#"i,$2,col,$1,nc; i++}'
-    rm -f "$tmp"; echo ""
+
+    # Geo lookup happens here — after uniq has already collapsed the IP set
+    # to at most $n rows, so we fork mmdblookup $n times, not once per line.
+    local i=1 count ip col country
+    while read -r count ip; do
+        col=""
+        (( i == 1 ))             && col="$R"
+        (( i > 1 && i <= 3 ))    && col="$Y"
+        if (( show_geo )); then
+            country=$(geoip_country "$ip")
+            printf "%-5s  %-18s  %-7s  %b%10s%b\n" \
+                "#$i" "$ip" "$country" "$col" "$count" "$NC"
+        else
+            printf "%-5s  %-18s  %b%10s%b\n" \
+                "#$i" "$ip" "$col" "$count" "$NC"
+        fi
+        i=$((i+1))
+    done < <(sort "$tmp" | uniq -c | sort -rn | head -n "$n")
+
+    rm -f "$tmp"
+    echo
 }
 
 # ==============================================================================
@@ -965,58 +1026,88 @@ mode_suspects() {
     local window="${2:-2000}"
 
     echo -e "\n${W}── MiLog: Suspicious IPs (last ${window} lines/app, top ${topn}) ──${NC}\n"
-    printf "%-6s  %-18s  %6s  %5s  %5s  %6s  %s\n" \
-        "SCORE" "IP" "REQ" "4XX" "5XX" "PATHS" "FLAGS"
-    printf "%-6s  %-18s  %6s  %5s  %5s  %6s  %s\n" \
-        "─────" "─────────────────" "──────" "─────" "─────" "──────" "──────────"
+
+    local show_geo=0
+    [[ "${GEOIP_ENABLED:-0}" == "1" && -f "$MMDB_PATH" ]] && show_geo=1
+
+    if (( show_geo )); then
+        printf "%-6s  %-18s  %-7s  %6s  %5s  %5s  %6s  %s\n" \
+            "SCORE" "IP" "COUNTRY" "REQ" "4XX" "5XX" "PATHS" "FLAGS"
+        printf "%-6s  %-18s  %-7s  %6s  %5s  %5s  %6s  %s\n" \
+            "─────" "─────────────────" "───────" "──────" "─────" "─────" "──────" "──────────"
+    else
+        printf "%-6s  %-18s  %6s  %5s  %5s  %6s  %s\n" \
+            "SCORE" "IP" "REQ" "4XX" "5XX" "PATHS" "FLAGS"
+        printf "%-6s  %-18s  %6s  %5s  %5s  %6s  %s\n" \
+            "─────" "─────────────────" "──────" "─────" "─────" "──────" "──────────"
+    fi
 
     local tmp; tmp=$(mktemp)
+    local name
     for name in "${LOGS[@]}"; do
         local file="$LOG_DIR/$name.access.log"
         [[ -f "$file" ]] && tail -n "$window" "$file" >> "$tmp"
     done
 
-    awk '
-    BEGIN { FS = "\"" }
-    NF >= 6 {
-        split($1, a, " ");  ip = a[1]
-        gsub(/^ +| +$/, "", $3);  split($3, s, " ");  status = s[1]
-        req = $2;  ua = $6
+    # Score + top-N in one awk+sort pipeline. Post-aggregation, we pretty-
+    # print in bash so we can slot in an optional per-IP country lookup
+    # (mmdblookup runs at most $topn times — never per-line).
+    local ranked
+    ranked=$(awk '
+        BEGIN { FS = "\"" }
+        NF >= 6 {
+            split($1, a, " ");  ip = a[1]
+            gsub(/^ +| +$/, "", $3);  split($3, s, " ");  status = s[1]
+            req = $2;  ua = $6
 
-        reqs[ip]++
-        if (status ~ /^4/) e4[ip]++
-        if (status ~ /^5/) e5[ip]++
-        if (ua == "-" || ua == "") no_ua[ip]++
+            reqs[ip]++
+            if (status ~ /^4/) e4[ip]++
+            if (status ~ /^5/) e5[ip]++
+            if (ua == "-" || ua == "") no_ua[ip]++
 
-        key = ip "|" req
-        if (!(key in seen)) { seen[key] = 1;  paths[ip]++ }
+            key = ip "|" req
+            if (!(key in seen)) { seen[key] = 1;  paths[ip]++ }
 
-        ual = tolower(ua)
-        if (ual ~ /masscan|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|ffuf|wfuzz|feroxbuster|libredtail|l9explore|shodan|censysinspect|expanseinc|httpx|python-requests|go-http-client|okhttp|libwww-perl|scanner|fuzzer|leakix/) {
-            scanner_ua[ip] = 1
+            ual = tolower(ua)
+            if (ual ~ /masscan|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|ffuf|wfuzz|feroxbuster|libredtail|l9explore|shodan|censysinspect|expanseinc|httpx|python-requests|go-http-client|okhttp|libwww-perl|scanner|fuzzer|leakix/) {
+                scanner_ua[ip] = 1
+            }
         }
-    }
-    END {
-        for (ip in reqs) {
-            sc = e4[ip]*2 + e5[ip]*3 + no_ua[ip] + (scanner_ua[ip]?10:0) + int(paths[ip]/5)
-            if (sc < 3) continue
-            f = ""
-            if (scanner_ua[ip])    f = f " SCANNER"
-            if (no_ua[ip] > 0)     f = f " NO-UA"
-            if (e4[ip] >= 20)      f = f " HIGH-4XX"
-            if (e5[ip] >= 5)       f = f " HIGH-5XX"
-            if (paths[ip] >= 10)   f = f " MANY-PATHS"
-            sub(/^ /, "", f)
-            printf "%d\t%s\t%d\t%d\t%d\t%d\t%s\n", sc, ip, reqs[ip], e4[ip]+0, e5[ip]+0, paths[ip]+0, f
-        }
-    }' "$tmp" | sort -t$'\t' -k1,1 -rn | head -n "$topn" | \
-    awk -F'\t' -v R="$R" -v Y="$Y" -v G="$G" -v NC="$NC" '{
-        c = G;  if ($1+0 >= 10) c = Y;  if ($1+0 >= 30) c = R
-        printf "%s%-6s%s  %-18s  %6s  %5s  %5s  %6s  %s\n", c, $1, NC, $2, $3, $4, $5, $6, $7
-    }'
+        END {
+            for (ip in reqs) {
+                sc = e4[ip]*2 + e5[ip]*3 + no_ua[ip] + (scanner_ua[ip]?10:0) + int(paths[ip]/5)
+                if (sc < 3) continue
+                f = ""
+                if (scanner_ua[ip])    f = f " SCANNER"
+                if (no_ua[ip] > 0)     f = f " NO-UA"
+                if (e4[ip] >= 20)      f = f " HIGH-4XX"
+                if (e5[ip] >= 5)       f = f " HIGH-5XX"
+                if (paths[ip] >= 10)   f = f " MANY-PATHS"
+                sub(/^ /, "", f)
+                printf "%d\t%s\t%d\t%d\t%d\t%d\t%s\n", sc, ip, reqs[ip], e4[ip]+0, e5[ip]+0, paths[ip]+0, f
+            }
+        }' "$tmp" | sort -t$'\t' -k1,1 -rn | head -n "$topn")
 
     rm -f "$tmp"
-    echo ""
+
+    [[ -z "$ranked" ]] && { echo; return 0; }
+
+    local sc ip req e4 e5 p_count flags c country
+    while IFS=$'\t' read -r sc ip req e4 e5 p_count flags; do
+        c=$G
+        (( sc >= 10 )) && c=$Y
+        (( sc >= 30 )) && c=$R
+        if (( show_geo )); then
+            country=$(geoip_country "$ip")
+            printf "%b%-6s%b  %-18s  %-7s  %6s  %5s  %5s  %6s  %s\n" \
+                "$c" "$sc" "$NC" "$ip" "$country" "$req" "$e4" "$e5" "$p_count" "$flags"
+        else
+            printf "%b%-6s%b  %-18s  %6s  %5s  %5s  %6s  %s\n" \
+                "$c" "$sc" "$NC" "$ip" "$req" "$e4" "$e5" "$p_count" "$flags"
+        fi
+    done <<< "$ranked"
+
+    echo
 }
 
 # ==============================================================================
@@ -1190,6 +1281,8 @@ config_show() {
     printf "  %-22s 4xx=%s 5xx=%s\n"   "status thresholds" "$THRESH_4XX_WARN" "$THRESH_5XX_WARN"
     printf "  %-22s warn=%sms crit=%sms\n" "p95 response time" "$P95_WARN_MS" "$P95_CRIT_MS"
     printf "  %-22s %s\n" "SLOW_WINDOW"   "$SLOW_WINDOW"
+    printf "  %-22s enabled=%s mmdb=%s\n" "geoip" "$GEOIP_ENABLED" \
+        "$([[ -f "$MMDB_PATH" ]] && echo "$MMDB_PATH" || echo "MISSING:$MMDB_PATH")"
     printf "  %-22s webhook=%s enabled=%s cooldown=%ss\n" "discord alerts" \
         "$([[ -n "$DISCORD_WEBHOOK" ]] && echo set || echo unset)" "$ALERTS_ENABLED" "$ALERT_COOLDOWN"
 }
@@ -1230,6 +1323,10 @@ config_init() {
 # P95_WARN_MS=500
 # P95_CRIT_MS=1500
 # SLOW_WINDOW=1000      # lines scanned per app by `milog slow`
+
+# GeoIP — requires mmdblookup + a MaxMind GeoLite2-Country.mmdb. See README.
+# GEOIP_ENABLED=0
+# MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
 # Discord alerts — requires curl. Leave DISCORD_WEBHOOK empty to disable.
 # DISCORD_WEBHOOK="https://discord.com/api/webhooks/ID/TOKEN"
