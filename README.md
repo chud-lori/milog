@@ -9,25 +9,24 @@ heuristic scanner/exploit detection, Discord alerts, headless daemon.
 ## Requirements
 
 Linux, bash 4+, coreutils, `ps`, `df`, `uptime`, read access to
-`/var/log/nginx/*.access.log`. Everything else (gawk, curl, optional
-sqlite3 / mmdblookup) is handled by `install.sh`.
+`/var/log/nginx/*.access.log`. Everything else (gawk, curl, sqlite3, and
+optionally mmdblookup) is handled by `install.sh`.
 
 ## Install
 
-One-liner — downloads the installer, installs `gawk` + `curl` through your
-distro's package manager, then drops `milog` into `/usr/local/bin`:
+One-liner — downloads the installer, installs `gawk` + `curl` + `sqlite3`
+through your distro's package manager, then drops `milog` into
+`/usr/local/bin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh | sudo bash
 ```
 
-Optional extras (pass through with `-s --`):
+Add GeoIP enrichment (opt-in — `mmdblookup` + requires a MaxMind MMDB):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
-  | sudo bash -s -- --with-history          # also install sqlite3
-curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
-  | sudo bash -s -- --with-geoip            # also install mmdblookup
+  | sudo bash -s -- --with-geoip
 ```
 
 Or from a clone (the installer auto-detects and uses the local `milog.sh`):
@@ -228,21 +227,10 @@ MiLog looks up country only after the top-N list is already aggregated, so
 ## Historical metrics (optional)
 
 When `milog daemon` is running with `HISTORY_ENABLED=1`, every minute it
-writes one row per app into a local SQLite database. This unlocks the
-upcoming `milog trend` / `milog diff` read modes and keeps an hourly
-top-IPs rollup.
-
-Install the CLI tool — via the installer,
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
-  | sudo bash -s -- --with-history
-```
-
-or directly: `sudo apt install sqlite3` / `sudo dnf install sqlite` /
-`sudo pacman -S sqlite`.
-
-Turn it on:
+writes one row per app into a local SQLite database. This backs the
+`milog trend` and `milog diff` read modes and keeps an hourly top-IPs
+rollup. `sqlite3` is installed by the default installer, so no extra step
+is needed — just turn the feature on:
 
 ```bash
 milog config set HISTORY_ENABLED 1

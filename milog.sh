@@ -486,7 +486,8 @@ SQL
 _history_precheck() {
     if ! command -v sqlite3 >/dev/null 2>&1; then
         echo -e "${R}sqlite3 is not installed${NC}" >&2
-        echo -e "${D}  install with: curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh | sudo bash -s -- --with-history${NC}" >&2
+        echo -e "${D}  re-run the installer (sqlite3 is now installed by default) or:${NC}" >&2
+        echo -e "${D}  sudo apt install sqlite3  /  sudo dnf install sqlite  /  sudo pacman -S sqlite${NC}" >&2
         return 1
     fi
     if [[ ! -f "$HISTORY_DB" ]]; then

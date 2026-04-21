@@ -13,12 +13,13 @@
 #        git clone https://github.com/chud-lori/milog.git /opt/milog
 #        cd /opt/milog && sudo ./install.sh
 #
-# Installs gawk + curl by default; `--with-history` adds sqlite3,
-# `--with-geoip` adds mmdblookup. Then places milog.sh at /usr/local/bin/milog.
+# Installs gawk + curl + sqlite3 by default. `--with-geoip` adds mmdblookup
+# for the optional GeoIP COUNTRY column. Then places milog.sh at
+# /usr/local/bin/milog.
 #
 # Flags:
-#   --with-history         install sqlite3 for `milog trend` / `milog diff`
 #   --with-geoip           install mmdblookup for GeoIP enrichment
+#   --with-history         (deprecated — sqlite3 is installed by default)
 #   --bin PATH             install destination (default: /usr/local/bin/milog)
 #   --script-url URL       override milog.sh source URL (pipe mode)
 #   --uninstall            remove binary (configs preserved)
@@ -120,14 +121,15 @@ EOF
 # ---- install ----------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: install.sh [--with-history] [--with-geoip] [--bin PATH]
-                  [--script-url URL] [--uninstall]
+Usage: install.sh [--with-geoip] [--bin PATH] [--script-url URL] [--uninstall]
 
-  --with-history    install sqlite3 (for \`milog trend\` / \`milog diff\`)
   --with-geoip      install mmdblookup (for GeoIP enrichment in top/suspects)
   --bin PATH        install destination (default: /usr/local/bin/milog)
   --script-url URL  override milog.sh download URL (pipe-install mode)
   --uninstall       remove installed binary (keeps config and state dirs)
+
+Core deps (gawk, curl, sqlite3) are always installed.
+The --with-history flag is accepted silently for backward compatibility.
 EOF
 }
 
@@ -174,12 +176,12 @@ resolve_script_src() {
 }
 
 main() {
-    local with_history=0 with_geoip=0 do_uninstall=0
+    local with_geoip=0 do_uninstall=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --with-history) with_history=1; shift ;;
             --with-geoip)   with_geoip=1;   shift ;;
+            --with-history) shift ;;   # deprecated no-op; sqlite3 is default
             --bin)          BIN_DST="${2:?--bin needs a path}"; shift 2 ;;
             --script-url)   SCRIPT_URL="${2:?--script-url needs a URL}"; shift 2 ;;
             --uninstall)    do_uninstall=1; shift ;;
@@ -197,11 +199,12 @@ main() {
     [[ "$pm" == "none" ]] && die "no supported package manager (apt-get/dnf/yum/pacman) found"
     info "Package manager: $pm"
 
-    # Abstract-name dependency list. gawk is recommended over busybox/mawk
-    # for speed on large logs; curl is required for Discord webhooks.
-    local deps=(gawk curl)
-    (( with_history )) && deps+=(sqlite3)
-    (( with_geoip   )) && deps+=(mmdblookup)
+    # Abstract-name dependency list. gawk is preferred over busybox/mawk
+    # for speed on large logs; curl is required for Discord webhooks;
+    # sqlite3 powers the history/trend/diff modes and is cheap enough to
+    # always install. mmdblookup stays opt-in (needs a MaxMind account).
+    local deps=(gawk curl sqlite3)
+    (( with_geoip )) && deps+=(mmdblookup)
 
     # Only install what's missing — idempotent reruns stay fast.
     local need_install=() tool resolved
