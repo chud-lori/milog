@@ -1,193 +1,194 @@
 # MiLog
 
-Single-script nginx + system monitor. TUI dashboards, log tailing,
-heuristic scanner/exploit detection, per-app stats.
+Single-script nginx + system monitor. TUI dashboard, log tailing,
+heuristic scanner/exploit detection, Discord alerts, headless daemon.
+
+> Internals, design principles, and extension guide live in
+> [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Requirements
 
-- Linux (uses `/proc`, `/sys/class/net`, `ip`)
-- `bash` 4.x, `awk` (gawk recommended), `grep`, `tail`, `ps`, `df`, `uptime`
-- Read access to `/var/log/nginx/*.access.log` (or whatever you configure)
+Linux, bash 4+, awk (gawk recommended), coreutils, `ps`, `df`, `uptime`,
+read access to `/var/log/nginx/*.access.log`. `curl` is needed for Discord
+alerts (optional).
 
 ## Install
 
-### Option A — single-file download
-
 ```bash
+# Option A — single file
 sudo curl -fLo /usr/local/bin/milog \
   https://raw.githubusercontent.com/chud-lori/ldr/main/milog.sh
 sudo chmod +x /usr/local/bin/milog
-```
 
-### Option B — clone + symlink (easy to update with `git pull`)
-
-```bash
+# Option B — clone + symlink (easy to git pull)
 sudo git clone https://github.com/chud-lori/ldr.git /opt/ldr
 sudo ln -sf /opt/ldr/milog.sh /usr/local/bin/milog
 ```
 
-### Verify
-
-```bash
-milog help
-```
-
-## Configure
-
-MiLog resolves settings in this order (later wins):
-
-1. Hardcoded defaults in the script
-2. Config file (`~/.config/milog/config.sh` by default)
-3. Environment variables
-4. Auto-discovery (only if `LOGS` ends up empty)
-
-### Fastest path: `milog config` subcommands
-
-You don't need to open the config file in a text editor.
-
-```bash
-milog config init              # create a commented template
-milog config add api           # append app to LOGS
-milog config add web
-milog config rm old            # remove an app
-milog config dir /var/log/nginx
-milog config set REFRESH 3
-milog config set THRESH_REQ_CRIT 60
-milog config                   # show resolved values + path
-milog config edit              # open $EDITOR as escape hatch
-```
-
-### Config file (manual editing)
-
-```bash
-mkdir -p ~/.config/milog
-cat > ~/.config/milog/config.sh <<'EOF'
-# Where nginx writes its access logs
-LOG_DIR="/var/log/nginx"
-
-# Apps to monitor — basenames of <name>.access.log files.
-# Leave empty to auto-discover every *.access.log in LOG_DIR.
-LOGS=(api web admin)
-# LOGS=()
-
-# Dashboard refresh interval (seconds)
-REFRESH=5
-
-# Optional threshold overrides
-# THRESH_REQ_WARN=15
-# THRESH_REQ_CRIT=40
-# THRESH_CPU_WARN=70
-# THRESH_CPU_CRIT=90
-# THRESH_MEM_WARN=80
-# THRESH_MEM_CRIT=95
-# THRESH_DISK_WARN=80
-# THRESH_DISK_CRIT=95
-# THRESH_4XX_WARN=20
-# THRESH_5XX_WARN=5
-EOF
-```
-
-Point to a different config file with `MILOG_CONFIG=/path/to/config.sh`.
-
-### Env var overrides (one-shot or scripted)
-
-| Variable         | Effect                                                     |
-| ---------------- | ---------------------------------------------------------- |
-| `MILOG_LOG_DIR`  | Override `LOG_DIR`                                         |
-| `MILOG_APPS`     | Space-separated app list — overrides `LOGS`                |
-| `MILOG_CONFIG`   | Path to an alternate config file                           |
-
-```bash
-MILOG_LOG_DIR=/var/log/nginx MILOG_APPS="api web" milog monitor
-```
-
-### Auto-discovery
-
-If `LOGS` is empty after config + env (e.g. config contains `LOGS=()`),
-MiLog globs `$LOG_DIR/*.access.log` and uses the basenames. Good when your
-log filenames follow `<name>.access.log` and you don't want to maintain a list.
-
-If nothing is configured and nothing is discovered, MiLog exits with a clear
-message telling you where it looked.
+Verify: `milog help`.
 
 ## Usage
 
 ```
-milog              # tail all logs, merged by timestamp, colored per app
+milog              # merged color-prefixed tail of all apps
 milog monitor      # full TUI: nginx + CPU/MEM/DISK/NET + workers
+milog daemon       # headless — fire Discord alerts, no TUI
 milog rate         # nginx-only req/min dashboard
 milog health       # 2xx/3xx/4xx/5xx totals per app
 milog top [N]      # top N source IPs (default 10)
 milog stats <app>  # hourly request histogram
-milog suspects [N] [W]   # heuristic bot ranking (top N=20, last W=2000 lines/app)
+milog suspects [N] [W]   # heuristic bot ranking
 milog errors       # live tail of 4xx/5xx
-milog exploits     # live tail matching LFI/RCE/SQLi/XSS/infra-probe payloads
-milog probes       # live tail matching scanner/bot UAs + protocol smuggling
-milog grep <app> <pat>   # filter-tail one app
+milog exploits     # LFI/RCE/SQLi/XSS/infra-probe live tail
+milog probes       # scanner/bot traffic live tail
+milog grep <app> <pat>
 milog <app>        # raw tail of one app
+milog config [...]
 milog help
 ```
 
-`Ctrl+C` exits any live view.
+### `monitor` keys
 
-### `monitor` keybindings
+| Key        | Action                     |
+| ---------- | -------------------------- |
+| `q`        | quit                       |
+| `p`        | pause (freezes sparklines) |
+| `r`        | refresh now                |
+| `+` / `-`  | decrease / increase rate   |
 
-| Key        | Action                                                |
-| ---------- | ----------------------------------------------------- |
-| `q`        | quit                                                  |
-| `p`        | toggle pause (freezes sparklines; `[PAUSED]` in footer) |
-| `r`        | refresh now                                           |
-| `+` / `-`  | decrease / increase refresh interval                  |
+## Configuration
 
-Sparklines in the INTENSITY column show each app's last ~30 samples of
-`req/min`. Change history depth by setting `SPARK_LEN=60` in the config.
+Resolution order: hardcoded defaults → config file → env vars → auto-discover
+(see [ARCHITECTURE.md](ARCHITECTURE.md#configuration-layering) for the full
+precedence rules).
 
-## nginx log format
+Fast path — the `config` subcommand:
 
-MiLog expects the default `combined` format:
-
+```bash
+milog config init              # write commented template
+milog config add api           # append to LOGS
+milog config rm old
+milog config dir /var/log/nginx
+milog config set REFRESH 3
+milog config set THRESH_REQ_CRIT 60
+milog config                   # show resolved values + path
+milog config edit              # open $EDITOR
 ```
-log_format combined '$remote_addr - $remote_user [$time_local] '
-                    '"$request" $status $body_bytes_sent '
-                    '"$http_referer" "$http_user_agent"';
-```
 
-Per-app log files named `<name>.access.log` inside `LOG_DIR`:
+Config file location: `$MILOG_CONFIG` (default `~/.config/milog/config.sh`).
+Useful env vars: `MILOG_LOG_DIR`, `MILOG_APPS="a b c"`, `MILOG_CONFIG`.
+
+### nginx log format
+
+MiLog expects the default `combined` format per app in `LOG_DIR`, one file
+per app named `<name>.access.log`:
 
 ```nginx
 access_log /var/log/nginx/api.access.log combined;
 ```
 
-## Permissions
+### Permissions
 
-`/var/log/nginx` is usually owned by `root` or `adm`. Either:
+`/var/log/nginx` is usually owned by `root` or `adm`. Either run with `sudo`
+or add your user to the `adm` group: `sudo usermod -aG adm $USER`.
 
-- Run MiLog with `sudo`, or
-- Add your user to the `adm` group: `sudo usermod -aG adm $USER` (log out/in)
+## Discord alerts
+
+MiLog can POST to a Discord webhook when a threshold trips or an exploit/probe
+pattern hits. Off by default.
+
+1. Create a webhook in your Discord channel: *Channel → Edit → Integrations →
+   Webhooks → New Webhook → Copy URL*.
+2. Configure:
+
+   ```bash
+   milog config set DISCORD_WEBHOOK "https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
+   milog config set ALERTS_ENABLED 1
+   ```
+
+   Or via env:
+
+   ```bash
+   export DISCORD_WEBHOOK="https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
+   export ALERTS_ENABLED=1
+   ```
+
+3. Optional tuning:
+
+   ```bash
+   milog config set ALERT_COOLDOWN 300           # seconds between repeats
+   milog config set ALERT_STATE_DIR /var/lib/milog
+   ```
+
+### What fires
+
+| Rule              | Key                          | Trigger                                        |
+| ----------------- | ---------------------------- | ---------------------------------------------- |
+| 5xx spike         | `5xx:<app>`                  | last minute ≥ `THRESH_5XX_WARN` (default 5)    |
+| 4xx spike         | `4xx:<app>`                  | last minute ≥ `THRESH_4XX_WARN` (default 20)   |
+| CPU / MEM / Disk  | `cpu` / `mem` / `disk:/`     | ≥ corresponding `THRESH_*_CRIT`                |
+| Workers down      | `workers`                    | zero nginx worker processes                    |
+| Exploit match     | `exploit:<app>:<category>`   | `mode_exploits` pattern hit                    |
+| Probe match       | `probe:<app>`                | `mode_probes` pattern hit                      |
+
+Every rule is deduped by key inside `ALERT_COOLDOWN`. Alerts fire from both
+the interactive modes (`monitor`, `exploits`, `probes`) and from `milog daemon`.
+
+## `milog daemon` + systemd
+
+Headless mode runs the same rule evaluator without a TUI. Useful on servers
+where nobody is watching the dashboard.
+
+```bash
+milog daemon    # foreground; stderr = decision log
+```
+
+### systemd unit
+
+```ini
+[Unit]
+Description=MiLog headless alerter
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/milog daemon
+Restart=on-failure
+User=milog
+Environment=MILOG_CONFIG=/etc/milog/config.sh
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Drop into `/etc/systemd/system/milog.service`, set your config file at
+`/etc/milog/config.sh` with `DISCORD_WEBHOOK` + `ALERTS_ENABLED=1`, then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now milog
+sudo journalctl -u milog -f
+```
 
 ## Troubleshooting
 
-**"no apps configured and none found"** — `LOG_DIR` is wrong or the
-directory has no `*.access.log` files. Check with `ls $LOG_DIR` and either
-set `MILOG_APPS` or fix `LOG_DIR` in the config.
-
-**Empty dashboard, no request counts** — MiLog matches the *current minute*
-in the log's `[dd/Mon/yyyy:HH:MM` field. If nginx is logging in UTC but the
-shell is in a different timezone, counts will be zero. Set `TZ=UTC milog monitor`
-or align nginx's timezone.
-
-**`monitor` mode shows 0 workers** — the `ps aux` parse expects processes named
-`nginx: worker`. Confirm with `ps aux | grep nginx`.
-
-**Live tails miss new lines after logrotate** — MiLog uses `tail -F` (uppercase),
-which re-opens on rotate. If you're on a system without GNU `tail`, install
-`coreutils`.
+- **"no apps configured and none found"** — check `ls $LOG_DIR`. Either set
+  `MILOG_APPS` or fix `LOG_DIR`.
+- **Empty dashboard / zero counts** — MiLog matches the *current minute*
+  in `[dd/Mon/yyyy:HH:MM`. If nginx logs in UTC but your shell isn't, try
+  `TZ=UTC milog monitor`.
+- **`monitor` shows 0 workers** — the `ps aux` match expects `nginx: worker`.
+  Confirm with `ps aux | grep nginx`.
+- **Live tails miss lines after logrotate** — install GNU coreutils; BSD
+  `tail -F` is not equivalent.
+- **Discord alerts never arrive** — check `ALERTS_ENABLED=1`, `DISCORD_WEBHOOK`
+  reachable (`curl -v "$DISCORD_WEBHOOK"`), and state file at
+  `$ALERT_STATE_DIR/alerts.state` — stale entries suppress via cooldown.
 
 ## Uninstall
 
 ```bash
 sudo rm /usr/local/bin/milog
-rm -rf ~/.config/milog
-# if cloned:
-sudo rm -rf /opt/ldr
+rm -rf ~/.config/milog ~/.cache/milog
+sudo rm -rf /opt/ldr   # if cloned
 ```
