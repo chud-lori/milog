@@ -15,6 +15,12 @@ ALERTS_ENABLED=0
 ALERT_COOLDOWN=300
 ALERT_STATE_DIR="$HOME/.cache/milog"
 
+# Response-time percentile thresholds (milliseconds) — used to colour the p95
+# tag in the monitor dashboard. Requires nginx to log $request_time; see
+# README → "Response-time percentiles".
+P95_WARN_MS=500
+P95_CRIT_MS=1500
+
 # Optional user config — sourced if present. Can override any variable above.
 # Example:
 #     LOG_DIR="/var/log/nginx"
@@ -84,6 +90,12 @@ json_escape() {
 # Fire a Discord webhook embed. Silently no-ops when alerts are disabled,
 # no webhook is configured, or curl is missing. Never crashes callers —
 # on any error the TUI must keep rendering.
+#
+# Security: bodies frequently contain attacker-controlled log-line bytes
+# (User-Agent, URL path, headers). We set allowed_mentions.parse=[] so an
+# embedded `@everyone` or `<@&roleid>` never produces a real ping. The
+# triple-backtick code block protects markdown rendering; allowed_mentions
+# protects the Discord pings surface.
 #   $1 title   $2 body   $3 color_int  (decimal; default 15158332 = red)
 alert_discord() {
     [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
@@ -91,7 +103,7 @@ alert_discord() {
     command -v curl >/dev/null 2>&1     || return 0
     local title="$1" body="$2" color="${3:-15158332}"
     local payload
-    payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}]}' \
+    payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")
     curl -sS -m 5 -H "Content-Type: application/json" \
          -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
@@ -340,6 +352,30 @@ percentiles() {
         }'
 }
 
+# Cached p95 lookup. TIMED_APPS is a process-lifetime per-app cache:
+# unset=unknown, 0=no timing, 1=has timing. First call probes and memoises;
+# subsequent calls for a 0-marked app return immediately without rescanning
+# the log. Restart MiLog to pick up a log_format change.
+#
+# Declared lazily (`-gA` inside the function) so the script stays parseable
+# on bash 3.2 hosts where top-level associative arrays aren't supported —
+# the same pattern already used for HIST inside mode_monitor.
+#
+# Prints the p95 in milliseconds on stdout, or empty when unavailable.
+_p95_cached() {
+    declare -gA TIMED_APPS
+    local name="$1" cur="$2"
+    [[ "${TIMED_APPS[$name]:-}" == "0" ]] && return 0
+    local _p50 p95 _p99
+    read -r _p50 p95 _p99 <<< "$(percentiles "$name" "$cur")"
+    if [[ "$p95" =~ ^[0-9]+$ ]]; then
+        TIMED_APPS[$name]=1
+        printf '%s' "$p95"
+    else
+        TIMED_APPS[$name]=0
+    fi
+}
+
 # HTTP rule-hook — fires 4xx/5xx spike alerts. Called from both nginx_row
 # (render-mode) and mode_daemon. Cooldown gate inside alert_should_fire.
 nginx_check_http_alerts() {
@@ -395,6 +431,11 @@ nginx_row() {
 
     nginx_check_http_alerts "$name" "$c4" "$c5"
 
+    # Response-time p95 (skipped automatically for apps without the timed
+    # log format after the first probe — see _p95_cached / TIMED_APPS).
+    local p95_ms
+    p95_ms=$(_p95_cached "$name" "$CUR_TIME")
+
     local bars_plain bars_col
     if [[ "${MILOG_HIST_ENABLED:-0}" == "1" ]]; then
         # Push current sample into ring buffer (HIST is a global assoc array).
@@ -426,17 +467,27 @@ nginx_row() {
         fi
     fi
 
-    # Append error tag, trimming bar/sparkline to fit
-    if [[ $c4 -gt 0 || $c5 -gt 0 ]]; then
-        local etag_p=" 4xx:${c4} 5xx:${c5}"
-        local etag_c=" ${Y}4xx:${c4}${NC} ${R}5xx:${c5}${NC}"
+    # Build the right-aligned tag strip — 4xx/5xx counts and/or p95 — then
+    # trim the bar/sparkline to fit before concatenating. Each tag is
+    # optional; the tag strip is only applied when at least one is present.
+    local etag_p="" etag_c=""
+    if (( c4 > 0 || c5 > 0 )); then
+        etag_p+=" 4xx:${c4} 5xx:${c5}"
+        etag_c+=" ${Y}4xx:${c4}${NC} ${R}5xx:${c5}${NC}"
+    fi
+    if [[ -n "$p95_ms" ]]; then
+        local pcol
+        pcol=$(tcol "$p95_ms" "$P95_WARN_MS" "$P95_CRIT_MS")
+        etag_p+=" p95:${p95_ms}ms"
+        etag_c+=" ${pcol}p95:${p95_ms}ms${NC}"
+    fi
+    if [[ -n "$etag_p" ]]; then
         local max_b=$(( W_BAR - ${#etag_p} ))
         if [[ ${#bars_plain} -gt $max_b ]]; then
             bars_plain="${bars_plain:0:$max_b}"
             if [[ "${MILOG_HIST_ENABLED:-0}" == "1" ]]; then
-                # Re-render sparkline truncated to max_b samples (tail end)
                 local -a trimmed=( ${HIST[$name]:-} )
-                trimmed=( "${trimmed[@]: -$max_b}" )
+                (( max_b > 0 && ${#trimmed[@]} > max_b )) && trimmed=( "${trimmed[@]: -$max_b}" )
                 bars_col="${b_col}$(sparkline_render "${trimmed[*]}")${NC}"
             else
                 bars_col="${b_col}${bars_plain}${NC}"
@@ -1045,6 +1096,9 @@ config_show() {
     printf "  %-22s warn=%s crit=%s\n" "mem"      "$THRESH_MEM_WARN"  "$THRESH_MEM_CRIT"
     printf "  %-22s warn=%s crit=%s\n" "disk"     "$THRESH_DISK_WARN" "$THRESH_DISK_CRIT"
     printf "  %-22s 4xx=%s 5xx=%s\n"   "status thresholds" "$THRESH_4XX_WARN" "$THRESH_5XX_WARN"
+    printf "  %-22s warn=%sms crit=%sms\n" "p95 response time" "$P95_WARN_MS" "$P95_CRIT_MS"
+    printf "  %-22s webhook=%s enabled=%s cooldown=%ss\n" "discord alerts" \
+        "$([[ -n "$DISCORD_WEBHOOK" ]] && echo set || echo unset)" "$ALERTS_ENABLED" "$ALERT_COOLDOWN"
 }
 
 config_init() {
@@ -1080,6 +1134,14 @@ config_init() {
 # THRESH_DISK_CRIT=95
 # THRESH_4XX_WARN=20
 # THRESH_5XX_WARN=5
+# P95_WARN_MS=500
+# P95_CRIT_MS=1500
+
+# Discord alerts — requires curl. Leave DISCORD_WEBHOOK empty to disable.
+# DISCORD_WEBHOOK="https://discord.com/api/webhooks/ID/TOKEN"
+# ALERTS_ENABLED=0
+# ALERT_COOLDOWN=300
+# ALERT_STATE_DIR="$HOME/.cache/milog"
 EOF
     echo -e "${G}Created${NC} $MILOG_CONFIG"
     echo "Edit with 'milog config edit' or set values with 'milog config set <KEY> <VALUE>'."
@@ -1295,6 +1357,7 @@ ${W}THRESHOLDS${NC}
   cpu      warn=${THRESH_CPU_WARN}%  crit=${THRESH_CPU_CRIT}%
   mem      warn=${THRESH_MEM_WARN}%  crit=${THRESH_MEM_CRIT}%
   4xx      warn=${THRESH_4XX_WARN}   5xx warn=${THRESH_5XX_WARN}
+  p95      warn=${P95_WARN_MS}ms  crit=${P95_CRIT_MS}ms
 
 ${W}APPS${NC}  ${LOGS[*]}
   ${D}dir:${NC} ${LOG_DIR}
