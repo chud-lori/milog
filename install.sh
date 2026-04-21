@@ -19,10 +19,14 @@
 #
 # Flags:
 #   --with-geoip           install mmdblookup for GeoIP enrichment
+#   --with-systemd         write + enable /etc/systemd/system/milog.service
+#                          so `milog daemon` survives reboots + ssh disconnect
+#   --webhook URL          pre-configure DISCORD_WEBHOOK + ALERTS_ENABLED=1
+#                          in the target user's config file
 #   --with-history         (deprecated — sqlite3 is installed by default)
 #   --bin PATH             install destination (default: /usr/local/bin/milog)
 #   --script-url URL       override milog.sh source URL (pipe mode)
-#   --uninstall            remove binary (configs preserved)
+#   --uninstall            remove binary + systemd unit (configs preserved)
 # ==============================================================================
 set -euo pipefail
 

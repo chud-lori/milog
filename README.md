@@ -152,28 +152,42 @@ or add your user to the `adm` group: `sudo usermod -aG adm $USER`.
 MiLog can POST to a Discord webhook when a threshold trips or an exploit/probe
 pattern hits. Off by default.
 
-1. Create a webhook in your Discord channel: *Channel → Edit → Integrations →
-   Webhooks → New Webhook → Copy URL*.
-2. Configure:
+### One-command setup
 
-   ```bash
-   milog config set DISCORD_WEBHOOK "https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
-   milog config set ALERTS_ENABLED 1
-   ```
+```bash
+# 1. In Discord: Channel → Edit → Integrations → Webhooks → New → Copy URL
+# 2. On the server:
+sudo milog alert on 'https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN'
+```
 
-   Or via env:
+That writes the webhook to your config, enables alerts, installs
+`/etc/systemd/system/milog.service`, and starts the daemon — survives ssh
+disconnect and reboot. Verify:
 
-   ```bash
-   export DISCORD_WEBHOOK="https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
-   export ALERTS_ENABLED=1
-   ```
+```bash
+milog alert status        # webhook / service / recent fires
+milog alert test          # fire a test Discord embed right now
+```
 
-3. Optional tuning:
+To pause alerting (e.g. planned maintenance):
 
-   ```bash
-   milog config set ALERT_COOLDOWN 300           # seconds between repeats
-   milog config set ALERT_STATE_DIR /var/lib/milog
-   ```
+```bash
+sudo milog alert off      # stops service + sets ALERTS_ENABLED=0
+```
+
+### Manual setup (if you prefer config files)
+
+```bash
+milog config set DISCORD_WEBHOOK "https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
+milog config set ALERTS_ENABLED 1
+
+# Optional tuning
+milog config set ALERT_COOLDOWN 300            # seconds between repeats
+milog config set ALERT_STATE_DIR /var/lib/milog
+```
+
+For env-var overrides (systemd units, one-shot runs), see the env table
+in the [Configuration](#configuration) section above.
 
 ### What fires
 
