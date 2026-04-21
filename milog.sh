@@ -292,24 +292,60 @@ wait_or_key() {
 # NGINX ROW HELPERS
 # ==============================================================================
 
+# Extract the single awk pass so the daemon can reuse it without the
+# rendering side-effects of nginx_row. Prints "count c4 c5" (zeros if the
+# log file is missing or unreadable).
+nginx_minute_counts() {
+    local file="$LOG_DIR/$1.access.log"
+    [[ -f "$file" ]] || { printf '0 0 0\n'; return; }
+    awk -v t="$2" '
+        index($0, t) {
+            n++
+            if (match($0, / [45][0-9][0-9] /)) {
+                if (substr($0, RSTART+1, 1) == "4") e4++; else e5++
+            }
+        }
+        END { printf "%d %d %d\n", n+0, e4+0, e5+0 }
+    ' "$file" 2>/dev/null
+}
+
+# HTTP rule-hook — fires 4xx/5xx spike alerts. Called from both nginx_row
+# (render-mode) and mode_daemon. Cooldown gate inside alert_should_fire.
+nginx_check_http_alerts() {
+    local name="$1" c4="$2" c5="$3"
+    if (( c5 >= THRESH_5XX_WARN )) && alert_should_fire "5xx:$name"; then
+        alert_discord "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 &
+    fi
+    if (( c4 >= THRESH_4XX_WARN )) && alert_should_fire "4xx:$name"; then
+        alert_discord "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 &
+    fi
+}
+
+# System rule-hook — fires CPU/MEM/DISK/workers alerts. Shared by monitor
+# and daemon so threshold logic has one home.
+sys_check_alerts() {
+    local cpu="$1" mem_pct="$2" mem_used="$3" mem_total="$4"
+    local disk_pct="$5" disk_used="$6" disk_total="$7" worker_count="$8"
+    if (( cpu >= THRESH_CPU_CRIT )) && alert_should_fire "cpu"; then
+        alert_discord "CPU critical" "CPU at ${cpu}% (crit=${THRESH_CPU_CRIT}%)" 15158332 &
+    fi
+    if (( mem_pct >= THRESH_MEM_CRIT )) && alert_should_fire "mem"; then
+        alert_discord "Memory critical" "MEM at ${mem_pct}% — used ${mem_used}MB of ${mem_total}MB (crit=${THRESH_MEM_CRIT}%)" 15158332 &
+    fi
+    if (( disk_pct >= THRESH_DISK_CRIT )) && alert_should_fire "disk:/"; then
+        alert_discord "Disk critical" "Disk at ${disk_pct}% on / — ${disk_used}GB of ${disk_total}GB used (crit=${THRESH_DISK_CRIT}%)" 15158332 &
+    fi
+    if (( worker_count == 0 )) && alert_should_fire "workers"; then
+        alert_discord "Nginx workers down" "Zero nginx worker processes detected on $(hostname 2>/dev/null || echo host)" 15158332 &
+    fi
+}
+
 nginx_row() {
     local name="$1" CUR_TIME="$2" TOTAL_ref="$3"
-    local file="$LOG_DIR/$name.access.log"
     local count=0 c4=0 c5=0
 
-    # Single awk pass: total + 4xx + 5xx in one file scan.
-    if [[ -f "$file" ]]; then
-        read -r count c4 c5 <<< "$(awk -v t="$CUR_TIME" '
-            index($0, t) {
-                n++
-                if (match($0, / [45][0-9][0-9] /)) {
-                    if (substr($0, RSTART+1, 1) == "4") e4++; else e5++
-                }
-            }
-            END { printf "%d %d %d\n", n+0, e4+0, e5+0 }
-        ' "$file" 2>/dev/null)"
-        count=${count:-0}; c4=${c4:-0}; c5=${c5:-0}
-    fi
+    read -r count c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+    count=${count:-0}; c4=${c4:-0}; c5=${c5:-0}
     # shellcheck disable=SC2034
     eval "$TOTAL_ref=$(( ${!TOTAL_ref} + count ))"
 
@@ -326,14 +362,7 @@ nginx_row() {
     [[ $c4 -ge $THRESH_4XX_WARN && -z "$alert" ]]    && alert="$R"
     [[ $count -gt $THRESH_REQ_CRIT && -z "$alert" ]] && alert="$R"
 
-    # Discord: 5xx/4xx spike rules. Gate with ALERTS_ENABLED (handled inside
-    # alert_discord). Background the webhook so the render loop never blocks.
-    if (( c5 >= THRESH_5XX_WARN )) && alert_should_fire "5xx:$name"; then
-        alert_discord "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 &
-    fi
-    if (( c4 >= THRESH_4XX_WARN )) && alert_should_fire "4xx:$name"; then
-        alert_discord "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 &
-    fi
+    nginx_check_http_alerts "$name" "$c4" "$c5"
 
     local bars_plain bars_col
     if [[ "${MILOG_HIST_ENABLED:-0}" == "1" ]]; then
@@ -510,21 +539,8 @@ mode_monitor() {
             done <<< "$workers"
         fi
 
-        # Discord: system-metric rules. Each runs the cooldown gate separately
-        # so one tripping doesn't suppress another. Webhook calls are
-        # backgrounded so the render loop stays responsive.
-        if (( cpu >= THRESH_CPU_CRIT )) && alert_should_fire "cpu"; then
-            alert_discord "CPU critical" "CPU at ${cpu}% (crit=${THRESH_CPU_CRIT}%)" 15158332 &
-        fi
-        if (( mem_pct >= THRESH_MEM_CRIT )) && alert_should_fire "mem"; then
-            alert_discord "Memory critical" "MEM at ${mem_pct}% — used ${mem_used}MB of ${mem_total}MB (crit=${THRESH_MEM_CRIT}%)" 15158332 &
-        fi
-        if (( disk_pct >= THRESH_DISK_CRIT )) && alert_should_fire "disk:/"; then
-            alert_discord "Disk critical" "Disk at ${disk_pct}% on / — ${disk_used}GB of ${disk_total}GB used (crit=${THRESH_DISK_CRIT}%)" 15158332 &
-        fi
-        if (( worker_count == 0 )) && alert_should_fire "workers"; then
-            alert_discord "Nginx workers down" "Zero nginx worker processes detected on $(hostname 2>/dev/null || echo host)" 15158332 &
-        fi
+        sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
+                         "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
 
         bdr_mid
 
@@ -886,6 +902,63 @@ mode_exploits() {
 }
 
 # ==============================================================================
+# MODE: daemon — headless sampler + rule evaluator (no TUI)
+# Fires the same rules as the live modes. stderr decision log only;
+# webhook sends are backgrounded so a slow Discord never wedges the loop.
+# ==============================================================================
+_dlog() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+
+mode_daemon() {
+    local hook_state
+    hook_state="disabled"
+    [[ "$ALERTS_ENABLED" == "1" && -n "$DISCORD_WEBHOOK" ]] && hook_state="enabled"
+    _dlog "milog daemon starting — refresh=${REFRESH}s alerts=${hook_state} apps=(${LOGS[*]})"
+    [[ "$ALERTS_ENABLED" != "1" ]] && _dlog "WARNING: ALERTS_ENABLED=0 — rules will log but no webhooks will be fired"
+    [[ -z "$DISCORD_WEBHOOK"    ]] && _dlog "WARNING: DISCORD_WEBHOOK empty — no webhooks will be fired"
+
+    # Live-tail watchers for exploit + probe rules. Their stdout is suppressed;
+    # the alert call sites inside each mode fire webhooks directly.
+    local watcher_pids=()
+    ( mode_exploits > /dev/null ) & watcher_pids+=($!)
+    ( mode_probes   > /dev/null ) & watcher_pids+=($!)
+
+    local _cleanup='
+        _dlog "milog daemon shutting down"
+        kill "${watcher_pids[@]}" 2>/dev/null
+        exit 0
+    '
+    trap "$_cleanup" INT TERM
+
+    while :; do
+        local CUR_TIME
+        CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
+
+        # System metrics — same helpers mode_monitor uses.
+        local cpu mem_pct mem_used mem_total disk_pct disk_used disk_total
+        cpu=$(cpu_usage)
+        [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
+        read -r mem_pct mem_used mem_total <<< "$(mem_info)"
+        read -r disk_pct disk_used disk_total <<< "$(disk_info)"
+
+        local worker_count
+        worker_count=$(ps aux 2>/dev/null | awk '/nginx: worker/{n++} END{print n+0}')
+
+        sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
+                         "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
+
+        # Per-app HTTP rules.
+        local name cnt c4 c5
+        for name in "${LOGS[@]}"; do
+            read -r cnt c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+            cnt=${cnt:-0}; c4=${c4:-0}; c5=${c5:-0}
+            nginx_check_http_alerts "$name" "$c4" "$c5"
+        done
+
+        sleep "$REFRESH"
+    done
+}
+
+# ==============================================================================
 # MODE: config — manage the user config file without opening an editor
 # ==============================================================================
 
@@ -1161,6 +1234,7 @@ ${W}DASHBOARDS${NC}
   ${C}monitor${NC}            full TUI: nginx + CPU/MEM/DISK/NET + workers
                      ${D}keys: q=quit  p=pause  r=refresh  +/-=rate${NC}
   ${C}rate${NC}               nginx-only req/min dashboard
+  ${C}daemon${NC}             headless alerter — no TUI, fires Discord webhooks
 
 ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
@@ -1204,6 +1278,7 @@ ${W}APPS${NC}  ${LOGS[*]}
 # ==============================================================================
 case "${1:-}" in
     monitor)  mode_monitor ;;
+    daemon)   mode_daemon ;;
     rate)     mode_rate ;;
     health)   mode_health ;;
     top)      mode_top "${2:-10}" ;;
