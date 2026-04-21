@@ -247,18 +247,36 @@ History is daemon-only — the interactive modes (`monitor`, `rate`) don't
 write. If you want both alerts and history, run `milog daemon` as a service
 (systemd unit below) and use `milog monitor` ad hoc.
 
-## `milog daemon` + systemd
+## `milog daemon`
 
-Headless mode runs the same rule evaluator without a TUI. Useful on servers
-where nobody is watching the dashboard.
+### What is it for
+
+`milog daemon` is the **headless** mode of MiLog: no TUI, no keyboard input,
+just the rule evaluator running on a loop. It's what you run on a server
+where nobody is watching a terminal.
+
+Same rules as the interactive modes — 5xx/4xx spikes, CPU/MEM/disk/worker
+critical thresholds, exploit and probe pattern hits — all wired to Discord
+webhooks with per-rule cooldown. Additionally, when `HISTORY_ENABLED=1`,
+it writes one per-minute row per app into SQLite for `milog trend` and
+`milog diff`.
+
+Typical usage: one `milog daemon` running as a systemd service on each
+host, plus `milog monitor` used interactively when you want to watch the
+dashboard.
+
+### Run it in the foreground (quick test)
 
 ```bash
-milog daemon    # foreground; stderr = decision log
+milog daemon    # Ctrl-C to stop; stderr is the decision log
 ```
 
-### systemd unit
+### Run it under systemd (production)
 
-```ini
+One-liner setup — runs as the invoking user, reads `$USER`'s config:
+
+```bash
+sudo tee /etc/systemd/system/milog.service >/dev/null <<EOF
 [Unit]
 Description=MiLog headless alerter
 After=network.target
@@ -267,20 +285,28 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/milog daemon
 Restart=on-failure
-User=milog
-Environment=MILOG_CONFIG=/etc/milog/config.sh
+User=$USER
+Environment=MILOG_CONFIG=$HOME/.config/milog/config.sh
 
 [Install]
 WantedBy=multi-user.target
-```
+EOF
 
-Drop into `/etc/systemd/system/milog.service`, set your config file at
-`/etc/milog/config.sh` with `DISCORD_WEBHOOK` + `ALERTS_ENABLED=1`, then:
-
-```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now milog
-sudo journalctl -u milog -f
+sudo systemctl status milog --no-pager
+sudo journalctl -u milog -f           # tail decision log
+```
+
+If the daemon can't read `/var/log/nginx/*.access.log`, either add the
+user to the `adm` group (`sudo usermod -aG adm $USER` — log out + in) or
+change `User=` to `root` in the unit.
+
+### Update + restart after `curl | bash`
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh | sudo bash
+sudo systemctl restart milog
 ```
 
 ## Troubleshooting
