@@ -138,16 +138,20 @@ EOF
 #   - otherwise (curl|bash mode), download from SCRIPT_URL into a tempfile
 # The downloaded file is removed on exit via the trap set below.
 resolve_script_src() {
-    # Try local clone mode first — only valid when BASH_SOURCE resolves to a
-    # real directory containing milog.sh.
-    local self_dir=""
-    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
-        self_dir=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || self_dir=""
-    fi
-    if [[ -n "$self_dir" && -f "$self_dir/milog.sh" ]]; then
-        SCRIPT_SRC="$self_dir/milog.sh"
-        info "Using local milog.sh at $SCRIPT_SRC"
-        return 0
+    # Trust BASH_SOURCE as a "local clone" signal only when it looks like a
+    # real file path (absolute or dir-prefixed). In curl|bash mode bash
+    # sets BASH_SOURCE[0] to something like "bash" or "main" — dirname of
+    # that collapses to "." and would pick up any milog.sh in the caller's
+    # cwd, which is wrong.
+    local self_path="${BASH_SOURCE[0]:-}"
+    if [[ "$self_path" == /* || "$self_path" == */* ]] && [[ -f "$self_path" ]]; then
+        local self_dir
+        self_dir=$(cd -P "$(dirname "$self_path")" 2>/dev/null && pwd) || self_dir=""
+        if [[ -n "$self_dir" && -f "$self_dir/milog.sh" ]]; then
+            SCRIPT_SRC="$self_dir/milog.sh"
+            info "Using local milog.sh at $SCRIPT_SRC"
+            return 0
+        fi
     fi
 
     # Pipe-install path: we need curl (which got us here) to fetch milog.sh.
