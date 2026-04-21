@@ -97,6 +97,29 @@ alert_discord() {
          -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
 }
 
+# Cooldown gate. Returns 0 (fire) if no prior fire for $1 is within
+# ALERT_COOLDOWN seconds, 1 (suppress) otherwise. On fire, rewrites the
+# state file with the current timestamp for that key.
+#
+# State file format:   <rule_key><TAB><last_fired_epoch>   (one per line)
+alert_should_fire() {
+    local key="$1"
+    local state_file="$ALERT_STATE_DIR/alerts.state"
+    local now last tmp
+    mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 1
+    now=$(date +%s)
+    last=$(awk -v k="$key" -F'\t' '$1==k {print $2; exit}' "$state_file" 2>/dev/null)
+    if [[ -n "$last" ]] && (( now - last < ALERT_COOLDOWN )); then
+        return 1
+    fi
+    tmp="$state_file.tmp.$$"
+    {
+        awk -v k="$key" -F'\t' 'BEGIN{OFS="\t"} $1!=k' "$state_file" 2>/dev/null
+        printf '%s\t%s\n' "$key" "$now"
+    } > "$tmp" && mv "$tmp" "$state_file"
+    return 0
+}
+
 # ==============================================================================
 # BOX DRAWING — single source of truth for geometry
 #
