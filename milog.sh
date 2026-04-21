@@ -32,6 +32,15 @@ SLOW_WINDOW=1000
 GEOIP_ENABLED=0
 MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
+# Historical metrics (off by default; requires sqlite3). When enabled in a
+# `milog daemon` context, one minute-aligned row per app lands in a local
+# SQLite database. Enables `milog trend` / `milog diff` read modes and
+# hour-bucket top-IP rollups. See README → "Historical metrics".
+HISTORY_ENABLED=0
+HISTORY_DB="$HOME/.local/share/milog/metrics.db"
+HISTORY_RETAIN_DAYS=30
+HISTORY_TOP_IP_N=50
+
 # Optional user config — sourced if present. Can override any variable above.
 # Example:
 #     LOG_DIR="/var/log/nginx"
@@ -53,6 +62,8 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_GEOIP_ENABLED:-}"   ]] && GEOIP_ENABLED="$MILOG_GEOIP_ENABLED"
 [[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
+[[ -n "${MILOG_HISTORY_ENABLED:-}" ]] && HISTORY_ENABLED="$MILOG_HISTORY_ENABLED"
+[[ -n "${MILOG_HISTORY_DB:-}"      ]] && HISTORY_DB="$MILOG_HISTORY_DB"
 
 # Auto-discover: if no apps ended up configured, glob *.access.log in LOG_DIR
 if [[ ${#LOGS[@]} -eq 0 ]]; then
@@ -320,24 +331,159 @@ wait_or_key() {
     fi
 }
 
+# Daemon/history stderr log — timestamped, never to stdout. Shared by any
+# code path that runs under mode_daemon (rule evaluator, history writers).
+_dlog() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+
+# ==============================================================================
+# HISTORY — SQLite-backed per-minute time series + hourly top-IP rollups
+# All writes go through a single sqlite3 invocation per call (heredoc),
+# per the plan's "don't spawn one process per app" rule.
+# ==============================================================================
+
+# SQLite string literal escape: doubles embedded single quotes, wraps in ''.
+_sql_quote() { local s="${1//\'/\'\'}"; printf "'%s'" "$s"; }
+
+# Portable "date at epoch" → log-line prefix (dd/Mon/yyyy:HH:MM). GNU date
+# takes `-d @TS`, BSD date takes `-r TS`. We just try both.
+_cur_time_at() {
+    local ts="$1"
+    date -d "@${ts}" '+%d/%b/%Y:%H:%M' 2>/dev/null \
+        || date -r "$ts" '+%d/%b/%Y:%H:%M' 2>/dev/null \
+        || printf ''
+}
+
+# Create tables + indexes if missing. Idempotent; safe to call on every
+# daemon start. Disables history on any failure mode (missing sqlite3,
+# unwritable path) so the rest of the daemon keeps running.
+history_init() {
+    [[ "$HISTORY_ENABLED" != "1" ]] && return 0
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        _dlog "WARNING: HISTORY_ENABLED=1 but sqlite3 is not on PATH — disabling history"
+        HISTORY_ENABLED=0
+        return 1
+    fi
+
+    local dir
+    dir=$(dirname "$HISTORY_DB")
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        _dlog "WARNING: cannot create history dir $dir — disabling history"
+        HISTORY_ENABLED=0
+        return 1
+    fi
+
+    if ! sqlite3 "$HISTORY_DB" <<'SQL' 2>/dev/null
+CREATE TABLE IF NOT EXISTS metrics_minute (
+    ts      INTEGER NOT NULL,
+    app     TEXT    NOT NULL,
+    req     INTEGER NOT NULL,
+    c2xx    INTEGER NOT NULL,
+    c3xx    INTEGER NOT NULL,
+    c4xx    INTEGER NOT NULL,
+    c5xx    INTEGER NOT NULL,
+    p50_ms  INTEGER,
+    p95_ms  INTEGER,
+    p99_ms  INTEGER,
+    PRIMARY KEY (ts, app)
+);
+CREATE TABLE IF NOT EXISTS top_ip_hour (
+    ts_hour INTEGER NOT NULL,
+    app     TEXT    NOT NULL,
+    ip      TEXT    NOT NULL,
+    hits    INTEGER NOT NULL,
+    PRIMARY KEY (ts_hour, app, ip)
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_app_ts ON metrics_minute(app, ts);
+SQL
+    then
+        _dlog "WARNING: sqlite3 init failed — disabling history"
+        HISTORY_ENABLED=0
+        return 1
+    fi
+
+    _dlog "history: schema ready at $HISTORY_DB"
+}
+
+# Insert one row per configured app for a completed minute. The timestamp
+# string must match the log format (dd/Mon/yyyy:HH:MM) so awk filters work.
+# p50/p95/p99 land as SQL NULL when the app has no $request_time samples.
+history_write_minute() {
+    [[ "$HISTORY_ENABLED" != "1" ]] && return 0
+    local ts="$1" cur_time="$2"
+    [[ -n "$cur_time" ]] || { _dlog "history: empty cur_time for ts=$ts; skipping"; return 0; }
+
+    local sql="" app count c2 c3 c4 c5 p50 p95 p99
+    for app in "${LOGS[@]}"; do
+        read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$app" "$cur_time")"
+        count=${count:-0}; c2=${c2:-0}; c3=${c3:-0}; c4=${c4:-0}; c5=${c5:-0}
+        read -r p50 p95 p99 <<< "$(percentiles "$app" "$cur_time")"
+        [[ "$p50" =~ ^[0-9]+$ ]] || p50="NULL"
+        [[ "$p95" =~ ^[0-9]+$ ]] || p95="NULL"
+        [[ "$p99" =~ ^[0-9]+$ ]] || p99="NULL"
+        sql+="INSERT OR REPLACE INTO metrics_minute VALUES"
+        sql+=" ($ts, $(_sql_quote "$app"), $count, $c2, $c3, $c4, $c5, $p50, $p95, $p99);"$'\n'
+    done
+
+    if ! { printf 'BEGIN;\n%sCOMMIT;\n' "$sql"; } | sqlite3 "$HISTORY_DB" 2>/dev/null; then
+        _dlog "history: minute write failed for ts=$ts"
+    fi
+}
+
+# Hourly top-IP rollup. Scans each app's log for lines prefixed with the
+# hour pattern (dd/Mon/yyyy:HH:), counts, and stores the top N. Lower N
+# caps the database size on servers with very bursty IP diversity.
+history_write_hour() {
+    [[ "$HISTORY_ENABLED" != "1" ]] && return 0
+    local ts_hour="$1"
+    local hour_pat
+    hour_pat=$(date -d "@${ts_hour}" '+%d/%b/%Y:%H:' 2>/dev/null \
+               || date -r "$ts_hour"  '+%d/%b/%Y:%H:' 2>/dev/null)
+    [[ -n "$hour_pat" ]] || return 0
+
+    local sql="" app file hits ip
+    for app in "${LOGS[@]}"; do
+        file="$LOG_DIR/$app.access.log"
+        [[ -f "$file" ]] || continue
+        while read -r hits ip; do
+            [[ -n "$ip" ]] || continue
+            sql+="INSERT OR REPLACE INTO top_ip_hour VALUES"
+            sql+=" ($ts_hour, $(_sql_quote "$app"), $(_sql_quote "$ip"), $hits);"$'\n'
+        done < <(grep -F "$hour_pat" "$file" 2>/dev/null \
+                 | awk '{print $1}' | sort | uniq -c | sort -rn \
+                 | head -n "${HISTORY_TOP_IP_N:-50}")
+    done
+
+    [[ -n "$sql" ]] || return 0
+    if ! { printf 'BEGIN;\n%sCOMMIT;\n' "$sql"; } | sqlite3 "$HISTORY_DB" 2>/dev/null; then
+        _dlog "history: hour write failed for ts_hour=$ts_hour"
+    fi
+}
+
 # ==============================================================================
 # NGINX ROW HELPERS
 # ==============================================================================
 
 # Extract the single awk pass so the daemon can reuse it without the
-# rendering side-effects of nginx_row. Prints "count c4 c5" (zeros if the
-# log file is missing or unreadable).
+# rendering side-effects of nginx_row. Prints "count c2 c3 c4 c5" (zeros
+# if the log file is missing or unreadable). One scan, four class buckets;
+# callers that only need c4/c5 just consume the first three fields they
+# care about and leave the rest as locals.
 nginx_minute_counts() {
     local file="$LOG_DIR/$1.access.log"
-    [[ -f "$file" ]] || { printf '0 0 0\n'; return; }
+    [[ -f "$file" ]] || { printf '0 0 0 0 0\n'; return; }
     awk -v t="$2" '
         index($0, t) {
             n++
-            if (match($0, / [45][0-9][0-9] /)) {
-                if (substr($0, RSTART+1, 1) == "4") e4++; else e5++
+            if (match($0, / [1-5][0-9][0-9] /)) {
+                cls = substr($0, RSTART+1, 1)
+                if      (cls == "2") e2++
+                else if (cls == "3") e3++
+                else if (cls == "4") e4++
+                else if (cls == "5") e5++
             }
         }
-        END { printf "%d %d %d\n", n+0, e4+0, e5+0 }
+        END { printf "%d %d %d %d %d\n", n+0, e2+0, e3+0, e4+0, e5+0 }
     ' "$file" 2>/dev/null
 }
 
@@ -400,6 +546,16 @@ geoip_country() {
 #
 # Prints the p95 in milliseconds on stdout, or empty when unavailable.
 _p95_cached() {
+    # On bash 3.2 (macOS dev boxes) associative arrays aren't available,
+    # so skip the cache entirely — correct result, just costs one log scan
+    # per tick. Real deployments target bash 4+ Linux where the cache
+    # short-circuits apps without timing data.
+    if (( ${BASH_VERSINFO[0]:-3} < 4 )); then
+        local _p50 p95 _p99
+        read -r _p50 p95 _p99 <<< "$(percentiles "$1" "$2")"
+        [[ "$p95" =~ ^[0-9]+$ ]] && printf '%s' "$p95"
+        return 0
+    fi
     declare -gA TIMED_APPS
     local name="$1" cur="$2"
     [[ "${TIMED_APPS[$name]:-}" == "0" ]] && return 0
@@ -446,9 +602,9 @@ sys_check_alerts() {
 
 nginx_row() {
     local name="$1" CUR_TIME="$2" TOTAL_ref="$3"
-    local count=0 c4=0 c5=0
+    local count=0 c2=0 c3=0 c4=0 c5=0
 
-    read -r count c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+    read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
     count=${count:-0}; c4=${c4:-0}; c5=${c5:-0}
     # shellcheck disable=SC2034
     eval "$TOTAL_ref=$(( ${!TOTAL_ref} + count ))"
@@ -1171,15 +1327,16 @@ mode_exploits() {
 # Fires the same rules as the live modes. stderr decision log only;
 # webhook sends are backgrounded so a slow Discord never wedges the loop.
 # ==============================================================================
-_dlog() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
 
 mode_daemon() {
     local hook_state
     hook_state="disabled"
     [[ "$ALERTS_ENABLED" == "1" && -n "$DISCORD_WEBHOOK" ]] && hook_state="enabled"
-    _dlog "milog daemon starting — refresh=${REFRESH}s alerts=${hook_state} apps=(${LOGS[*]})"
+    _dlog "milog daemon starting — refresh=${REFRESH}s alerts=${hook_state} history=${HISTORY_ENABLED} apps=(${LOGS[*]})"
     [[ "$ALERTS_ENABLED" != "1" ]] && _dlog "WARNING: ALERTS_ENABLED=0 — rules will log but no webhooks will be fired"
     [[ -z "$DISCORD_WEBHOOK"    ]] && _dlog "WARNING: DISCORD_WEBHOOK empty — no webhooks will be fired"
+
+    history_init   # no-op when HISTORY_ENABLED=0; disables itself on error
 
     # Live-tail watchers for exploit + probe rules. Their stdout is suppressed;
     # the alert call sites inside each mode fire webhooks directly.
@@ -1193,6 +1350,14 @@ mode_daemon() {
         exit 0
     '
     trap "$_cleanup" INT TERM
+
+    # Init rollover state — start at "current" so the first write happens
+    # only once we've crossed a real minute/hour boundary, never mid-minute
+    # on start-up with partial counts.
+    local last_min last_hour now
+    now=$(date +%s)
+    last_min=$((  now / 60   ))
+    last_hour=$(( now / 3600 ))
 
     while :; do
         local CUR_TIME
@@ -1212,12 +1377,28 @@ mode_daemon() {
                          "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
 
         # Per-app HTTP rules.
-        local name cnt c4 c5
+        local name cnt c2 c3 c4 c5
         for name in "${LOGS[@]}"; do
-            read -r cnt c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+            read -r cnt c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
             cnt=${cnt:-0}; c4=${c4:-0}; c5=${c5:-0}
             nginx_check_http_alerts "$name" "$c4" "$c5"
         done
+
+        # History rollover. Write the *previous* complete minute so nothing
+        # lands partial. Hour rollup runs similarly on the hour edge.
+        now=$(date +%s)
+        local cur_min=$((  now / 60   ))
+        local cur_hour=$(( now / 3600 ))
+        if (( cur_min > last_min )); then
+            local write_ts=$(( last_min * 60 ))
+            history_write_minute "$write_ts" "$(_cur_time_at "$write_ts")"
+            last_min=$cur_min
+        fi
+        if (( cur_hour > last_hour )); then
+            local write_hr_ts=$(( last_hour * 3600 ))
+            history_write_hour "$write_hr_ts"
+            last_hour=$cur_hour
+        fi
 
         sleep "$REFRESH"
     done
@@ -1283,6 +1464,8 @@ config_show() {
     printf "  %-22s %s\n" "SLOW_WINDOW"   "$SLOW_WINDOW"
     printf "  %-22s enabled=%s mmdb=%s\n" "geoip" "$GEOIP_ENABLED" \
         "$([[ -f "$MMDB_PATH" ]] && echo "$MMDB_PATH" || echo "MISSING:$MMDB_PATH")"
+    printf "  %-22s enabled=%s db=%s retain=%sd\n" "history" \
+        "$HISTORY_ENABLED" "$HISTORY_DB" "$HISTORY_RETAIN_DAYS"
     printf "  %-22s webhook=%s enabled=%s cooldown=%ss\n" "discord alerts" \
         "$([[ -n "$DISCORD_WEBHOOK" ]] && echo set || echo unset)" "$ALERTS_ENABLED" "$ALERT_COOLDOWN"
 }
@@ -1327,6 +1510,12 @@ config_init() {
 # GeoIP — requires mmdblookup + a MaxMind GeoLite2-Country.mmdb. See README.
 # GEOIP_ENABLED=0
 # MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
+
+# Historical metrics — requires sqlite3; writes from `milog daemon` only.
+# HISTORY_ENABLED=0
+# HISTORY_DB="$HOME/.local/share/milog/metrics.db"
+# HISTORY_RETAIN_DAYS=30
+# HISTORY_TOP_IP_N=50
 
 # Discord alerts — requires curl. Leave DISCORD_WEBHOOK empty to disable.
 # DISCORD_WEBHOOK="https://discord.com/api/webhooks/ID/TOKEN"

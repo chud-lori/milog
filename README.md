@@ -112,6 +112,8 @@ One-shot env overrides (useful in systemd units or ad-hoc runs):
 | `MILOG_ALERT_COOLDOWN`    | `ALERT_COOLDOWN`      |
 | `MILOG_GEOIP_ENABLED`     | `GEOIP_ENABLED`       |
 | `MILOG_MMDB_PATH`         | `MMDB_PATH`           |
+| `MILOG_HISTORY_ENABLED`   | `HISTORY_ENABLED`     |
+| `MILOG_HISTORY_DB`        | `HISTORY_DB`          |
 
 ### nginx log format
 
@@ -219,6 +221,40 @@ and the `.mmdb` file on disk.
 
 MiLog looks up country only after the top-N list is already aggregated, so
 `mmdblookup` runs at most N times per invocation — never per log line.
+
+## Historical metrics (optional)
+
+When `milog daemon` is running with `HISTORY_ENABLED=1`, every minute it
+writes one row per app into a local SQLite database. This unlocks the
+upcoming `milog trend` / `milog diff` read modes and keeps an hourly
+top-IPs rollup.
+
+Install the CLI tool — via the installer,
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chud-lori/ldr/main/install.sh \
+  | sudo bash -s -- --with-history
+```
+
+or directly: `sudo apt install sqlite3` / `sudo dnf install sqlite` /
+`sudo pacman -S sqlite`.
+
+Turn it on:
+
+```bash
+milog config set HISTORY_ENABLED 1
+milog config set HISTORY_RETAIN_DAYS 30    # optional
+# Default DB path is ~/.local/share/milog/metrics.db
+```
+
+Schema (created idempotently on daemon start):
+
+- `metrics_minute (ts, app, req, c2xx, c3xx, c4xx, c5xx, p50_ms, p95_ms, p99_ms)`
+- `top_ip_hour   (ts_hour, app, ip, hits)`
+
+History is daemon-only — the interactive modes (`monitor`, `rate`) don't
+write. If you want both alerts and history, run `milog daemon` as a service
+(systemd unit below) and use `milog monitor` ad hoc.
 
 ## `milog daemon` + systemd
 
