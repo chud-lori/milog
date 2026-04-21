@@ -571,34 +571,50 @@ geoip_country() {
     printf '%s' "${out:-—}"
 }
 
-# Cached p95 lookup. TIMED_APPS is a process-lifetime per-app cache:
-# unset=unknown, 0=no timing, 1=has timing. First call probes and memoises;
-# subsequent calls for a 0-marked app return immediately without rescanning
-# the log. Restart MiLog to pick up a log_format change.
+# Cached p95 lookup for the monitor row. Two-level cache:
+#   TIMED_APPS[name]   — unset=unknown, 0=never-timed, 1=timed. Skips the
+#                        file scan forever for apps that don't log
+#                        $request_time (restart MiLog after a log_format
+#                        change to re-probe).
+#   P95_LAST_MIN[name] — last minute string (dd/Mon/yyyy:HH:MM) we probed
+#   P95_LAST_VAL[name] — p95 value for that minute
+#
+# Within the same minute, re-use the cached p95 so a 5s monitor refresh
+# doesn't re-scan the whole log 12× per minute per app.
 #
 # Declared lazily (`-gA` inside the function) so the script stays parseable
-# on bash 3.2 hosts where top-level associative arrays aren't supported —
-# the same pattern already used for HIST inside mode_monitor.
+# on bash 3.2 hosts without associative arrays — same pattern used for HIST.
 #
 # Prints the p95 in milliseconds on stdout, or empty when unavailable.
 _p95_cached() {
     # On bash 3.2 (macOS dev boxes) associative arrays aren't available,
-    # so skip the cache entirely — correct result, just costs one log scan
-    # per tick. Real deployments target bash 4+ Linux where the cache
-    # short-circuits apps without timing data.
+    # so skip the cache entirely — correct result, uncached probe every
+    # call. Real deployments target bash 4+ Linux.
     if (( ${BASH_VERSINFO[0]:-3} < 4 )); then
         local _p50 p95 _p99
         read -r _p50 p95 _p99 <<< "$(percentiles "$1" "$2")"
         [[ "$p95" =~ ^[0-9]+$ ]] && printf '%s' "$p95"
         return 0
     fi
-    declare -gA TIMED_APPS
+    declare -gA TIMED_APPS P95_LAST_MIN P95_LAST_VAL
     local name="$1" cur="$2"
+
+    # Hard negative cache — don't scan apps we've already proven untimed.
     [[ "${TIMED_APPS[$name]:-}" == "0" ]] && return 0
+
+    # Per-minute positive cache — reuse the previous probe inside the same
+    # minute bucket so render loops at sub-minute cadence don't rescan.
+    if [[ "${P95_LAST_MIN[$name]:-}" == "$cur" ]]; then
+        printf '%s' "${P95_LAST_VAL[$name]}"
+        return 0
+    fi
+
     local _p50 p95 _p99
     read -r _p50 p95 _p99 <<< "$(percentiles "$name" "$cur")"
     if [[ "$p95" =~ ^[0-9]+$ ]]; then
         TIMED_APPS[$name]=1
+        P95_LAST_MIN[$name]="$cur"
+        P95_LAST_VAL[$name]="$p95"
         printf '%s' "$p95"
     else
         TIMED_APPS[$name]=0
