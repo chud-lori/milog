@@ -67,6 +67,9 @@ milog trend [app] [H]    # sparkline of req/min from history (needs sqlite3)
 milog diff               # req per app: now vs 1d ago vs 7d ago
 milog auto-tune [D]      # suggest thresholds from history (default: 7 days)
 milog replay <file>      # summary of an archived log (.log, .gz, .bz2)
+milog search <pat> [--since Nh] [--app NAME] [--path SUB] [--regex] [--archives]
+milog attacker <IP>      # forensic view: one IP's activity across all apps
+milog alerts [window]    # local fire history (today / Nh / Nd / Nw / all)
 milog doctor       # checklist: tools, logs, log format, webhook, history, geoip
 milog errors       # live tail of 4xx/5xx
 milog exploits     # LFI/RCE/SQLi/XSS/infra-probe live tail

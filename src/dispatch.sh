@@ -22,6 +22,7 @@ ${W}ANALYSIS${NC}
   ${C}diff${NC}               per-app req: now vs 1d ago vs 7d ago
   ${C}auto-tune [D]${NC}      suggest thresholds from history  ${D}(default: 7 days)${NC}
   ${C}replay <file>${NC}      postmortem summary for one archived log file
+  ${C}search <pat> ...${NC}   grep across all apps (flags: --since/--app/--path/--regex/--archives)
 
 ${W}ALERTING${NC}
   ${C}alert on [URL]${NC}     enable Discord alerts + install systemd service
@@ -87,6 +88,7 @@ case "${1:-}" in
     stats)    mode_stats "${2:-}" ;;
     trend)    mode_trend "${2:-}" "${3:-24}" ;;
     replay)   mode_replay "${2:-}" ;;
+    search)   shift; mode_search "$@" ;;
     diff)     mode_diff ;;
     auto-tune|autotune|tune) mode_auto_tune "${2:-7}" ;;
     grep)     mode_grep "${2:-}" "${3:-.}" ;;
