@@ -1,11 +1,17 @@
 # ==============================================================================
-# MODE: alert — toggle Discord alerting + manage the systemd service
+# MODE: alert — toggle alerting + manage the systemd service
 #
 # Subcommands:
-#   on [WEBHOOK_URL]  — set webhook (optional), enable, install+start systemd
+#   on [WEBHOOK_URL]  — set Discord webhook (optional), enable, install+start systemd
 #   off               — disable alerts, stop + disable systemd
-#   status            — show webhook/service/recent-fire state
-#   test              — fire a one-off Discord test embed (bypasses cooldown)
+#   status            — show destinations / service / recent-fire state
+#   test              — fire a one-off alert to EVERY configured destination
+#                       (Discord + Slack + Telegram + Matrix), bypassing
+#                       cooldown and ALERTS_ENABLED. Any silent channel is
+#                       a wire issue, not config.
+#
+# `milog alert on` wires only Discord (historical default). Other
+# destinations are opt-in via config file or env var — see docs/alerts.md.
 #
 # When invoked via sudo, we write config into the *invoking* user's home
 # (resolved from SUDO_USER) and run the systemd service as that user — not
@@ -242,57 +248,99 @@ alert_status() {
 }
 
 alert_test() {
-    local target_user target_home target_config webhook
+    local target_user target_home target_config
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
 
-    # Prefer the target-user's config over whatever this process loaded at
-    # startup — handles `sudo milog alert test` reading alice's webhook.
-    webhook=$(_alert_read_webhook "$target_config")
-    [[ -z "$webhook" ]] && webhook="${DISCORD_WEBHOOK:-}"
-    if [[ -z "$webhook" ]]; then
-        echo -e "${R}no DISCORD_WEBHOOK configured${NC}" >&2
+    # Pull every destination from the target-user's config file, not the
+    # env this process started with. Makes `sudo milog alert test` test
+    # alice's full fanout (Discord + Slack + Telegram + Matrix), not just
+    # whatever happens to live in root's env.
+    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room
+    d_url=$(   _alert_read_webhook "$target_config")
+    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+
+    # Track which destinations will actually fire so we can print a
+    # per-destination line. Mirrors the readiness logic in each
+    # _alert_send_* guard.
+    local -a dests_ok=() dests_partial=()
+    [[ -n "$d_url"    ]] && dests_ok+=("discord")
+    [[ -n "$s_url"    ]] && dests_ok+=("slack")
+    if   [[ -n "$tg_token" && -n "$tg_chat" ]]; then dests_ok+=("telegram")
+    elif [[ -n "$tg_token" || -n "$tg_chat" ]]; then dests_partial+=("telegram"); fi
+    if   [[ -n "$mx_hs" && -n "$mx_token" && -n "$mx_room" ]]; then dests_ok+=("matrix")
+    elif [[ -n "$mx_hs" || -n "$mx_token" || -n "$mx_room" ]]; then dests_partial+=("matrix"); fi
+
+    if (( ${#dests_ok[@]} == 0 )); then
+        echo -e "${R}no alert destinations configured in $target_config${NC}" >&2
+        if (( ${#dests_partial[@]} > 0 )); then
+            echo -e "${Y}  partial:${NC} ${dests_partial[*]} — needs all required vars" >&2
+        fi
         echo "  set one first:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+        echo "  or edit config: milog config edit" >&2
         return 1
     fi
 
-    # Temporarily force the gate regardless of ALERTS_ENABLED state — this
-    # is a manual test of the webhook wire, not a rule-triggered alert.
-    local _saved_enabled="$ALERTS_ENABLED" _saved_webhook="$DISCORD_WEBHOOK"
+    # Swap every destination var into the process env so alert_fire's
+    # fanout picks them all up. Saved + restored so a subsequent interactive
+    # alert (same bash session) still sees the original state. Force
+    # ALERTS_ENABLED=1 — test bypasses the master switch by design.
+    local _s_enabled="$ALERTS_ENABLED" _s_dw="$DISCORD_WEBHOOK" _s_sw="$SLACK_WEBHOOK"
+    local _s_tt="$TELEGRAM_BOT_TOKEN" _s_tc="$TELEGRAM_CHAT_ID"
+    local _s_mh="$MATRIX_HOMESERVER"  _s_mt="$MATRIX_TOKEN"    _s_mr="$MATRIX_ROOM"
     ALERTS_ENABLED=1
-    DISCORD_WEBHOOK="$webhook"
+    DISCORD_WEBHOOK="$d_url"
+    SLACK_WEBHOOK="$s_url"
+    TELEGRAM_BOT_TOKEN="$tg_token"; TELEGRAM_CHAT_ID="$tg_chat"
+    MATRIX_HOMESERVER="$mx_hs";     MATRIX_TOKEN="$mx_token";  MATRIX_ROOM="$mx_room"
 
-    echo "Firing test alert to Discord..."
+    echo -e "Firing test alert to: ${G}${dests_ok[*]}${NC}"
+    if (( ${#dests_partial[@]} > 0 )); then
+        echo -e "${Y}  skipped (incomplete config):${NC} ${dests_partial[*]}"
+    fi
+
     alert_fire "MiLog test alert" \
         "Manual test from \`$(hostname 2>/dev/null || echo host)\` at $(date -Iseconds 2>/dev/null || date)" \
         3447003 "alert:test"
 
-    ALERTS_ENABLED="$_saved_enabled"
-    DISCORD_WEBHOOK="$_saved_webhook"
-    echo -e "${G}✓${NC} webhook call returned — check your Discord channel"
+    ALERTS_ENABLED="$_s_enabled"
+    DISCORD_WEBHOOK="$_s_dw";       SLACK_WEBHOOK="$_s_sw"
+    TELEGRAM_BOT_TOKEN="$_s_tt";    TELEGRAM_CHAT_ID="$_s_tc"
+    MATRIX_HOMESERVER="$_s_mh";     MATRIX_TOKEN="$_s_mt";     MATRIX_ROOM="$_s_mr"
+    echo -e "${G}✓${NC} fanout dispatched — check each channel; any silent dest is a wire issue, not a config issue"
 }
 
 alert_help() {
     echo -e "
-${W}milog alert${NC} — toggle Discord alerting and manage the systemd service
+${W}milog alert${NC} — toggle alerting and manage the systemd service
 
 ${W}USAGE${NC}
-  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts; install + start systemd
+  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts (Discord); install + start systemd
   ${C}milog alert off${NC}                disable alerts; stop + disable service
-  ${C}milog alert status${NC}             show webhook/service/recent-fire state
-  ${C}milog alert test${NC}               send a one-shot Discord test embed
+  ${C}milog alert status${NC}             show destinations/service/recent-fire state
+  ${C}milog alert test${NC}               fire one test alert to EVERY configured
+                              destination (Discord + Slack + Telegram + Matrix)
 
 ${W}EXAMPLES${NC}
-  ${D}# First-time setup in one command:${NC}
+  ${D}# First-time setup in one command (Discord):${NC}
   sudo milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'
 
-  ${D}# Verify end-to-end:${NC}
+  ${D}# Verify end-to-end — pings every configured channel at once:${NC}
   milog alert status
   milog alert test
 
   ${D}# Pause alerting during maintenance:${NC}
   sudo milog alert off
+
+${W}OTHER DESTINATIONS${NC}
+  Slack / Telegram / Matrix are opt-in via ${C}milog config edit${NC} or env vars.
+  See: ${C}docs/alerts.md${NC}.
 "
 }
 

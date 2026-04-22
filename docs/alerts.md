@@ -20,7 +20,7 @@ Verify:
 
 ```bash
 milog alert status   # destinations / enabled / cooldown / service / recent fires
-milog alert test     # fire a test embed right now
+milog alert test     # fire one test embed to EVERY configured destination
 ```
 
 To pause (e.g. planned maintenance):

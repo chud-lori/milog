@@ -43,6 +43,32 @@ _url_encode() {
     printf '%s' "$out"
 }
 
+# In-place rotation for alerts.log. When the file grows past
+# ALERT_LOG_MAX_BYTES, keep roughly the most recent half (byte-aligned;
+# drops the first partial line to resync on a record boundary). Silent
+# on any error — a rotation blip must never block the alert path.
+#
+# Called from _alert_record AFTER the append, so the current record is
+# always in whichever half survives.
+_alert_rotate_if_big() {
+    local f="$1"
+    local max="${ALERT_LOG_MAX_BYTES:-10485760}"
+    # 0 (or non-numeric) disables rotation entirely.
+    [[ "$max" =~ ^[0-9]+$ ]] && (( max > 0 )) || return 0
+    [[ -f "$f" ]] || return 0
+    local sz
+    # GNU stat (-c) vs BSD stat (-f). Both harmless-fail on missing file.
+    sz=$(stat -c '%s' "$f" 2>/dev/null || stat -f '%z' "$f" 2>/dev/null) || return 0
+    [[ "$sz" =~ ^[0-9]+$ ]] || return 0
+    (( sz > max )) || return 0
+    local half=$(( max / 2 )) tmp
+    tmp=$(mktemp "${f}.rot.XXXXXX" 2>/dev/null) || return 0
+    # tail -c lands mid-line; `tail -n +2` drops the first (likely partial)
+    # record so every surviving line is a complete TSV row.
+    tail -c "$half" "$f" 2>/dev/null | tail -n +2 > "$tmp" 2>/dev/null
+    mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+}
+
 # Append one alert record to ALERT_STATE_DIR/alerts.log for later inspection
 # via `milog alerts`. Silent on error — we never want a disk-full or
 # permission blip to crash the caller.
@@ -63,6 +89,7 @@ _alert_record() {
     body="${body:0:300}"
     printf '%s\t%s\t%s\t%s\t%s\n' "$now" "${1:-unknown}" "${4:-0}" "${2:-?}" "$body" \
         >> "$log_file" 2>/dev/null || true
+    _alert_rotate_if_big "$log_file"
 }
 
 # --- Per-destination senders --------------------------------------------------

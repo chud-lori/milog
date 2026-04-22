@@ -17,9 +17,10 @@
 # Default: today.
 #
 # Log file:       $ALERT_STATE_DIR/alerts.log
-# Rotation:       none (grows ~1 line per unique alert within cooldown
-#                 window; negligible on most deployments). Prune manually
-#                 if it ever matters:  `> ~/.cache/milog/alerts.log`
+# Rotation:       automatic, in-place, on each append. When the file
+#                 exceeds ALERT_LOG_MAX_BYTES (default 10 MB) it's truncated
+#                 to ~50% keeping the most recent records. No `.1` backup.
+#                 Set ALERT_LOG_MAX_BYTES=0 to disable.
 # ==============================================================================
 
 # Parse a window spec (today/yesterday/all/Nh/Nd/Nw) to a Unix epoch cutoff.

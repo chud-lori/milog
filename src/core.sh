@@ -34,6 +34,12 @@ ALERT_COOLDOWN=300
 # so rule-level and event-level suppression can evolve independently.
 ALERT_DEDUP_WINDOW=300
 ALERT_STATE_DIR="$HOME/.cache/milog"
+# alerts.log rotation — when the file exceeds this many bytes, truncate it
+# in place to roughly the most recent 50%. No `.1` backup is kept: alerts
+# beyond the window are forensic noise (the state file + fingerprints already
+# carry the recent-fire state the rest of MiLog cares about). Set to 0 to
+# disable rotation entirely.
+ALERT_LOG_MAX_BYTES=10485760  # 10 MB
 
 # Response-time percentile thresholds (milliseconds) — used to colour the p95
 # tag in the monitor dashboard. Requires nginx to log $request_time; see
@@ -93,6 +99,7 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERTS_ENABLED:-}"  ]] && ALERTS_ENABLED="$MILOG_ALERTS_ENABLED"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
+[[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
 [[ -n "${MILOG_SLACK_WEBHOOK:-}"      ]] && SLACK_WEBHOOK="$MILOG_SLACK_WEBHOOK"
 [[ -n "${MILOG_TELEGRAM_BOT_TOKEN:-}" ]] && TELEGRAM_BOT_TOKEN="$MILOG_TELEGRAM_BOT_TOKEN"
 [[ -n "${MILOG_TELEGRAM_CHAT_ID:-}"   ]] && TELEGRAM_CHAT_ID="$MILOG_TELEGRAM_CHAT_ID"
@@ -136,6 +143,34 @@ THRESH_5XX_WARN=5
 
 # Sparkline history depth (samples kept per app in monitor mode)
 SPARK_LEN=30
+
+# Per-app threshold override resolver. Looks up `<var>_<safe_app>` first,
+# falls back to the global `<var>`. Bash var names only allow [A-Za-z0-9_],
+# so `-` and `.` in an app name are mapped to `_` before the lookup.
+#
+#   _thresh THRESH_REQ_CRIT api       → $THRESH_REQ_CRIT_api  or  $THRESH_REQ_CRIT
+#   _thresh P95_WARN_MS    my-app     → $P95_WARN_MS_my_app   or  $P95_WARN_MS
+#
+# Overrides live in the config file the same way global thresholds do:
+#   THRESH_REQ_CRIT=40
+#   THRESH_REQ_CRIT_finance=80    # finance is louder; use its own limit
+#   P95_WARN_MS_api=200
+#
+# Kept in core.sh so every subsystem (nginx.sh, history.sh, daemon) reaches
+# the same resolver — threshold divergence between render-path and
+# alert-path has bitten us before.
+_thresh() {
+    local var="$1" app="${2:-}"
+    if [[ -n "$app" ]]; then
+        local safe="${app//[^A-Za-z0-9_]/_}"
+        local per="${var}_${safe}"
+        if [[ -n "${!per:-}" ]]; then
+            printf '%s' "${!per}"
+            return 0
+        fi
+    fi
+    printf '%s' "${!var:-0}"
+}
 
 # --- ANSI ---
 R="\033[0;31m"  G="\033[0;32m"  Y="\033[0;33m"  B="\033[0;34m"

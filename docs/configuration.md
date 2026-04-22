@@ -82,6 +82,27 @@ Let `HISTORY_ENABLED=1` bank a few days of data, then run
 [`milog auto-tune`](historical-metrics.md#milog-auto-tune-days) to get
 calibrated values.
 
+#### Per-app threshold overrides
+
+Append `_<app>` to any of the threshold variables above to override it for
+that app. Overrides fall back to the global when unset, so you only list
+the apps that differ:
+
+```bash
+# config.sh — quiet APIs keep the tight defaults,
+# a noisy finance backend gets its own limits.
+THRESH_REQ_CRIT=40
+THRESH_REQ_CRIT_finance=80
+THRESH_5XX_WARN=5
+THRESH_5XX_WARN_finance=10
+P95_WARN_MS_api=200            # tighter p95 on the critical API
+```
+
+App names with `-` or `.` map to `_` for the variable name lookup
+(`my-app` → `THRESH_REQ_CRIT_my_app`). Applies to all `THRESH_*` and
+`P95_*_MS` variables; **system-wide thresholds** (CPU / MEM / DISK) have
+no per-app form — they're not app-scoped.
+
 ### Alerts
 
 | Variable              | Default             | Purpose                                   |
@@ -90,6 +111,7 @@ calibrated values.
 | `ALERT_COOLDOWN`      | `300` (5 min)       | Per-rule fire interval                    |
 | `ALERT_DEDUP_WINDOW`  | `300` (5 min)       | Cross-rule `(ip, path)` dedup TTL         |
 | `ALERT_STATE_DIR`     | `~/.cache/milog`    | Where cooldown/dedup state + alerts.log live |
+| `ALERT_LOG_MAX_BYTES` | `10485760` (10 MB)  | In-place rotate alerts.log past this size; `0` disables |
 | `DISCORD_WEBHOOK`     | (empty)             | Set to enable Discord                     |
 | `SLACK_WEBHOOK`       | (empty)             | Set to enable Slack                       |
 | `TELEGRAM_BOT_TOKEN`  | (empty)             | Bot token (with matching CHAT_ID)         |
@@ -135,6 +157,7 @@ systemd units, one-shot runs, or CI:
 | `MILOG_ALERTS_ENABLED`        | `ALERTS_ENABLED`        |
 | `MILOG_ALERT_COOLDOWN`        | `ALERT_COOLDOWN`        |
 | `MILOG_ALERT_DEDUP_WINDOW`    | `ALERT_DEDUP_WINDOW`    |
+| `MILOG_ALERT_LOG_MAX_BYTES`   | `ALERT_LOG_MAX_BYTES`   |
 | `MILOG_GEOIP_ENABLED`         | `GEOIP_ENABLED`         |
 | `MILOG_MMDB_PATH`             | `MMDB_PATH`             |
 | `MILOG_HISTORY_ENABLED`       | `HISTORY_ENABLED`       |

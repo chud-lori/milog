@@ -125,13 +125,19 @@ _p95_cached() {
 
 # HTTP rule-hook — fires 4xx/5xx spike alerts. Called from both nginx_row
 # (render-mode) and mode_daemon. Cooldown gate inside alert_should_fire.
+#
+# Thresholds resolve via _thresh so `THRESH_5XX_WARN_api=10` in config.sh
+# loosens just the `api` app while leaving the global default intact.
 nginx_check_http_alerts() {
     local name="$1" c4="$2" c5="$3"
-    if (( c5 >= THRESH_5XX_WARN )) && alert_should_fire "5xx:$name"; then
-        alert_fire "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 "5xx:$name" &
+    local t5 t4
+    t5=$(_thresh THRESH_5XX_WARN "$name")
+    t4=$(_thresh THRESH_4XX_WARN "$name")
+    if (( c5 >= t5 )) && alert_should_fire "5xx:$name"; then
+        alert_fire "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${t5})" 15158332 "5xx:$name" &
     fi
-    if (( c4 >= THRESH_4XX_WARN )) && alert_should_fire "4xx:$name"; then
-        alert_fire "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 "4xx:$name" &
+    if (( c4 >= t4 )) && alert_should_fire "4xx:$name"; then
+        alert_fire "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${t4})" 16753920 "4xx:$name" &
     fi
 }
 
@@ -163,18 +169,27 @@ nginx_row() {
     # shellcheck disable=SC2034
     eval "$TOTAL_ref=$(( ${!TOTAL_ref} + count ))"
 
+    # Per-app threshold overrides — config may set THRESH_REQ_WARN_<app> etc.
+    # Resolved once per row to keep the branch cheap; _thresh falls back to
+    # the global when no override exists.
+    local tr_warn tr_crit t4_warn t5_warn
+    tr_warn=$(_thresh THRESH_REQ_WARN  "$name")
+    tr_crit=$(_thresh THRESH_REQ_CRIT  "$name")
+    t4_warn=$(_thresh THRESH_4XX_WARN  "$name")
+    t5_warn=$(_thresh THRESH_5XX_WARN  "$name")
+
     local st_plain st_col b_col alert=""
     if [[ $count -gt 0 ]]; then
         st_plain="● ACTIVE  "; st_col="${G}● ACTIVE  ${NC}"; b_col=$G
-        [[ $count -gt $THRESH_REQ_WARN ]] && b_col=$Y
-        [[ $count -gt $THRESH_REQ_CRIT ]] && { b_col=$R; st_col="${R}● ACTIVE  ${NC}"; }
+        [[ $count -gt $tr_warn ]] && b_col=$Y
+        [[ $count -gt $tr_crit ]] && { b_col=$R; st_col="${R}● ACTIVE  ${NC}"; }
     else
         st_plain="○ IDLE    "; st_col="${D}○ IDLE    ${NC}"; b_col=$D
     fi
 
-    [[ $c5 -ge $THRESH_5XX_WARN ]]                   && alert="$RBLINK"
-    [[ $c4 -ge $THRESH_4XX_WARN && -z "$alert" ]]    && alert="$R"
-    [[ $count -gt $THRESH_REQ_CRIT && -z "$alert" ]] && alert="$R"
+    [[ $c5 -ge $t5_warn ]]                   && alert="$RBLINK"
+    [[ $c4 -ge $t4_warn && -z "$alert" ]]    && alert="$R"
+    [[ $count -gt $tr_crit && -z "$alert" ]] && alert="$R"
 
     nginx_check_http_alerts "$name" "$c4" "$c5"
 
@@ -223,8 +238,10 @@ nginx_row() {
         etag_c+=" ${Y}4xx:${c4}${NC} ${R}5xx:${c5}${NC}"
     fi
     if [[ -n "$p95_ms" ]]; then
-        local pcol
-        pcol=$(tcol "$p95_ms" "$P95_WARN_MS" "$P95_CRIT_MS")
+        local pcol p95w p95c
+        p95w=$(_thresh P95_WARN_MS "$name")
+        p95c=$(_thresh P95_CRIT_MS "$name")
+        pcol=$(tcol "$p95_ms" "$p95w" "$p95c")
         etag_p+=" p95:${p95_ms}ms"
         etag_c+=" ${pcol}p95:${p95_ms}ms${NC}"
     fi

@@ -14,9 +14,11 @@ mode_health() {
         s3=$(grep -c ' 3[0-9][0-9] ' "$file" 2>/dev/null || true)
         s4=$(grep -c ' 4[0-9][0-9] ' "$file" 2>/dev/null || true)
         s5=$(grep -c ' 5[0-9][0-9] ' "$file" 2>/dev/null || true)
-        local c4=$NC c5=$NC
-        [[ $s4 -gt $THRESH_4XX_WARN ]] && c4=$Y
-        [[ $s5 -gt $THRESH_5XX_WARN ]] && c5=$R
+        local c4=$NC c5=$NC t4 t5
+        t4=$(_thresh THRESH_4XX_WARN "$name")
+        t5=$(_thresh THRESH_5XX_WARN "$name")
+        [[ $s4 -gt $t4 ]] && c4=$Y
+        [[ $s5 -gt $t5 ]] && c5=$R
         printf "%-12s  %8s  %8s  %8s  ${c4}%8s${NC}  ${c5}%8s${NC}\n" \
             "$name" "$total" "$s2" "$s3" "$s4" "$s5"
     done

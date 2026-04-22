@@ -34,6 +34,12 @@ ALERT_COOLDOWN=300
 # so rule-level and event-level suppression can evolve independently.
 ALERT_DEDUP_WINDOW=300
 ALERT_STATE_DIR="$HOME/.cache/milog"
+# alerts.log rotation — when the file exceeds this many bytes, truncate it
+# in place to roughly the most recent 50%. No `.1` backup is kept: alerts
+# beyond the window are forensic noise (the state file + fingerprints already
+# carry the recent-fire state the rest of MiLog cares about). Set to 0 to
+# disable rotation entirely.
+ALERT_LOG_MAX_BYTES=10485760  # 10 MB
 
 # Response-time percentile thresholds (milliseconds) — used to colour the p95
 # tag in the monitor dashboard. Requires nginx to log $request_time; see
@@ -93,6 +99,7 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERTS_ENABLED:-}"  ]] && ALERTS_ENABLED="$MILOG_ALERTS_ENABLED"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
+[[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
 [[ -n "${MILOG_SLACK_WEBHOOK:-}"      ]] && SLACK_WEBHOOK="$MILOG_SLACK_WEBHOOK"
 [[ -n "${MILOG_TELEGRAM_BOT_TOKEN:-}" ]] && TELEGRAM_BOT_TOKEN="$MILOG_TELEGRAM_BOT_TOKEN"
 [[ -n "${MILOG_TELEGRAM_CHAT_ID:-}"   ]] && TELEGRAM_CHAT_ID="$MILOG_TELEGRAM_CHAT_ID"
@@ -136,6 +143,34 @@ THRESH_5XX_WARN=5
 
 # Sparkline history depth (samples kept per app in monitor mode)
 SPARK_LEN=30
+
+# Per-app threshold override resolver. Looks up `<var>_<safe_app>` first,
+# falls back to the global `<var>`. Bash var names only allow [A-Za-z0-9_],
+# so `-` and `.` in an app name are mapped to `_` before the lookup.
+#
+#   _thresh THRESH_REQ_CRIT api       → $THRESH_REQ_CRIT_api  or  $THRESH_REQ_CRIT
+#   _thresh P95_WARN_MS    my-app     → $P95_WARN_MS_my_app   or  $P95_WARN_MS
+#
+# Overrides live in the config file the same way global thresholds do:
+#   THRESH_REQ_CRIT=40
+#   THRESH_REQ_CRIT_finance=80    # finance is louder; use its own limit
+#   P95_WARN_MS_api=200
+#
+# Kept in core.sh so every subsystem (nginx.sh, history.sh, daemon) reaches
+# the same resolver — threshold divergence between render-path and
+# alert-path has bitten us before.
+_thresh() {
+    local var="$1" app="${2:-}"
+    if [[ -n "$app" ]]; then
+        local safe="${app//[^A-Za-z0-9_]/_}"
+        local per="${var}_${safe}"
+        if [[ -n "${!per:-}" ]]; then
+            printf '%s' "${!per}"
+            return 0
+        fi
+    fi
+    printf '%s' "${!var:-0}"
+}
 
 # --- ANSI ---
 R="\033[0;31m"  G="\033[0;32m"  Y="\033[0;33m"  B="\033[0;34m"
@@ -188,6 +223,32 @@ _url_encode() {
     printf '%s' "$out"
 }
 
+# In-place rotation for alerts.log. When the file grows past
+# ALERT_LOG_MAX_BYTES, keep roughly the most recent half (byte-aligned;
+# drops the first partial line to resync on a record boundary). Silent
+# on any error — a rotation blip must never block the alert path.
+#
+# Called from _alert_record AFTER the append, so the current record is
+# always in whichever half survives.
+_alert_rotate_if_big() {
+    local f="$1"
+    local max="${ALERT_LOG_MAX_BYTES:-10485760}"
+    # 0 (or non-numeric) disables rotation entirely.
+    [[ "$max" =~ ^[0-9]+$ ]] && (( max > 0 )) || return 0
+    [[ -f "$f" ]] || return 0
+    local sz
+    # GNU stat (-c) vs BSD stat (-f). Both harmless-fail on missing file.
+    sz=$(stat -c '%s' "$f" 2>/dev/null || stat -f '%z' "$f" 2>/dev/null) || return 0
+    [[ "$sz" =~ ^[0-9]+$ ]] || return 0
+    (( sz > max )) || return 0
+    local half=$(( max / 2 )) tmp
+    tmp=$(mktemp "${f}.rot.XXXXXX" 2>/dev/null) || return 0
+    # tail -c lands mid-line; `tail -n +2` drops the first (likely partial)
+    # record so every surviving line is a complete TSV row.
+    tail -c "$half" "$f" 2>/dev/null | tail -n +2 > "$tmp" 2>/dev/null
+    mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+}
+
 # Append one alert record to ALERT_STATE_DIR/alerts.log for later inspection
 # via `milog alerts`. Silent on error — we never want a disk-full or
 # permission blip to crash the caller.
@@ -208,6 +269,7 @@ _alert_record() {
     body="${body:0:300}"
     printf '%s\t%s\t%s\t%s\t%s\n' "$now" "${1:-unknown}" "${4:-0}" "${2:-?}" "$body" \
         >> "$log_file" 2>/dev/null || true
+    _alert_rotate_if_big "$log_file"
 }
 
 # --- Per-destination senders --------------------------------------------------
@@ -1009,13 +1071,19 @@ _p95_cached() {
 
 # HTTP rule-hook — fires 4xx/5xx spike alerts. Called from both nginx_row
 # (render-mode) and mode_daemon. Cooldown gate inside alert_should_fire.
+#
+# Thresholds resolve via _thresh so `THRESH_5XX_WARN_api=10` in config.sh
+# loosens just the `api` app while leaving the global default intact.
 nginx_check_http_alerts() {
     local name="$1" c4="$2" c5="$3"
-    if (( c5 >= THRESH_5XX_WARN )) && alert_should_fire "5xx:$name"; then
-        alert_fire "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 "5xx:$name" &
+    local t5 t4
+    t5=$(_thresh THRESH_5XX_WARN "$name")
+    t4=$(_thresh THRESH_4XX_WARN "$name")
+    if (( c5 >= t5 )) && alert_should_fire "5xx:$name"; then
+        alert_fire "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${t5})" 15158332 "5xx:$name" &
     fi
-    if (( c4 >= THRESH_4XX_WARN )) && alert_should_fire "4xx:$name"; then
-        alert_fire "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 "4xx:$name" &
+    if (( c4 >= t4 )) && alert_should_fire "4xx:$name"; then
+        alert_fire "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${t4})" 16753920 "4xx:$name" &
     fi
 }
 
@@ -1047,18 +1115,27 @@ nginx_row() {
     # shellcheck disable=SC2034
     eval "$TOTAL_ref=$(( ${!TOTAL_ref} + count ))"
 
+    # Per-app threshold overrides — config may set THRESH_REQ_WARN_<app> etc.
+    # Resolved once per row to keep the branch cheap; _thresh falls back to
+    # the global when no override exists.
+    local tr_warn tr_crit t4_warn t5_warn
+    tr_warn=$(_thresh THRESH_REQ_WARN  "$name")
+    tr_crit=$(_thresh THRESH_REQ_CRIT  "$name")
+    t4_warn=$(_thresh THRESH_4XX_WARN  "$name")
+    t5_warn=$(_thresh THRESH_5XX_WARN  "$name")
+
     local st_plain st_col b_col alert=""
     if [[ $count -gt 0 ]]; then
         st_plain="● ACTIVE  "; st_col="${G}● ACTIVE  ${NC}"; b_col=$G
-        [[ $count -gt $THRESH_REQ_WARN ]] && b_col=$Y
-        [[ $count -gt $THRESH_REQ_CRIT ]] && { b_col=$R; st_col="${R}● ACTIVE  ${NC}"; }
+        [[ $count -gt $tr_warn ]] && b_col=$Y
+        [[ $count -gt $tr_crit ]] && { b_col=$R; st_col="${R}● ACTIVE  ${NC}"; }
     else
         st_plain="○ IDLE    "; st_col="${D}○ IDLE    ${NC}"; b_col=$D
     fi
 
-    [[ $c5 -ge $THRESH_5XX_WARN ]]                   && alert="$RBLINK"
-    [[ $c4 -ge $THRESH_4XX_WARN && -z "$alert" ]]    && alert="$R"
-    [[ $count -gt $THRESH_REQ_CRIT && -z "$alert" ]] && alert="$R"
+    [[ $c5 -ge $t5_warn ]]                   && alert="$RBLINK"
+    [[ $c4 -ge $t4_warn && -z "$alert" ]]    && alert="$R"
+    [[ $count -gt $tr_crit && -z "$alert" ]] && alert="$R"
 
     nginx_check_http_alerts "$name" "$c4" "$c5"
 
@@ -1107,8 +1184,10 @@ nginx_row() {
         etag_c+=" ${Y}4xx:${c4}${NC} ${R}5xx:${c5}${NC}"
     fi
     if [[ -n "$p95_ms" ]]; then
-        local pcol
-        pcol=$(tcol "$p95_ms" "$P95_WARN_MS" "$P95_CRIT_MS")
+        local pcol p95w p95c
+        p95w=$(_thresh P95_WARN_MS "$name")
+        p95c=$(_thresh P95_CRIT_MS "$name")
+        pcol=$(tcol "$p95_ms" "$p95w" "$p95c")
         etag_p+=" p95:${p95_ms}ms"
         etag_c+=" ${pcol}p95:${p95_ms}ms${NC}"
     fi
@@ -1602,13 +1681,19 @@ _web_stop() {
 }
 
 # ==============================================================================
-# MODE: alert — toggle Discord alerting + manage the systemd service
+# MODE: alert — toggle alerting + manage the systemd service
 #
 # Subcommands:
-#   on [WEBHOOK_URL]  — set webhook (optional), enable, install+start systemd
+#   on [WEBHOOK_URL]  — set Discord webhook (optional), enable, install+start systemd
 #   off               — disable alerts, stop + disable systemd
-#   status            — show webhook/service/recent-fire state
-#   test              — fire a one-off Discord test embed (bypasses cooldown)
+#   status            — show destinations / service / recent-fire state
+#   test              — fire a one-off alert to EVERY configured destination
+#                       (Discord + Slack + Telegram + Matrix), bypassing
+#                       cooldown and ALERTS_ENABLED. Any silent channel is
+#                       a wire issue, not config.
+#
+# `milog alert on` wires only Discord (historical default). Other
+# destinations are opt-in via config file or env var — see docs/alerts.md.
 #
 # When invoked via sudo, we write config into the *invoking* user's home
 # (resolved from SUDO_USER) and run the systemd service as that user — not
@@ -1845,57 +1930,99 @@ alert_status() {
 }
 
 alert_test() {
-    local target_user target_home target_config webhook
+    local target_user target_home target_config
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
 
-    # Prefer the target-user's config over whatever this process loaded at
-    # startup — handles `sudo milog alert test` reading alice's webhook.
-    webhook=$(_alert_read_webhook "$target_config")
-    [[ -z "$webhook" ]] && webhook="${DISCORD_WEBHOOK:-}"
-    if [[ -z "$webhook" ]]; then
-        echo -e "${R}no DISCORD_WEBHOOK configured${NC}" >&2
+    # Pull every destination from the target-user's config file, not the
+    # env this process started with. Makes `sudo milog alert test` test
+    # alice's full fanout (Discord + Slack + Telegram + Matrix), not just
+    # whatever happens to live in root's env.
+    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room
+    d_url=$(   _alert_read_webhook "$target_config")
+    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+
+    # Track which destinations will actually fire so we can print a
+    # per-destination line. Mirrors the readiness logic in each
+    # _alert_send_* guard.
+    local -a dests_ok=() dests_partial=()
+    [[ -n "$d_url"    ]] && dests_ok+=("discord")
+    [[ -n "$s_url"    ]] && dests_ok+=("slack")
+    if   [[ -n "$tg_token" && -n "$tg_chat" ]]; then dests_ok+=("telegram")
+    elif [[ -n "$tg_token" || -n "$tg_chat" ]]; then dests_partial+=("telegram"); fi
+    if   [[ -n "$mx_hs" && -n "$mx_token" && -n "$mx_room" ]]; then dests_ok+=("matrix")
+    elif [[ -n "$mx_hs" || -n "$mx_token" || -n "$mx_room" ]]; then dests_partial+=("matrix"); fi
+
+    if (( ${#dests_ok[@]} == 0 )); then
+        echo -e "${R}no alert destinations configured in $target_config${NC}" >&2
+        if (( ${#dests_partial[@]} > 0 )); then
+            echo -e "${Y}  partial:${NC} ${dests_partial[*]} — needs all required vars" >&2
+        fi
         echo "  set one first:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+        echo "  or edit config: milog config edit" >&2
         return 1
     fi
 
-    # Temporarily force the gate regardless of ALERTS_ENABLED state — this
-    # is a manual test of the webhook wire, not a rule-triggered alert.
-    local _saved_enabled="$ALERTS_ENABLED" _saved_webhook="$DISCORD_WEBHOOK"
+    # Swap every destination var into the process env so alert_fire's
+    # fanout picks them all up. Saved + restored so a subsequent interactive
+    # alert (same bash session) still sees the original state. Force
+    # ALERTS_ENABLED=1 — test bypasses the master switch by design.
+    local _s_enabled="$ALERTS_ENABLED" _s_dw="$DISCORD_WEBHOOK" _s_sw="$SLACK_WEBHOOK"
+    local _s_tt="$TELEGRAM_BOT_TOKEN" _s_tc="$TELEGRAM_CHAT_ID"
+    local _s_mh="$MATRIX_HOMESERVER"  _s_mt="$MATRIX_TOKEN"    _s_mr="$MATRIX_ROOM"
     ALERTS_ENABLED=1
-    DISCORD_WEBHOOK="$webhook"
+    DISCORD_WEBHOOK="$d_url"
+    SLACK_WEBHOOK="$s_url"
+    TELEGRAM_BOT_TOKEN="$tg_token"; TELEGRAM_CHAT_ID="$tg_chat"
+    MATRIX_HOMESERVER="$mx_hs";     MATRIX_TOKEN="$mx_token";  MATRIX_ROOM="$mx_room"
 
-    echo "Firing test alert to Discord..."
+    echo -e "Firing test alert to: ${G}${dests_ok[*]}${NC}"
+    if (( ${#dests_partial[@]} > 0 )); then
+        echo -e "${Y}  skipped (incomplete config):${NC} ${dests_partial[*]}"
+    fi
+
     alert_fire "MiLog test alert" \
         "Manual test from \`$(hostname 2>/dev/null || echo host)\` at $(date -Iseconds 2>/dev/null || date)" \
         3447003 "alert:test"
 
-    ALERTS_ENABLED="$_saved_enabled"
-    DISCORD_WEBHOOK="$_saved_webhook"
-    echo -e "${G}✓${NC} webhook call returned — check your Discord channel"
+    ALERTS_ENABLED="$_s_enabled"
+    DISCORD_WEBHOOK="$_s_dw";       SLACK_WEBHOOK="$_s_sw"
+    TELEGRAM_BOT_TOKEN="$_s_tt";    TELEGRAM_CHAT_ID="$_s_tc"
+    MATRIX_HOMESERVER="$_s_mh";     MATRIX_TOKEN="$_s_mt";     MATRIX_ROOM="$_s_mr"
+    echo -e "${G}✓${NC} fanout dispatched — check each channel; any silent dest is a wire issue, not a config issue"
 }
 
 alert_help() {
     echo -e "
-${W}milog alert${NC} — toggle Discord alerting and manage the systemd service
+${W}milog alert${NC} — toggle alerting and manage the systemd service
 
 ${W}USAGE${NC}
-  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts; install + start systemd
+  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts (Discord); install + start systemd
   ${C}milog alert off${NC}                disable alerts; stop + disable service
-  ${C}milog alert status${NC}             show webhook/service/recent-fire state
-  ${C}milog alert test${NC}               send a one-shot Discord test embed
+  ${C}milog alert status${NC}             show destinations/service/recent-fire state
+  ${C}milog alert test${NC}               fire one test alert to EVERY configured
+                              destination (Discord + Slack + Telegram + Matrix)
 
 ${W}EXAMPLES${NC}
-  ${D}# First-time setup in one command:${NC}
+  ${D}# First-time setup in one command (Discord):${NC}
   sudo milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'
 
-  ${D}# Verify end-to-end:${NC}
+  ${D}# Verify end-to-end — pings every configured channel at once:${NC}
   milog alert status
   milog alert test
 
   ${D}# Pause alerting during maintenance:${NC}
   sudo milog alert off
+
+${W}OTHER DESTINATIONS${NC}
+  Slack / Telegram / Matrix are opt-in via ${C}milog config edit${NC} or env vars.
+  See: ${C}docs/alerts.md${NC}.
 "
 }
 
@@ -1930,9 +2057,10 @@ mode_alert() {
 # Default: today.
 #
 # Log file:       $ALERT_STATE_DIR/alerts.log
-# Rotation:       none (grows ~1 line per unique alert within cooldown
-#                 window; negligible on most deployments). Prune manually
-#                 if it ever matters:  `> ~/.cache/milog/alerts.log`
+# Rotation:       automatic, in-place, on each append. When the file
+#                 exceeds ALERT_LOG_MAX_BYTES (default 10 MB) it's truncated
+#                 to ~50% keeping the most recent records. No `.1` backup.
+#                 Set ALERT_LOG_MAX_BYTES=0 to disable.
 # ==============================================================================
 
 # Parse a window spec (today/yesterday/all/Nh/Nd/Nw) to a Unix epoch cutoff.
@@ -3297,9 +3425,11 @@ mode_health() {
         s3=$(grep -c ' 3[0-9][0-9] ' "$file" 2>/dev/null || true)
         s4=$(grep -c ' 4[0-9][0-9] ' "$file" 2>/dev/null || true)
         s5=$(grep -c ' 5[0-9][0-9] ' "$file" 2>/dev/null || true)
-        local c4=$NC c5=$NC
-        [[ $s4 -gt $THRESH_4XX_WARN ]] && c4=$Y
-        [[ $s5 -gt $THRESH_5XX_WARN ]] && c5=$R
+        local c4=$NC c5=$NC t4 t5
+        t4=$(_thresh THRESH_4XX_WARN "$name")
+        t5=$(_thresh THRESH_5XX_WARN "$name")
+        [[ $s4 -gt $t4 ]] && c4=$Y
+        [[ $s5 -gt $t5 ]] && c5=$R
         printf "%-12s  %8s  %8s  %8s  ${c4}%8s${NC}  ${c5}%8s${NC}\n" \
             "$name" "$total" "$s2" "$s3" "$s4" "$s5"
     done
