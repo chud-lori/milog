@@ -2708,7 +2708,13 @@ _web_respond() {
         429) msg="Too Many Requests" ;;
         500) msg="Internal Server Error" ;;
     esac
-    local len=${#body}
+    # Byte length — NOT ${#body}, which under a UTF-8 locale counts codepoints
+    # and under-reports by (bytes-1) for every multi-byte char. That mismatch
+    # lets the browser finish reading a truncated response, chopping off the
+    # tail of the HTML (including the closing </script> tag). wc -c always
+    # counts bytes, regardless of LC_ALL.
+    local len
+    len=$(printf '%s' "$body" | wc -c | tr -d ' ')
     printf 'HTTP/1.1 %s %s\r\n' "$status" "$msg"
     printf 'Content-Type: %s; charset=utf-8\r\n' "$ctype"
     printf 'Content-Length: %d\r\n' "$len"
