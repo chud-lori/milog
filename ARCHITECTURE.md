@@ -72,6 +72,11 @@ line numbers):
 | `mode_exploits`           | L7 attack payload live tail                       |
 | `mode_probes`             | Scanner/bot UA live tail                          |
 | `mode_suspects`           | Behavioral IP ranking                             |
+| `mode_top_paths`          | Per-URL req / 4xx / 5xx / p95 (query-stripped)    |
+| `mode_trend`              | Sparkline chart from `metrics_minute`             |
+| `mode_diff`               | Hour-level now vs 1d ago vs 7d ago                |
+| `mode_auto_tune`          | Suggest thresholds from history percentiles       |
+| `mode_doctor`             | Runtime health/config checklist                   |
 | `mode_config`             | Config-file subcommand router                     |
 | `color_prefix`            | Default merged log tail                           |
 
@@ -88,14 +93,21 @@ Shared helpers (must be callable from any mode):
 | `json_escape`               | Minimal JSON string escaper                       |
 | `_exploit_category`         | Classify an exploit match into a category slug    |
 | `_dlog`                     | Timestamped stderr log (daemon)                   |
+| `percentiles` / `_p95_cached` | Per-minute p50/p95/p99 on `$request_time` field |
+| `_pct_from_stdin`           | Stream-based percentile for auto-tune             |
+| `milog_update_geometry`     | Recompute `INNER`/`W_BAR`/`BW` from `tput cols`   |
 
 ## TUI rendering
 
-The box drawing is hand-computed: `INNER=74` chars between outer `│`s.
-Column widths (`W_APP=10`, `W_REQ=8`, `W_ST=10`, `W_BAR=35`) are tuned so
-`row-chars == rule-chars == 74`. Adding a column means recomputing all of
-them — read the geometry comment block at the top of the box-drawing
-section before touching widths.
+The box drawing is hand-computed and **reflows to terminal width** each
+render tick. `milog_update_geometry()` reads `tput cols` (or `MILOG_WIDTH`
+if set) and sets `INNER` to `cols-2`, clamped to `[MIN_INNER=74,
+MAX_INNER=200]`. Fixed columns (`W_APP=10`, `W_REQ=8`, `W_ST=10`) stay
+constant; the slack flows into `W_BAR` (INTENSITY/sparkline column), and
+the 3-bar sysmetric row picks up `BW = (INNER - 40) / 3`. Adding a new
+column means updating both the geometry helper and the border rule fns
+(`bdr_top`/`bdr_hdr`/`bdr_sep`) — read the comment block at the top of the
+box-drawing section before touching widths.
 
 Sparklines use 8 Unicode block characters (`▁▂▃…█`). Each app's ring buffer
 lives in a global associative array `HIST`. When paused (`p` key), the

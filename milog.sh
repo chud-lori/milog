@@ -1166,6 +1166,131 @@ mode_slow() {
 }
 
 # ==============================================================================
+# MODE: top-paths — aggregate URLs across all app logs, show per-path stats
+#
+# The single most useful incident question ("what URL is eating traffic?" or
+# "what URL is spiking 5xx?") isn't well served by `top` (IPs) or `slow`
+# (p95). This surfaces REQ + 4xx + 5xx + p95 per path. Query string is
+# stripped so /search?q=x and /search?q=y collapse into one row.
+#
+# Pipeline mirrors mode_slow: awk emit → external sort by path → group awk
+# → sort by count → head N. p95 requires the extended log format; shows
+# "—" when $request_time is absent.
+# ==============================================================================
+mode_top_paths() {
+    local n="${1:-20}"
+    local window="${SLOW_WINDOW:-2000}"
+
+    [[ "$n"      =~ ^[0-9]+$ ]] || { echo -e "${R}top-paths: N must be numeric${NC}" >&2; return 1; }
+    [[ "$window" =~ ^[0-9]+$ ]] || { echo -e "${R}top-paths: SLOW_WINDOW must be numeric${NC}" >&2; return 1; }
+
+    echo -e "\n${W}── MiLog: Top ${n} paths (window=${window} lines/app) ──${NC}\n"
+
+    local files=() name f
+    for name in "${LOGS[@]}"; do
+        f="$LOG_DIR/$name.access.log"
+        [[ -f "$f" ]] && files+=("$f")
+    done
+    if (( ${#files[@]} == 0 )); then
+        echo -e "${R}No log files found in ${LOG_DIR}${NC}"
+        return 1
+    fi
+
+    # awk pass 1: extract (path, status, ms-or-"-") per line.
+    #   $7  = request URI  (nginx combined: `"GET /path HTTP/1.1"` is fields 6-8)
+    #   $9  = status code
+    #   $NF = $request_time when combined_timed is in use (plain number)
+    # Query string is stripped so /x?a=1 + /x?a=2 collapse to /x.
+    #
+    # awk pass 2: sort by path + ms-numeric, group, emit count/4xx/5xx/p95.
+    # Numeric sort with "-" present: gawk/sort put "-" first (treated as 0),
+    # numeric values follow in ascending order — our group-awk only counts
+    # numerics into v[], so the p95 position is computed against just the
+    # timed samples for each path.
+    local rows
+    rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
+        | awk '
+            NF >= 9 {
+                path = $7
+                q = index(path, "?")
+                if (q > 0) path = substr(path, 1, q - 1)
+                if (length(path) == 0) next
+                status = $9
+                if (status !~ /^[0-9]+$/) next
+                lf = $NF
+                if (lf ~ /^[0-9]+(\.[0-9]+)?$/ && NF >= 12) {
+                    printf "%s\t%s\t%d\n", path, status, int(lf * 1000 + 0.5)
+                } else {
+                    printf "%s\t%s\t-\n", path, status
+                }
+            }' \
+        | sort -t $'\t' -k1,1 -k3,3n \
+        | awk -F'\t' '
+            function emit(   pi, p95) {
+                if (cur == "") return
+                if (nt > 0) {
+                    pi = int((nt * 95 + 99) / 100)
+                    if (pi < 1) pi = 1
+                    if (pi > nt) pi = nt
+                    p95 = v[pi]
+                } else {
+                    p95 = "-"
+                }
+                printf "%s\t%d\t%d\t%d\t%s\n", cur, count, c4, c5, p95
+            }
+            BEGIN { cur = ""; count = 0; c4 = 0; c5 = 0; nt = 0 }
+            {
+                if ($1 != cur) {
+                    emit()
+                    cur = $1; count = 0; c4 = 0; c5 = 0; nt = 0; delete v
+                }
+                count++
+                if ($2 ~ /^4/) c4++
+                if ($2 ~ /^5/) c5++
+                if ($3 != "-") { nt++; v[nt] = $3 }
+            }
+            END { emit() }' \
+        | sort -t $'\t' -k2,2 -rn \
+        | head -n "$n")
+
+    if [[ -z "$rows" ]]; then
+        echo -e "${D}No loglines matched in window.${NC}\n"
+        return 0
+    fi
+
+    printf "%-5s  %7s  %5s  %5s  %9s  %s\n" "RANK" "REQ" "4XX" "5XX" "P95" "PATH"
+    printf "%-5s  %7s  %5s  %5s  %9s  %s\n" "────" "───────" "─────" "─────" "─────────" "────────────────────"
+
+    local i=1 path count c4 c5 p95 col_err col_p95 p95_disp display
+    while IFS=$'\t' read -r path count c4 c5 p95; do
+        col_err=""
+        (( c5 > 0 )) && col_err="$R"
+        col_err+=""    # no-op but keeps the colour local
+        if [[ "$p95" == "-" ]]; then
+            # ASCII placeholder so printf byte-width == visual width. Unicode
+            # em-dash is 3 bytes / 1 column → throws off alignment.
+            p95_disp=$(printf "%b%9s%b" "$D" "n/a" "$NC")
+            col_p95=""
+        else
+            col_p95=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
+            # 7-wide number + "ms" = 9 visible chars (matches %9s header)
+            p95_disp=$(printf "%b%7sms%b" "$col_p95" "$p95" "$NC")
+        fi
+        display="$path"
+        if (( ${#display} > 60 )); then
+            display="${display:0:57}..."
+        fi
+        printf "#%-4d  %7d  %b%5d%b  %b%5d%b  %b  %s\n" \
+            "$i" "$count" \
+            "$Y" "$c4" "$NC" \
+            "$R" "$c5" "$NC" \
+            "$p95_disp" "$display"
+        i=$(( i + 1 ))
+    done <<< "$rows"
+    echo
+}
+
+# ==============================================================================
 # MODE: grep
 # ==============================================================================
 mode_grep() {
@@ -2075,6 +2200,385 @@ SQL
 }
 
 # ==============================================================================
+# MODE: auto-tune — suggest thresholds from history baselines
+#
+# Picks thresholds that would have fired ~rarely on your actual traffic
+# instead of making users guess "what's a reasonable 5xx/min for this box?".
+# Reads metrics_minute over a recent window and prints:
+#   1) side-by-side table of CURRENT vs SUGGESTED
+#   2) a copy-paste block of `milog config set …` commands
+#
+# Percentile picks:
+#   THRESH_REQ_WARN  = p90(req)       — alert on the top 10% of minutes
+#   THRESH_REQ_CRIT  = p99(req)       — alert on clear outliers
+#   THRESH_4XX_WARN  = p95(c4xx)      — floor at 5 so tiny clients don't spam
+#   THRESH_5XX_WARN  = p95(c5xx)      — floor at 1 (any 5xx > 0 is worth a ping)
+#   P95_WARN_MS      = p75(p95_ms)    — warn when current p95 worse than 3-in-4 historical minutes
+#   P95_CRIT_MS      = p99(p95_ms)    — crit on top 1% latency outliers
+#
+# CPU/MEM/DISK are not in the DB, so those thresholds aren't tuned here.
+# ==============================================================================
+
+# Stdin-to-percentile helper: read newline-separated numbers, print the
+# p-th percentile (1..100) using the existing `sort -n | awk positional`
+# idiom (same logic as percentiles() but for a generic stream).
+_pct_from_stdin() {
+    local p=$1
+    sort -n | awk -v p="$p" '
+        NF && $1 ~ /^[0-9]+(\.[0-9]+)?$/ { v[++n] = $1 }
+        END {
+            if (n == 0) exit
+            i = int((n * p + 99) / 100)
+            if (i < 1) i = 1
+            if (i > n) i = n
+            print v[i]
+        }'
+}
+
+# Format one table row. Visual widths: METRIC(20) CURRENT(11) SUGGESTED(11) DELTA(9)
+_tune_row() {
+    local metric="$1" current="$2" suggested="$3"
+    local delta=""
+    if [[ "$current" =~ ^[0-9]+$ && "$suggested" =~ ^[0-9]+$ ]]; then
+        local d=$(( suggested - current ))
+        if   (( d > 0 )); then delta="${Y}+${d}${NC}"
+        elif (( d < 0 )); then delta="${G}${d}${NC}"
+        else                   delta="${D}0${NC}"
+        fi
+    else
+        delta="${D}  —${NC}"
+    fi
+    printf "  %-20s  %-11s  ${W}%-11s${NC}  %b\n" \
+        "$metric" "$current" "$suggested" "$delta"
+}
+
+mode_auto_tune() {
+    local days="${1:-7}"
+    [[ "$days" =~ ^[1-9][0-9]*$ ]] \
+        || { echo -e "${R}auto-tune: days must be a positive integer${NC}" >&2; return 1; }
+
+    _history_precheck || return 1
+
+    local now since count
+    now=$(date +%s)
+    since=$(( now - days * 86400 ))
+    count=$(sqlite3 "$HISTORY_DB" \
+        "SELECT COUNT(*) FROM metrics_minute WHERE ts >= $since;" 2>/dev/null || echo 0)
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+
+    echo -e "\n${W}── MiLog: auto-tune (window=${days}d, ${count} rows) ──${NC}\n"
+
+    # 100 rows ≈ 100 minutes ≈ 1.6h of data — anything less and percentiles
+    # are too noisy to base thresholds on.
+    if (( count < 100 )); then
+        echo -e "${R}Not enough history (${count} rows — need ≥100).${NC}"
+        echo -e "${D}  let 'milog daemon' run for a few hours with HISTORY_ENABLED=1,${NC}"
+        echo -e "${D}  or widen the window: milog auto-tune 30${NC}\n"
+        return 1
+    fi
+
+    # Pull each metric's samples once. Filtering req>0 excludes quiet-hour
+    # zeros so the percentile reflects real traffic — otherwise a mostly-idle
+    # server would suggest THRESH_REQ_WARN=0.
+    local p95_samples req_samples c4_samples c5_samples
+    p95_samples=$(sqlite3 "$HISTORY_DB" \
+        "SELECT p95_ms FROM metrics_minute WHERE ts >= $since AND p95_ms IS NOT NULL AND req > 0;" 2>/dev/null)
+    req_samples=$(sqlite3 "$HISTORY_DB" \
+        "SELECT req FROM metrics_minute WHERE ts >= $since AND req > 0;" 2>/dev/null)
+    c4_samples=$(sqlite3 "$HISTORY_DB" \
+        "SELECT c4xx FROM metrics_minute WHERE ts >= $since;" 2>/dev/null)
+    c5_samples=$(sqlite3 "$HISTORY_DB" \
+        "SELECT c5xx FROM metrics_minute WHERE ts >= $since;" 2>/dev/null)
+
+    local s_req_warn s_req_crit s_c4_warn s_c5_warn s_p95_warn s_p95_crit
+    s_req_warn=$(printf '%s\n' "$req_samples" | _pct_from_stdin 90)
+    s_req_crit=$(printf '%s\n' "$req_samples" | _pct_from_stdin 99)
+    s_c4_warn=$( printf '%s\n' "$c4_samples"  | _pct_from_stdin 95)
+    s_c5_warn=$( printf '%s\n' "$c5_samples"  | _pct_from_stdin 95)
+    s_p95_warn=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 75)
+    s_p95_crit=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 99)
+
+    # Floors so "empty" days don't suggest zeros that fire on any activity.
+    [[ "$s_c4_warn"  =~ ^[0-9]+$ ]] && (( s_c4_warn  < 5 )) && s_c4_warn=5
+    [[ "$s_c5_warn"  =~ ^[0-9]+$ ]] && (( s_c5_warn  < 1 )) && s_c5_warn=1
+    [[ "$s_req_warn" =~ ^[0-9]+$ ]] && (( s_req_warn < 5 )) && s_req_warn=5
+
+    # Fall back to blank when we had zero samples for a metric (no timed
+    # traffic at all means p95 tuning is impossible).
+    : "${s_req_warn:=}"; : "${s_req_crit:=}"; : "${s_c4_warn:=}"; : "${s_c5_warn:=}"
+    : "${s_p95_warn:=}"; : "${s_p95_crit:=}"
+
+    printf "  %-20s  %-11s  %-11s  %-s\n" "METRIC" "CURRENT" "SUGGESTED" "DELTA"
+    printf "  %-20s  %-11s  %-11s  %-s\n" "────────────────────" "───────────" "───────────" "──────"
+    _tune_row "THRESH_REQ_WARN"  "$THRESH_REQ_WARN"  "${s_req_warn:--}"
+    _tune_row "THRESH_REQ_CRIT"  "$THRESH_REQ_CRIT"  "${s_req_crit:--}"
+    _tune_row "THRESH_4XX_WARN"  "$THRESH_4XX_WARN"  "${s_c4_warn:--}"
+    _tune_row "THRESH_5XX_WARN"  "$THRESH_5XX_WARN"  "${s_c5_warn:--}"
+    _tune_row "P95_WARN_MS"      "$P95_WARN_MS"      "${s_p95_warn:--}"
+    _tune_row "P95_CRIT_MS"      "$P95_CRIT_MS"      "${s_p95_crit:--}"
+
+    # Ready-to-apply block — skip lines we couldn't tune.
+    echo -e "\n${W}Ready to apply${NC} ${D}(copy-paste to set):${NC}"
+    local line printed=0
+    for line in \
+        "THRESH_REQ_WARN $s_req_warn" \
+        "THRESH_REQ_CRIT $s_req_crit" \
+        "THRESH_4XX_WARN $s_c4_warn" \
+        "THRESH_5XX_WARN $s_c5_warn" \
+        "P95_WARN_MS $s_p95_warn" \
+        "P95_CRIT_MS $s_p95_crit"
+    do
+        local k v
+        k="${line%% *}"; v="${line#* }"
+        [[ -n "$v" && "$v" =~ ^[0-9]+$ ]] || continue
+        printf "  milog config set %s %s\n" "$k" "$v"
+        printed=$(( printed + 1 ))
+    done
+    if (( printed == 0 )); then
+        echo -e "  ${D}(no actionable suggestions — samples were empty for every tuned metric)${NC}"
+    fi
+    echo -e "\n  ${D}note: tunes to the quiet-hour-excluded p90/p75/p95/p99 of your last ${days} day(s).${NC}"
+    echo -e "  ${D}       re-run after traffic patterns change (new service, traffic source, load).${NC}\n"
+    return 0
+}
+
+# ==============================================================================
+# MODE: doctor — checklist of what's installed/configured/reachable
+#
+# The tool no-ops gracefully when sqlite3, mmdblookup, a webhook, or the
+# extended log format are missing — which is friendly but can hide a
+# misconfigured install. `doctor` makes every degraded capability visible
+# with a one-line hint on how to enable it.
+#
+# Output: ✓ (ready) / ! (degraded, works-but-limited) / ✗ (broken/required).
+# Exit code: 0 if all required deps are present; 1 otherwise. CI-friendly.
+# ==============================================================================
+_doc_line() {
+    # $1=marker (colored glyph)  $2=headline  $3=optional hint
+    printf "  %b %s\n" "$1" "$2"
+    [[ -n "${3:-}" ]] && printf "     ${D}%s${NC}\n" "$3"
+    return 0   # guard against set -e when hint is empty
+}
+_doc_ok()   { _doc_line "${G}✓${NC}" "$1" "${2:-}"; }
+_doc_warn() { _doc_line "${Y}!${NC}" "$1" "${2:-}"; }
+_doc_fail() { _doc_line "${R}✗${NC}" "$1" "${2:-}"; }
+_doc_head() { printf "\n${W}── %s ──${NC}\n" "$1"; }
+
+mode_doctor() {
+    local fail=0 warn=0
+    echo -e "\n${W}── MiLog: doctor ──${NC}"
+
+    # ---- core tools (required) ----------------------------------------------
+    _doc_head "core tools"
+    local tool
+    for tool in bash gawk curl; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            _doc_ok "$tool present  ($(command -v "$tool"))"
+        else
+            _doc_fail "$tool NOT on PATH" "required — install via your package manager"
+            fail=$(( fail + 1 ))
+        fi
+    done
+    local bmaj="${BASH_VERSINFO[0]:-3}"
+    if (( bmaj >= 4 )); then
+        _doc_ok "bash ${BASH_VERSION}  (sparkline cache enabled)"
+    else
+        _doc_warn "bash ${BASH_VERSION}" "bash<4 — monitor skips the p95 cache; upgrade for smoother TUI"
+        warn=$(( warn + 1 ))
+    fi
+
+    # ---- optional tools ------------------------------------------------------
+    _doc_head "optional tools"
+    if command -v sqlite3 >/dev/null 2>&1; then
+        _doc_ok "sqlite3 present  ($(sqlite3 --version 2>/dev/null | awk '{print $1}'))"
+    else
+        _doc_warn "sqlite3 missing" "trend/replay/diff/auto-tune will be disabled — install 'sqlite3'"
+        warn=$(( warn + 1 ))
+    fi
+    if command -v mmdblookup >/dev/null 2>&1; then
+        _doc_ok "mmdblookup present" "GeoIP country enrichment available when GEOIP_ENABLED=1"
+    else
+        _doc_warn "mmdblookup missing" "GeoIP column disabled — install 'mmdb-bin' / 'libmaxminddb'"
+        warn=$(( warn + 1 ))
+    fi
+
+    # ---- log dir + per-app logs ---------------------------------------------
+    _doc_head "log directory"
+    if [[ -d "$LOG_DIR" && -r "$LOG_DIR" ]]; then
+        _doc_ok "$LOG_DIR readable"
+    else
+        _doc_fail "$LOG_DIR missing or unreadable" "set MILOG_LOG_DIR or edit LOG_DIR in $MILOG_CONFIG"
+        fail=$(( fail + 1 ))
+    fi
+
+    _doc_head "app logs (${#LOGS[@]} configured)"
+    if (( ${#LOGS[@]} == 0 )); then
+        _doc_warn "LOGS is empty" "add apps via 'milog config add <name>' or set MILOG_APPS='a b c'"
+        warn=$(( warn + 1 ))
+    else
+        local app file mtime now age
+        now=$(date +%s)
+        for app in "${LOGS[@]}"; do
+            file="$LOG_DIR/$app.access.log"
+            if [[ ! -f "$file" ]]; then
+                _doc_warn "$app — no access log" "expected: $file"
+                warn=$(( warn + 1 ))
+                continue
+            fi
+            mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
+            age=$(( now - mtime ))
+            if (( age < 3600 )); then
+                _doc_ok "$app — active  (last write ${age}s ago)"
+            elif (( age < 86400 )); then
+                _doc_warn "$app — stale  (last write $(( age / 3600 ))h ago)"
+                warn=$(( warn + 1 ))
+            else
+                _doc_warn "$app — idle  (last write $(( age / 86400 ))d ago)"
+                warn=$(( warn + 1 ))
+            fi
+        done
+    fi
+
+    # ---- nginx log format — does it carry $request_time? --------------------
+    _doc_head "nginx log format"
+    local sample_app sample_file timed=-1
+    for sample_app in "${LOGS[@]}"; do
+        [[ -f "$LOG_DIR/$sample_app.access.log" ]] && { sample_file="$LOG_DIR/$sample_app.access.log"; break; }
+    done
+    if [[ -n "${sample_file:-}" ]]; then
+        # Read the last non-empty line and check whether the final field is
+        # a plain number (seconds.milliseconds) — that's the conventional
+        # placement of $request_time in combined_timed.
+        local last
+        last=$(tail -n 50 "$sample_file" 2>/dev/null | awk 'NF>0' | tail -n 1)
+        if [[ -n "$last" ]]; then
+            local nf lastfield
+            nf=$(awk '{print NF}' <<< "$last")
+            lastfield=$(awk '{print $NF}' <<< "$last")
+            if [[ "$lastfield" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( nf >= 12 )); then
+                _doc_ok "extended log format detected  ('$sample_app' line ends with ${lastfield})" \
+                        "slow / p95 alerts enabled"
+                timed=1
+            else
+                _doc_warn "log format appears to be 'combined' (no \$request_time)" \
+                          "add \$request_time as the LAST field to enable slow/p95 — see README"
+                warn=$(( warn + 1 ))
+                timed=0
+            fi
+        else
+            _doc_warn "no loglines in $sample_file to inspect"
+            warn=$(( warn + 1 ))
+        fi
+    else
+        _doc_warn "no readable app log to inspect"
+    fi
+
+    # ---- Discord alerting ----------------------------------------------------
+    _doc_head "alerting (Discord)"
+    if [[ -z "${DISCORD_WEBHOOK:-}" ]]; then
+        _doc_warn "DISCORD_WEBHOOK not configured" \
+                  "run: sudo milog alert on \"https://discord.com/api/webhooks/ID/TOKEN\""
+        warn=$(( warn + 1 ))
+    else
+        _doc_ok "DISCORD_WEBHOOK configured  (${DISCORD_WEBHOOK:0:40}…)"
+        # Reachability — a POST with an empty content is ignored by Discord,
+        # so we GET the webhook metadata instead (returns 200 + JSON on valid
+        # webhooks, 404 on stale). 5s cap so doctor never hangs.
+        local http
+        http=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 \
+               "$DISCORD_WEBHOOK" 2>/dev/null || echo 000)
+        case "$http" in
+            200) _doc_ok "webhook reachable  (HTTP 200)" ;;
+            401|403|404) _doc_fail "webhook rejected  (HTTP $http)" "webhook was deleted or token invalid — regenerate in Discord"; fail=$(( fail + 1 )) ;;
+            000) _doc_warn "webhook unreachable (network/timeout)" "is this box allowed to egress to discord.com?"; warn=$(( warn + 1 )) ;;
+            *)   _doc_warn "webhook returned HTTP $http" "unexpected — may still work for POSTs; test with 'milog alert test'"; warn=$(( warn + 1 )) ;;
+        esac
+    fi
+    if [[ "${ALERTS_ENABLED:-0}" == "1" ]]; then
+        _doc_ok "ALERTS_ENABLED=1  (cooldown=${ALERT_COOLDOWN}s)"
+    else
+        _doc_warn "ALERTS_ENABLED=0" "alerts are armed but disabled — 'milog alert on' to flip"
+        warn=$(( warn + 1 ))
+    fi
+
+    # ---- history DB ---------------------------------------------------------
+    _doc_head "history (SQLite)"
+    if [[ "${HISTORY_ENABLED:-0}" != "1" ]]; then
+        _doc_warn "HISTORY_ENABLED=0" "set to 1 to let 'milog daemon' persist metrics for trend/diff/auto-tune"
+        warn=$(( warn + 1 ))
+    elif ! command -v sqlite3 >/dev/null 2>&1; then
+        _doc_fail "HISTORY_ENABLED=1 but sqlite3 missing" "install sqlite3 or set HISTORY_ENABLED=0"
+        fail=$(( fail + 1 ))
+    elif [[ ! -f "$HISTORY_DB" ]]; then
+        _doc_warn "db not yet written: $HISTORY_DB" "run 'milog daemon' for at least one minute to populate"
+        warn=$(( warn + 1 ))
+    else
+        local rows oldest
+        rows=$(sqlite3 "$HISTORY_DB" "SELECT COUNT(*) FROM metrics_minute;" 2>/dev/null || echo 0)
+        oldest=$(sqlite3 "$HISTORY_DB" "SELECT MIN(ts) FROM metrics_minute;" 2>/dev/null || echo 0)
+        if [[ "$rows" =~ ^[0-9]+$ ]] && (( rows > 0 )); then
+            local days=0
+            if [[ "$oldest" =~ ^[0-9]+$ ]] && (( oldest > 0 )); then
+                days=$(( ( $(date +%s) - oldest ) / 86400 ))
+            fi
+            _doc_ok "$HISTORY_DB  (${rows} rows, ~${days}d of history, retain=${HISTORY_RETAIN_DAYS}d)"
+        else
+            _doc_warn "$HISTORY_DB is empty" "daemon hasn't flushed a minute yet"
+            warn=$(( warn + 1 ))
+        fi
+    fi
+
+    # ---- GeoIP --------------------------------------------------------------
+    _doc_head "geoip"
+    if [[ "${GEOIP_ENABLED:-0}" != "1" ]]; then
+        _doc_warn "GEOIP_ENABLED=0" "optional — set to 1 + install the MaxMind MMDB to enable country column"
+        warn=$(( warn + 1 ))
+    elif ! command -v mmdblookup >/dev/null 2>&1; then
+        _doc_fail "GEOIP_ENABLED=1 but mmdblookup missing"
+        fail=$(( fail + 1 ))
+    elif [[ ! -f "$MMDB_PATH" ]]; then
+        _doc_fail "MMDB not found: $MMDB_PATH" "sign up at maxmind.com and download GeoLite2-Country.mmdb"
+        fail=$(( fail + 1 ))
+    else
+        local probe
+        probe=$(geoip_country 8.8.8.8 2>/dev/null)
+        if [[ -n "$probe" && "$probe" != "--" ]]; then
+            _doc_ok "$MMDB_PATH  (8.8.8.8 → $probe)"
+        else
+            _doc_warn "$MMDB_PATH present but lookup returned empty — DB may be corrupt"
+            warn=$(( warn + 1 ))
+        fi
+    fi
+
+    # ---- systemd unit (only meaningful where systemd is installed) ----------
+    if command -v systemctl >/dev/null 2>&1; then
+        _doc_head "systemd"
+        if [[ ! -f /etc/systemd/system/milog.service ]]; then
+            _doc_warn "milog.service not installed" "run: sudo milog alert on (installs + enables the unit)"
+            warn=$(( warn + 1 ))
+        elif systemctl is-active --quiet milog.service 2>/dev/null; then
+            _doc_ok "milog.service active" "logs: journalctl -u milog.service -f"
+        else
+            _doc_warn "milog.service installed but inactive" "start: sudo systemctl start milog.service"
+            warn=$(( warn + 1 ))
+        fi
+    fi
+
+    # ---- summary -------------------------------------------------------------
+    echo
+    if (( fail > 0 )); then
+        echo -e "  ${R}${fail} failure(s)${NC}, ${Y}${warn} warning(s)${NC} — required functionality is missing."
+        return 1
+    elif (( warn > 0 )); then
+        echo -e "  ${G}core OK${NC} — ${Y}${warn} optional feature(s) disabled${NC}."
+        return 0
+    else
+        echo -e "  ${G}all checks passed${NC}"
+        return 0
+    fi
+}
+
+# ==============================================================================
 # MODE: config — manage the user config file without opening an editor
 # ==============================================================================
 
@@ -2382,11 +2886,13 @@ ${W}DASHBOARDS${NC}
 ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
   ${C}top [N]${NC}            top N source IPs  ${D}(default: 10)${NC}
+  ${C}top-paths [N]${NC}      top N URLs — req/4xx/5xx/p95 per path  ${D}(default: 20)${NC}
   ${C}slow [N]${NC}           top N slow endpoints by p95  ${D}(requires \$request_time)${NC}
   ${C}stats <app>${NC}        hourly request histogram
   ${C}suspects [N] [W]${NC}   heuristic bot ranking ${D}(top N=20, window=2000 lines/app)${NC}
   ${C}trend [app] [H]${NC}    sparkline of req/min from history ${D}(default: all apps, 24h)${NC}
   ${C}diff${NC}               per-app req: now vs 1d ago vs 7d ago
+  ${C}auto-tune [D]${NC}      suggest thresholds from history  ${D}(default: 7 days)${NC}
   ${C}replay <file>${NC}      postmortem summary for one archived log file
 
 ${W}ALERTING${NC}
@@ -2394,6 +2900,9 @@ ${W}ALERTING${NC}
   ${C}alert off${NC}          disable alerts + stop service
   ${C}alert status${NC}       webhook / service / recent-fire state
   ${C}alert test${NC}         send a test Discord embed right now
+
+${W}DIAGNOSTICS${NC}
+  ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
 
 ${W}CONFIG${NC}
   ${C}config${NC}             show resolved config + path
@@ -2436,11 +2945,13 @@ case "${1:-}" in
     rate)     mode_rate ;;
     health)   mode_health ;;
     top)      mode_top "${2:-10}" ;;
+    top-paths|toppaths) mode_top_paths "${2:-20}" "${3:-}" ;;
     slow)     mode_slow "${2:-10}" ;;
     stats)    mode_stats "${2:-}" ;;
     trend)    mode_trend "${2:-}" "${3:-24}" ;;
     replay)   mode_replay "${2:-}" ;;
     diff)     mode_diff ;;
+    auto-tune|autotune|tune) mode_auto_tune "${2:-7}" ;;
     grep)     mode_grep "${2:-}" "${3:-.}" ;;
     errors)   mode_errors ;;
     exploits) mode_exploits ;;
@@ -2448,6 +2959,7 @@ case "${1:-}" in
     suspects) mode_suspects "${2:-20}" "${3:-2000}" ;;
     config)   shift; mode_config "$@" ;;
     alert)    shift; mode_alert  "$@" ;;
+    doctor)   mode_doctor ;;
     -h|--help|help) show_help ;;
     ""|logs)  color_prefix ;;
     *)

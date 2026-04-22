@@ -46,7 +46,9 @@ sudo curl -fLo /usr/local/bin/milog \
 sudo chmod +x /usr/local/bin/milog
 ```
 
-Verify: `milog help`.
+Verify: `milog help`. Run `milog doctor` anytime to see what's wired up and
+what's degraded — it reports on every optional capability (sqlite3, geoip,
+webhook, extended log format, systemd unit) with a one-line fix for each.
 
 ## Usage
 
@@ -57,12 +59,15 @@ milog daemon       # headless — fire Discord alerts, no TUI
 milog rate         # nginx-only req/min dashboard
 milog health       # 2xx/3xx/4xx/5xx totals per app
 milog top [N]      # top N source IPs (default 10)
+milog top-paths [N]      # top N URLs: req / 4xx / 5xx / p95 per path (default 20)
 milog slow [N]     # top N slow endpoints by p95 (needs $request_time)
 milog stats <app>  # hourly request histogram
 milog suspects [N] [W]   # heuristic bot ranking
 milog trend [app] [H]    # sparkline of req/min from history (needs sqlite3)
 milog diff               # req per app: now vs 1d ago vs 7d ago
+milog auto-tune [D]      # suggest thresholds from history (default: 7 days)
 milog replay <file>      # summary of an archived log (.log, .gz, .bz2)
+milog doctor       # checklist: tools, logs, log format, webhook, history, geoip
 milog errors       # live tail of 4xx/5xx
 milog exploits     # LFI/RCE/SQLi/XSS/infra-probe live tail
 milog probes       # scanner/bot traffic live tail
@@ -260,6 +265,11 @@ Schema (created idempotently on daemon start):
 History is daemon-only — the interactive modes (`monitor`, `rate`) don't
 write. If you want both alerts and history, run `milog daemon` as a service
 (systemd unit below) and use `milog monitor` ad hoc.
+
+Once a few days of history have built up, `milog auto-tune` will analyze it
+and suggest threshold values based on your actual traffic (instead of having
+you guess). It prints a ready-to-paste block of `milog config set …`
+commands — re-run whenever traffic patterns change.
 
 ## `milog daemon`
 
