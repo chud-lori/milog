@@ -310,8 +310,8 @@ milog web stop       # kill it
 
 ```bash
 # On your laptop:
-ssh -L 8080:localhost:8080 <host>
-# then open http://localhost:8080/?t=<TOKEN-from-server-banner>
+ssh -L 8765:localhost:8765 <host>
+# then open http://localhost:8765/?t=<TOKEN-from-server-banner>
 ```
 
 **2. Tailscale / WireGuard overlay** — phone-friendly.
@@ -327,7 +327,7 @@ milog web --bind 100.x.y.z   # the server's tailscale IP
 ```bash
 # One-time: install cloudflared (see https://github.com/cloudflare/cloudflared)
 milog web                                   # starts local listener
-cloudflared tunnel --url http://localhost:8080
+cloudflared tunnel --url http://localhost:8765
 # cloudflared prints a https://<random>.trycloudflare.com URL — paste in browser.
 # Stack Cloudflare Access on top for SSO + MFA (free on Zero Trust tier).
 ```

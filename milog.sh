@@ -45,7 +45,9 @@ HISTORY_TOP_IP_N=50
 # listener (socat or ncat) that serves a read-only JSON + HTML view.
 # Binds to loopback; expose via SSH tunnel, Tailscale, or Cloudflare
 # Tunnel (see README → "milog web"). Non-loopback bind requires --trust.
-WEB_PORT=8080
+# 8765 is unassigned by IANA and rarely used (unlike 8080, which collides
+# with Jenkins / Tomcat / "my random dev server"). Override via --port.
+WEB_PORT=8765
 WEB_BIND="127.0.0.1"
 WEB_STATE_DIR="$HOME/.cache/milog"
 WEB_TOKEN_FILE="$HOME/.config/milog/web.token"
@@ -2641,9 +2643,9 @@ mode_doctor() {
 #   - DISCORD_WEBHOOK is always redacted to its prefix in API responses.
 #
 # Transport choices (ranked, see README):
-#   1. SSH port-forward:  ssh -L 8080:localhost:8080 host   (zero exposure)
+#   1. SSH port-forward:  ssh -L 8765:localhost:8765 host   (zero exposure)
 #   2. Tailscale/WireGuard overlay                          (phone-friendly)
-#   3. Cloudflare Tunnel  cloudflared tunnel --url http://localhost:8080
+#   3. Cloudflare Tunnel  cloudflared tunnel --url http://localhost:8765
 #
 # Listener: socat or ncat (checked at start; clear error if neither).
 # ==============================================================================
@@ -3084,14 +3086,14 @@ mode_web() {
 
     # Expose-to-network guard — forces explicit consent.
     if [[ "$WEB_BIND" != "127.0.0.1" && "$WEB_BIND" != "localhost" && "$WEB_BIND" != "::1" ]] && (( ! trust )); then
-        cat >&2 <<EOF
+        printf '%b' "
 ${R}refusing --bind $WEB_BIND without --trust${NC}
 ${D}  this exposes the dashboard beyond loopback. Safer transports:${NC}
 ${D}    1. SSH tunnel:     ssh -L $WEB_PORT:localhost:$WEB_PORT $USER@<host>${NC}
 ${D}    2. Tailscale/WG:   --bind <overlay-ip> (only reachable on your tailnet)${NC}
 ${D}    3. Cloudflare:     cloudflared tunnel --url http://localhost:$WEB_PORT${NC}
 ${D}  If you really mean it:  milog web --bind $WEB_BIND --port $WEB_PORT --trust${NC}
-EOF
+" >&2
         return 1
     fi
 
@@ -3112,12 +3114,12 @@ EOF
     elif command -v ncat >/dev/null 2>&1; then
         listener="ncat"
     else
-        cat >&2 <<EOF
+        printf '%b' "
 ${R}milog web needs socat or ncat to accept connections.${NC}
 ${D}  sudo apt install -y socat    (Debian/Ubuntu)${NC}
 ${D}  sudo dnf install -y socat    (RHEL/Fedora/Rocky)${NC}
 ${D}  sudo pacman -S socat         (Arch)${NC}
-EOF
+" >&2
         return 1
     fi
 
@@ -3131,8 +3133,10 @@ EOF
     local scheme="http"
     local url="${scheme}://${WEB_BIND}:${WEB_PORT}/?t=${token}"
 
-    cat <<EOF
-
+    # printf '%b' interprets the \033[…] escape sequences in $W / $G / $C /
+    # $D / $NC. `cat <<EOF` would pass them through literally (you'd see
+    # "\033[1;37m" text in the terminal).
+    printf '%b' "
 ${W}MiLog web${NC}  listening on ${G}${WEB_BIND}:${WEB_PORT}${NC}  (${listener}, loopback-only by default)
 
   ${W}URL:${NC} ${C}${url}${NC}
@@ -3145,7 +3149,7 @@ ${W}MiLog web${NC}  listening on ${G}${WEB_BIND}:${WEB_PORT}${NC}  (${listener},
   ${D}access log:${NC} ${WEB_ACCESS_LOG}
   ${D}stop:${NC}       milog web stop    (or Ctrl+C)
 
-EOF
+"
 
     echo $$ > "$(_web_pid_file)"
     trap 'rm -f "$(_web_pid_file)"' EXIT
