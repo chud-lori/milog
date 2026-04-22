@@ -195,14 +195,48 @@ _exploit_category() {
 # ==============================================================================
 # BOX DRAWING — single source of truth for geometry
 #
-# Table columns: APP(10) | REQ/MIN(8) | STATUS(10) | INTENSITY(35)
+# Table columns: APP(10) | REQ/MIN(8) | STATUS(10) | INTENSITY(W_BAR)
 # Row layout between outer │…│:
-#   " " app(10) " │ " req(8) " │ " status(10) " │ " bar(35) " "
-#   = 1+10 + 3+8 + 3+10 + 3+35+1 = 74
-# Box rules:  ─(12)┬─(10)┬─(12)┬─(37) = 12+1+10+1+12+1+37 = 74  ✓
+#   " " app(10) " │ " req(8) " │ " status(10) " │ " bar(W_BAR) " "
+#   = 11 + (W_REQ+3) + (W_ST+3) + (W_BAR+4) = W_APP+W_REQ+W_ST+W_BAR+11
+#
+# INNER is the interior width (chars between the outer │…│) and scales with
+# terminal width; W_BAR absorbs the slack so the INTENSITY column — which
+# carries the sparkline — gets wider on bigger screens. The fixed columns
+# (APP/REQ/STATUS) stay the same so numbers line up at a glance.
+#
+# milog_update_geometry() recomputes INNER/W_BAR/BW from `tput cols` and is
+# called at the top of every render tick — so SIGWINCH / live resize just
+# works (next frame reflows). Override with MILOG_WIDTH=N to pin a width,
+# useful in terminals that misreport cols (screen, some CI runners).
 # ==============================================================================
-W_APP=10; W_REQ=8; W_ST=10; W_BAR=35
-INNER=74   # verified: row chars == rule chars == 74
+W_APP=10; W_REQ=8; W_ST=10
+W_BAR=35                 # INTENSITY column — grows with terminal width
+INNER=74                 # interior chars between outer │ │ (grows with terminal)
+BW=11                    # sysmetric bar width: (INNER-39)/3 — recomputed per tick
+MIN_INNER=74             # layout breaks below this; clamp as floor
+MAX_INNER=200            # above this, rows stop being scan-able — clamp as ceiling
+
+milog_update_geometry() {
+    local cols
+    cols=${MILOG_WIDTH:-0}
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=0
+    if (( cols <= 0 )); then
+        cols=$(tput cols 2>/dev/null || echo 80)
+    fi
+    local target=$(( cols - 2 ))   # reserve 2 chars for outer │ │
+    (( target < MIN_INNER )) && target=$MIN_INNER
+    (( target > MAX_INNER )) && target=$MAX_INNER
+    INNER=$target
+    W_BAR=$(( INNER - W_APP - W_REQ - W_ST - 11 ))
+    # Sysmetric row is " CPU xxx% [bar]  MEM xxx% [bar]  DISK xxx% [bar]"
+    # → 39 fixed chars + 3 bars. Reserve 1 trailing char so `]` never kisses
+    # the right │. Floor BW at 5 so small terms stay legible.
+    BW=$(( (INNER - 40) / 3 ))
+    (( BW < 5 )) && BW=5
+    return 0   # guard against set -e when BW>=5 makes `((…))` return 1
+}
+milog_update_geometry    # initialise for non-TUI modes that use draw_row
 
 spc() { printf '%*s' "$1" ''; }
 hrule() { printf '─%.0s' $(seq 1 "$1"); }
@@ -793,6 +827,8 @@ mode_monitor() {
 
     local first=1 paused=0
     while true; do
+        # Reflow for terminal size — runs per tick so SIGWINCH just works.
+        milog_update_geometry
         if (( first )); then
             clear
             first=0
@@ -823,7 +859,6 @@ mode_monitor() {
         mem_col=$(tcol "$mem_pct"  $THRESH_MEM_WARN  $THRESH_MEM_CRIT)
         disk_col=$(tcol "$disk_pct" $THRESH_DISK_WARN $THRESH_DISK_CRIT)
 
-        local BW=11  # bar width: (INNER=74 - 39 fixed chars) / 3 cols = 11 max
         local cpu_bar mem_bar disk_bar
         cpu_bar=$(ascii_bar $BW "$cpu"      100)
         mem_bar=$(ascii_bar $BW "$mem_pct"  100)
@@ -922,6 +957,7 @@ mode_monitor() {
 # ==============================================================================
 mode_rate() {
     while true; do
+        milog_update_geometry
         clear
         local CUR_TIME TIMESTAMP TOTAL=0
         CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
@@ -1827,7 +1863,12 @@ mode_trend() {
 
     _history_precheck || return 1
 
-    local now since width=60 window_sec
+    # Sparkline width scales with terminal: 40-char floor so short terms
+    # still show something useful; each bucket maps to window_sec/width seconds.
+    milog_update_geometry
+    local now since width window_sec
+    width=$(( INNER - 40 ))
+    (( width < 40 )) && width=40
     now=$(date +%s)
     window_sec=$(( hours * 3600 ))
     since=$(( now - window_sec ))
