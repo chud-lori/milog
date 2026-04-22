@@ -134,17 +134,20 @@ hand to a non-technical user.
 
 ## What the dashboard shows
 
-Today:
-
 - **System row** — CPU / Memory / Disk with colored bars and
   absolute values
 - **Nginx table** — per-app req / 2xx / 3xx / 4xx / 5xx counts for
   the **last minute**
+- **Recent alerts** — fires from `alerts.log`, filtered by a
+  selectable window (1h / 24h / 7d / today / all). Severity is
+  color-coded (crit red, warn yellow, info green). Polls every 15 s
+  — alerts don't move at the 3-second summary cadence and the log
+  file scan is negligible but pointless at that rate. Source is the
+  same `$ALERT_STATE_DIR/alerts.log` that `milog alerts` reads.
 
-That's the whole UI. It's intentionally minimal for v1 — everything
-investigation-flavored (top paths, alerts history, p95 per app) still
-lives in the CLI. Adding an alerts panel + historical charts is
-planned; see the plan doc if you're on the contributor path.
+Deeper investigation (top paths, p95 per app, per-IP drilldown)
+still lives in the CLI. Historical charts are planned — see the
+plan doc if you're on the contributor path.
 
 ## Custom port
 

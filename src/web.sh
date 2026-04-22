@@ -159,6 +159,70 @@ _web_route_meta() {
     _web_respond 200 "application/json" "$body"
 }
 
+# ---- route: /api/alerts.json -------------------------------------------------
+# Returns the last N alerts from ALERT_STATE_DIR/alerts.log, filtered by a
+# window query param (?window=24h, 1d, 7d, today, all — same grammar as
+# `milog alerts`). Default window is 24h, capped at 100 rows to keep the
+# payload tight. Reads are best-effort: a missing/empty log returns an
+# empty array, not an error — the panel is informational, not critical.
+#
+# Severity is derived from the Discord color int stored per row so the
+# client can tint the RULE column without re-computing it.
+_web_route_alerts() {
+    local window="${1:-24h}" cap=100
+    local log_file="$ALERT_STATE_DIR/alerts.log"
+
+    local arr="[]"
+    if [[ -f "$log_file" ]]; then
+        local cutoff
+        cutoff=$(_alerts_window_to_epoch "$window" 2>/dev/null) || cutoff=0
+        # The filter + JSON-build runs entirely in awk so log files with tens
+        # of thousands of rows don't fork-per-row in bash. Awk emits one JSON
+        # object per surviving record (capped at `cap`), newline-separated,
+        # which we then comma-join in pure bash.
+        local raw
+        raw=$(awk -F'\t' -v cutoff="$cutoff" -v cap="$cap" '
+            function jesc(s,   r) {
+                # Minimal JSON string escaper: backslash, quote, and control
+                # chars. Tabs/newlines are already stripped on ingest by
+                # _alert_record, but escape defensively in case an older
+                # entry slipped through.
+                gsub(/\\/, "\\\\", s)
+                gsub(/"/,  "\\\"", s)
+                gsub(/\n/, "\\n", s)
+                gsub(/\r/, "\\r", s)
+                gsub(/\t/, "\\t", s)
+                return s
+            }
+            function sev(c) {
+                if (c == 15158332 || c == 16711680) return "crit"
+                if (c == 16753920 || c == 15844367) return "warn"
+                return "info"
+            }
+            $1 >= cutoff && NF >= 5 {
+                rows[++n] = $0
+            }
+            END {
+                start = (n > cap) ? n - cap + 1 : 1
+                for (i = start; i <= n; i++) {
+                    split(rows[i], f, "\t")
+                    printf "{\"ts\":%d,\"rule\":\"%s\",\"sev\":\"%s\",\"title\":\"%s\",\"body\":\"%s\"}\n",
+                        f[1]+0, jesc(f[2]), sev(f[3]+0), jesc(f[4]), jesc(f[5])
+                }
+            }
+        ' "$log_file" 2>/dev/null)
+        if [[ -n "$raw" ]]; then
+            # Join newline-separated objects with commas; no trailing comma.
+            arr="[$(printf '%s' "$raw" | paste -sd, -)]"
+        fi
+    fi
+
+    local body
+    body=$(printf '{"window":%s,"alerts":%s}' \
+        "$(json_escape "$window")" "$arr")
+    _web_respond 200 "application/json" "$body"
+}
+
 # ---- route: / ---------------------------------------------------------------
 # Single self-contained HTML page. CSS + JS inline. Polls /api/summary.json
 # every N seconds with the token in the Authorization header. No external
@@ -204,6 +268,16 @@ _web_route_index() {
   th.n, td.n { text-align:right; font-variant-numeric: tabular-nums; }
   td.err4 { color:#d29922; }
   td.err5 { color:#f85149; }
+  .sev-crit { color:#f85149; font-weight:600; }
+  .sev-warn { color:#d29922; font-weight:600; }
+  .sev-info { color:#3fb950; font-weight:600; }
+  .alerts-head { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:.6rem; gap:.8rem; }
+  .alerts-head h2 { margin:0; }
+  .alerts-head select { background:#10141a; color:#d6d9dc; border:1px solid #30363d; border-radius:.3rem; padding:.15rem .4rem; font:inherit; font-size:.8rem; }
+  td.rule { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space:nowrap; }
+  td.when { color:#8b949e; white-space:nowrap; font-variant-numeric: tabular-nums; }
+  td.title { color:#d6d9dc; overflow:hidden; text-overflow:ellipsis; max-width:48ch; }
+  .empty { color:#6b7177; padding:.6rem 0; }
   footer { padding:1rem 1.2rem; color:#6b7177; font-size:.75rem; text-align:center; }
   .err { color:#f85149; padding:.6rem; border:1px solid #da3633; border-radius:.3rem; background:#2a1215; }
 </style>
@@ -227,6 +301,22 @@ _web_route_index() {
     <table id="apps">
       <thead><tr><th>APP</th><th class="n">REQ</th><th class="n">2xx</th><th class="n">3xx</th><th class="n">4xx</th><th class="n">5xx</th></tr></thead>
       <tbody><tr><td colspan="6">loading…</td></tr></tbody>
+    </table>
+  </section>
+  <section>
+    <div class="alerts-head">
+      <h2>Recent alerts</h2>
+      <select id="alerts-window" aria-label="alerts window">
+        <option value="1h">last 1h</option>
+        <option value="24h" selected>last 24h</option>
+        <option value="7d">last 7d</option>
+        <option value="today">today</option>
+        <option value="all">all</option>
+      </select>
+    </div>
+    <table id="alerts">
+      <thead><tr><th>WHEN</th><th>SEV</th><th>RULE</th><th>TITLE</th></tr></thead>
+      <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
     </table>
   </section>
   <section id="err-section" hidden><div class="err" id="err">&nbsp;</div></section>
@@ -311,8 +401,50 @@ _web_route_index() {
     document.getElementById('meta-uptime').textContent = 'host uptime: ' + (m.uptime || '?');
   }).catch(function(){ /* non-fatal */ });
 
+  // ---- alerts panel ------------------------------------------------------
+  // Refreshes slower than summary — alerts don't change every 3s, and
+  // reading alerts.log is cheaper but still pointless at summary cadence.
+  function fmtWhen(ts) {
+    // ts is Unix epoch seconds. Local time, 24h.
+    var d = new Date(ts * 1000);
+    function pad(n){ return n < 10 ? '0' + n : '' + n; }
+    return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate())
+         + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+  function renderAlerts(d) {
+    var tbody = document.querySelector('#alerts tbody');
+    tbody.innerHTML = '';
+    var list = (d && d.alerts) || [];
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">no alerts in window</td></tr>';
+      return;
+    }
+    // Chronological order: server returns oldest→newest; reverse so newest first.
+    list.slice().reverse().forEach(function(a){
+      var tr = document.createElement('tr');
+      function td(v, cls){ var c = document.createElement('td'); if (cls) c.className = cls; c.textContent = v; return c; }
+      tr.appendChild(td(fmtWhen(a.ts), 'when'));
+      var sev = document.createElement('td');
+      sev.className = 'sev-' + (a.sev || 'info');
+      sev.textContent = (a.sev || 'info').toUpperCase();
+      tr.appendChild(sev);
+      tr.appendChild(td(a.rule || '', 'rule'));
+      tr.appendChild(td(a.title || '', 'title'));
+      tbody.appendChild(tr);
+    });
+  }
+  function tickAlerts() {
+    var w = document.getElementById('alerts-window').value;
+    api('/api/alerts.json?window=' + encodeURIComponent(w))
+      .then(renderAlerts)
+      .catch(function(){ /* non-fatal; summary tick already surfaces errors */ });
+  }
+  document.getElementById('alerts-window').addEventListener('change', tickAlerts);
+
   tick();
+  tickAlerts();
   setInterval(tick, 3000);
+  setInterval(tickAlerts, 15000);
 })();
 </script>
 </body></html>
@@ -379,6 +511,17 @@ _web_handle() {
         /)                  _web_route_index;   _web_access_log "$client_ip" "$method" "$path" 200 ;;
         /api/summary.json)  _web_route_summary; _web_access_log "$client_ip" "$method" "$path" 200 ;;
         /api/meta.json)     _web_route_meta;    _web_access_log "$client_ip" "$method" "$path" 200 ;;
+        /api/alerts.json)
+            # Extract window=... from the query string (validated to the
+            # grammar _alerts_window_to_epoch accepts; anything malformed
+            # falls through to its default).
+            local win=""
+            if [[ "$query_string" =~ (^|&)window=([A-Za-z0-9]+) ]]; then
+                win="${BASH_REMATCH[2]}"
+            fi
+            _web_route_alerts "$win"
+            _web_access_log "$client_ip" "$method" "$path" 200
+            ;;
         *)                  _web_respond 404 "text/plain" "not found"
                             _web_access_log "$client_ip" "$method" "$path" 404 ;;
     esac
