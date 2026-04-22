@@ -395,7 +395,30 @@ _web_access_log() {
 # ---- subcommands: start / stop / status --------------------------------------
 _web_pid_file() { echo "$WEB_STATE_DIR/web.pid"; }
 
+# Is the systemd user unit currently active? Returns 0 if yes.
+# Guarded so callers on non-systemd hosts short-circuit to "no".
+_web_systemd_active() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl --user is-active --quiet milog-web.service 2>/dev/null
+}
+
 _web_status() {
+    # Report systemd state first — it's the "installed service" path, which
+    # is how most users will run it after install-service. Falls through to
+    # pidfile for the foreground/nohup case.
+    if _web_systemd_active; then
+        local main_pid; main_pid=$(systemctl --user show --value -p MainPID milog-web.service 2>/dev/null)
+        echo -e "${G}running${NC}  (systemd user unit)  pid=${main_pid:-?}  bind=${WEB_BIND}:${WEB_PORT}"
+        echo -e "${D}  unit:  ${HOME}/.config/systemd/user/milog-web.service${NC}"
+        echo -e "${D}  logs:  journalctl --user -u milog-web.service -f${NC}"
+        echo -e "${D}  token: $WEB_TOKEN_FILE${NC}"
+        if [[ -f "$WEB_ACCESS_LOG" ]]; then
+            local hits; hits=$(wc -l < "$WEB_ACCESS_LOG" 2>/dev/null || echo 0)
+            echo -e "${D}  ${hits} requests served (total)${NC}"
+        fi
+        return 0
+    fi
+
     local pf; pf=$(_web_pid_file)
     if [[ ! -f "$pf" ]]; then
         echo -e "${D}not running${NC}"
@@ -407,7 +430,7 @@ _web_status() {
         rm -f "$pf"
         return 1
     fi
-    echo -e "${G}running${NC}  pid=$pid  bind=${WEB_BIND}:${WEB_PORT}"
+    echo -e "${G}running${NC}  (foreground)  pid=$pid  bind=${WEB_BIND}:${WEB_PORT}"
     echo -e "${D}  token: $WEB_TOKEN_FILE${NC}"
     echo -e "${D}  access log: $WEB_ACCESS_LOG${NC}"
     if [[ -f "$WEB_ACCESS_LOG" ]]; then
@@ -418,6 +441,15 @@ _web_status() {
 }
 
 _web_stop() {
+    # If the systemd unit is up, stop it via systemctl — direct kill would
+    # trigger Restart=on-failure and spawn a replacement.
+    if _web_systemd_active; then
+        systemctl --user stop milog-web.service 2>/dev/null \
+            && echo -e "${G}stopped${NC}  (systemd user unit)" \
+            || echo -e "${R}failed to stop milog-web.service${NC}"
+        return 0
+    fi
+
     local pf; pf=$(_web_pid_file)
     if [[ ! -f "$pf" ]]; then
         echo -e "${D}not running${NC}"

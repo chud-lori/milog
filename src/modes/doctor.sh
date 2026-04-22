@@ -249,9 +249,10 @@ mode_doctor() {
         fi
     fi
 
-    # ---- systemd unit (only meaningful where systemd is installed) ----------
+    # ---- systemd units (only meaningful where systemd is installed) ---------
     if command -v systemctl >/dev/null 2>&1; then
         _doc_head "systemd"
+        # milog.service (system unit) — the alert daemon.
         if [[ ! -f /etc/systemd/system/milog.service ]]; then
             _doc_warn "milog.service not installed" "run: sudo milog alert on (installs + enables the unit)"
             warn=$(( warn + 1 ))
@@ -260,6 +261,18 @@ mode_doctor() {
         else
             _doc_warn "milog.service installed but inactive" "start: sudo systemctl start milog.service"
             warn=$(( warn + 1 ))
+        fi
+        # milog-web.service (user unit) — optional dashboard. Only report if
+        # something has attempted to install it; absent-by-choice is fine.
+        local web_unit="${HOME}/.config/systemd/user/milog-web.service"
+        if [[ -f "$web_unit" ]]; then
+            if systemctl --user is-active --quiet milog-web.service 2>/dev/null; then
+                _doc_ok "milog-web.service active (user unit)" "logs: journalctl --user -u milog-web.service -f"
+            else
+                _doc_warn "milog-web.service installed but inactive" \
+                          "start: systemctl --user start milog-web.service"
+                warn=$(( warn + 1 ))
+            fi
         fi
     fi
 

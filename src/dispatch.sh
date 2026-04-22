@@ -34,9 +34,11 @@ ${W}DIAGNOSTICS${NC}
   ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
 
 ${W}WEB UI${NC} ${D}(read-only, token-gated, loopback-only by default)${NC}
-  ${C}web${NC}                start the local HTTP dashboard
-  ${C}web stop${NC}           kill the running dashboard
+  ${C}web${NC}                start the local HTTP dashboard (foreground)
+  ${C}web stop${NC}           kill the running dashboard (systemd or foreground)
   ${C}web status${NC}         is it running? on what port?
+  ${C}web install-service${NC}   install + start systemd user unit (always-on)
+  ${C}web uninstall-service${NC} remove the systemd user unit
 
 ${W}CONFIG${NC}
   ${C}config${NC}             show resolved config + path

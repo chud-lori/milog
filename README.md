@@ -286,8 +286,27 @@ curl -fsSL https://.../install.sh | sudo bash -s -- --with-web
 
 milog web            # prints a URL with an auto-generated ?t=TOKEN
 milog web status     # is it running? on what port?
-milog web stop       # kill it
+milog web stop       # kill it (systemd unit or foreground — handles either)
 ```
+
+**Always-on (systemd user unit):** foreground mode dies when you close the
+terminal. For a persistent dashboard, install it as a systemd user service
+in one command:
+
+```bash
+milog web install-service     # writes + enables + starts milog-web.service
+milog web status              # confirms systemd is running it
+milog web uninstall-service   # undo
+```
+
+To survive logout and reboots, also run (one time, needs root):
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+Without linger, the service stops when you log out. Logs go to the user
+journal: `journalctl --user -u milog-web.service -f`.
 
 **Security defaults — read before exposing:**
 
