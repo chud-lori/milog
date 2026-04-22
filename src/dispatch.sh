@@ -14,6 +14,7 @@ ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
   ${C}top [N]${NC}            top N source IPs  ${D}(default: 10)${NC}
   ${C}top-paths [N]${NC}      top N URLs — req/4xx/5xx/p95 per path  ${D}(default: 20)${NC}
+  ${C}attacker <IP>${NC}      forensic view: one IP's activity across all apps
   ${C}slow [N]${NC}           top N slow endpoints by p95  ${D}(requires \$request_time)${NC}
   ${C}stats <app>${NC}        hourly request histogram
   ${C}suspects [N] [W]${NC}   heuristic bot ranking ${D}(top N=20, window=2000 lines/app)${NC}
@@ -78,6 +79,7 @@ case "${1:-}" in
     health)   mode_health ;;
     top)      mode_top "${2:-10}" ;;
     top-paths|toppaths) mode_top_paths "${2:-20}" "${3:-}" ;;
+    attacker) mode_attacker "${2:-}" ;;
     slow)     mode_slow "${2:-10}" ;;
     stats)    mode_stats "${2:-}" ;;
     trend)    mode_trend "${2:-}" "${3:-24}" ;;
