@@ -59,8 +59,17 @@ config_show() {
         "$([[ -f "$MMDB_PATH" ]] && echo "$MMDB_PATH" || echo "MISSING:$MMDB_PATH")"
     printf "  %-22s enabled=%s db=%s retain=%sd\n" "history" \
         "$HISTORY_ENABLED" "$HISTORY_DB" "$HISTORY_RETAIN_DAYS"
-    printf "  %-22s webhook=%s enabled=%s cooldown=%ss\n" "discord alerts" \
-        "$([[ -n "$DISCORD_WEBHOOK" ]] && echo set || echo unset)" "$ALERTS_ENABLED" "$ALERT_COOLDOWN"
+    printf "  %-22s enabled=%s cooldown=%ss dedup=%ss\n" "alerts" \
+        "$ALERTS_ENABLED" "$ALERT_COOLDOWN" "${ALERT_DEDUP_WINDOW:-300}"
+    # Render per-destination status from the process-sourced env (same
+    # values the running daemon/TUI would use). For a target-user view
+    # under sudo, use `milog alert status` instead — it reads the
+    # target's config file directly.
+    _alert_destinations_status \
+        "${DISCORD_WEBHOOK:-}" \
+        "${SLACK_WEBHOOK:-}" \
+        "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" \
+        "${MATRIX_HOMESERVER:-}" "${MATRIX_TOKEN:-}" "${MATRIX_ROOM:-}"
 }
 
 config_init() {

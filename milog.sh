@@ -338,6 +338,93 @@ alert_fire() {
 # hasn't been updated to the new name yet. Prefer `alert_fire` in new code.
 alert_discord() { alert_fire "$@"; }
 
+# --- Redaction previews -------------------------------------------------------
+# Each returns a short string that (a) confirms which account/webhook is
+# wired up and (b) never leaks the secret. Used by `alert status` and
+# `config` so users can tell at a glance what's actually configured.
+
+_alert_redact_discord() {
+    local w="${1:-}"
+    [[ -z "$w" ]] && return 0
+    if [[ "$w" =~ ^(https?://[^/]+/api/webhooks/[0-9]+/).* ]]; then
+        printf '%s****' "${BASH_REMATCH[1]}"
+    else
+        printf '%.40s…' "$w"
+    fi
+}
+
+_alert_redact_slack() {
+    local w="${1:-}"
+    [[ -z "$w" ]] && return 0
+    # Slack: https://hooks.slack.com/services/T<workspace>/B<webhook>/<secret>
+    if [[ "$w" =~ ^(https?://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/).* ]]; then
+        printf '%s****' "${BASH_REMATCH[1]}"
+    else
+        printf '%.40s…' "$w"
+    fi
+}
+
+_alert_redact_telegram() {
+    local token="${1:-}" chat="${2:-}"
+    [[ -z "$token" || -z "$chat" ]] && return 0
+    # Telegram bot token is `<bot_id>:<secret>`. Bot ID is public-ish
+    # (visible to anyone messaging the bot), so keep it; mask the secret.
+    local bot_id="${token%%:*}"
+    printf 'bot%s:**** chat=%s' "$bot_id" "$chat"
+}
+
+_alert_redact_matrix() {
+    local hs="${1:-}" token="${2:-}" room="${3:-}"
+    [[ -z "$hs" || -z "$token" || -z "$room" ]] && return 0
+    # Homeserver + room are fine to show (they're addressable); token is
+    # the access bearer, always masked.
+    printf '%s  room=%s  token=****' "${hs%/}" "$room"
+}
+
+# --- Destinations status line renderer ---------------------------------------
+# Prints one line per configured-or-not destination. Accepts ALL values as
+# positional args so callers can feed either env vars (process-state view,
+# used by `config`) or values pre-read from a specific config file (target-
+# user view, used by `alert status` under sudo).
+#
+# Args: discord_url slack_url tg_token tg_chat matrix_hs matrix_token matrix_room
+_alert_destinations_status() {
+    local d="${1:-}" s="${2:-}" tt="${3:-}" tc="${4:-}" mh="${5:-}" mt="${6:-}" mr="${7:-}"
+    local preview
+
+    if [[ -n "$d" ]]; then
+        preview=$(_alert_redact_discord "$d")
+        printf "    %-10s ${G}✓ set${NC}   %s\n" "discord" "$preview"
+    else
+        printf "    %-10s ${D}—${NC}\n" "discord"
+    fi
+
+    if [[ -n "$s" ]]; then
+        preview=$(_alert_redact_slack "$s")
+        printf "    %-10s ${G}✓ set${NC}   %s\n" "slack" "$preview"
+    else
+        printf "    %-10s ${D}—${NC}\n" "slack"
+    fi
+
+    if [[ -n "$tt" && -n "$tc" ]]; then
+        preview=$(_alert_redact_telegram "$tt" "$tc")
+        printf "    %-10s ${G}✓ set${NC}   %s\n" "telegram" "$preview"
+    elif [[ -n "$tt" || -n "$tc" ]]; then
+        printf "    %-10s ${Y}partial${NC} need both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID\n" "telegram"
+    else
+        printf "    %-10s ${D}—${NC}\n" "telegram"
+    fi
+
+    if [[ -n "$mh" && -n "$mt" && -n "$mr" ]]; then
+        preview=$(_alert_redact_matrix "$mh" "$mt" "$mr")
+        printf "    %-10s ${G}✓ set${NC}   %s\n" "matrix" "$preview"
+    elif [[ -n "$mh" || -n "$mt" || -n "$mr" ]]; then
+        printf "    %-10s ${Y}partial${NC} need MATRIX_HOMESERVER + MATRIX_TOKEN + MATRIX_ROOM\n" "matrix"
+    else
+        printf "    %-10s ${D}—${NC}\n" "matrix"
+    fi
+}
+
 # Cooldown gate. Returns 0 (fire) if no prior fire for $1 is within
 # ALERT_COOLDOWN seconds, 1 (suppress) otherwise. On fire, rewrites the
 # state file with the current timestamp for that key.
@@ -1704,10 +1791,19 @@ alert_status() {
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
 
-    local wh wh_state enabled svc_state
-    wh=$(_alert_read_webhook "$target_config")
-    if [[ -n "$wh" ]]; then wh_state="${G}set${NC}"; else wh_state="${R}unset${NC}"; fi
+    # Read all destinations from the target config. Done via _alert_read_key
+    # (not env) so `sudo milog alert status` shows alice's real config,
+    # not root's. Empty strings when unset.
+    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room
+    d_url=$(_alert_read_webhook "$target_config")
+    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
 
+    local enabled svc_state
     enabled=$(_alert_read_key "$target_config" "ALERTS_ENABLED")
     enabled="${enabled:-0}"
 
@@ -1722,9 +1818,14 @@ alert_status() {
     fi
 
     echo -e "\n${W}── MiLog: Alert status ──${NC}\n"
-    printf "  %-18s %b\n"  "webhook"         "$wh_state"
+
+    echo -e "  ${W}destinations${NC}"
+    _alert_destinations_status "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room"
+    echo
+
     printf "  %-18s %s\n"  "ALERTS_ENABLED"  "$enabled"
     printf "  %-18s %ss\n" "cooldown"        "${ALERT_COOLDOWN:-300}"
+    printf "  %-18s %ss\n" "dedup window"    "${ALERT_DEDUP_WINDOW:-300}"
     printf "  %-18s %s\n"  "state dir"       "${ALERT_STATE_DIR:-$HOME/.cache/milog}"
     printf "  %-18s %s\n"  "config"          "$target_config"
     printf "  %-18s %b\n"  "systemd service" "$svc_state"
@@ -2378,8 +2479,17 @@ config_show() {
         "$([[ -f "$MMDB_PATH" ]] && echo "$MMDB_PATH" || echo "MISSING:$MMDB_PATH")"
     printf "  %-22s enabled=%s db=%s retain=%sd\n" "history" \
         "$HISTORY_ENABLED" "$HISTORY_DB" "$HISTORY_RETAIN_DAYS"
-    printf "  %-22s webhook=%s enabled=%s cooldown=%ss\n" "discord alerts" \
-        "$([[ -n "$DISCORD_WEBHOOK" ]] && echo set || echo unset)" "$ALERTS_ENABLED" "$ALERT_COOLDOWN"
+    printf "  %-22s enabled=%s cooldown=%ss dedup=%ss\n" "alerts" \
+        "$ALERTS_ENABLED" "$ALERT_COOLDOWN" "${ALERT_DEDUP_WINDOW:-300}"
+    # Render per-destination status from the process-sourced env (same
+    # values the running daemon/TUI would use). For a target-user view
+    # under sudo, use `milog alert status` instead — it reads the
+    # target's config file directly.
+    _alert_destinations_status \
+        "${DISCORD_WEBHOOK:-}" \
+        "${SLACK_WEBHOOK:-}" \
+        "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" \
+        "${MATRIX_HOMESERVER:-}" "${MATRIX_TOKEN:-}" "${MATRIX_ROOM:-}"
 }
 
 config_init() {

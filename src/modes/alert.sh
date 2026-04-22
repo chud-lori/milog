@@ -188,10 +188,19 @@ alert_status() {
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
 
-    local wh wh_state enabled svc_state
-    wh=$(_alert_read_webhook "$target_config")
-    if [[ -n "$wh" ]]; then wh_state="${G}set${NC}"; else wh_state="${R}unset${NC}"; fi
+    # Read all destinations from the target config. Done via _alert_read_key
+    # (not env) so `sudo milog alert status` shows alice's real config,
+    # not root's. Empty strings when unset.
+    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room
+    d_url=$(_alert_read_webhook "$target_config")
+    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
 
+    local enabled svc_state
     enabled=$(_alert_read_key "$target_config" "ALERTS_ENABLED")
     enabled="${enabled:-0}"
 
@@ -206,9 +215,14 @@ alert_status() {
     fi
 
     echo -e "\n${W}── MiLog: Alert status ──${NC}\n"
-    printf "  %-18s %b\n"  "webhook"         "$wh_state"
+
+    echo -e "  ${W}destinations${NC}"
+    _alert_destinations_status "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room"
+    echo
+
     printf "  %-18s %s\n"  "ALERTS_ENABLED"  "$enabled"
     printf "  %-18s %ss\n" "cooldown"        "${ALERT_COOLDOWN:-300}"
+    printf "  %-18s %ss\n" "dedup window"    "${ALERT_DEDUP_WINDOW:-300}"
     printf "  %-18s %s\n"  "state dir"       "${ALERT_STATE_DIR:-$HOME/.cache/milog}"
     printf "  %-18s %s\n"  "config"          "$target_config"
     printf "  %-18s %b\n"  "systemd service" "$svc_state"
