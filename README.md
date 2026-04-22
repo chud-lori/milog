@@ -1,7 +1,12 @@
 # MiLog
 
-Single-script nginx + system monitor. TUI dashboard, log tailing,
-heuristic scanner/exploit detection, Discord alerts, headless daemon.
+Bash nginx + system monitor. TUI dashboard, read-only web UI, log tailing,
+heuristic scanner/exploit detection, multi-destination alerts
+(Discord / Slack / Telegram / Matrix), headless daemon, historical metrics.
+
+The shipping artifact is still a single file (`milog.sh` → `/usr/local/bin/milog`),
+but it's **built from modular source under [`src/`](src/README.md)** by
+[`build.sh`](build.sh). Users install one file; contributors edit small ones.
 
 > Internals, design principles, and extension guide live in
 > [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -38,13 +43,17 @@ sudo ./install.sh
 sudo ./install.sh --uninstall   # keeps ~/.config/milog/, ~/.cache/milog/
 ```
 
-Manual single-file download (skip the installer):
+Direct download (bypasses the installer — does not install gawk / curl /
+sqlite3 / socat for you):
 
 ```bash
 sudo curl -fLo /usr/local/bin/milog \
   https://raw.githubusercontent.com/chud-lori/milog/main/milog.sh
 sudo chmod +x /usr/local/bin/milog
 ```
+
+`milog.sh` is the bundled artifact — one self-contained bash script, even
+though its source is split across `src/*.sh`. No runtime assembly.
 
 Verify: `milog help`. Run `milog doctor` anytime to see what's wired up and
 what's degraded — it reports on every optional capability (sqlite3, geoip,
