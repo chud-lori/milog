@@ -2440,37 +2440,48 @@ mode_doctor() {
     fi
 
     # ---- nginx log format — does it carry $request_time? --------------------
+    #
+    # Scan the tail of every configured app's log and look for any timed line
+    # (numeric last field, NF>=12). One app's tail might still be pre-reload
+    # old-format while others are already new-format — we report ✓ as long
+    # as at least one app has timed samples recently. Simultaneously tracks
+    # apps with only old-format lines so the hint can call them out for
+    # manual verification.
     _doc_head "nginx log format"
-    local sample_app sample_file timed=-1
-    for sample_app in "${LOGS[@]}"; do
-        [[ -f "$LOG_DIR/$sample_app.access.log" ]] && { sample_file="$LOG_DIR/$sample_app.access.log"; break; }
-    done
-    if [[ -n "${sample_file:-}" ]]; then
-        # Read the last non-empty line and check whether the final field is
-        # a plain number (seconds.milliseconds) — that's the conventional
-        # placement of $request_time in combined_timed.
-        local last
-        last=$(tail -n 50 "$sample_file" 2>/dev/null | awk 'NF>0' | tail -n 1)
-        if [[ -n "$last" ]]; then
-            local nf lastfield
+    if (( ${#LOGS[@]} == 0 )); then
+        _doc_warn "no configured apps"
+    else
+        local app file last nf lastfield
+        local timed_apps=() untimed_apps=() witness=""
+        for app in "${LOGS[@]}"; do
+            file="$LOG_DIR/$app.access.log"
+            [[ -f "$file" ]] || continue
+            last=$(tail -n 200 "$file" 2>/dev/null | awk 'NF>0' | tail -n 1)
+            [[ -n "$last" ]] || continue
             nf=$(awk '{print NF}' <<< "$last")
             lastfield=$(awk '{print $NF}' <<< "$last")
             if [[ "$lastfield" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( nf >= 12 )); then
-                _doc_ok "extended log format detected  ('$sample_app' line ends with ${lastfield})" \
-                        "slow / p95 alerts enabled"
-                timed=1
+                timed_apps+=("$app")
+                [[ -z "$witness" ]] && witness="$app line ends with $lastfield"
             else
-                _doc_warn "log format appears to be 'combined' (no \$request_time)" \
-                          "add \$request_time as the LAST field to enable slow/p95 — see README"
-                warn=$(( warn + 1 ))
-                timed=0
+                untimed_apps+=("$app")
             fi
+        done
+        if (( ${#timed_apps[@]} > 0 )); then
+            _doc_ok "extended log format detected  ($witness)" \
+                    "slow / p95 / top-paths fully enabled"
+            if (( ${#untimed_apps[@]} > 0 )); then
+                _doc_warn "apps still showing old-format tail: ${untimed_apps[*]}" \
+                          "likely just no post-reload traffic yet — not a config issue"
+            fi
+        elif (( ${#untimed_apps[@]} > 0 )); then
+            _doc_warn "log format appears to be 'combined' (no \$request_time)" \
+                      "add \$request_time as the LAST field to enable slow/p95 — see README"
+            warn=$(( warn + 1 ))
         else
-            _doc_warn "no loglines in $sample_file to inspect"
+            _doc_warn "no loglines to inspect in any app"
             warn=$(( warn + 1 ))
         fi
-    else
-        _doc_warn "no readable app log to inspect"
     fi
 
     # ---- Discord alerting ----------------------------------------------------
