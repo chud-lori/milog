@@ -406,3 +406,13 @@ sudo rm /usr/local/bin/milog
 rm -rf ~/.config/milog ~/.cache/milog
 sudo rm -rf /opt/milog   # if cloned
 ```
+
+## Contributing
+
+The shipping artifact at `milog.sh` is generated from `src/*.sh` by
+`build.sh`. Don't edit `milog.sh` by hand — edit the file under `src/` that
+owns the code, then run `bash build.sh` to regenerate the bundle. Commit
+both the source change and the regenerated `milog.sh`.
+
+See [`src/README.md`](src/README.md) for the source layout and
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for design internals.

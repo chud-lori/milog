@@ -4,12 +4,49 @@ Internals for contributors. For install/usage, see [README.md](README.md).
 
 ## Overview
 
-MiLog is a single-file bash script (`milog.sh`) that renders a TUI dashboard,
-tails nginx access logs, detects scanner/exploit traffic, and — as of the
-alerts work — fires Discord webhooks headlessly via `milog daemon`.
+MiLog renders a TUI dashboard, tails nginx access logs, detects
+scanner/exploit traffic, and — via `milog daemon` + Discord webhooks — alerts
+headlessly. A read-only web dashboard (`milog web`) exposes the same data
+over HTTP with a minimal single-page HTML UI.
 
-No build step. No runtime deps beyond bash 4+, coreutils, awk, `ps`, `df`,
-and optionally `curl` (webhooks). Target: Linux VMs, `/var/log/nginx`.
+**Runtime deps:** bash 4+, coreutils, `awk` (gawk preferred), `ps`, `df`,
+`curl` (alerts), `sqlite3` (history/trend/diff/auto-tune), and optionally
+`socat`/`ncat` (web dashboard) and `mmdblookup` (GeoIP).
+
+**Target:** Linux VMs, `/var/log/nginx` (or an arbitrary dir via `LOG_DIR`).
+
+## Source layout
+
+The shipping artifact is still `milog.sh` — a single bundled bash file
+installed to `/usr/local/bin/milog`. Contributors don't edit it directly:
+it's generated from `src/*.sh` by `build.sh`.
+
+```
+milog/
+├── milog.sh          # bundled artifact (shipped to users; regenerated)
+├── build.sh          # concatenates src/** → milog.sh
+├── src/
+│   ├── README.md     # contributor guide
+│   ├── core.sh       # shebang, set -euo, config defaults, env overrides,
+│   │                 # colors. This is the only file that executes at load.
+│   ├── alerts.sh     # alert_discord, alert_should_fire, _exploit_category
+│   ├── ui.sh         # box rules, geometry, milog_update_geometry
+│   ├── system.sh     # cpu_usage, mem_info, disk_info, sparkline_render
+│   ├── history.sh    # SQLite schema + writes, percentiles
+│   ├── nginx.sh      # nginx_minute_counts, nginx_row, sys_check_alerts
+│   ├── web.sh        # _web_* helpers for the read-only dashboard
+│   ├── modes/*.sh    # one file per subcommand (mode_<name>)
+│   └── dispatch.sh   # show_help + the final `case "${1:-}"`
+├── install.sh        # downloads + installs milog.sh (unchanged UX)
+└── docs/*.md
+```
+
+Order matters only for `src/core.sh` (first, executes) and `src/dispatch.sh`
+(last, runs the chosen mode). Everything between is function definitions
+whose load order is irrelevant.
+
+CI contract: `bash build.sh && git diff --exit-code milog.sh` must succeed.
+Editing a `src/*.sh` file without regenerating the bundle fails CI.
 
 ## Design principles
 
@@ -49,12 +86,15 @@ the user's config.
 
 ## Runtime model
 
-Dispatch is a `case` statement at the bottom of the script. Each subcommand
-maps to a `mode_*` function. To add a command:
+Dispatch is a `case` statement in `src/dispatch.sh` that runs after every
+other file has been sourced. Each subcommand maps to a `mode_*` function
+defined in `src/modes/<cmd>.sh`. To add a command:
 
-1. Write `mode_foo`.
-2. Add `foo) mode_foo ;;` to the dispatch block.
-3. Add a line to `show_help`.
+1. Create `src/modes/foo.sh` with a `mode_foo` function.
+2. Add `foo) mode_foo ;;` to the dispatch block in `src/dispatch.sh`.
+3. Add a line to `show_help` (also in `src/dispatch.sh`).
+4. Run `bash build.sh` to regenerate `milog.sh`.
+5. Commit both the new source file and the regenerated `milog.sh`.
 
 Component index (subject to drift — grep for function names, don't trust
 line numbers):
@@ -186,9 +226,10 @@ stays clean.
 
 ## Extending — how to add a new alert rule
 
-1. Add the detection at the natural single source of truth for the metric
-   (a mode function or a shared helper). Don't re-scan logs just to fire
-   an alert.
+1. Edit the right file under `src/` — detection lives at the natural single
+   source of truth for the metric (usually a mode file in `src/modes/`, or
+   `src/nginx.sh` for HTTP rules, `src/system.sh` for CPU/MEM/DISK). Don't
+   re-scan logs just to fire an alert.
 2. Build a stable `rule_key` — the `<type>:<scope>` shape keeps keys
    predictable and greppable in the state file.
 3. Call `alert_should_fire "<rule_key>"`, then on true call
@@ -196,9 +237,14 @@ stays clean.
 4. Background the webhook. Always.
 5. Document the rule key in the table in [README.md](README.md#what-fires)
    and here.
+6. Run `bash build.sh` and commit the regenerated `milog.sh` alongside the
+   source change.
 
 ## Things to watch
 
+- **Regenerate the bundle.** Editing `src/*.sh` without running `bash build.sh`
+  produces a diff in `src/` but no behavior change on deployed boxes. CI
+  catches this (`git diff --exit-code milog.sh`) but local testing won't.
 - Adding TUI columns → recompute `INNER` and every `hrule` / `spc` width.
 - Empty associative-array iteration under `set -u` on bash 3.2 — guard.
 - Don't insert `| cat` / `| head` inside single-awk-pass blocks — it
@@ -210,3 +256,7 @@ stays clean.
   under, but a burst of rule hits inside one cooldown window still all
   produce webhooks if they're separate rule keys. Consider a coalescing
   queue in `mode_daemon` if this ever matters in practice.
+- **HTTP responses built in bash:** use byte-count (`wc -c`) for
+  `Content-Length`, not `${#var}` — under UTF-8 locales the latter counts
+  codepoints and truncates multi-byte responses. See `_web_respond` in
+  `src/web.sh` for the pattern.

@@ -800,1831 +800,6 @@ nginx_row() {
     trow "$name" "$count" "$st_plain" "$st_col" "$bars_plain" "$bars_col" "$alert"
 }
 
-# ==============================================================================
-# MODE: monitor
-# ==============================================================================
-mode_monitor() {
-    # Async CPU sampler — reads /proc/stat in a background loop, writes the
-    # latest % to a tmpfile. Keeps the render loop from blocking on sleep 0.2.
-    local cpu_file cpu_pid
-    cpu_file=$(mktemp 2>/dev/null || echo "/tmp/milog.cpu.$$")
-    echo 0 > "$cpu_file"
-    (
-        while :; do
-            v=$(cpu_usage)
-            printf '%s\n' "$v" > "${cpu_file}.tmp" 2>/dev/null \
-                && mv "${cpu_file}.tmp" "$cpu_file" 2>/dev/null
-            sleep 1
-        done
-    ) & cpu_pid=$!
-
-    # Enable sparkline history for nginx_row
-    MILOG_HIST_ENABLED=1
-    declare -gA HIST
-
-    # Hide cursor and quiet input echo so keystrokes don't litter the TUI.
-    tput civis 2>/dev/null || true
-    stty -echo 2>/dev/null || true
-
-    local _cleanup='
-        kill '"$cpu_pid"' 2>/dev/null
-        rm -f "'"$cpu_file"'" "'"${cpu_file}.tmp"'" 2>/dev/null
-        stty echo 2>/dev/null
-        tput cnorm 2>/dev/null
-        printf "\n"
-    '
-    trap "$_cleanup; exit 0" INT TERM
-    trap "$_cleanup" EXIT
-
-    local net_prev_rx=0 net_prev_tx=0
-    read -r net_prev_rx net_prev_tx _ <<< "$(net_rx_tx)"
-
-    local first=1 paused=0
-    while true; do
-        # Reflow for terminal size — runs per tick so SIGWINCH just works.
-        milog_update_geometry
-        if (( first )); then
-            clear
-            first=0
-        else
-            tput cup 0 0 2>/dev/null || printf '\033[H'
-        fi
-        local CUR_TIME TIMESTAMP TOTAL=0
-        CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
-        TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-
-        local cpu mem_pct mem_used mem_total disk_pct disk_used disk_total
-        cpu=$(cat "$cpu_file" 2>/dev/null); cpu=${cpu:-0}
-        [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
-        read -r mem_pct mem_used mem_total <<< "$(mem_info)"
-        read -r disk_pct disk_used disk_total <<< "$(disk_info)"
-
-        local net_rx net_tx net_iface
-        read -r net_rx net_tx net_iface <<< "$(net_rx_tx)"
-        local drx=$(( net_rx - net_prev_rx ))
-        local dtx=$(( net_tx - net_prev_tx ))
-        if (( ! paused )); then
-            net_prev_rx=$net_rx; net_prev_tx=$net_tx
-        fi
-        local rx_s tx_s; rx_s=$(fmt_bytes "$drx"); tx_s=$(fmt_bytes "$dtx")
-
-        local cpu_col mem_col disk_col
-        cpu_col=$(tcol "$cpu"      $THRESH_CPU_WARN  $THRESH_CPU_CRIT)
-        mem_col=$(tcol "$mem_pct"  $THRESH_MEM_WARN  $THRESH_MEM_CRIT)
-        disk_col=$(tcol "$disk_pct" $THRESH_DISK_WARN $THRESH_DISK_CRIT)
-
-        local cpu_bar mem_bar disk_bar
-        cpu_bar=$(ascii_bar $BW "$cpu"      100)
-        mem_bar=$(ascii_bar $BW "$mem_pct"  100)
-        disk_bar=$(ascii_bar $BW "$disk_pct" 100)
-
-        # --- Single unified box starts here ---
-        bdr_top
-
-        # Title row
-        local t_p=" MiLog   ${TIMESTAMP}   ${net_iface}"
-        local t_c=" ${W}MiLog${NC}   ${D}${TIMESTAMP}${NC}   ${D}${net_iface}${NC}"
-        draw_row "$t_p" "$t_c"
-
-        bdr_mid
-
-        # System metrics row 1 — bars
-        # Plain: " CPU  xx% [bar18]  MEM  xx% [bar18]  DISK  xx% [bar18]"
-        local r1_p
-        r1_p=$(printf " CPU %3d%% [%-${BW}s]  MEM %3d%% [%-${BW}s]  DISK %3d%% [%-${BW}s]" \
-            "$cpu" "$cpu_bar" "$mem_pct" "$mem_bar" "$disk_pct" "$disk_bar")
-        local r1_c
-        r1_c=$(printf " CPU %b%3d%%%b [%b%s%b]  MEM %b%3d%%%b [%b%s%b]  DISK %b%3d%%%b [%b%s%b]" \
-            "$cpu_col"  "$cpu"      "$NC" "$cpu_col"  "$cpu_bar"  "$NC" \
-            "$mem_col"  "$mem_pct"  "$NC" "$mem_col"  "$mem_bar"  "$NC" \
-            "$disk_col" "$disk_pct" "$NC" "$disk_col" "$disk_bar" "$NC")
-        draw_row "$r1_p" "$r1_c"
-
-        # System metrics row 2 — detail + net
-        # Max visible: ' MEM 99999/99999MB  DISK 999.9/999.9GB  dn:999.9MB/s up:999.9MB/s' = 72
-        local r2_p=" MEM ${mem_used}/${mem_total}MB  DISK ${disk_used}/${disk_total}GB  dn:${rx_s}/s up:${tx_s}/s"
-        local r2_c=" ${D}MEM${NC} ${mem_used}/${mem_total}MB  ${D}DISK${NC} ${disk_used}/${disk_total}GB  ${C}dn:${rx_s}/s${NC} ${G}up:${tx_s}/s${NC}"
-        draw_row "$r2_p" "$r2_c"
-
-        bdr_mid
-
-        # Nginx workers
-        draw_row " NGINX WORKERS" " ${W}NGINX WORKERS${NC}"
-        local workers worker_count
-        workers=$(ps aux 2>/dev/null | awk '/nginx: worker/{printf "  pid:%-8s  cpu:%5s%%  mem:%5s%%\n",$2,$3,$4}' | head -6)
-        if [[ -z "$workers" ]]; then
-            worker_count=0
-            draw_row "  (no nginx worker processes found)" "  ${D}(no nginx worker processes found)${NC}"
-        else
-            worker_count=$(printf '%s\n' "$workers" | wc -l | awk '{print $1}')
-            while IFS= read -r wline; do
-                draw_row "$wline" "  ${D}${wline:2}${NC}"
-            done <<< "$workers"
-        fi
-
-        sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
-                         "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
-
-        bdr_mid
-
-        # Nginx per-app table (no nested box — continues same box with col separators)
-        bdr_hdr
-        hdr_row
-        bdr_hdr
-
-        for name in "${LOGS[@]}"; do
-            nginx_row "$name" "$CUR_TIME" TOTAL
-        done
-
-        bdr_sep
-
-        # Footer
-        local upstr; upstr=$(uptime -p 2>/dev/null | sed 's/up //' || echo 'n/a')
-        local f_p=" TOTAL: ${TOTAL} req/min   UP: ${upstr}"
-        local f_c=" ${W}TOTAL:${NC} ${TOTAL} req/min   ${D}UP: ${upstr}${NC}"
-        draw_row "$f_p" "$f_c"
-
-        bdr_bot
-        local ptag=""
-        (( paused )) && ptag="  ${R}[PAUSED]${NC}"
-        # Clear-to-EOL so shorter footer over a longer one doesn't leave junk.
-        printf "${D} q:quit  p:pause  r:refresh  +/-:rate (${REFRESH}s)  |  5xx>=${THRESH_5XX_WARN} blinks${NC}${ptag}\033[K\n"
-        # Also clear from cursor down in case previous frame was taller.
-        printf '\033[J'
-
-        MILOG_HIST_PAUSED=$paused
-        local key
-        key=$(wait_or_key "$REFRESH")
-        case "$key" in
-            q|Q) break ;;
-            p|P) paused=$(( 1 - paused )) ;;
-            r|R) ;;
-            +)   (( REFRESH > 1 )) && REFRESH=$(( REFRESH - 1 )) ;;
-            -)   REFRESH=$(( REFRESH + 1 )) ;;
-            *)   ;;
-        esac
-    done
-}
-
-# ==============================================================================
-# MODE: rate — nginx-only
-# ==============================================================================
-mode_rate() {
-    while true; do
-        milog_update_geometry
-        clear
-        local CUR_TIME TIMESTAMP TOTAL=0
-        CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
-        TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-
-        bdr_top
-        draw_row " MiLog   ${TIMESTAMP}" " ${W}MiLog${NC}   ${D}${TIMESTAMP}${NC}"
-        bdr_mid
-        bdr_hdr
-        hdr_row
-        bdr_hdr
-
-        for name in "${LOGS[@]}"; do
-            nginx_row "$name" "$CUR_TIME" TOTAL
-        done
-
-        bdr_sep
-        draw_row " TOTAL: ${TOTAL} req/min" " ${W}TOTAL:${NC} ${TOTAL} req/min"
-        bdr_bot
-        printf "${D} Ctrl+C to exit  |  Refresh: ${REFRESH}s${NC}\n"
-        sleep "$REFRESH"
-    done
-}
-
-# ==============================================================================
-# MODE: health
-# ==============================================================================
-mode_health() {
-    echo -e "\n${W}── MiLog: Status Code Health ──${NC}\n"
-    printf "%-12s  %8s  %8s  %8s  %8s  %8s\n" "APP" "TOTAL" "2xx" "3xx" "4xx" "5xx"
-    printf "%-12s  %8s  %8s  %8s  %8s  %8s\n" "───────────" "───────" "───────" "───────" "───────" "───────"
-    for name in "${LOGS[@]}"; do
-        local file="$LOG_DIR/$name.access.log"
-        [[ -f "$file" ]] || { printf "%-12s  %8s\n" "$name" "(not found)"; continue; }
-        local total s2=0 s3=0 s4=0 s5=0
-        total=$(wc -l < "$file")
-        s2=$(grep -c ' 2[0-9][0-9] ' "$file" 2>/dev/null || true)
-        s3=$(grep -c ' 3[0-9][0-9] ' "$file" 2>/dev/null || true)
-        s4=$(grep -c ' 4[0-9][0-9] ' "$file" 2>/dev/null || true)
-        s5=$(grep -c ' 5[0-9][0-9] ' "$file" 2>/dev/null || true)
-        local c4=$NC c5=$NC
-        [[ $s4 -gt $THRESH_4XX_WARN ]] && c4=$Y
-        [[ $s5 -gt $THRESH_5XX_WARN ]] && c5=$R
-        printf "%-12s  %8s  %8s  %8s  ${c4}%8s${NC}  ${c5}%8s${NC}\n" \
-            "$name" "$total" "$s2" "$s3" "$s4" "$s5"
-    done
-    echo ""
-}
-
-# ==============================================================================
-# MODE: top
-# ==============================================================================
-mode_top() {
-    local n="${1:-10}"
-    echo -e "\n${W}── MiLog: Top ${n} IPs ──${NC}\n"
-
-    local show_geo=0
-    [[ "${GEOIP_ENABLED:-0}" == "1" && -f "$MMDB_PATH" ]] && show_geo=1
-
-    if (( show_geo )); then
-        printf "%-5s  %-18s  %-7s  %10s\n" "RANK" "IP" "COUNTRY" "REQUESTS"
-        printf "%-5s  %-18s  %-7s  %10s\n" "────" "─────────────────" "───────" "────────"
-    else
-        printf "%-5s  %-18s  %10s\n" "RANK" "IP" "REQUESTS"
-        printf "%-5s  %-18s  %10s\n" "────" "─────────────────" "────────"
-    fi
-
-    local tmp; tmp=$(mktemp)
-    local name
-    for name in "${LOGS[@]}"; do
-        [[ -f "$LOG_DIR/$name.access.log" ]] \
-            && awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
-    done
-
-    # Geo lookup happens here — after uniq has already collapsed the IP set
-    # to at most $n rows, so we fork mmdblookup $n times, not once per line.
-    local i=1 count ip col country
-    while read -r count ip; do
-        col=""
-        (( i == 1 ))             && col="$R"
-        (( i > 1 && i <= 3 ))    && col="$Y"
-        if (( show_geo )); then
-            country=$(geoip_country "$ip")
-            printf "%-5s  %-18s  %-7s  %b%10s%b\n" \
-                "#$i" "$ip" "$country" "$col" "$count" "$NC"
-        else
-            printf "%-5s  %-18s  %b%10s%b\n" \
-                "#$i" "$ip" "$col" "$count" "$NC"
-        fi
-        i=$((i+1))
-    done < <(sort "$tmp" | uniq -c | sort -rn | head -n "$n")
-
-    rm -f "$tmp"
-    echo
-}
-
-# ==============================================================================
-# MODE: stats
-# ==============================================================================
-mode_stats() {
-    local name="${1:-}"
-    [[ -z "$name" || ! " ${LOGS[*]} " =~ " $name " ]] && {
-        echo -e "${R}Usage: $0 stats <app>${NC}  Apps: ${LOGS[*]}"; exit 1; }
-    local file="$LOG_DIR/$name.access.log"
-    [[ -f "$file" ]] || { echo -e "${R}Not found: $file${NC}"; exit 1; }
-    echo -e "\n${W}── MiLog: Hourly breakdown — ${name} ──${NC}\n"
-    awk '{match($4,/\[([0-9]{2}\/[A-Za-z]+\/[0-9]{4}):([0-9]{2})/,a)
-         if(a[2]!="")h[a[2]]++}
-         END{for(x in h)print x,h[x]}' "$file" | sort | \
-    awk -v g="$G" -v y="$Y" -v r="$R" -v nc="$NC" '
-    BEGIN{max=0}{if($2>max)max=$2;d[NR]=$0;n=NR}
-    END{for(i=1;i<=n;i++){split(d[i],a," ")
-        b=int((a[2]/max)*40); bars=""
-        for(j=0;j<b;j++) bars=bars"|"
-        col=g; if(a[2]/max>0.6)col=y; if(a[2]/max>0.85)col=r
-        printf "%s:00  %s%-40s%s  %d\n",a[1],col,bars,nc,a[2]}}'
-    echo ""
-}
-
-# ==============================================================================
-# MODE: slow — top N endpoints by p95 response time
-# Requires the extended (combined_timed) log format — see README.
-# Pipeline: tail -> extract (path, ms) -> sort by path -> per-path p95
-#           -> sort by p95 desc -> head N. All portable POSIX awk; no
-#           gawk-only features (asort / PROCINFO) required.
-# ==============================================================================
-mode_slow() {
-    local n="${1:-10}"
-    local window="${SLOW_WINDOW:-1000}"
-
-    # Basic arg validation — integers only, otherwise later arithmetic trips.
-    [[ "$n"      =~ ^[0-9]+$ ]] || { echo -e "${R}slow: N must be numeric${NC}" >&2; return 1; }
-    [[ "$window" =~ ^[0-9]+$ ]] || { echo -e "${R}slow: SLOW_WINDOW must be numeric${NC}" >&2; return 1; }
-
-    echo -e "\n${W}── MiLog: Top ${n} slow endpoints (window=${window} lines/app) ──${NC}\n"
-
-    local files=() name
-    for name in "${LOGS[@]}"; do
-        local f="$LOG_DIR/$name.access.log"
-        [[ -f "$f" ]] && files+=("$f")
-    done
-
-    if (( ${#files[@]} == 0 )); then
-        echo -e "${R}No log files found in ${LOG_DIR}${NC}"
-        return 1
-    fi
-
-    # Stream through two awk stages with sort in between so per-path p95 can
-    # be computed without multi-dim arrays.
-    local top_rows
-    top_rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
-        | awk '
-            $NF ~ /^[0-9]+(\.[0-9]+)?$/ && NF >= 8 {
-                path = $7
-                q = index(path, "?")
-                if (q > 0) path = substr(path, 1, q - 1)
-                if (length(path) > 0) {
-                    printf "%s\t%d\n", path, int($NF * 1000 + 0.5)
-                }
-            }' \
-        | sort -t $'\t' -k1,1 -k2,2n \
-        | awk -F'\t' '
-            function emit(   pi) {
-                if (n > 0) {
-                    pi = int((n * 95 + 99) / 100)
-                    if (pi < 1) pi = 1
-                    if (pi > n) pi = n
-                    printf "%s\t%d\t%d\n", cur, v[pi], n
-                }
-            }
-            BEGIN { cur = ""; n = 0 }
-            {
-                if ($1 != cur) {
-                    emit()
-                    cur = $1; n = 0; delete v
-                }
-                n++
-                v[n] = $2
-            }
-            END { emit() }' \
-        | sort -t $'\t' -k2,2 -rn \
-        | head -n "$n")
-
-    if [[ -z "$top_rows" ]]; then
-        echo -e "${D}No timed samples in window — is \$request_time in your log_format?${NC}"
-        echo
-        return 0
-    fi
-
-    printf "%-5s  %-9s  %7s  %s\n" "RANK" "P95"     "COUNT" "PATH"
-    printf "%-5s  %-9s  %7s  %s\n" "────" "────────" "───────" "────────────────────"
-
-    local i=1 path p95 count col
-    while IFS=$'\t' read -r path p95 count; do
-        col=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
-        # Truncate absurdly long paths so the table stays aligned. URL paths
-        # are ASCII, so ${#path} is safe for width math.
-        local display="$path"
-        if (( ${#display} > 80 )); then
-            display="${display:0:77}..."
-        fi
-        printf "#%-4d  %b%-9s${NC}  %7d  %s\n" "$i" "$col" "${p95}ms" "$count" "$display"
-        i=$((i+1))
-    done <<< "$top_rows"
-    echo
-}
-
-# ==============================================================================
-# MODE: top-paths — aggregate URLs across all app logs, show per-path stats
-#
-# The single most useful incident question ("what URL is eating traffic?" or
-# "what URL is spiking 5xx?") isn't well served by `top` (IPs) or `slow`
-# (p95). This surfaces REQ + 4xx + 5xx + p95 per path. Query string is
-# stripped so /search?q=x and /search?q=y collapse into one row.
-#
-# Pipeline mirrors mode_slow: awk emit → external sort by path → group awk
-# → sort by count → head N. p95 requires the extended log format; shows
-# "—" when $request_time is absent.
-# ==============================================================================
-mode_top_paths() {
-    local n="${1:-20}"
-    local window="${SLOW_WINDOW:-2000}"
-
-    [[ "$n"      =~ ^[0-9]+$ ]] || { echo -e "${R}top-paths: N must be numeric${NC}" >&2; return 1; }
-    [[ "$window" =~ ^[0-9]+$ ]] || { echo -e "${R}top-paths: SLOW_WINDOW must be numeric${NC}" >&2; return 1; }
-
-    echo -e "\n${W}── MiLog: Top ${n} paths (window=${window} lines/app) ──${NC}\n"
-
-    local files=() name f
-    for name in "${LOGS[@]}"; do
-        f="$LOG_DIR/$name.access.log"
-        [[ -f "$f" ]] && files+=("$f")
-    done
-    if (( ${#files[@]} == 0 )); then
-        echo -e "${R}No log files found in ${LOG_DIR}${NC}"
-        return 1
-    fi
-
-    # awk pass 1: extract (path, status, ms-or-"-") per line.
-    #   $7  = request URI  (nginx combined: `"GET /path HTTP/1.1"` is fields 6-8)
-    #   $9  = status code
-    #   $NF = $request_time when combined_timed is in use (plain number)
-    # Query string is stripped so /x?a=1 + /x?a=2 collapse to /x.
-    #
-    # awk pass 2: sort by path + ms-numeric, group, emit count/4xx/5xx/p95.
-    # Numeric sort with "-" present: gawk/sort put "-" first (treated as 0),
-    # numeric values follow in ascending order — our group-awk only counts
-    # numerics into v[], so the p95 position is computed against just the
-    # timed samples for each path.
-    local rows
-    rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
-        | awk '
-            NF >= 9 {
-                path = $7
-                q = index(path, "?")
-                if (q > 0) path = substr(path, 1, q - 1)
-                if (length(path) == 0) next
-                status = $9
-                if (status !~ /^[0-9]+$/) next
-                lf = $NF
-                if (lf ~ /^[0-9]+(\.[0-9]+)?$/ && NF >= 12) {
-                    printf "%s\t%s\t%d\n", path, status, int(lf * 1000 + 0.5)
-                } else {
-                    printf "%s\t%s\t-\n", path, status
-                }
-            }' \
-        | sort -t $'\t' -k1,1 -k3,3n \
-        | awk -F'\t' '
-            function emit(   pi, p95) {
-                if (cur == "") return
-                if (nt > 0) {
-                    pi = int((nt * 95 + 99) / 100)
-                    if (pi < 1) pi = 1
-                    if (pi > nt) pi = nt
-                    p95 = v[pi]
-                } else {
-                    p95 = "-"
-                }
-                printf "%s\t%d\t%d\t%d\t%s\n", cur, count, c4, c5, p95
-            }
-            BEGIN { cur = ""; count = 0; c4 = 0; c5 = 0; nt = 0 }
-            {
-                if ($1 != cur) {
-                    emit()
-                    cur = $1; count = 0; c4 = 0; c5 = 0; nt = 0; delete v
-                }
-                count++
-                if ($2 ~ /^4/) c4++
-                if ($2 ~ /^5/) c5++
-                if ($3 != "-") { nt++; v[nt] = $3 }
-            }
-            END { emit() }' \
-        | sort -t $'\t' -k2,2 -rn \
-        | head -n "$n")
-
-    if [[ -z "$rows" ]]; then
-        echo -e "${D}No loglines matched in window.${NC}\n"
-        return 0
-    fi
-
-    printf "%-5s  %7s  %5s  %5s  %9s  %s\n" "RANK" "REQ" "4XX" "5XX" "P95" "PATH"
-    printf "%-5s  %7s  %5s  %5s  %9s  %s\n" "────" "───────" "─────" "─────" "─────────" "────────────────────"
-
-    local i=1 path count c4 c5 p95 col_err col_p95 p95_disp display
-    while IFS=$'\t' read -r path count c4 c5 p95; do
-        col_err=""
-        (( c5 > 0 )) && col_err="$R"
-        col_err+=""    # no-op but keeps the colour local
-        if [[ "$p95" == "-" ]]; then
-            # ASCII placeholder so printf byte-width == visual width. Unicode
-            # em-dash is 3 bytes / 1 column → throws off alignment.
-            p95_disp=$(printf "%b%9s%b" "$D" "n/a" "$NC")
-            col_p95=""
-        else
-            col_p95=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
-            # 7-wide number + "ms" = 9 visible chars (matches %9s header)
-            p95_disp=$(printf "%b%7sms%b" "$col_p95" "$p95" "$NC")
-        fi
-        display="$path"
-        if (( ${#display} > 60 )); then
-            display="${display:0:57}..."
-        fi
-        printf "#%-4d  %7d  %b%5d%b  %b%5d%b  %b  %s\n" \
-            "$i" "$count" \
-            "$Y" "$c4" "$NC" \
-            "$R" "$c5" "$NC" \
-            "$p95_disp" "$display"
-        i=$(( i + 1 ))
-    done <<< "$rows"
-    echo
-}
-
-# ==============================================================================
-# MODE: grep
-# ==============================================================================
-mode_grep() {
-    local name="${1:-}" pattern="${2:-.}"
-    [[ -z "$name" || ! " ${LOGS[*]} " =~ " $name " ]] && {
-        echo -e "${R}Usage: $0 grep <app> <pattern>${NC}  Apps: ${LOGS[*]}"; exit 1; }
-    echo -e "${D}tail -F $LOG_DIR/$name.access.log | grep '$pattern'  (Ctrl+C)${NC}\n"
-    tail -F "$LOG_DIR/$name.access.log" | grep --line-buffered -i "$pattern"
-}
-
-# ==============================================================================
-# MODE: errors
-# ==============================================================================
-mode_errors() {
-    echo -e "${D}Watching 4xx/5xx across all apps... (Ctrl+C)${NC}\n"
-    local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
-    for name in "${LOGS[@]}"; do
-        local file="$LOG_DIR/$name.access.log"
-        local col="${colors[$i]}" label
-        label=$(printf "%-8s" "$name")
-        if [[ -f "$file" ]]; then
-            tail -F "$file" 2>/dev/null | \
-                grep --line-buffered ' [45][0-9][0-9] ' | \
-                awk -v col="$col" -v lbl="$label" -v nc="$NC" \
-                    '{print col"["lbl"]"nc" "$0; fflush()}' &
-            pids+=($!)
-        fi
-        (( i++ )) || true
-    done
-    trap 'kill "${pids[@]}" 2>/dev/null; exit' INT TERM
-    wait
-}
-
-# ==============================================================================
-# MODE: probes — scanner / bot traffic by user-agent + protocol-level probes
-# Wide UA database covering security tools, mass scanners, SEO bots,
-# generic HTTP libs, AI crawlers, and non-HTTP protocol smuggling attempts.
-# ==============================================================================
-mode_probes() {
-    echo -e "${D}Watching scanner/bot traffic across all apps... (Ctrl+C)${NC}\n"
-    local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
-
-    # Protocol-level: SSH banner, TLS ClientHello sent to plain HTTP (nginx logs
-    # the bytes as literal \xNN — double backslash so grep sees one).
-    local pat='SSH-2\.0|\\x16\\x03|\\x00\\x00'
-    # Security / pentest tools
-    pat+='|masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster'
-    pat+='|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan'
-    pat+='|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag'
-    # Mass internet scanners / research crawlers
-    pat+='|l9explore|l9tcpid|l9retrieve|leakix'
-    pat+='|libredtail|httpx|naabu|katana|subfinder'
-    pat+='|expanseinc|censysinspect|shodan|stretchoid|internet-measurement'
-    pat+='|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey'
-    pat+='|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe'
-    # SEO / advertising crawlers (often unwanted)
-    pat+='|ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat'
-    pat+='|dataforseobot|bytespider|mauibot|megaindex|seznambot'
-    # AI crawlers
-    pat+='|claudebot|gptbot|ccbot|anthropic-ai|perplexitybot|youbot'
-    pat+='|amazonbot|applebot-extended|cohere-ai|diffbot'
-    # Generic HTTP libraries (legit use exists but often scripted)
-    pat+='|python-requests|python-urllib|aiohttp|go-http-client|okhttp'
-    pat+='|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2'
-    pat+='|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize'
-    # Headless / automation
-    pat+='|headlesschrome|phantomjs|puppeteer|playwright|selenium'
-    # Generic bot / crawler hints in UA
-    pat+='|[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester'
-    # Known payloads
-    pat+='|hello,\s*world'
-
-    for name in "${LOGS[@]}"; do
-        local file="$LOG_DIR/$name.access.log"
-        local col="${colors[$i]}" label
-        label=$(printf "%-8s" "$name")
-        if [[ -f "$file" ]]; then
-            (
-                app="$name"
-                tail -F "$file" 2>/dev/null | \
-                    grep --line-buffered -Ei "$pat" | \
-                while IFS= read -r line; do
-                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$line"
-                    if alert_should_fire "probe:$app"; then
-                        alert_discord "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 &
-                    fi
-                done
-            ) &
-            pids+=($!)
-        fi
-        (( i++ )) || true
-    done
-    trap 'kill "${pids[@]}" 2>/dev/null; exit' INT TERM
-    wait
-}
-
-# ==============================================================================
-# MODE: suspects — heuristic IP ranking (behavioral, not just UA)
-# Scores each IP in the last N log lines across all apps, using:
-#   4xx hits      × 2   (probing non-existent paths)
-#   5xx hits      × 3   (causing errors)
-#   missing UA    × 1   (scripted requests often send "-")
-#   scanner UA    + 10  (flat bonus if UA matches known tool)
-#   unique paths  / 5   (scanning behavior — many endpoints from one IP)
-# Prints top N with flags explaining why.
-# ==============================================================================
-mode_suspects() {
-    local topn="${1:-20}"
-    local window="${2:-2000}"
-
-    echo -e "\n${W}── MiLog: Suspicious IPs (last ${window} lines/app, top ${topn}) ──${NC}\n"
-
-    local show_geo=0
-    [[ "${GEOIP_ENABLED:-0}" == "1" && -f "$MMDB_PATH" ]] && show_geo=1
-
-    if (( show_geo )); then
-        printf "%-6s  %-18s  %-7s  %6s  %5s  %5s  %6s  %s\n" \
-            "SCORE" "IP" "COUNTRY" "REQ" "4XX" "5XX" "PATHS" "FLAGS"
-        printf "%-6s  %-18s  %-7s  %6s  %5s  %5s  %6s  %s\n" \
-            "─────" "─────────────────" "───────" "──────" "─────" "─────" "──────" "──────────"
-    else
-        printf "%-6s  %-18s  %6s  %5s  %5s  %6s  %s\n" \
-            "SCORE" "IP" "REQ" "4XX" "5XX" "PATHS" "FLAGS"
-        printf "%-6s  %-18s  %6s  %5s  %5s  %6s  %s\n" \
-            "─────" "─────────────────" "──────" "─────" "─────" "──────" "──────────"
-    fi
-
-    local tmp; tmp=$(mktemp)
-    local name
-    for name in "${LOGS[@]}"; do
-        local file="$LOG_DIR/$name.access.log"
-        [[ -f "$file" ]] && tail -n "$window" "$file" >> "$tmp"
-    done
-
-    # Score + top-N in one awk+sort pipeline. Post-aggregation, we pretty-
-    # print in bash so we can slot in an optional per-IP country lookup
-    # (mmdblookup runs at most $topn times — never per-line).
-    local ranked
-    ranked=$(awk '
-        BEGIN { FS = "\"" }
-        NF >= 6 {
-            split($1, a, " ");  ip = a[1]
-            gsub(/^ +| +$/, "", $3);  split($3, s, " ");  status = s[1]
-            req = $2;  ua = $6
-
-            reqs[ip]++
-            if (status ~ /^4/) e4[ip]++
-            if (status ~ /^5/) e5[ip]++
-            if (ua == "-" || ua == "") no_ua[ip]++
-
-            key = ip "|" req
-            if (!(key in seen)) { seen[key] = 1;  paths[ip]++ }
-
-            ual = tolower(ua)
-            if (ual ~ /masscan|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|ffuf|wfuzz|feroxbuster|libredtail|l9explore|shodan|censysinspect|expanseinc|httpx|python-requests|go-http-client|okhttp|libwww-perl|scanner|fuzzer|leakix/) {
-                scanner_ua[ip] = 1
-            }
-        }
-        END {
-            for (ip in reqs) {
-                sc = e4[ip]*2 + e5[ip]*3 + no_ua[ip] + (scanner_ua[ip]?10:0) + int(paths[ip]/5)
-                if (sc < 3) continue
-                f = ""
-                if (scanner_ua[ip])    f = f " SCANNER"
-                if (no_ua[ip] > 0)     f = f " NO-UA"
-                if (e4[ip] >= 20)      f = f " HIGH-4XX"
-                if (e5[ip] >= 5)       f = f " HIGH-5XX"
-                if (paths[ip] >= 10)   f = f " MANY-PATHS"
-                sub(/^ /, "", f)
-                printf "%d\t%s\t%d\t%d\t%d\t%d\t%s\n", sc, ip, reqs[ip], e4[ip]+0, e5[ip]+0, paths[ip]+0, f
-            }
-        }' "$tmp" | sort -t$'\t' -k1,1 -rn | head -n "$topn")
-
-    rm -f "$tmp"
-
-    [[ -z "$ranked" ]] && { echo; return 0; }
-
-    local sc ip req e4 e5 p_count flags c country
-    while IFS=$'\t' read -r sc ip req e4 e5 p_count flags; do
-        c=$G
-        (( sc >= 10 )) && c=$Y
-        (( sc >= 30 )) && c=$R
-        if (( show_geo )); then
-            country=$(geoip_country "$ip")
-            printf "%b%-6s%b  %-18s  %-7s  %6s  %5s  %5s  %6s  %s\n" \
-                "$c" "$sc" "$NC" "$ip" "$country" "$req" "$e4" "$e5" "$p_count" "$flags"
-        else
-            printf "%b%-6s%b  %-18s  %6s  %5s  %5s  %6s  %s\n" \
-                "$c" "$sc" "$NC" "$ip" "$req" "$e4" "$e5" "$p_count" "$flags"
-        fi
-    done <<< "$ranked"
-
-    echo
-}
-
-# ==============================================================================
-# MODE: exploits — L7 attack payloads + scanner fingerprints
-# Catches path traversal, LFI, RCE, SQLi, XSS, Log4Shell, dotfile/secret probes,
-# infra-API probes (Docker/actuator/etc), CMS admin scans, and known scanner UAs.
-# Example matches:
-#   GET /index.php?lang=../../../../tmp/foo      (path traversal)
-#   GET /containers/json                         (docker API probe)
-#   GET /SDK/webLanguage                         (hikvision probe)
-#   "libredtail-http" user-agent                 (scanner UA)
-# ==============================================================================
-mode_exploits() {
-    echo -e "${D}Watching exploit attempts across all apps... (Ctrl+C)${NC}\n"
-    local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
-
-    # Pattern built in groups for readability. ERE, case-insensitive.
-    local pat='\.\./|%2e%2e'                                                   # path traversal
-    pat+='|/etc/passwd|/etc/shadow|/proc/self/environ'                         # target files
-    pat+='|/containers/json|/actuator/|/server-status|/console(/|\?)|/druid/'  # infra probes
-    pat+='|/SDK/web|/cgi-bin/|/boaform/|/HNAP1'                                # embedded-device probes
-    pat+='|/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php'               # wordpress
-    pat+='|/phpmyadmin|/pma/|/mysql/admin'                                     # phpmyadmin
-    pat+='|/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store'                         # dotfiles / secrets
-    pat+='|/config\.(php|json|yml|yaml)|/web\.config'                          # config files
-    pat+='|jndi:|\$\{jndi|log4j'                                               # log4shell
-    pat+='|union[+% ]+select|select[+% ]+from|sleep\([0-9]|benchmark\('        # sqli
-    pat+='|or[+% ]+1=1|%27[+% ]*or|%27%20or'                                  # sqli
-    pat+='|<script|%3cscript|onerror=|onload=|javascript:'                     # xss
-    pat+='|base64_decode|eval\(|system\(|passthru\(|shell_exec'                # rce fn
-    pat+='|libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster'              # scanner UAs
-    pat+='|dirbuster|wfuzz|l9explore|l9tcpid|hello,\s?world'                   # scanner UAs
-
-    for name in "${LOGS[@]}"; do
-        local file="$LOG_DIR/$name.access.log"
-        local col="${colors[$i]}" label
-        label=$(printf "%-8s" "$name")
-        if [[ -f "$file" ]]; then
-            (
-                app="$name"
-                tail -F "$file" 2>/dev/null | \
-                    grep --line-buffered -Ei "$pat" | \
-                while IFS= read -r line; do
-                    printf '%b[%s]%b %b[EXPLOIT]%b %s\n' "$col" "$label" "$NC" "$R" "$NC" "$line"
-                    cat_slug=$(_exploit_category "$line")
-                    if alert_should_fire "exploit:$app:$cat_slug"; then
-                        alert_discord "Exploit attempt: $app / $cat_slug" "\`\`\`${line:0:1800}\`\`\`" 15158332 &
-                    fi
-                done
-            ) &
-            pids+=($!)
-        fi
-        (( i++ )) || true
-    done
-    trap 'kill "${pids[@]}" 2>/dev/null; exit' INT TERM
-    wait
-}
-
-# ==============================================================================
-# MODE: daemon — headless sampler + rule evaluator (no TUI)
-# Fires the same rules as the live modes. stderr decision log only;
-# webhook sends are backgrounded so a slow Discord never wedges the loop.
-# ==============================================================================
-
-mode_daemon() {
-    local hook_state
-    hook_state="disabled"
-    [[ "$ALERTS_ENABLED" == "1" && -n "$DISCORD_WEBHOOK" ]] && hook_state="enabled"
-    _dlog "milog daemon starting — refresh=${REFRESH}s alerts=${hook_state} history=${HISTORY_ENABLED} apps=(${LOGS[*]})"
-    [[ "$ALERTS_ENABLED" != "1" ]] && _dlog "WARNING: ALERTS_ENABLED=0 — rules will log but no webhooks will be fired"
-    [[ -z "$DISCORD_WEBHOOK"    ]] && _dlog "WARNING: DISCORD_WEBHOOK empty — no webhooks will be fired"
-
-    history_init   # no-op when HISTORY_ENABLED=0; disables itself on error
-
-    # Live-tail watchers for exploit + probe rules. Their stdout is suppressed;
-    # the alert call sites inside each mode fire webhooks directly.
-    local watcher_pids=()
-    ( mode_exploits > /dev/null ) & watcher_pids+=($!)
-    ( mode_probes   > /dev/null ) & watcher_pids+=($!)
-
-    local _cleanup='
-        _dlog "milog daemon shutting down"
-        kill "${watcher_pids[@]}" 2>/dev/null
-        exit 0
-    '
-    trap "$_cleanup" INT TERM
-
-    # Init rollover state — start at "current" so the first write happens
-    # only once we've crossed a real minute/hour/day boundary, never mid-
-    # minute on start-up with partial counts.
-    local last_min last_hour last_day now
-    now=$(date +%s)
-    last_min=$((  now / 60   ))
-    last_hour=$(( now / 3600 ))
-    last_day=$((  now / 86400 ))
-
-    while :; do
-        local CUR_TIME
-        CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
-
-        # System metrics — same helpers mode_monitor uses.
-        local cpu mem_pct mem_used mem_total disk_pct disk_used disk_total
-        cpu=$(cpu_usage)
-        [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
-        read -r mem_pct mem_used mem_total <<< "$(mem_info)"
-        read -r disk_pct disk_used disk_total <<< "$(disk_info)"
-
-        local worker_count
-        worker_count=$(ps aux 2>/dev/null | awk '/nginx: worker/{n++} END{print n+0}')
-
-        sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
-                         "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
-
-        # Per-app HTTP rules.
-        local name cnt c2 c3 c4 c5
-        for name in "${LOGS[@]}"; do
-            read -r cnt c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
-            cnt=${cnt:-0}; c4=${c4:-0}; c5=${c5:-0}
-            nginx_check_http_alerts "$name" "$c4" "$c5"
-        done
-
-        # History rollover. Write the *previous* complete minute so nothing
-        # lands partial. Hour rollup runs similarly on the hour edge.
-        now=$(date +%s)
-        local cur_min=$((  now / 60   ))
-        local cur_hour=$(( now / 3600 ))
-        if (( cur_min > last_min )); then
-            local write_ts=$(( last_min * 60 ))
-            history_write_minute "$write_ts" "$(_cur_time_at "$write_ts")"
-            last_min=$cur_min
-        fi
-        if (( cur_hour > last_hour )); then
-            local write_hr_ts=$(( last_hour * 3600 ))
-            history_write_hour "$write_hr_ts"
-            last_hour=$cur_hour
-        fi
-        local cur_day=$(( now / 86400 ))
-        if (( cur_day > last_day )); then
-            history_prune
-            last_day=$cur_day
-        fi
-
-        sleep "$REFRESH"
-    done
-}
-
-# ==============================================================================
-# MODE: alert — toggle Discord alerting + manage the systemd service
-#
-# Subcommands:
-#   on [WEBHOOK_URL]  — set webhook (optional), enable, install+start systemd
-#   off               — disable alerts, stop + disable systemd
-#   status            — show webhook/service/recent-fire state
-#   test              — fire a one-off Discord test embed (bypasses cooldown)
-#
-# When invoked via sudo, we write config into the *invoking* user's home
-# (resolved from SUDO_USER) and run the systemd service as that user — not
-# as root. Matches user intuition: `sudo milog alert on` sets up alerting
-# for the person who ran it, not for root.
-# ==============================================================================
-
-_alert_target_user() {
-    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-        printf '%s' "$SUDO_USER"
-    else
-        id -un
-    fi
-}
-
-_alert_target_home() {
-    local u="$1" h
-    h=$(getent passwd "$u" 2>/dev/null | cut -d: -f6)
-    [[ -n "$h" ]] && printf '%s' "$h" || printf '%s' "${HOME:-/root}"
-}
-
-# Upsert a single KEY=VALUE line in the target user's config file. Handles
-# dir creation + ownership fix when running as root on behalf of a user.
-_alert_write_config() {
-    local target_user="$1" target_home="$2" line="$3"
-    local dir="$target_home/.config/milog" file="$target_home/.config/milog/config.sh"
-    local key="${line%%=*}" tmp
-    mkdir -p "$dir" 2>/dev/null || { echo -e "${R}cannot create $dir${NC}" >&2; return 1; }
-    [[ -e "$file" ]] || : > "$file"
-    if grep -qE "^[[:space:]]*${key}=" "$file" 2>/dev/null; then
-        tmp=$(mktemp "$dir/.cfg.XXXXXX") || return 1
-        awk -v k="$key" -v repl="$line" '
-            $0 ~ "^[[:space:]]*" k "=" && !done { print repl; done=1; next }
-            { print }
-        ' "$file" > "$tmp" && mv "$tmp" "$file"
-    else
-        printf '%s\n' "$line" >> "$file"
-    fi
-    # Fix ownership so the target user can read/edit their own config when
-    # the write happened as root.
-    if [[ $(id -u) -eq 0 && "$target_user" != "root" ]]; then
-        chown -R "$target_user:$target_user" "$dir" 2>/dev/null || true
-    fi
-}
-
-# Read DISCORD_WEBHOOK from a config file (strips surrounding quotes).
-# Always returns 0 and emits empty string when the config doesn't exist or
-# doesn't set the key — keeps callers simple under `set -euo pipefail`.
-_alert_read_webhook() {
-    local file="$1"
-    [[ -f "$file" ]] || return 0
-    {
-        grep -E '^[[:space:]]*DISCORD_WEBHOOK=' "$file" 2>/dev/null \
-            | head -1 \
-            | sed -E 's/^[^=]*=//; s/^"//; s/"[[:space:]]*$//'
-    } || true
-    return 0
-}
-
-# Read a simple KEY's value from the config file — same no-fail contract.
-_alert_read_key() {
-    local file="$1" key="$2"
-    [[ -f "$file" ]] || return 0
-    {
-        grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null \
-            | head -1 \
-            | sed -E 's/^[^=]*=//; s/^"//; s/"[[:space:]]*$//'
-    } || true
-    return 0
-}
-
-# Write + enable the milog systemd unit. Caller must already be root.
-_alert_install_service() {
-    local target_user="$1" target_config="$2"
-    local exe unit="/etc/systemd/system/milog.service"
-    exe=$(command -v milog 2>/dev/null || echo "/usr/local/bin/milog")
-    cat > "$unit" <<EOF
-[Unit]
-Description=MiLog headless alerter
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$exe daemon
-Restart=on-failure
-RestartSec=5
-User=$target_user
-Environment=MILOG_CONFIG=$target_config
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable milog.service >/dev/null 2>&1
-    systemctl restart milog.service
-}
-
-# Short human-readable duration — "12s", "3m", "5h", "2d".
-_alert_fmt_dur() {
-    local s="$1"
-    if   (( s < 60 ));    then printf '%ds' "$s"
-    elif (( s < 3600 ));  then printf '%dm' "$((s / 60))"
-    elif (( s < 86400 )); then printf '%dh' "$((s / 3600))"
-    else                       printf '%dd' "$((s / 86400))"
-    fi
-}
-
-alert_on() {
-    local webhook_arg="${1:-}"
-    local target_user target_home target_config
-    target_user=$(_alert_target_user)
-    target_home=$(_alert_target_home "$target_user")
-    target_config="$target_home/.config/milog/config.sh"
-
-    if [[ -n "$webhook_arg" ]]; then
-        case "$webhook_arg" in
-            https://discord.com/api/webhooks/*) ;;
-            https://discordapp.com/api/webhooks/*) ;;
-            *) echo -e "${Y}warning:${NC} URL doesn't look like a Discord webhook — proceeding" ;;
-        esac
-        _alert_write_config "$target_user" "$target_home" \
-            "DISCORD_WEBHOOK=\"$webhook_arg\"" || return 1
-    fi
-    _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=1" || return 1
-
-    local current_webhook
-    current_webhook=$(_alert_read_webhook "$target_config")
-    if [[ -z "$current_webhook" ]]; then
-        echo -e "${R}no DISCORD_WEBHOOK configured in $target_config${NC}" >&2
-        echo "  pass one:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
-        return 1
-    fi
-
-    echo -e "${G}✓${NC} ALERTS_ENABLED=1 in $target_config"
-
-    if ! command -v systemctl >/dev/null 2>&1; then
-        echo -e "${Y}no systemctl on this host — run \`milog daemon\` under your own supervisor${NC}"
-        return 0
-    fi
-    if [[ $(id -u) -ne 0 ]]; then
-        echo -e "${Y}systemd setup needs root. Re-run:${NC}  sudo milog alert on"
-        return 0
-    fi
-
-    _alert_install_service "$target_user" "$target_config"
-    echo -e "${G}✓${NC} milog.service enabled and running (User=$target_user)"
-    echo
-    echo "  Verify state:  milog alert status"
-    echo "  Send a test:   milog alert test"
-    echo "  Tail log:      sudo journalctl -u milog -f"
-}
-
-alert_off() {
-    local target_user target_home target_config
-    target_user=$(_alert_target_user)
-    target_home=$(_alert_target_home "$target_user")
-    target_config="$target_home/.config/milog/config.sh"
-
-    _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=0" \
-        && echo -e "${G}✓${NC} ALERTS_ENABLED=0 in $target_config"
-
-    if ! command -v systemctl >/dev/null 2>&1; then return 0; fi
-
-    if [[ ! -f /etc/systemd/system/milog.service ]]; then
-        return 0
-    fi
-    if [[ $(id -u) -ne 0 ]]; then
-        echo
-        echo -e "${Y}To also stop the systemd service:${NC}  sudo milog alert off"
-        return 0
-    fi
-    systemctl stop    milog.service 2>/dev/null || true
-    systemctl disable milog.service >/dev/null 2>&1 || true
-    echo -e "${G}✓${NC} milog.service stopped and disabled"
-}
-
-alert_status() {
-    local target_user target_home target_config
-    target_user=$(_alert_target_user)
-    target_home=$(_alert_target_home "$target_user")
-    target_config="$target_home/.config/milog/config.sh"
-
-    local wh wh_state enabled svc_state
-    wh=$(_alert_read_webhook "$target_config")
-    if [[ -n "$wh" ]]; then wh_state="${G}set${NC}"; else wh_state="${R}unset${NC}"; fi
-
-    enabled=$(_alert_read_key "$target_config" "ALERTS_ENABLED")
-    enabled="${enabled:-0}"
-
-    if ! command -v systemctl >/dev/null 2>&1; then
-        svc_state="${D}no systemctl${NC}"
-    elif systemctl is-active --quiet milog.service 2>/dev/null; then
-        svc_state="${G}active${NC}"
-    elif [[ -f /etc/systemd/system/milog.service ]]; then
-        svc_state="${Y}installed (not running)${NC}"
-    else
-        svc_state="${D}not installed${NC}"
-    fi
-
-    echo -e "\n${W}── MiLog: Alert status ──${NC}\n"
-    printf "  %-18s %b\n"  "webhook"         "$wh_state"
-    printf "  %-18s %s\n"  "ALERTS_ENABLED"  "$enabled"
-    printf "  %-18s %ss\n" "cooldown"        "${ALERT_COOLDOWN:-300}"
-    printf "  %-18s %s\n"  "state dir"       "${ALERT_STATE_DIR:-$HOME/.cache/milog}"
-    printf "  %-18s %s\n"  "config"          "$target_config"
-    printf "  %-18s %b\n"  "systemd service" "$svc_state"
-
-    local state_file="${ALERT_STATE_DIR:-$HOME/.cache/milog}/alerts.state"
-    if [[ -s "$state_file" ]]; then
-        echo
-        echo -e "  ${W}Recent fires${NC} (most recent first):"
-        local now; now=$(date +%s)
-        sort -t$'\t' -k2,2 -rn "$state_file" 2>/dev/null | head -5 | \
-        while IFS=$'\t' read -r key ts; do
-            [[ -n "$ts" && "$ts" =~ ^[0-9]+$ ]] || continue
-            printf "    %-32s  %s ago\n" "$key" "$(_alert_fmt_dur $(( now - ts )))"
-        done
-    fi
-    echo
-}
-
-alert_test() {
-    local target_user target_home target_config webhook
-    target_user=$(_alert_target_user)
-    target_home=$(_alert_target_home "$target_user")
-    target_config="$target_home/.config/milog/config.sh"
-
-    # Prefer the target-user's config over whatever this process loaded at
-    # startup — handles `sudo milog alert test` reading alice's webhook.
-    webhook=$(_alert_read_webhook "$target_config")
-    [[ -z "$webhook" ]] && webhook="${DISCORD_WEBHOOK:-}"
-    if [[ -z "$webhook" ]]; then
-        echo -e "${R}no DISCORD_WEBHOOK configured${NC}" >&2
-        echo "  set one first:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
-        return 1
-    fi
-
-    # Temporarily force the gate regardless of ALERTS_ENABLED state — this
-    # is a manual test of the webhook wire, not a rule-triggered alert.
-    local _saved_enabled="$ALERTS_ENABLED" _saved_webhook="$DISCORD_WEBHOOK"
-    ALERTS_ENABLED=1
-    DISCORD_WEBHOOK="$webhook"
-
-    echo "Firing test alert to Discord..."
-    alert_discord "MiLog test alert" \
-        "Manual test from \`$(hostname 2>/dev/null || echo host)\` at $(date -Iseconds 2>/dev/null || date)" \
-        3447003
-
-    ALERTS_ENABLED="$_saved_enabled"
-    DISCORD_WEBHOOK="$_saved_webhook"
-    echo -e "${G}✓${NC} webhook call returned — check your Discord channel"
-}
-
-alert_help() {
-    echo -e "
-${W}milog alert${NC} — toggle Discord alerting and manage the systemd service
-
-${W}USAGE${NC}
-  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts; install + start systemd
-  ${C}milog alert off${NC}                disable alerts; stop + disable service
-  ${C}milog alert status${NC}             show webhook/service/recent-fire state
-  ${C}milog alert test${NC}               send a one-shot Discord test embed
-
-${W}EXAMPLES${NC}
-  ${D}# First-time setup in one command:${NC}
-  sudo milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'
-
-  ${D}# Verify end-to-end:${NC}
-  milog alert status
-  milog alert test
-
-  ${D}# Pause alerting during maintenance:${NC}
-  sudo milog alert off
-"
-}
-
-mode_alert() {
-    local sub="${1:-status}"; shift 2>/dev/null || true
-    case "$sub" in
-        on)             alert_on "${1:-}" ;;
-        off)            alert_off ;;
-        status|'')      alert_status ;;
-        test)           alert_test ;;
-        -h|--help|help) alert_help ;;
-        *) echo -e "${R}Unknown alert subcommand:${NC} $sub"; alert_help; exit 1 ;;
-    esac
-}
-
-# ==============================================================================
-# MODE: trend — ASCII sparkline chart from metrics_minute history
-# Requires HISTORY_ENABLED daemon to have written the DB. Renders two rows
-# per app: req/min (green) and 4xx+5xx errors (red). Bucket-aggregates so
-# the sparkline fits the fixed 60-char width.
-# ==============================================================================
-_render_trend_one() {
-    local app="$1" since="$2" window_sec="$3" width="$4"
-
-    # SQL buckets row timestamps into exactly `width` columns across the
-    # window. Empty columns (no samples) won't appear in output — we fill
-    # them in with zeros on the shell side below.
-    local rows
-    rows=$(sqlite3 -separator $'\t' "$HISTORY_DB" <<SQL 2>/dev/null
-SELECT CAST((ts - $since) * $width / $window_sec AS INTEGER) AS col,
-       COALESCE(SUM(req), 0),
-       COALESCE(SUM(c4xx + c5xx), 0)
-FROM metrics_minute
-WHERE app = $(_sql_quote "$app") AND ts >= $since
-GROUP BY col
-ORDER BY col;
-SQL
-)
-    if [[ -z "$rows" ]]; then
-        printf "  ${D}%-10s  no data in window${NC}\n\n" "$app"
-        return
-    fi
-
-    local -a req_samples=() err_samples=()
-    local i
-    for (( i = 0; i < width; i++ )); do
-        req_samples+=(0)
-        err_samples+=(0)
-    done
-
-    local col req err
-    while IFS=$'\t' read -r col req err; do
-        [[ "$col" =~ ^[0-9]+$ ]] || continue
-        if (( col >= 0 && col < width )); then
-            req_samples[$col]="${req:-0}"
-            err_samples[$col]="${err:-0}"
-        fi
-    done <<< "$rows"
-
-    local req_spark err_spark v peak=0 total=0
-    req_spark=$(sparkline_render "${req_samples[*]}")
-    err_spark=$(sparkline_render "${err_samples[*]}")
-    for v in "${req_samples[@]}"; do (( v > peak  )) && peak=$v; done
-    for v in "${err_samples[@]}"; do total=$(( total + v )); done
-
-    printf "  ${W}%-10s${NC}  req ${G}%s${NC}  peak=%d/bucket\n" "$app" "$req_spark" "$peak"
-    printf "  %-10s  err ${R}%s${NC}  total=%d\n" "" "$err_spark" "$total"
-    echo
-}
-
-mode_trend() {
-    local app_arg="${1:-}" hours="${2:-24}"
-    [[ "$hours" =~ ^[1-9][0-9]*$ ]] \
-        || { echo -e "${R}trend: hours must be a positive integer${NC}" >&2; return 1; }
-
-    _history_precheck || return 1
-
-    # Sparkline width scales with terminal: 40-char floor so short terms
-    # still show something useful; each bucket maps to window_sec/width seconds.
-    milog_update_geometry
-    local now since width window_sec
-    width=$(( INNER - 40 ))
-    (( width < 40 )) && width=40
-    now=$(date +%s)
-    window_sec=$(( hours * 3600 ))
-    since=$(( now - window_sec ))
-
-    local -a apps
-    if [[ -n "$app_arg" ]]; then
-        # Reject app names that can't appear in LOGS, so a typo doesn't
-        # render "no data" forever.
-        local ok=0 name
-        for name in "${LOGS[@]}"; do
-            [[ "$name" == "$app_arg" ]] && { ok=1; break; }
-        done
-        if (( ! ok )); then
-            echo -e "${R}trend: unknown app '$app_arg'${NC}  Apps: ${LOGS[*]}" >&2
-            return 1
-        fi
-        apps=("$app_arg")
-    else
-        apps=("${LOGS[@]}")
-    fi
-
-    echo -e "\n${W}── MiLog: Trend (last ${hours}h, ${width} buckets) ──${NC}\n"
-
-    local a
-    for a in "${apps[@]}"; do
-        _render_trend_one "$a" "$since" "$window_sec" "$width"
-    done
-}
-
-# ==============================================================================
-# MODE: replay — postmortem summary of one archived log file
-# Read-only: never writes history. Handles .gz / .bz2 transparently.
-# Three passes of the file: counts + date range, timings (sort + percentile),
-# top source IPs. Each pass is single-awk-per-metric — same discipline as
-# the live dashboard helpers.
-# ==============================================================================
-mode_replay() {
-    local file="${1:-}"
-    if [[ -z "$file" ]]; then
-        echo -e "${R}Usage:${NC} milog replay <log-file>" >&2
-        return 1
-    fi
-    [[ -f "$file" ]] || { echo -e "${R}Not found: $file${NC}" >&2; return 1; }
-
-    # Pick reader based on extension. Array form so no word-splitting risks
-    # when $file contains spaces.
-    local -a reader=(cat --)
-    case "$file" in
-        *.gz)
-            if   command -v gzcat >/dev/null 2>&1; then reader=(gzcat --)
-            elif command -v zcat  >/dev/null 2>&1; then reader=(zcat  --)
-            else echo -e "${R}gzcat/zcat needed for .gz files${NC}" >&2; return 1
-            fi
-            ;;
-        *.bz2)
-            command -v bzcat >/dev/null 2>&1 \
-                || { echo -e "${R}bzcat needed for .bz2 files${NC}" >&2; return 1; }
-            reader=(bzcat --)
-            ;;
-    esac
-
-    echo -e "\n${W}── MiLog: Replay — ${file} ──${NC}\n"
-
-    # Pass 1: lines, first/last timestamp, status-class tallies.
-    local summary n first last e2 e3 e4 e5
-    summary=$("${reader[@]}" "$file" 2>/dev/null | awk '
-        {
-            n++
-            if (match($0, /\[[0-9]{2}\/[A-Za-z]+\/[0-9]{4}:[0-9]{2}:[0-9]{2}/)) {
-                t = substr($0, RSTART+1, 20)
-                if (first == "") first = t
-                last = t
-            }
-            if (match($0, / [1-5][0-9][0-9] /)) {
-                cls = substr($0, RSTART+1, 1)
-                if      (cls == "2") e2++
-                else if (cls == "3") e3++
-                else if (cls == "4") e4++
-                else if (cls == "5") e5++
-            }
-        }
-        END { printf "%d\t%s\t%s\t%d\t%d\t%d\t%d\n", n+0, first, last, e2+0, e3+0, e4+0, e5+0 }')
-    IFS=$'\t' read -r n first last e2 e3 e4 e5 <<< "$summary"
-
-    if [[ -z "$n" || "$n" -eq 0 ]]; then
-        echo -e "  ${D}(empty or unreadable)${NC}\n"
-        return 0
-    fi
-
-    printf "  %-10s  %d\n"           "lines"   "$n"
-    printf "  %-10s  %s  →  %s\n"    "range"   "${first:--}" "${last:--}"
-    printf "  %-10s  2xx=%s  3xx=%s  ${Y}4xx=%s${NC}  ${R}5xx=%s${NC}\n" \
-           "status"  "$e2" "$e3" "$e4" "$e5"
-
-    # Pass 2: percentiles, only if any line has a numeric final field.
-    local sorted
-    sorted=$("${reader[@]}" "$file" 2>/dev/null \
-        | awk '$NF ~ /^[0-9]+(\.[0-9]+)?$/ { print int($NF * 1000 + 0.5) }' \
-        | sort -n)
-    if [[ -n "$sorted" ]]; then
-        local pct p50 p95 p99
-        pct=$(printf '%s\n' "$sorted" | awk '
-            { a[NR]=$1; n=NR }
-            END {
-                i50=int((n*50+99)/100); if (i50<1) i50=1; if (i50>n) i50=n
-                i95=int((n*95+99)/100); if (i95<1) i95=1; if (i95>n) i95=n
-                i99=int((n*99+99)/100); if (i99<1) i99=1; if (i99>n) i99=n
-                printf "%d %d %d\n", a[i50], a[i95], a[i99]
-            }')
-        read -r p50 p95 p99 <<< "$pct"
-        printf "  %-10s  p50=%dms  p95=%dms  p99=%dms\n" "response" "$p50" "$p95" "$p99"
-    fi
-
-    # Pass 3: top 10 source IPs.
-    echo
-    echo -e "  ${W}Top source IPs:${NC}"
-    "${reader[@]}" "$file" 2>/dev/null \
-        | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 \
-        | awk -v Y="$Y" -v R="$R" -v NC="$NC" '{
-              col = ""
-              if      (NR == 1) col = R
-              else if (NR <= 3) col = Y
-              printf "    %s#%-3d%s  %-18s  %d requests\n", col, NR, NC, $2, $1
-          }'
-    echo
-}
-
-# ==============================================================================
-# MODE: diff — hour-level comparison: now vs 1d ago vs 7d ago, per app
-# Same-hour windows against metrics_minute. Percent deltas computed in the
-# shell because bash arithmetic handles the small integer math cleanly.
-# ==============================================================================
-mode_diff() {
-    _history_precheck || return 1
-
-    local now hr_start_now
-    now=$(date +%s)
-    hr_start_now=$(( now - (now % 3600) ))
-
-    local yest_start=$((  hr_start_now - 86400     ))
-    local yest_end=$((    yest_start   + 3600      ))
-    local week_start=$((  hr_start_now - 7 * 86400 ))
-    local week_end=$((    week_start   + 3600      ))
-
-    local hr_label
-    hr_label=$(date -d "@${hr_start_now}" '+%H:00' 2>/dev/null \
-               || date -r "$hr_start_now" '+%H:00' 2>/dev/null \
-               || echo "this hour")
-
-    echo -e "\n${W}── MiLog: Hourly diff (${hr_label} vs 1d/7d ago) ──${NC}\n"
-
-    local rows
-    rows=$(sqlite3 -separator $'\t' "$HISTORY_DB" <<SQL 2>/dev/null
-SELECT app,
-       COALESCE(SUM(CASE WHEN ts >= $hr_start_now AND ts < $now      THEN req END), 0) AS now_r,
-       COALESCE(SUM(CASE WHEN ts >= $yest_start   AND ts < $yest_end THEN req END), 0) AS d1,
-       COALESCE(SUM(CASE WHEN ts >= $week_start   AND ts < $week_end THEN req END), 0) AS d7
-FROM metrics_minute
-WHERE ts >= $week_start
-GROUP BY app
-ORDER BY app;
-SQL
-)
-    if [[ -z "$rows" ]]; then
-        echo -e "  ${D}no data in the windows${NC}\n"
-        return 0
-    fi
-
-    # ASCII header labels — Δ is a 2-byte 1-column char that confuses
-    # printf byte-width formatting. Divider em-dashes are counted to match
-    # each column's VISUAL width (12/10/10/10/8/8) so rows line up.
-    printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \
-           "APP" "NOW" "1d ago" "7d ago" "d1 %" "d7 %"
-    printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \
-           "────────────" "──────────" "──────────" "──────────" "────────" "────────"
-
-    local app now_r d1 d7 d1p d7p d1_col d7_col
-    while IFS=$'\t' read -r app now_r d1 d7; do
-        now_r=${now_r:-0}; d1=${d1:-0}; d7=${d7:-0}
-        if (( d1 > 0 )); then
-            d1p=$(( (now_r - d1) * 100 / d1 ))
-            d1_col=$G
-            (( d1p <= -25 || d1p >= 50 ))  && d1_col=$Y
-            (( d1p <= -50 || d1p >= 100 )) && d1_col=$R
-            d1p="$(printf '%+d%%' "$d1p")"
-        else
-            d1p="—"; d1_col="$D"
-        fi
-        if (( d7 > 0 )); then
-            d7p=$(( (now_r - d7) * 100 / d7 ))
-            d7_col=$G
-            (( d7p <= -25 || d7p >= 50 ))  && d7_col=$Y
-            (( d7p <= -50 || d7p >= 100 )) && d7_col=$R
-            d7p="$(printf '%+d%%' "$d7p")"
-        else
-            d7p="—"; d7_col="$D"
-        fi
-        printf "  %-12s  %10d  %10d  %10d  ${d1_col}%8s${NC}  ${d7_col}%8s${NC}\n" \
-               "$app" "$now_r" "$d1" "$d7" "$d1p" "$d7p"
-    done <<< "$rows"
-    echo
-    echo -e "  ${D}(NOW is the partial current hour so far; 1d/7d are full same-hour windows)${NC}"
-    echo
-}
-
-# ==============================================================================
-# MODE: auto-tune — suggest thresholds from history baselines
-#
-# Picks thresholds that would have fired ~rarely on your actual traffic
-# instead of making users guess "what's a reasonable 5xx/min for this box?".
-# Reads metrics_minute over a recent window and prints:
-#   1) side-by-side table of CURRENT vs SUGGESTED
-#   2) a copy-paste block of `milog config set …` commands
-#
-# Percentile picks:
-#   THRESH_REQ_WARN  = p90(req)       — alert on the top 10% of minutes
-#   THRESH_REQ_CRIT  = p99(req)       — alert on clear outliers
-#   THRESH_4XX_WARN  = p95(c4xx)      — floor at 5 so tiny clients don't spam
-#   THRESH_5XX_WARN  = p95(c5xx)      — floor at 1 (any 5xx > 0 is worth a ping)
-#   P95_WARN_MS      = p75(p95_ms)    — warn when current p95 worse than 3-in-4 historical minutes
-#   P95_CRIT_MS      = p99(p95_ms)    — crit on top 1% latency outliers
-#
-# CPU/MEM/DISK are not in the DB, so those thresholds aren't tuned here.
-# ==============================================================================
-
-# Stdin-to-percentile helper: read newline-separated numbers, print the
-# p-th percentile (1..100) using the existing `sort -n | awk positional`
-# idiom (same logic as percentiles() but for a generic stream).
-_pct_from_stdin() {
-    local p=$1
-    sort -n | awk -v p="$p" '
-        NF && $1 ~ /^[0-9]+(\.[0-9]+)?$/ { v[++n] = $1 }
-        END {
-            if (n == 0) exit
-            i = int((n * p + 99) / 100)
-            if (i < 1) i = 1
-            if (i > n) i = n
-            print v[i]
-        }'
-}
-
-# Format one table row. Visual widths: METRIC(20) CURRENT(11) SUGGESTED(11) DELTA(9)
-_tune_row() {
-    local metric="$1" current="$2" suggested="$3"
-    local delta=""
-    if [[ "$current" =~ ^[0-9]+$ && "$suggested" =~ ^[0-9]+$ ]]; then
-        local d=$(( suggested - current ))
-        if   (( d > 0 )); then delta="${Y}+${d}${NC}"
-        elif (( d < 0 )); then delta="${G}${d}${NC}"
-        else                   delta="${D}0${NC}"
-        fi
-    else
-        delta="${D}  —${NC}"
-    fi
-    printf "  %-20s  %-11s  ${W}%-11s${NC}  %b\n" \
-        "$metric" "$current" "$suggested" "$delta"
-}
-
-mode_auto_tune() {
-    local days="${1:-7}"
-    [[ "$days" =~ ^[1-9][0-9]*$ ]] \
-        || { echo -e "${R}auto-tune: days must be a positive integer${NC}" >&2; return 1; }
-
-    _history_precheck || return 1
-
-    local now since count
-    now=$(date +%s)
-    since=$(( now - days * 86400 ))
-    count=$(sqlite3 "$HISTORY_DB" \
-        "SELECT COUNT(*) FROM metrics_minute WHERE ts >= $since;" 2>/dev/null || echo 0)
-    [[ "$count" =~ ^[0-9]+$ ]] || count=0
-
-    echo -e "\n${W}── MiLog: auto-tune (window=${days}d, ${count} rows) ──${NC}\n"
-
-    # 100 rows ≈ 100 minutes ≈ 1.6h of data — anything less and percentiles
-    # are too noisy to base thresholds on.
-    if (( count < 100 )); then
-        echo -e "${R}Not enough history (${count} rows — need ≥100).${NC}"
-        echo -e "${D}  let 'milog daemon' run for a few hours with HISTORY_ENABLED=1,${NC}"
-        echo -e "${D}  or widen the window: milog auto-tune 30${NC}\n"
-        return 1
-    fi
-
-    # Pull each metric's samples once. Filtering req>0 excludes quiet-hour
-    # zeros so the percentile reflects real traffic — otherwise a mostly-idle
-    # server would suggest THRESH_REQ_WARN=0.
-    local p95_samples req_samples c4_samples c5_samples
-    p95_samples=$(sqlite3 "$HISTORY_DB" \
-        "SELECT p95_ms FROM metrics_minute WHERE ts >= $since AND p95_ms IS NOT NULL AND req > 0;" 2>/dev/null)
-    req_samples=$(sqlite3 "$HISTORY_DB" \
-        "SELECT req FROM metrics_minute WHERE ts >= $since AND req > 0;" 2>/dev/null)
-    c4_samples=$(sqlite3 "$HISTORY_DB" \
-        "SELECT c4xx FROM metrics_minute WHERE ts >= $since;" 2>/dev/null)
-    c5_samples=$(sqlite3 "$HISTORY_DB" \
-        "SELECT c5xx FROM metrics_minute WHERE ts >= $since;" 2>/dev/null)
-
-    local s_req_warn s_req_crit s_c4_warn s_c5_warn s_p95_warn s_p95_crit
-    s_req_warn=$(printf '%s\n' "$req_samples" | _pct_from_stdin 90)
-    s_req_crit=$(printf '%s\n' "$req_samples" | _pct_from_stdin 99)
-    s_c4_warn=$( printf '%s\n' "$c4_samples"  | _pct_from_stdin 95)
-    s_c5_warn=$( printf '%s\n' "$c5_samples"  | _pct_from_stdin 95)
-    s_p95_warn=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 75)
-    s_p95_crit=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 99)
-
-    # Floors so "empty" days don't suggest zeros that fire on any activity.
-    [[ "$s_c4_warn"  =~ ^[0-9]+$ ]] && (( s_c4_warn  < 5 )) && s_c4_warn=5
-    [[ "$s_c5_warn"  =~ ^[0-9]+$ ]] && (( s_c5_warn  < 1 )) && s_c5_warn=1
-    [[ "$s_req_warn" =~ ^[0-9]+$ ]] && (( s_req_warn < 5 )) && s_req_warn=5
-
-    # Fall back to blank when we had zero samples for a metric (no timed
-    # traffic at all means p95 tuning is impossible).
-    : "${s_req_warn:=}"; : "${s_req_crit:=}"; : "${s_c4_warn:=}"; : "${s_c5_warn:=}"
-    : "${s_p95_warn:=}"; : "${s_p95_crit:=}"
-
-    printf "  %-20s  %-11s  %-11s  %-s\n" "METRIC" "CURRENT" "SUGGESTED" "DELTA"
-    printf "  %-20s  %-11s  %-11s  %-s\n" "────────────────────" "───────────" "───────────" "──────"
-    _tune_row "THRESH_REQ_WARN"  "$THRESH_REQ_WARN"  "${s_req_warn:--}"
-    _tune_row "THRESH_REQ_CRIT"  "$THRESH_REQ_CRIT"  "${s_req_crit:--}"
-    _tune_row "THRESH_4XX_WARN"  "$THRESH_4XX_WARN"  "${s_c4_warn:--}"
-    _tune_row "THRESH_5XX_WARN"  "$THRESH_5XX_WARN"  "${s_c5_warn:--}"
-    _tune_row "P95_WARN_MS"      "$P95_WARN_MS"      "${s_p95_warn:--}"
-    _tune_row "P95_CRIT_MS"      "$P95_CRIT_MS"      "${s_p95_crit:--}"
-
-    # Ready-to-apply block — skip lines we couldn't tune.
-    echo -e "\n${W}Ready to apply${NC} ${D}(copy-paste to set):${NC}"
-    local line printed=0
-    for line in \
-        "THRESH_REQ_WARN $s_req_warn" \
-        "THRESH_REQ_CRIT $s_req_crit" \
-        "THRESH_4XX_WARN $s_c4_warn" \
-        "THRESH_5XX_WARN $s_c5_warn" \
-        "P95_WARN_MS $s_p95_warn" \
-        "P95_CRIT_MS $s_p95_crit"
-    do
-        local k v
-        k="${line%% *}"; v="${line#* }"
-        [[ -n "$v" && "$v" =~ ^[0-9]+$ ]] || continue
-        printf "  milog config set %s %s\n" "$k" "$v"
-        printed=$(( printed + 1 ))
-    done
-    if (( printed == 0 )); then
-        echo -e "  ${D}(no actionable suggestions — samples were empty for every tuned metric)${NC}"
-    fi
-    echo -e "\n  ${D}note: tunes to the quiet-hour-excluded p90/p75/p95/p99 of your last ${days} day(s).${NC}"
-    echo -e "  ${D}       re-run after traffic patterns change (new service, traffic source, load).${NC}\n"
-    return 0
-}
-
-# ==============================================================================
-# MODE: doctor — checklist of what's installed/configured/reachable
-#
-# The tool no-ops gracefully when sqlite3, mmdblookup, a webhook, or the
-# extended log format are missing — which is friendly but can hide a
-# misconfigured install. `doctor` makes every degraded capability visible
-# with a one-line hint on how to enable it.
-#
-# Output: ✓ (ready) / ! (degraded, works-but-limited) / ✗ (broken/required).
-# Exit code: 0 if all required deps are present; 1 otherwise. CI-friendly.
-# ==============================================================================
-_doc_line() {
-    # $1=marker (colored glyph)  $2=headline  $3=optional hint
-    printf "  %b %s\n" "$1" "$2"
-    [[ -n "${3:-}" ]] && printf "     ${D}%s${NC}\n" "$3"
-    return 0   # guard against set -e when hint is empty
-}
-_doc_ok()   { _doc_line "${G}✓${NC}" "$1" "${2:-}"; }
-_doc_warn() { _doc_line "${Y}!${NC}" "$1" "${2:-}"; }
-_doc_fail() { _doc_line "${R}✗${NC}" "$1" "${2:-}"; }
-_doc_head() { printf "\n${W}── %s ──${NC}\n" "$1"; }
-
-mode_doctor() {
-    local fail=0 warn=0
-    echo -e "\n${W}── MiLog: doctor ──${NC}"
-
-    # ---- core tools (required) ----------------------------------------------
-    _doc_head "core tools"
-    local tool
-    for tool in bash gawk curl; do
-        if command -v "$tool" >/dev/null 2>&1; then
-            _doc_ok "$tool present  ($(command -v "$tool"))"
-        else
-            _doc_fail "$tool NOT on PATH" "required — install via your package manager"
-            fail=$(( fail + 1 ))
-        fi
-    done
-    local bmaj="${BASH_VERSINFO[0]:-3}"
-    if (( bmaj >= 4 )); then
-        _doc_ok "bash ${BASH_VERSION}  (sparkline cache enabled)"
-    else
-        _doc_warn "bash ${BASH_VERSION}" "bash<4 — monitor skips the p95 cache; upgrade for smoother TUI"
-        warn=$(( warn + 1 ))
-    fi
-
-    # ---- optional tools ------------------------------------------------------
-    _doc_head "optional tools"
-    if command -v sqlite3 >/dev/null 2>&1; then
-        _doc_ok "sqlite3 present  ($(sqlite3 --version 2>/dev/null | awk '{print $1}'))"
-    else
-        _doc_warn "sqlite3 missing" "trend/replay/diff/auto-tune will be disabled — install 'sqlite3'"
-        warn=$(( warn + 1 ))
-    fi
-    if command -v mmdblookup >/dev/null 2>&1; then
-        _doc_ok "mmdblookup present" "GeoIP country enrichment available when GEOIP_ENABLED=1"
-    else
-        _doc_warn "mmdblookup missing" "GeoIP column disabled — install 'mmdb-bin' / 'libmaxminddb'"
-        warn=$(( warn + 1 ))
-    fi
-
-    # ---- log dir + per-app logs ---------------------------------------------
-    _doc_head "log directory"
-    if [[ -d "$LOG_DIR" && -r "$LOG_DIR" ]]; then
-        _doc_ok "$LOG_DIR readable"
-    else
-        _doc_fail "$LOG_DIR missing or unreadable" "set MILOG_LOG_DIR or edit LOG_DIR in $MILOG_CONFIG"
-        fail=$(( fail + 1 ))
-    fi
-
-    _doc_head "app logs (${#LOGS[@]} configured)"
-    if (( ${#LOGS[@]} == 0 )); then
-        _doc_warn "LOGS is empty" "add apps via 'milog config add <name>' or set MILOG_APPS='a b c'"
-        warn=$(( warn + 1 ))
-    else
-        local app file mtime now age
-        now=$(date +%s)
-        for app in "${LOGS[@]}"; do
-            file="$LOG_DIR/$app.access.log"
-            if [[ ! -f "$file" ]]; then
-                _doc_warn "$app — no access log" "expected: $file"
-                warn=$(( warn + 1 ))
-                continue
-            fi
-            mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
-            age=$(( now - mtime ))
-            if (( age < 3600 )); then
-                _doc_ok "$app — active  (last write ${age}s ago)"
-            elif (( age < 86400 )); then
-                _doc_warn "$app — stale  (last write $(( age / 3600 ))h ago)"
-                warn=$(( warn + 1 ))
-            else
-                _doc_warn "$app — idle  (last write $(( age / 86400 ))d ago)"
-                warn=$(( warn + 1 ))
-            fi
-        done
-    fi
-
-    # ---- nginx log format — does it carry $request_time? --------------------
-    #
-    # Scan the tail of every configured app's log and look for any timed line
-    # (numeric last field, NF>=12). One app's tail might still be pre-reload
-    # old-format while others are already new-format — we report ✓ as long
-    # as at least one app has timed samples recently. Simultaneously tracks
-    # apps with only old-format lines so the hint can call them out for
-    # manual verification.
-    _doc_head "nginx log format"
-    if (( ${#LOGS[@]} == 0 )); then
-        _doc_warn "no configured apps"
-    else
-        local app file last nf lastfield
-        local timed_apps=() untimed_apps=() witness=""
-        for app in "${LOGS[@]}"; do
-            file="$LOG_DIR/$app.access.log"
-            [[ -f "$file" ]] || continue
-            last=$(tail -n 200 "$file" 2>/dev/null | awk 'NF>0' | tail -n 1)
-            [[ -n "$last" ]] || continue
-            nf=$(awk '{print NF}' <<< "$last")
-            lastfield=$(awk '{print $NF}' <<< "$last")
-            if [[ "$lastfield" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( nf >= 12 )); then
-                timed_apps+=("$app")
-                [[ -z "$witness" ]] && witness="$app line ends with $lastfield"
-            else
-                untimed_apps+=("$app")
-            fi
-        done
-        if (( ${#timed_apps[@]} > 0 )); then
-            _doc_ok "extended log format detected  ($witness)" \
-                    "slow / p95 / top-paths fully enabled"
-            if (( ${#untimed_apps[@]} > 0 )); then
-                _doc_warn "apps still showing old-format tail: ${untimed_apps[*]}" \
-                          "likely just no post-reload traffic yet — not a config issue"
-            fi
-        elif (( ${#untimed_apps[@]} > 0 )); then
-            _doc_warn "log format appears to be 'combined' (no \$request_time)" \
-                      "add \$request_time as the LAST field to enable slow/p95 — see README"
-            warn=$(( warn + 1 ))
-        else
-            _doc_warn "no loglines to inspect in any app"
-            warn=$(( warn + 1 ))
-        fi
-    fi
-
-    # ---- Discord alerting ----------------------------------------------------
-    _doc_head "alerting (Discord)"
-    if [[ -z "${DISCORD_WEBHOOK:-}" ]]; then
-        _doc_warn "DISCORD_WEBHOOK not configured" \
-                  "run: sudo milog alert on \"https://discord.com/api/webhooks/ID/TOKEN\""
-        warn=$(( warn + 1 ))
-    else
-        _doc_ok "DISCORD_WEBHOOK configured  (${DISCORD_WEBHOOK:0:40}…)"
-        # Reachability — a POST with an empty content is ignored by Discord,
-        # so we GET the webhook metadata instead (returns 200 + JSON on valid
-        # webhooks, 404 on stale). 5s cap so doctor never hangs.
-        local http
-        http=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 \
-               "$DISCORD_WEBHOOK" 2>/dev/null || echo 000)
-        case "$http" in
-            200) _doc_ok "webhook reachable  (HTTP 200)" ;;
-            401|403|404) _doc_fail "webhook rejected  (HTTP $http)" "webhook was deleted or token invalid — regenerate in Discord"; fail=$(( fail + 1 )) ;;
-            000) _doc_warn "webhook unreachable (network/timeout)" "is this box allowed to egress to discord.com?"; warn=$(( warn + 1 )) ;;
-            *)   _doc_warn "webhook returned HTTP $http" "unexpected — may still work for POSTs; test with 'milog alert test'"; warn=$(( warn + 1 )) ;;
-        esac
-    fi
-    if [[ "${ALERTS_ENABLED:-0}" == "1" ]]; then
-        _doc_ok "ALERTS_ENABLED=1  (cooldown=${ALERT_COOLDOWN}s)"
-    else
-        _doc_warn "ALERTS_ENABLED=0" "alerts are armed but disabled — 'milog alert on' to flip"
-        warn=$(( warn + 1 ))
-    fi
-
-    # ---- history DB ---------------------------------------------------------
-    _doc_head "history (SQLite)"
-    if [[ "${HISTORY_ENABLED:-0}" != "1" ]]; then
-        _doc_warn "HISTORY_ENABLED=0" "set to 1 to let 'milog daemon' persist metrics for trend/diff/auto-tune"
-        warn=$(( warn + 1 ))
-    elif ! command -v sqlite3 >/dev/null 2>&1; then
-        _doc_fail "HISTORY_ENABLED=1 but sqlite3 missing" "install sqlite3 or set HISTORY_ENABLED=0"
-        fail=$(( fail + 1 ))
-    elif [[ ! -f "$HISTORY_DB" ]]; then
-        _doc_warn "db not yet written: $HISTORY_DB" "run 'milog daemon' for at least one minute to populate"
-        warn=$(( warn + 1 ))
-    else
-        local rows oldest
-        rows=$(sqlite3 "$HISTORY_DB" "SELECT COUNT(*) FROM metrics_minute;" 2>/dev/null || echo 0)
-        oldest=$(sqlite3 "$HISTORY_DB" "SELECT MIN(ts) FROM metrics_minute;" 2>/dev/null || echo 0)
-        if [[ "$rows" =~ ^[0-9]+$ ]] && (( rows > 0 )); then
-            local days=0
-            if [[ "$oldest" =~ ^[0-9]+$ ]] && (( oldest > 0 )); then
-                days=$(( ( $(date +%s) - oldest ) / 86400 ))
-            fi
-            _doc_ok "$HISTORY_DB  (${rows} rows, ~${days}d of history, retain=${HISTORY_RETAIN_DAYS}d)"
-        else
-            _doc_warn "$HISTORY_DB is empty" "daemon hasn't flushed a minute yet"
-            warn=$(( warn + 1 ))
-        fi
-    fi
-
-    # ---- GeoIP --------------------------------------------------------------
-    _doc_head "geoip"
-    if [[ "${GEOIP_ENABLED:-0}" != "1" ]]; then
-        _doc_warn "GEOIP_ENABLED=0" "optional — set to 1 + install the MaxMind MMDB to enable country column"
-        warn=$(( warn + 1 ))
-    elif ! command -v mmdblookup >/dev/null 2>&1; then
-        _doc_fail "GEOIP_ENABLED=1 but mmdblookup missing"
-        fail=$(( fail + 1 ))
-    elif [[ ! -f "$MMDB_PATH" ]]; then
-        _doc_fail "MMDB not found: $MMDB_PATH" "sign up at maxmind.com and download GeoLite2-Country.mmdb"
-        fail=$(( fail + 1 ))
-    else
-        local probe
-        probe=$(geoip_country 8.8.8.8 2>/dev/null)
-        if [[ -n "$probe" && "$probe" != "--" ]]; then
-            _doc_ok "$MMDB_PATH  (8.8.8.8 → $probe)"
-        else
-            _doc_warn "$MMDB_PATH present but lookup returned empty — DB may be corrupt"
-            warn=$(( warn + 1 ))
-        fi
-    fi
-
-    # ---- web dashboard ------------------------------------------------------
-    _doc_head "web dashboard"
-    if command -v socat >/dev/null 2>&1 || command -v ncat >/dev/null 2>&1; then
-        local listener
-        listener=$(command -v socat 2>/dev/null || command -v ncat 2>/dev/null)
-        _doc_ok "listener available  ($listener)"
-    else
-        _doc_warn "neither socat nor ncat installed" \
-                  "install with: sudo apt install -y socat — enables 'milog web'"
-        warn=$(( warn + 1 ))
-    fi
-    if [[ -f "$WEB_STATE_DIR/web.pid" ]]; then
-        local wpid; wpid=$(< "$WEB_STATE_DIR/web.pid" 2>/dev/null)
-        if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
-            _doc_ok "milog web running  (pid=$wpid, $WEB_BIND:$WEB_PORT)"
-        else
-            _doc_warn "stale web pidfile (not running)" "milog web stop  # cleans it up"
-            warn=$(( warn + 1 ))
-        fi
-    fi
-
-    # ---- systemd unit (only meaningful where systemd is installed) ----------
-    if command -v systemctl >/dev/null 2>&1; then
-        _doc_head "systemd"
-        if [[ ! -f /etc/systemd/system/milog.service ]]; then
-            _doc_warn "milog.service not installed" "run: sudo milog alert on (installs + enables the unit)"
-            warn=$(( warn + 1 ))
-        elif systemctl is-active --quiet milog.service 2>/dev/null; then
-            _doc_ok "milog.service active" "logs: journalctl -u milog.service -f"
-        else
-            _doc_warn "milog.service installed but inactive" "start: sudo systemctl start milog.service"
-            warn=$(( warn + 1 ))
-        fi
-    fi
-
-    # ---- summary -------------------------------------------------------------
-    echo
-    if (( fail > 0 )); then
-        echo -e "  ${R}${fail} failure(s)${NC}, ${Y}${warn} warning(s)${NC} — required functionality is missing."
-        return 1
-    elif (( warn > 0 )); then
-        echo -e "  ${G}core OK${NC} — ${Y}${warn} optional feature(s) disabled${NC}."
-        return 0
-    else
-        echo -e "  ${G}all checks passed${NC}"
-        return 0
-    fi
-}
-
-# ==============================================================================
 # MODE: web — tiny read-only HTTP dashboard
 #
 # Security posture (read carefully before changing defaults):
@@ -3063,118 +1238,445 @@ _web_stop() {
     rm -f "$pf"
 }
 
-mode_web() {
-    # Subcommand dispatch — treats a leading --flag as implicit 'start' so
-    # `milog web --port 9000` works without the redundant literal 'start'.
-    local sub="start"
-    case "${1:-}" in
-        stop)     _web_stop;   return ;;
-        status)   _web_status; return ;;
-        start)    shift ;;
-        ""|--*)   : ;;
-        *)        echo -e "${R}usage: milog web [start|stop|status] [--port N] [--bind ADDR] [--trust]${NC}" >&2
-                  return 1 ;;
-    esac
+# ==============================================================================
+# MODE: alert — toggle Discord alerting + manage the systemd service
+#
+# Subcommands:
+#   on [WEBHOOK_URL]  — set webhook (optional), enable, install+start systemd
+#   off               — disable alerts, stop + disable systemd
+#   status            — show webhook/service/recent-fire state
+#   test              — fire a one-off Discord test embed (bypasses cooldown)
+#
+# When invoked via sudo, we write config into the *invoking* user's home
+# (resolved from SUDO_USER) and run the systemd service as that user — not
+# as root. Matches user intuition: `sudo milog alert on` sets up alerting
+# for the person who ran it, not for root.
+# ==============================================================================
 
-    # Parse flags
-    local trust=0
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --port)  WEB_PORT="${2:?}"; shift 2 ;;
-            --bind)  WEB_BIND="${2:?}"; shift 2 ;;
-            --trust) trust=1; shift ;;
-            *)       echo -e "${R}unknown option: $1${NC}" >&2; return 1 ;;
-        esac
-    done
-
-    [[ "$WEB_PORT" =~ ^[0-9]+$ ]] \
-        || { echo -e "${R}--port must be numeric${NC}" >&2; return 1; }
-
-    # Expose-to-network guard — forces explicit consent.
-    if [[ "$WEB_BIND" != "127.0.0.1" && "$WEB_BIND" != "localhost" && "$WEB_BIND" != "::1" ]] && (( ! trust )); then
-        printf '%b' "
-${R}refusing --bind $WEB_BIND without --trust${NC}
-${D}  this exposes the dashboard beyond loopback. Safer transports:${NC}
-${D}    1. SSH tunnel:     ssh -L $WEB_PORT:localhost:$WEB_PORT $USER@<host>${NC}
-${D}    2. Tailscale/WG:   --bind <overlay-ip> (only reachable on your tailnet)${NC}
-${D}    3. Cloudflare:     cloudflared tunnel --url http://localhost:$WEB_PORT${NC}
-${D}  If you really mean it:  milog web --bind $WEB_BIND --port $WEB_PORT --trust${NC}
-" >&2
-        return 1
-    fi
-
-    # Already running?
-    if _web_status >/dev/null 2>&1; then
-        echo -e "${Y}milog web is already running (milog web status).${NC}"
-        return 1
-    fi
-
-    # Token + state dirs.
-    _web_token_ensure || return 1
-    mkdir -p "$WEB_STATE_DIR" 2>/dev/null
-
-    # Pick a listener.
-    local listener=""
-    if command -v socat >/dev/null 2>&1; then
-        listener="socat"
-    elif command -v ncat >/dev/null 2>&1; then
-        listener="ncat"
+_alert_target_user() {
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        printf '%s' "$SUDO_USER"
     else
-        printf '%b' "
-${R}milog web needs socat or ncat to accept connections.${NC}
-${D}  sudo apt install -y socat    (Debian/Ubuntu)${NC}
-${D}  sudo dnf install -y socat    (RHEL/Fedora/Rocky)${NC}
-${D}  sudo pacman -S socat         (Arch)${NC}
-" >&2
+        id -un
+    fi
+}
+
+_alert_target_home() {
+    local u="$1" h
+    h=$(getent passwd "$u" 2>/dev/null | cut -d: -f6)
+    [[ -n "$h" ]] && printf '%s' "$h" || printf '%s' "${HOME:-/root}"
+}
+
+# Upsert a single KEY=VALUE line in the target user's config file. Handles
+# dir creation + ownership fix when running as root on behalf of a user.
+_alert_write_config() {
+    local target_user="$1" target_home="$2" line="$3"
+    local dir="$target_home/.config/milog" file="$target_home/.config/milog/config.sh"
+    local key="${line%%=*}" tmp
+    mkdir -p "$dir" 2>/dev/null || { echo -e "${R}cannot create $dir${NC}" >&2; return 1; }
+    [[ -e "$file" ]] || : > "$file"
+    if grep -qE "^[[:space:]]*${key}=" "$file" 2>/dev/null; then
+        tmp=$(mktemp "$dir/.cfg.XXXXXX") || return 1
+        awk -v k="$key" -v repl="$line" '
+            $0 ~ "^[[:space:]]*" k "=" && !done { print repl; done=1; next }
+            { print }
+        ' "$file" > "$tmp" && mv "$tmp" "$file"
+    else
+        printf '%s\n' "$line" >> "$file"
+    fi
+    # Fix ownership so the target user can read/edit their own config when
+    # the write happened as root.
+    if [[ $(id -u) -eq 0 && "$target_user" != "root" ]]; then
+        chown -R "$target_user:$target_user" "$dir" 2>/dev/null || true
+    fi
+}
+
+# Read DISCORD_WEBHOOK from a config file (strips surrounding quotes).
+# Always returns 0 and emits empty string when the config doesn't exist or
+# doesn't set the key — keeps callers simple under `set -euo pipefail`.
+_alert_read_webhook() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    {
+        grep -E '^[[:space:]]*DISCORD_WEBHOOK=' "$file" 2>/dev/null \
+            | head -1 \
+            | sed -E 's/^[^=]*=//; s/^"//; s/"[[:space:]]*$//'
+    } || true
+    return 0
+}
+
+# Read a simple KEY's value from the config file — same no-fail contract.
+_alert_read_key() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 0
+    {
+        grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null \
+            | head -1 \
+            | sed -E 's/^[^=]*=//; s/^"//; s/"[[:space:]]*$//'
+    } || true
+    return 0
+}
+
+# Write + enable the milog systemd unit. Caller must already be root.
+_alert_install_service() {
+    local target_user="$1" target_config="$2"
+    local exe unit="/etc/systemd/system/milog.service"
+    exe=$(command -v milog 2>/dev/null || echo "/usr/local/bin/milog")
+    cat > "$unit" <<EOF
+[Unit]
+Description=MiLog headless alerter
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$exe daemon
+Restart=on-failure
+RestartSec=5
+User=$target_user
+Environment=MILOG_CONFIG=$target_config
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable milog.service >/dev/null 2>&1
+    systemctl restart milog.service
+}
+
+# Short human-readable duration — "12s", "3m", "5h", "2d".
+_alert_fmt_dur() {
+    local s="$1"
+    if   (( s < 60 ));    then printf '%ds' "$s"
+    elif (( s < 3600 ));  then printf '%dm' "$((s / 60))"
+    elif (( s < 86400 )); then printf '%dh' "$((s / 3600))"
+    else                       printf '%dd' "$((s / 86400))"
+    fi
+}
+
+alert_on() {
+    local webhook_arg="${1:-}"
+    local target_user target_home target_config
+    target_user=$(_alert_target_user)
+    target_home=$(_alert_target_home "$target_user")
+    target_config="$target_home/.config/milog/config.sh"
+
+    if [[ -n "$webhook_arg" ]]; then
+        case "$webhook_arg" in
+            https://discord.com/api/webhooks/*) ;;
+            https://discordapp.com/api/webhooks/*) ;;
+            *) echo -e "${Y}warning:${NC} URL doesn't look like a Discord webhook — proceeding" ;;
+        esac
+        _alert_write_config "$target_user" "$target_home" \
+            "DISCORD_WEBHOOK=\"$webhook_arg\"" || return 1
+    fi
+    _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=1" || return 1
+
+    local current_webhook
+    current_webhook=$(_alert_read_webhook "$target_config")
+    if [[ -z "$current_webhook" ]]; then
+        echo -e "${R}no DISCORD_WEBHOOK configured in $target_config${NC}" >&2
+        echo "  pass one:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
         return 1
     fi
 
-    # Resolve the milog script path so the per-connection child can re-exec
-    # us through the `__web_handler` internal dispatch target. Works whether
-    # milog is installed at /usr/local/bin/milog or run from a clone.
-    local self="${BASH_SOURCE[0]}"
-    [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+    echo -e "${G}✓${NC} ALERTS_ENABLED=1 in $target_config"
 
-    local token; token=$(_web_token_read)
-    local scheme="http"
-    local url="${scheme}://${WEB_BIND}:${WEB_PORT}/?t=${token}"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${Y}no systemctl on this host — run \`milog daemon\` under your own supervisor${NC}"
+        return 0
+    fi
+    if [[ $(id -u) -ne 0 ]]; then
+        echo -e "${Y}systemd setup needs root. Re-run:${NC}  sudo milog alert on"
+        return 0
+    fi
 
-    # printf '%b' interprets the \033[…] escape sequences in $W / $G / $C /
-    # $D / $NC. `cat <<EOF` would pass them through literally (you'd see
-    # "\033[1;37m" text in the terminal).
-    printf '%b' "
-${W}MiLog web${NC}  listening on ${G}${WEB_BIND}:${WEB_PORT}${NC}  (${listener}, loopback-only by default)
+    _alert_install_service "$target_user" "$target_config"
+    echo -e "${G}✓${NC} milog.service enabled and running (User=$target_user)"
+    echo
+    echo "  Verify state:  milog alert status"
+    echo "  Send a test:   milog alert test"
+    echo "  Tail log:      sudo journalctl -u milog -f"
+}
 
-  ${W}URL:${NC} ${C}${url}${NC}
+alert_off() {
+    local target_user target_home target_config
+    target_user=$(_alert_target_user)
+    target_home=$(_alert_target_home "$target_user")
+    target_config="$target_home/.config/milog/config.sh"
 
-  ${D}Phone/laptop from another machine:${NC}
-    ssh -L ${WEB_PORT}:localhost:${WEB_PORT} \$USER@<this-host>
-    open http://localhost:${WEB_PORT}/?t=${token}
+    _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=0" \
+        && echo -e "${G}✓${NC} ALERTS_ENABLED=0 in $target_config"
 
-  ${D}token:${NC}      ${WEB_TOKEN_FILE}
-  ${D}access log:${NC} ${WEB_ACCESS_LOG}
-  ${D}stop:${NC}       milog web stop    (or Ctrl+C)
+    if ! command -v systemctl >/dev/null 2>&1; then return 0; fi
 
+    if [[ ! -f /etc/systemd/system/milog.service ]]; then
+        return 0
+    fi
+    if [[ $(id -u) -ne 0 ]]; then
+        echo
+        echo -e "${Y}To also stop the systemd service:${NC}  sudo milog alert off"
+        return 0
+    fi
+    systemctl stop    milog.service 2>/dev/null || true
+    systemctl disable milog.service >/dev/null 2>&1 || true
+    echo -e "${G}✓${NC} milog.service stopped and disabled"
+}
+
+alert_status() {
+    local target_user target_home target_config
+    target_user=$(_alert_target_user)
+    target_home=$(_alert_target_home "$target_user")
+    target_config="$target_home/.config/milog/config.sh"
+
+    local wh wh_state enabled svc_state
+    wh=$(_alert_read_webhook "$target_config")
+    if [[ -n "$wh" ]]; then wh_state="${G}set${NC}"; else wh_state="${R}unset${NC}"; fi
+
+    enabled=$(_alert_read_key "$target_config" "ALERTS_ENABLED")
+    enabled="${enabled:-0}"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        svc_state="${D}no systemctl${NC}"
+    elif systemctl is-active --quiet milog.service 2>/dev/null; then
+        svc_state="${G}active${NC}"
+    elif [[ -f /etc/systemd/system/milog.service ]]; then
+        svc_state="${Y}installed (not running)${NC}"
+    else
+        svc_state="${D}not installed${NC}"
+    fi
+
+    echo -e "\n${W}── MiLog: Alert status ──${NC}\n"
+    printf "  %-18s %b\n"  "webhook"         "$wh_state"
+    printf "  %-18s %s\n"  "ALERTS_ENABLED"  "$enabled"
+    printf "  %-18s %ss\n" "cooldown"        "${ALERT_COOLDOWN:-300}"
+    printf "  %-18s %s\n"  "state dir"       "${ALERT_STATE_DIR:-$HOME/.cache/milog}"
+    printf "  %-18s %s\n"  "config"          "$target_config"
+    printf "  %-18s %b\n"  "systemd service" "$svc_state"
+
+    local state_file="${ALERT_STATE_DIR:-$HOME/.cache/milog}/alerts.state"
+    if [[ -s "$state_file" ]]; then
+        echo
+        echo -e "  ${W}Recent fires${NC} (most recent first):"
+        local now; now=$(date +%s)
+        sort -t$'\t' -k2,2 -rn "$state_file" 2>/dev/null | head -5 | \
+        while IFS=$'\t' read -r key ts; do
+            [[ -n "$ts" && "$ts" =~ ^[0-9]+$ ]] || continue
+            printf "    %-32s  %s ago\n" "$key" "$(_alert_fmt_dur $(( now - ts )))"
+        done
+    fi
+    echo
+}
+
+alert_test() {
+    local target_user target_home target_config webhook
+    target_user=$(_alert_target_user)
+    target_home=$(_alert_target_home "$target_user")
+    target_config="$target_home/.config/milog/config.sh"
+
+    # Prefer the target-user's config over whatever this process loaded at
+    # startup — handles `sudo milog alert test` reading alice's webhook.
+    webhook=$(_alert_read_webhook "$target_config")
+    [[ -z "$webhook" ]] && webhook="${DISCORD_WEBHOOK:-}"
+    if [[ -z "$webhook" ]]; then
+        echo -e "${R}no DISCORD_WEBHOOK configured${NC}" >&2
+        echo "  set one first:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+        return 1
+    fi
+
+    # Temporarily force the gate regardless of ALERTS_ENABLED state — this
+    # is a manual test of the webhook wire, not a rule-triggered alert.
+    local _saved_enabled="$ALERTS_ENABLED" _saved_webhook="$DISCORD_WEBHOOK"
+    ALERTS_ENABLED=1
+    DISCORD_WEBHOOK="$webhook"
+
+    echo "Firing test alert to Discord..."
+    alert_discord "MiLog test alert" \
+        "Manual test from \`$(hostname 2>/dev/null || echo host)\` at $(date -Iseconds 2>/dev/null || date)" \
+        3447003
+
+    ALERTS_ENABLED="$_saved_enabled"
+    DISCORD_WEBHOOK="$_saved_webhook"
+    echo -e "${G}✓${NC} webhook call returned — check your Discord channel"
+}
+
+alert_help() {
+    echo -e "
+${W}milog alert${NC} — toggle Discord alerting and manage the systemd service
+
+${W}USAGE${NC}
+  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts; install + start systemd
+  ${C}milog alert off${NC}                disable alerts; stop + disable service
+  ${C}milog alert status${NC}             show webhook/service/recent-fire state
+  ${C}milog alert test${NC}               send a one-shot Discord test embed
+
+${W}EXAMPLES${NC}
+  ${D}# First-time setup in one command:${NC}
+  sudo milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'
+
+  ${D}# Verify end-to-end:${NC}
+  milog alert status
+  milog alert test
+
+  ${D}# Pause alerting during maintenance:${NC}
+  sudo milog alert off
 "
+}
 
-    echo $$ > "$(_web_pid_file)"
-    trap 'rm -f "$(_web_pid_file)"' EXIT
-
-    # Exec the listener. Both spawn the handler per connection, passing the
-    # parsed socket to stdin/stdout.
-    case "$listener" in
-        socat)
-            exec socat "TCP-LISTEN:${WEB_PORT},reuseaddr,fork,bind=${WEB_BIND}" \
-                       "EXEC:$self __web_handler"
-            ;;
-        ncat)
-            exec ncat -lk --sh-exec "$self __web_handler" \
-                      "$WEB_BIND" "$WEB_PORT"
-            ;;
+mode_alert() {
+    local sub="${1:-status}"; shift 2>/dev/null || true
+    case "$sub" in
+        on)             alert_on "${1:-}" ;;
+        off)            alert_off ;;
+        status|'')      alert_status ;;
+        test)           alert_test ;;
+        -h|--help|help) alert_help ;;
+        *) echo -e "${R}Unknown alert subcommand:${NC} $sub"; alert_help; exit 1 ;;
     esac
 }
 
 # ==============================================================================
+# MODE: auto-tune — suggest thresholds from history baselines
+#
+# Picks thresholds that would have fired ~rarely on your actual traffic
+# instead of making users guess "what's a reasonable 5xx/min for this box?".
+# Reads metrics_minute over a recent window and prints:
+#   1) side-by-side table of CURRENT vs SUGGESTED
+#   2) a copy-paste block of `milog config set …` commands
+#
+# Percentile picks:
+#   THRESH_REQ_WARN  = p90(req)       — alert on the top 10% of minutes
+#   THRESH_REQ_CRIT  = p99(req)       — alert on clear outliers
+#   THRESH_4XX_WARN  = p95(c4xx)      — floor at 5 so tiny clients don't spam
+#   THRESH_5XX_WARN  = p95(c5xx)      — floor at 1 (any 5xx > 0 is worth a ping)
+#   P95_WARN_MS      = p75(p95_ms)    — warn when current p95 worse than 3-in-4 historical minutes
+#   P95_CRIT_MS      = p99(p95_ms)    — crit on top 1% latency outliers
+#
+# CPU/MEM/DISK are not in the DB, so those thresholds aren't tuned here.
+# ==============================================================================
+
+# Stdin-to-percentile helper: read newline-separated numbers, print the
+# p-th percentile (1..100) using the existing `sort -n | awk positional`
+# idiom (same logic as percentiles() but for a generic stream).
+_pct_from_stdin() {
+    local p=$1
+    sort -n | awk -v p="$p" '
+        NF && $1 ~ /^[0-9]+(\.[0-9]+)?$/ { v[++n] = $1 }
+        END {
+            if (n == 0) exit
+            i = int((n * p + 99) / 100)
+            if (i < 1) i = 1
+            if (i > n) i = n
+            print v[i]
+        }'
+}
+
+# Format one table row. Visual widths: METRIC(20) CURRENT(11) SUGGESTED(11) DELTA(9)
+_tune_row() {
+    local metric="$1" current="$2" suggested="$3"
+    local delta=""
+    if [[ "$current" =~ ^[0-9]+$ && "$suggested" =~ ^[0-9]+$ ]]; then
+        local d=$(( suggested - current ))
+        if   (( d > 0 )); then delta="${Y}+${d}${NC}"
+        elif (( d < 0 )); then delta="${G}${d}${NC}"
+        else                   delta="${D}0${NC}"
+        fi
+    else
+        delta="${D}  —${NC}"
+    fi
+    printf "  %-20s  %-11s  ${W}%-11s${NC}  %b\n" \
+        "$metric" "$current" "$suggested" "$delta"
+}
+
+mode_auto_tune() {
+    local days="${1:-7}"
+    [[ "$days" =~ ^[1-9][0-9]*$ ]] \
+        || { echo -e "${R}auto-tune: days must be a positive integer${NC}" >&2; return 1; }
+
+    _history_precheck || return 1
+
+    local now since count
+    now=$(date +%s)
+    since=$(( now - days * 86400 ))
+    count=$(sqlite3 "$HISTORY_DB" \
+        "SELECT COUNT(*) FROM metrics_minute WHERE ts >= $since;" 2>/dev/null || echo 0)
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+
+    echo -e "\n${W}── MiLog: auto-tune (window=${days}d, ${count} rows) ──${NC}\n"
+
+    # 100 rows ≈ 100 minutes ≈ 1.6h of data — anything less and percentiles
+    # are too noisy to base thresholds on.
+    if (( count < 100 )); then
+        echo -e "${R}Not enough history (${count} rows — need ≥100).${NC}"
+        echo -e "${D}  let 'milog daemon' run for a few hours with HISTORY_ENABLED=1,${NC}"
+        echo -e "${D}  or widen the window: milog auto-tune 30${NC}\n"
+        return 1
+    fi
+
+    # Pull each metric's samples once. Filtering req>0 excludes quiet-hour
+    # zeros so the percentile reflects real traffic — otherwise a mostly-idle
+    # server would suggest THRESH_REQ_WARN=0.
+    local p95_samples req_samples c4_samples c5_samples
+    p95_samples=$(sqlite3 "$HISTORY_DB" \
+        "SELECT p95_ms FROM metrics_minute WHERE ts >= $since AND p95_ms IS NOT NULL AND req > 0;" 2>/dev/null)
+    req_samples=$(sqlite3 "$HISTORY_DB" \
+        "SELECT req FROM metrics_minute WHERE ts >= $since AND req > 0;" 2>/dev/null)
+    c4_samples=$(sqlite3 "$HISTORY_DB" \
+        "SELECT c4xx FROM metrics_minute WHERE ts >= $since;" 2>/dev/null)
+    c5_samples=$(sqlite3 "$HISTORY_DB" \
+        "SELECT c5xx FROM metrics_minute WHERE ts >= $since;" 2>/dev/null)
+
+    local s_req_warn s_req_crit s_c4_warn s_c5_warn s_p95_warn s_p95_crit
+    s_req_warn=$(printf '%s\n' "$req_samples" | _pct_from_stdin 90)
+    s_req_crit=$(printf '%s\n' "$req_samples" | _pct_from_stdin 99)
+    s_c4_warn=$( printf '%s\n' "$c4_samples"  | _pct_from_stdin 95)
+    s_c5_warn=$( printf '%s\n' "$c5_samples"  | _pct_from_stdin 95)
+    s_p95_warn=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 75)
+    s_p95_crit=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 99)
+
+    # Floors so "empty" days don't suggest zeros that fire on any activity.
+    [[ "$s_c4_warn"  =~ ^[0-9]+$ ]] && (( s_c4_warn  < 5 )) && s_c4_warn=5
+    [[ "$s_c5_warn"  =~ ^[0-9]+$ ]] && (( s_c5_warn  < 1 )) && s_c5_warn=1
+    [[ "$s_req_warn" =~ ^[0-9]+$ ]] && (( s_req_warn < 5 )) && s_req_warn=5
+
+    # Fall back to blank when we had zero samples for a metric (no timed
+    # traffic at all means p95 tuning is impossible).
+    : "${s_req_warn:=}"; : "${s_req_crit:=}"; : "${s_c4_warn:=}"; : "${s_c5_warn:=}"
+    : "${s_p95_warn:=}"; : "${s_p95_crit:=}"
+
+    printf "  %-20s  %-11s  %-11s  %-s\n" "METRIC" "CURRENT" "SUGGESTED" "DELTA"
+    printf "  %-20s  %-11s  %-11s  %-s\n" "────────────────────" "───────────" "───────────" "──────"
+    _tune_row "THRESH_REQ_WARN"  "$THRESH_REQ_WARN"  "${s_req_warn:--}"
+    _tune_row "THRESH_REQ_CRIT"  "$THRESH_REQ_CRIT"  "${s_req_crit:--}"
+    _tune_row "THRESH_4XX_WARN"  "$THRESH_4XX_WARN"  "${s_c4_warn:--}"
+    _tune_row "THRESH_5XX_WARN"  "$THRESH_5XX_WARN"  "${s_c5_warn:--}"
+    _tune_row "P95_WARN_MS"      "$P95_WARN_MS"      "${s_p95_warn:--}"
+    _tune_row "P95_CRIT_MS"      "$P95_CRIT_MS"      "${s_p95_crit:--}"
+
+    # Ready-to-apply block — skip lines we couldn't tune.
+    echo -e "\n${W}Ready to apply${NC} ${D}(copy-paste to set):${NC}"
+    local line printed=0
+    for line in \
+        "THRESH_REQ_WARN $s_req_warn" \
+        "THRESH_REQ_CRIT $s_req_crit" \
+        "THRESH_4XX_WARN $s_c4_warn" \
+        "THRESH_5XX_WARN $s_c5_warn" \
+        "P95_WARN_MS $s_p95_warn" \
+        "P95_CRIT_MS $s_p95_crit"
+    do
+        local k v
+        k="${line%% *}"; v="${line#* }"
+        [[ -n "$v" && "$v" =~ ^[0-9]+$ ]] || continue
+        printf "  milog config set %s %s\n" "$k" "$v"
+        printed=$(( printed + 1 ))
+    done
+    if (( printed == 0 )); then
+        echo -e "  ${D}(no actionable suggestions — samples were empty for every tuned metric)${NC}"
+    fi
+    echo -e "\n  ${D}note: tunes to the quiet-hour-excluded p90/p75/p95/p99 of your last ${days} day(s).${NC}"
+    echo -e "  ${D}       re-run after traffic patterns change (new service, traffic source, load).${NC}\n"
+    return 0
+}
+
 # MODE: config — manage the user config file without opening an editor
 # ==============================================================================
 
@@ -3466,6 +1968,1504 @@ color_prefix() {
 
 # ==============================================================================
 # HELP
+# ==============================================================================
+# ==============================================================================
+# MODE: daemon — headless sampler + rule evaluator (no TUI)
+# Fires the same rules as the live modes. stderr decision log only;
+# webhook sends are backgrounded so a slow Discord never wedges the loop.
+# ==============================================================================
+
+mode_daemon() {
+    local hook_state
+    hook_state="disabled"
+    [[ "$ALERTS_ENABLED" == "1" && -n "$DISCORD_WEBHOOK" ]] && hook_state="enabled"
+    _dlog "milog daemon starting — refresh=${REFRESH}s alerts=${hook_state} history=${HISTORY_ENABLED} apps=(${LOGS[*]})"
+    [[ "$ALERTS_ENABLED" != "1" ]] && _dlog "WARNING: ALERTS_ENABLED=0 — rules will log but no webhooks will be fired"
+    [[ -z "$DISCORD_WEBHOOK"    ]] && _dlog "WARNING: DISCORD_WEBHOOK empty — no webhooks will be fired"
+
+    history_init   # no-op when HISTORY_ENABLED=0; disables itself on error
+
+    # Live-tail watchers for exploit + probe rules. Their stdout is suppressed;
+    # the alert call sites inside each mode fire webhooks directly.
+    local watcher_pids=()
+    ( mode_exploits > /dev/null ) & watcher_pids+=($!)
+    ( mode_probes   > /dev/null ) & watcher_pids+=($!)
+
+    local _cleanup='
+        _dlog "milog daemon shutting down"
+        kill "${watcher_pids[@]}" 2>/dev/null
+        exit 0
+    '
+    trap "$_cleanup" INT TERM
+
+    # Init rollover state — start at "current" so the first write happens
+    # only once we've crossed a real minute/hour/day boundary, never mid-
+    # minute on start-up with partial counts.
+    local last_min last_hour last_day now
+    now=$(date +%s)
+    last_min=$((  now / 60   ))
+    last_hour=$(( now / 3600 ))
+    last_day=$((  now / 86400 ))
+
+    while :; do
+        local CUR_TIME
+        CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
+
+        # System metrics — same helpers mode_monitor uses.
+        local cpu mem_pct mem_used mem_total disk_pct disk_used disk_total
+        cpu=$(cpu_usage)
+        [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
+        read -r mem_pct mem_used mem_total <<< "$(mem_info)"
+        read -r disk_pct disk_used disk_total <<< "$(disk_info)"
+
+        local worker_count
+        worker_count=$(ps aux 2>/dev/null | awk '/nginx: worker/{n++} END{print n+0}')
+
+        sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
+                         "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
+
+        # Per-app HTTP rules.
+        local name cnt c2 c3 c4 c5
+        for name in "${LOGS[@]}"; do
+            read -r cnt c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+            cnt=${cnt:-0}; c4=${c4:-0}; c5=${c5:-0}
+            nginx_check_http_alerts "$name" "$c4" "$c5"
+        done
+
+        # History rollover. Write the *previous* complete minute so nothing
+        # lands partial. Hour rollup runs similarly on the hour edge.
+        now=$(date +%s)
+        local cur_min=$((  now / 60   ))
+        local cur_hour=$(( now / 3600 ))
+        if (( cur_min > last_min )); then
+            local write_ts=$(( last_min * 60 ))
+            history_write_minute "$write_ts" "$(_cur_time_at "$write_ts")"
+            last_min=$cur_min
+        fi
+        if (( cur_hour > last_hour )); then
+            local write_hr_ts=$(( last_hour * 3600 ))
+            history_write_hour "$write_hr_ts"
+            last_hour=$cur_hour
+        fi
+        local cur_day=$(( now / 86400 ))
+        if (( cur_day > last_day )); then
+            history_prune
+            last_day=$cur_day
+        fi
+
+        sleep "$REFRESH"
+    done
+}
+
+# ==============================================================================
+# MODE: diff — hour-level comparison: now vs 1d ago vs 7d ago, per app
+# Same-hour windows against metrics_minute. Percent deltas computed in the
+# shell because bash arithmetic handles the small integer math cleanly.
+# ==============================================================================
+mode_diff() {
+    _history_precheck || return 1
+
+    local now hr_start_now
+    now=$(date +%s)
+    hr_start_now=$(( now - (now % 3600) ))
+
+    local yest_start=$((  hr_start_now - 86400     ))
+    local yest_end=$((    yest_start   + 3600      ))
+    local week_start=$((  hr_start_now - 7 * 86400 ))
+    local week_end=$((    week_start   + 3600      ))
+
+    local hr_label
+    hr_label=$(date -d "@${hr_start_now}" '+%H:00' 2>/dev/null \
+               || date -r "$hr_start_now" '+%H:00' 2>/dev/null \
+               || echo "this hour")
+
+    echo -e "\n${W}── MiLog: Hourly diff (${hr_label} vs 1d/7d ago) ──${NC}\n"
+
+    local rows
+    rows=$(sqlite3 -separator $'\t' "$HISTORY_DB" <<SQL 2>/dev/null
+SELECT app,
+       COALESCE(SUM(CASE WHEN ts >= $hr_start_now AND ts < $now      THEN req END), 0) AS now_r,
+       COALESCE(SUM(CASE WHEN ts >= $yest_start   AND ts < $yest_end THEN req END), 0) AS d1,
+       COALESCE(SUM(CASE WHEN ts >= $week_start   AND ts < $week_end THEN req END), 0) AS d7
+FROM metrics_minute
+WHERE ts >= $week_start
+GROUP BY app
+ORDER BY app;
+SQL
+)
+    if [[ -z "$rows" ]]; then
+        echo -e "  ${D}no data in the windows${NC}\n"
+        return 0
+    fi
+
+    # ASCII header labels — Δ is a 2-byte 1-column char that confuses
+    # printf byte-width formatting. Divider em-dashes are counted to match
+    # each column's VISUAL width (12/10/10/10/8/8) so rows line up.
+    printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \
+           "APP" "NOW" "1d ago" "7d ago" "d1 %" "d7 %"
+    printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \
+           "────────────" "──────────" "──────────" "──────────" "────────" "────────"
+
+    local app now_r d1 d7 d1p d7p d1_col d7_col
+    while IFS=$'\t' read -r app now_r d1 d7; do
+        now_r=${now_r:-0}; d1=${d1:-0}; d7=${d7:-0}
+        if (( d1 > 0 )); then
+            d1p=$(( (now_r - d1) * 100 / d1 ))
+            d1_col=$G
+            (( d1p <= -25 || d1p >= 50 ))  && d1_col=$Y
+            (( d1p <= -50 || d1p >= 100 )) && d1_col=$R
+            d1p="$(printf '%+d%%' "$d1p")"
+        else
+            d1p="—"; d1_col="$D"
+        fi
+        if (( d7 > 0 )); then
+            d7p=$(( (now_r - d7) * 100 / d7 ))
+            d7_col=$G
+            (( d7p <= -25 || d7p >= 50 ))  && d7_col=$Y
+            (( d7p <= -50 || d7p >= 100 )) && d7_col=$R
+            d7p="$(printf '%+d%%' "$d7p")"
+        else
+            d7p="—"; d7_col="$D"
+        fi
+        printf "  %-12s  %10d  %10d  %10d  ${d1_col}%8s${NC}  ${d7_col}%8s${NC}\n" \
+               "$app" "$now_r" "$d1" "$d7" "$d1p" "$d7p"
+    done <<< "$rows"
+    echo
+    echo -e "  ${D}(NOW is the partial current hour so far; 1d/7d are full same-hour windows)${NC}"
+    echo
+}
+
+# ==============================================================================
+# MODE: doctor — checklist of what's installed/configured/reachable
+#
+# The tool no-ops gracefully when sqlite3, mmdblookup, a webhook, or the
+# extended log format are missing — which is friendly but can hide a
+# misconfigured install. `doctor` makes every degraded capability visible
+# with a one-line hint on how to enable it.
+#
+# Output: ✓ (ready) / ! (degraded, works-but-limited) / ✗ (broken/required).
+# Exit code: 0 if all required deps are present; 1 otherwise. CI-friendly.
+# ==============================================================================
+_doc_line() {
+    # $1=marker (colored glyph)  $2=headline  $3=optional hint
+    printf "  %b %s\n" "$1" "$2"
+    [[ -n "${3:-}" ]] && printf "     ${D}%s${NC}\n" "$3"
+    return 0   # guard against set -e when hint is empty
+}
+_doc_ok()   { _doc_line "${G}✓${NC}" "$1" "${2:-}"; }
+_doc_warn() { _doc_line "${Y}!${NC}" "$1" "${2:-}"; }
+_doc_fail() { _doc_line "${R}✗${NC}" "$1" "${2:-}"; }
+_doc_head() { printf "\n${W}── %s ──${NC}\n" "$1"; }
+
+mode_doctor() {
+    local fail=0 warn=0
+    echo -e "\n${W}── MiLog: doctor ──${NC}"
+
+    # ---- core tools (required) ----------------------------------------------
+    _doc_head "core tools"
+    local tool
+    for tool in bash gawk curl; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            _doc_ok "$tool present  ($(command -v "$tool"))"
+        else
+            _doc_fail "$tool NOT on PATH" "required — install via your package manager"
+            fail=$(( fail + 1 ))
+        fi
+    done
+    local bmaj="${BASH_VERSINFO[0]:-3}"
+    if (( bmaj >= 4 )); then
+        _doc_ok "bash ${BASH_VERSION}  (sparkline cache enabled)"
+    else
+        _doc_warn "bash ${BASH_VERSION}" "bash<4 — monitor skips the p95 cache; upgrade for smoother TUI"
+        warn=$(( warn + 1 ))
+    fi
+
+    # ---- optional tools ------------------------------------------------------
+    _doc_head "optional tools"
+    if command -v sqlite3 >/dev/null 2>&1; then
+        _doc_ok "sqlite3 present  ($(sqlite3 --version 2>/dev/null | awk '{print $1}'))"
+    else
+        _doc_warn "sqlite3 missing" "trend/replay/diff/auto-tune will be disabled — install 'sqlite3'"
+        warn=$(( warn + 1 ))
+    fi
+    if command -v mmdblookup >/dev/null 2>&1; then
+        _doc_ok "mmdblookup present" "GeoIP country enrichment available when GEOIP_ENABLED=1"
+    else
+        _doc_warn "mmdblookup missing" "GeoIP column disabled — install 'mmdb-bin' / 'libmaxminddb'"
+        warn=$(( warn + 1 ))
+    fi
+
+    # ---- log dir + per-app logs ---------------------------------------------
+    _doc_head "log directory"
+    if [[ -d "$LOG_DIR" && -r "$LOG_DIR" ]]; then
+        _doc_ok "$LOG_DIR readable"
+    else
+        _doc_fail "$LOG_DIR missing or unreadable" "set MILOG_LOG_DIR or edit LOG_DIR in $MILOG_CONFIG"
+        fail=$(( fail + 1 ))
+    fi
+
+    _doc_head "app logs (${#LOGS[@]} configured)"
+    if (( ${#LOGS[@]} == 0 )); then
+        _doc_warn "LOGS is empty" "add apps via 'milog config add <name>' or set MILOG_APPS='a b c'"
+        warn=$(( warn + 1 ))
+    else
+        local app file mtime now age
+        now=$(date +%s)
+        for app in "${LOGS[@]}"; do
+            file="$LOG_DIR/$app.access.log"
+            if [[ ! -f "$file" ]]; then
+                _doc_warn "$app — no access log" "expected: $file"
+                warn=$(( warn + 1 ))
+                continue
+            fi
+            mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
+            age=$(( now - mtime ))
+            if (( age < 3600 )); then
+                _doc_ok "$app — active  (last write ${age}s ago)"
+            elif (( age < 86400 )); then
+                _doc_warn "$app — stale  (last write $(( age / 3600 ))h ago)"
+                warn=$(( warn + 1 ))
+            else
+                _doc_warn "$app — idle  (last write $(( age / 86400 ))d ago)"
+                warn=$(( warn + 1 ))
+            fi
+        done
+    fi
+
+    # ---- nginx log format — does it carry $request_time? --------------------
+    #
+    # Scan the tail of every configured app's log and look for any timed line
+    # (numeric last field, NF>=12). One app's tail might still be pre-reload
+    # old-format while others are already new-format — we report ✓ as long
+    # as at least one app has timed samples recently. Simultaneously tracks
+    # apps with only old-format lines so the hint can call them out for
+    # manual verification.
+    _doc_head "nginx log format"
+    if (( ${#LOGS[@]} == 0 )); then
+        _doc_warn "no configured apps"
+    else
+        local app file last nf lastfield
+        local timed_apps=() untimed_apps=() witness=""
+        for app in "${LOGS[@]}"; do
+            file="$LOG_DIR/$app.access.log"
+            [[ -f "$file" ]] || continue
+            last=$(tail -n 200 "$file" 2>/dev/null | awk 'NF>0' | tail -n 1)
+            [[ -n "$last" ]] || continue
+            nf=$(awk '{print NF}' <<< "$last")
+            lastfield=$(awk '{print $NF}' <<< "$last")
+            if [[ "$lastfield" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( nf >= 12 )); then
+                timed_apps+=("$app")
+                [[ -z "$witness" ]] && witness="$app line ends with $lastfield"
+            else
+                untimed_apps+=("$app")
+            fi
+        done
+        if (( ${#timed_apps[@]} > 0 )); then
+            _doc_ok "extended log format detected  ($witness)" \
+                    "slow / p95 / top-paths fully enabled"
+            if (( ${#untimed_apps[@]} > 0 )); then
+                _doc_warn "apps still showing old-format tail: ${untimed_apps[*]}" \
+                          "likely just no post-reload traffic yet — not a config issue"
+            fi
+        elif (( ${#untimed_apps[@]} > 0 )); then
+            _doc_warn "log format appears to be 'combined' (no \$request_time)" \
+                      "add \$request_time as the LAST field to enable slow/p95 — see README"
+            warn=$(( warn + 1 ))
+        else
+            _doc_warn "no loglines to inspect in any app"
+            warn=$(( warn + 1 ))
+        fi
+    fi
+
+    # ---- Discord alerting ----------------------------------------------------
+    _doc_head "alerting (Discord)"
+    if [[ -z "${DISCORD_WEBHOOK:-}" ]]; then
+        _doc_warn "DISCORD_WEBHOOK not configured" \
+                  "run: sudo milog alert on \"https://discord.com/api/webhooks/ID/TOKEN\""
+        warn=$(( warn + 1 ))
+    else
+        _doc_ok "DISCORD_WEBHOOK configured  (${DISCORD_WEBHOOK:0:40}…)"
+        # Reachability — a POST with an empty content is ignored by Discord,
+        # so we GET the webhook metadata instead (returns 200 + JSON on valid
+        # webhooks, 404 on stale). 5s cap so doctor never hangs.
+        local http
+        http=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 \
+               "$DISCORD_WEBHOOK" 2>/dev/null || echo 000)
+        case "$http" in
+            200) _doc_ok "webhook reachable  (HTTP 200)" ;;
+            401|403|404) _doc_fail "webhook rejected  (HTTP $http)" "webhook was deleted or token invalid — regenerate in Discord"; fail=$(( fail + 1 )) ;;
+            000) _doc_warn "webhook unreachable (network/timeout)" "is this box allowed to egress to discord.com?"; warn=$(( warn + 1 )) ;;
+            *)   _doc_warn "webhook returned HTTP $http" "unexpected — may still work for POSTs; test with 'milog alert test'"; warn=$(( warn + 1 )) ;;
+        esac
+    fi
+    if [[ "${ALERTS_ENABLED:-0}" == "1" ]]; then
+        _doc_ok "ALERTS_ENABLED=1  (cooldown=${ALERT_COOLDOWN}s)"
+    else
+        _doc_warn "ALERTS_ENABLED=0" "alerts are armed but disabled — 'milog alert on' to flip"
+        warn=$(( warn + 1 ))
+    fi
+
+    # ---- history DB ---------------------------------------------------------
+    _doc_head "history (SQLite)"
+    if [[ "${HISTORY_ENABLED:-0}" != "1" ]]; then
+        _doc_warn "HISTORY_ENABLED=0" "set to 1 to let 'milog daemon' persist metrics for trend/diff/auto-tune"
+        warn=$(( warn + 1 ))
+    elif ! command -v sqlite3 >/dev/null 2>&1; then
+        _doc_fail "HISTORY_ENABLED=1 but sqlite3 missing" "install sqlite3 or set HISTORY_ENABLED=0"
+        fail=$(( fail + 1 ))
+    elif [[ ! -f "$HISTORY_DB" ]]; then
+        _doc_warn "db not yet written: $HISTORY_DB" "run 'milog daemon' for at least one minute to populate"
+        warn=$(( warn + 1 ))
+    else
+        local rows oldest
+        rows=$(sqlite3 "$HISTORY_DB" "SELECT COUNT(*) FROM metrics_minute;" 2>/dev/null || echo 0)
+        oldest=$(sqlite3 "$HISTORY_DB" "SELECT MIN(ts) FROM metrics_minute;" 2>/dev/null || echo 0)
+        if [[ "$rows" =~ ^[0-9]+$ ]] && (( rows > 0 )); then
+            local days=0
+            if [[ "$oldest" =~ ^[0-9]+$ ]] && (( oldest > 0 )); then
+                days=$(( ( $(date +%s) - oldest ) / 86400 ))
+            fi
+            _doc_ok "$HISTORY_DB  (${rows} rows, ~${days}d of history, retain=${HISTORY_RETAIN_DAYS}d)"
+        else
+            _doc_warn "$HISTORY_DB is empty" "daemon hasn't flushed a minute yet"
+            warn=$(( warn + 1 ))
+        fi
+    fi
+
+    # ---- GeoIP --------------------------------------------------------------
+    _doc_head "geoip"
+    if [[ "${GEOIP_ENABLED:-0}" != "1" ]]; then
+        _doc_warn "GEOIP_ENABLED=0" "optional — set to 1 + install the MaxMind MMDB to enable country column"
+        warn=$(( warn + 1 ))
+    elif ! command -v mmdblookup >/dev/null 2>&1; then
+        _doc_fail "GEOIP_ENABLED=1 but mmdblookup missing"
+        fail=$(( fail + 1 ))
+    elif [[ ! -f "$MMDB_PATH" ]]; then
+        _doc_fail "MMDB not found: $MMDB_PATH" "sign up at maxmind.com and download GeoLite2-Country.mmdb"
+        fail=$(( fail + 1 ))
+    else
+        local probe
+        probe=$(geoip_country 8.8.8.8 2>/dev/null)
+        if [[ -n "$probe" && "$probe" != "--" ]]; then
+            _doc_ok "$MMDB_PATH  (8.8.8.8 → $probe)"
+        else
+            _doc_warn "$MMDB_PATH present but lookup returned empty — DB may be corrupt"
+            warn=$(( warn + 1 ))
+        fi
+    fi
+
+    # ---- web dashboard ------------------------------------------------------
+    _doc_head "web dashboard"
+    if command -v socat >/dev/null 2>&1 || command -v ncat >/dev/null 2>&1; then
+        local listener
+        listener=$(command -v socat 2>/dev/null || command -v ncat 2>/dev/null)
+        _doc_ok "listener available  ($listener)"
+    else
+        _doc_warn "neither socat nor ncat installed" \
+                  "install with: sudo apt install -y socat — enables 'milog web'"
+        warn=$(( warn + 1 ))
+    fi
+    if [[ -f "$WEB_STATE_DIR/web.pid" ]]; then
+        local wpid; wpid=$(< "$WEB_STATE_DIR/web.pid" 2>/dev/null)
+        if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
+            _doc_ok "milog web running  (pid=$wpid, $WEB_BIND:$WEB_PORT)"
+        else
+            _doc_warn "stale web pidfile (not running)" "milog web stop  # cleans it up"
+            warn=$(( warn + 1 ))
+        fi
+    fi
+
+    # ---- systemd unit (only meaningful where systemd is installed) ----------
+    if command -v systemctl >/dev/null 2>&1; then
+        _doc_head "systemd"
+        if [[ ! -f /etc/systemd/system/milog.service ]]; then
+            _doc_warn "milog.service not installed" "run: sudo milog alert on (installs + enables the unit)"
+            warn=$(( warn + 1 ))
+        elif systemctl is-active --quiet milog.service 2>/dev/null; then
+            _doc_ok "milog.service active" "logs: journalctl -u milog.service -f"
+        else
+            _doc_warn "milog.service installed but inactive" "start: sudo systemctl start milog.service"
+            warn=$(( warn + 1 ))
+        fi
+    fi
+
+    # ---- summary -------------------------------------------------------------
+    echo
+    if (( fail > 0 )); then
+        echo -e "  ${R}${fail} failure(s)${NC}, ${Y}${warn} warning(s)${NC} — required functionality is missing."
+        return 1
+    elif (( warn > 0 )); then
+        echo -e "  ${G}core OK${NC} — ${Y}${warn} optional feature(s) disabled${NC}."
+        return 0
+    else
+        echo -e "  ${G}all checks passed${NC}"
+        return 0
+    fi
+}
+
+# ==============================================================================
+# ==============================================================================
+# MODE: errors
+# ==============================================================================
+mode_errors() {
+    echo -e "${D}Watching 4xx/5xx across all apps... (Ctrl+C)${NC}\n"
+    local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
+    for name in "${LOGS[@]}"; do
+        local file="$LOG_DIR/$name.access.log"
+        local col="${colors[$i]}" label
+        label=$(printf "%-8s" "$name")
+        if [[ -f "$file" ]]; then
+            tail -F "$file" 2>/dev/null | \
+                grep --line-buffered ' [45][0-9][0-9] ' | \
+                awk -v col="$col" -v lbl="$label" -v nc="$NC" \
+                    '{print col"["lbl"]"nc" "$0; fflush()}' &
+            pids+=($!)
+        fi
+        (( i++ )) || true
+    done
+    trap 'kill "${pids[@]}" 2>/dev/null; exit' INT TERM
+    wait
+}
+
+# ==============================================================================
+# MODE: exploits — L7 attack payloads + scanner fingerprints
+# Catches path traversal, LFI, RCE, SQLi, XSS, Log4Shell, dotfile/secret probes,
+# infra-API probes (Docker/actuator/etc), CMS admin scans, and known scanner UAs.
+# Example matches:
+#   GET /index.php?lang=../../../../tmp/foo      (path traversal)
+#   GET /containers/json                         (docker API probe)
+#   GET /SDK/webLanguage                         (hikvision probe)
+#   "libredtail-http" user-agent                 (scanner UA)
+# ==============================================================================
+mode_exploits() {
+    echo -e "${D}Watching exploit attempts across all apps... (Ctrl+C)${NC}\n"
+    local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
+
+    # Pattern built in groups for readability. ERE, case-insensitive.
+    local pat='\.\./|%2e%2e'                                                   # path traversal
+    pat+='|/etc/passwd|/etc/shadow|/proc/self/environ'                         # target files
+    pat+='|/containers/json|/actuator/|/server-status|/console(/|\?)|/druid/'  # infra probes
+    pat+='|/SDK/web|/cgi-bin/|/boaform/|/HNAP1'                                # embedded-device probes
+    pat+='|/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php'               # wordpress
+    pat+='|/phpmyadmin|/pma/|/mysql/admin'                                     # phpmyadmin
+    pat+='|/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store'                         # dotfiles / secrets
+    pat+='|/config\.(php|json|yml|yaml)|/web\.config'                          # config files
+    pat+='|jndi:|\$\{jndi|log4j'                                               # log4shell
+    pat+='|union[+% ]+select|select[+% ]+from|sleep\([0-9]|benchmark\('        # sqli
+    pat+='|or[+% ]+1=1|%27[+% ]*or|%27%20or'                                  # sqli
+    pat+='|<script|%3cscript|onerror=|onload=|javascript:'                     # xss
+    pat+='|base64_decode|eval\(|system\(|passthru\(|shell_exec'                # rce fn
+    pat+='|libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster'              # scanner UAs
+    pat+='|dirbuster|wfuzz|l9explore|l9tcpid|hello,\s?world'                   # scanner UAs
+
+    for name in "${LOGS[@]}"; do
+        local file="$LOG_DIR/$name.access.log"
+        local col="${colors[$i]}" label
+        label=$(printf "%-8s" "$name")
+        if [[ -f "$file" ]]; then
+            (
+                app="$name"
+                tail -F "$file" 2>/dev/null | \
+                    grep --line-buffered -Ei "$pat" | \
+                while IFS= read -r line; do
+                    printf '%b[%s]%b %b[EXPLOIT]%b %s\n' "$col" "$label" "$NC" "$R" "$NC" "$line"
+                    cat_slug=$(_exploit_category "$line")
+                    if alert_should_fire "exploit:$app:$cat_slug"; then
+                        alert_discord "Exploit attempt: $app / $cat_slug" "\`\`\`${line:0:1800}\`\`\`" 15158332 &
+                    fi
+                done
+            ) &
+            pids+=($!)
+        fi
+        (( i++ )) || true
+    done
+    trap 'kill "${pids[@]}" 2>/dev/null; exit' INT TERM
+    wait
+}
+
+# ==============================================================================
+# MODE: grep
+# ==============================================================================
+mode_grep() {
+    local name="${1:-}" pattern="${2:-.}"
+    [[ -z "$name" || ! " ${LOGS[*]} " =~ " $name " ]] && {
+        echo -e "${R}Usage: $0 grep <app> <pattern>${NC}  Apps: ${LOGS[*]}"; exit 1; }
+    echo -e "${D}tail -F $LOG_DIR/$name.access.log | grep '$pattern'  (Ctrl+C)${NC}\n"
+    tail -F "$LOG_DIR/$name.access.log" | grep --line-buffered -i "$pattern"
+}
+
+# ==============================================================================
+# MODE: health
+# ==============================================================================
+mode_health() {
+    echo -e "\n${W}── MiLog: Status Code Health ──${NC}\n"
+    printf "%-12s  %8s  %8s  %8s  %8s  %8s\n" "APP" "TOTAL" "2xx" "3xx" "4xx" "5xx"
+    printf "%-12s  %8s  %8s  %8s  %8s  %8s\n" "───────────" "───────" "───────" "───────" "───────" "───────"
+    for name in "${LOGS[@]}"; do
+        local file="$LOG_DIR/$name.access.log"
+        [[ -f "$file" ]] || { printf "%-12s  %8s\n" "$name" "(not found)"; continue; }
+        local total s2=0 s3=0 s4=0 s5=0
+        total=$(wc -l < "$file")
+        s2=$(grep -c ' 2[0-9][0-9] ' "$file" 2>/dev/null || true)
+        s3=$(grep -c ' 3[0-9][0-9] ' "$file" 2>/dev/null || true)
+        s4=$(grep -c ' 4[0-9][0-9] ' "$file" 2>/dev/null || true)
+        s5=$(grep -c ' 5[0-9][0-9] ' "$file" 2>/dev/null || true)
+        local c4=$NC c5=$NC
+        [[ $s4 -gt $THRESH_4XX_WARN ]] && c4=$Y
+        [[ $s5 -gt $THRESH_5XX_WARN ]] && c5=$R
+        printf "%-12s  %8s  %8s  %8s  ${c4}%8s${NC}  ${c5}%8s${NC}\n" \
+            "$name" "$total" "$s2" "$s3" "$s4" "$s5"
+    done
+    echo ""
+}
+
+# ==============================================================================
+# MODE: monitor
+# ==============================================================================
+mode_monitor() {
+    # Async CPU sampler — reads /proc/stat in a background loop, writes the
+    # latest % to a tmpfile. Keeps the render loop from blocking on sleep 0.2.
+    local cpu_file cpu_pid
+    cpu_file=$(mktemp 2>/dev/null || echo "/tmp/milog.cpu.$$")
+    echo 0 > "$cpu_file"
+    (
+        while :; do
+            v=$(cpu_usage)
+            printf '%s\n' "$v" > "${cpu_file}.tmp" 2>/dev/null \
+                && mv "${cpu_file}.tmp" "$cpu_file" 2>/dev/null
+            sleep 1
+        done
+    ) & cpu_pid=$!
+
+    # Enable sparkline history for nginx_row
+    MILOG_HIST_ENABLED=1
+    declare -gA HIST
+
+    # Hide cursor and quiet input echo so keystrokes don't litter the TUI.
+    tput civis 2>/dev/null || true
+    stty -echo 2>/dev/null || true
+
+    local _cleanup='
+        kill '"$cpu_pid"' 2>/dev/null
+        rm -f "'"$cpu_file"'" "'"${cpu_file}.tmp"'" 2>/dev/null
+        stty echo 2>/dev/null
+        tput cnorm 2>/dev/null
+        printf "\n"
+    '
+    trap "$_cleanup; exit 0" INT TERM
+    trap "$_cleanup" EXIT
+
+    local net_prev_rx=0 net_prev_tx=0
+    read -r net_prev_rx net_prev_tx _ <<< "$(net_rx_tx)"
+
+    local first=1 paused=0
+    while true; do
+        # Reflow for terminal size — runs per tick so SIGWINCH just works.
+        milog_update_geometry
+        if (( first )); then
+            clear
+            first=0
+        else
+            tput cup 0 0 2>/dev/null || printf '\033[H'
+        fi
+        local CUR_TIME TIMESTAMP TOTAL=0
+        CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
+        TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+        local cpu mem_pct mem_used mem_total disk_pct disk_used disk_total
+        cpu=$(cat "$cpu_file" 2>/dev/null); cpu=${cpu:-0}
+        [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
+        read -r mem_pct mem_used mem_total <<< "$(mem_info)"
+        read -r disk_pct disk_used disk_total <<< "$(disk_info)"
+
+        local net_rx net_tx net_iface
+        read -r net_rx net_tx net_iface <<< "$(net_rx_tx)"
+        local drx=$(( net_rx - net_prev_rx ))
+        local dtx=$(( net_tx - net_prev_tx ))
+        if (( ! paused )); then
+            net_prev_rx=$net_rx; net_prev_tx=$net_tx
+        fi
+        local rx_s tx_s; rx_s=$(fmt_bytes "$drx"); tx_s=$(fmt_bytes "$dtx")
+
+        local cpu_col mem_col disk_col
+        cpu_col=$(tcol "$cpu"      $THRESH_CPU_WARN  $THRESH_CPU_CRIT)
+        mem_col=$(tcol "$mem_pct"  $THRESH_MEM_WARN  $THRESH_MEM_CRIT)
+        disk_col=$(tcol "$disk_pct" $THRESH_DISK_WARN $THRESH_DISK_CRIT)
+
+        local cpu_bar mem_bar disk_bar
+        cpu_bar=$(ascii_bar $BW "$cpu"      100)
+        mem_bar=$(ascii_bar $BW "$mem_pct"  100)
+        disk_bar=$(ascii_bar $BW "$disk_pct" 100)
+
+        # --- Single unified box starts here ---
+        bdr_top
+
+        # Title row
+        local t_p=" MiLog   ${TIMESTAMP}   ${net_iface}"
+        local t_c=" ${W}MiLog${NC}   ${D}${TIMESTAMP}${NC}   ${D}${net_iface}${NC}"
+        draw_row "$t_p" "$t_c"
+
+        bdr_mid
+
+        # System metrics row 1 — bars
+        # Plain: " CPU  xx% [bar18]  MEM  xx% [bar18]  DISK  xx% [bar18]"
+        local r1_p
+        r1_p=$(printf " CPU %3d%% [%-${BW}s]  MEM %3d%% [%-${BW}s]  DISK %3d%% [%-${BW}s]" \
+            "$cpu" "$cpu_bar" "$mem_pct" "$mem_bar" "$disk_pct" "$disk_bar")
+        local r1_c
+        r1_c=$(printf " CPU %b%3d%%%b [%b%s%b]  MEM %b%3d%%%b [%b%s%b]  DISK %b%3d%%%b [%b%s%b]" \
+            "$cpu_col"  "$cpu"      "$NC" "$cpu_col"  "$cpu_bar"  "$NC" \
+            "$mem_col"  "$mem_pct"  "$NC" "$mem_col"  "$mem_bar"  "$NC" \
+            "$disk_col" "$disk_pct" "$NC" "$disk_col" "$disk_bar" "$NC")
+        draw_row "$r1_p" "$r1_c"
+
+        # System metrics row 2 — detail + net
+        # Max visible: ' MEM 99999/99999MB  DISK 999.9/999.9GB  dn:999.9MB/s up:999.9MB/s' = 72
+        local r2_p=" MEM ${mem_used}/${mem_total}MB  DISK ${disk_used}/${disk_total}GB  dn:${rx_s}/s up:${tx_s}/s"
+        local r2_c=" ${D}MEM${NC} ${mem_used}/${mem_total}MB  ${D}DISK${NC} ${disk_used}/${disk_total}GB  ${C}dn:${rx_s}/s${NC} ${G}up:${tx_s}/s${NC}"
+        draw_row "$r2_p" "$r2_c"
+
+        bdr_mid
+
+        # Nginx workers
+        draw_row " NGINX WORKERS" " ${W}NGINX WORKERS${NC}"
+        local workers worker_count
+        workers=$(ps aux 2>/dev/null | awk '/nginx: worker/{printf "  pid:%-8s  cpu:%5s%%  mem:%5s%%\n",$2,$3,$4}' | head -6)
+        if [[ -z "$workers" ]]; then
+            worker_count=0
+            draw_row "  (no nginx worker processes found)" "  ${D}(no nginx worker processes found)${NC}"
+        else
+            worker_count=$(printf '%s\n' "$workers" | wc -l | awk '{print $1}')
+            while IFS= read -r wline; do
+                draw_row "$wline" "  ${D}${wline:2}${NC}"
+            done <<< "$workers"
+        fi
+
+        sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
+                         "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
+
+        bdr_mid
+
+        # Nginx per-app table (no nested box — continues same box with col separators)
+        bdr_hdr
+        hdr_row
+        bdr_hdr
+
+        for name in "${LOGS[@]}"; do
+            nginx_row "$name" "$CUR_TIME" TOTAL
+        done
+
+        bdr_sep
+
+        # Footer
+        local upstr; upstr=$(uptime -p 2>/dev/null | sed 's/up //' || echo 'n/a')
+        local f_p=" TOTAL: ${TOTAL} req/min   UP: ${upstr}"
+        local f_c=" ${W}TOTAL:${NC} ${TOTAL} req/min   ${D}UP: ${upstr}${NC}"
+        draw_row "$f_p" "$f_c"
+
+        bdr_bot
+        local ptag=""
+        (( paused )) && ptag="  ${R}[PAUSED]${NC}"
+        # Clear-to-EOL so shorter footer over a longer one doesn't leave junk.
+        printf "${D} q:quit  p:pause  r:refresh  +/-:rate (${REFRESH}s)  |  5xx>=${THRESH_5XX_WARN} blinks${NC}${ptag}\033[K\n"
+        # Also clear from cursor down in case previous frame was taller.
+        printf '\033[J'
+
+        MILOG_HIST_PAUSED=$paused
+        local key
+        key=$(wait_or_key "$REFRESH")
+        case "$key" in
+            q|Q) break ;;
+            p|P) paused=$(( 1 - paused )) ;;
+            r|R) ;;
+            +)   (( REFRESH > 1 )) && REFRESH=$(( REFRESH - 1 )) ;;
+            -)   REFRESH=$(( REFRESH + 1 )) ;;
+            *)   ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# MODE: probes — scanner / bot traffic by user-agent + protocol-level probes
+# Wide UA database covering security tools, mass scanners, SEO bots,
+# generic HTTP libs, AI crawlers, and non-HTTP protocol smuggling attempts.
+# ==============================================================================
+mode_probes() {
+    echo -e "${D}Watching scanner/bot traffic across all apps... (Ctrl+C)${NC}\n"
+    local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
+
+    # Protocol-level: SSH banner, TLS ClientHello sent to plain HTTP (nginx logs
+    # the bytes as literal \xNN — double backslash so grep sees one).
+    local pat='SSH-2\.0|\\x16\\x03|\\x00\\x00'
+    # Security / pentest tools
+    pat+='|masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster'
+    pat+='|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan'
+    pat+='|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag'
+    # Mass internet scanners / research crawlers
+    pat+='|l9explore|l9tcpid|l9retrieve|leakix'
+    pat+='|libredtail|httpx|naabu|katana|subfinder'
+    pat+='|expanseinc|censysinspect|shodan|stretchoid|internet-measurement'
+    pat+='|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey'
+    pat+='|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe'
+    # SEO / advertising crawlers (often unwanted)
+    pat+='|ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat'
+    pat+='|dataforseobot|bytespider|mauibot|megaindex|seznambot'
+    # AI crawlers
+    pat+='|claudebot|gptbot|ccbot|anthropic-ai|perplexitybot|youbot'
+    pat+='|amazonbot|applebot-extended|cohere-ai|diffbot'
+    # Generic HTTP libraries (legit use exists but often scripted)
+    pat+='|python-requests|python-urllib|aiohttp|go-http-client|okhttp'
+    pat+='|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2'
+    pat+='|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize'
+    # Headless / automation
+    pat+='|headlesschrome|phantomjs|puppeteer|playwright|selenium'
+    # Generic bot / crawler hints in UA
+    pat+='|[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester'
+    # Known payloads
+    pat+='|hello,\s*world'
+
+    for name in "${LOGS[@]}"; do
+        local file="$LOG_DIR/$name.access.log"
+        local col="${colors[$i]}" label
+        label=$(printf "%-8s" "$name")
+        if [[ -f "$file" ]]; then
+            (
+                app="$name"
+                tail -F "$file" 2>/dev/null | \
+                    grep --line-buffered -Ei "$pat" | \
+                while IFS= read -r line; do
+                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$line"
+                    if alert_should_fire "probe:$app"; then
+                        alert_discord "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 &
+                    fi
+                done
+            ) &
+            pids+=($!)
+        fi
+        (( i++ )) || true
+    done
+    trap 'kill "${pids[@]}" 2>/dev/null; exit' INT TERM
+    wait
+}
+
+# ==============================================================================
+# MODE: rate — nginx-only
+# ==============================================================================
+mode_rate() {
+    while true; do
+        milog_update_geometry
+        clear
+        local CUR_TIME TIMESTAMP TOTAL=0
+        CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
+        TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+        bdr_top
+        draw_row " MiLog   ${TIMESTAMP}" " ${W}MiLog${NC}   ${D}${TIMESTAMP}${NC}"
+        bdr_mid
+        bdr_hdr
+        hdr_row
+        bdr_hdr
+
+        for name in "${LOGS[@]}"; do
+            nginx_row "$name" "$CUR_TIME" TOTAL
+        done
+
+        bdr_sep
+        draw_row " TOTAL: ${TOTAL} req/min" " ${W}TOTAL:${NC} ${TOTAL} req/min"
+        bdr_bot
+        printf "${D} Ctrl+C to exit  |  Refresh: ${REFRESH}s${NC}\n"
+        sleep "$REFRESH"
+    done
+}
+
+# ==============================================================================
+# MODE: replay — postmortem summary of one archived log file
+# Read-only: never writes history. Handles .gz / .bz2 transparently.
+# Three passes of the file: counts + date range, timings (sort + percentile),
+# top source IPs. Each pass is single-awk-per-metric — same discipline as
+# the live dashboard helpers.
+# ==============================================================================
+mode_replay() {
+    local file="${1:-}"
+    if [[ -z "$file" ]]; then
+        echo -e "${R}Usage:${NC} milog replay <log-file>" >&2
+        return 1
+    fi
+    [[ -f "$file" ]] || { echo -e "${R}Not found: $file${NC}" >&2; return 1; }
+
+    # Pick reader based on extension. Array form so no word-splitting risks
+    # when $file contains spaces.
+    local -a reader=(cat --)
+    case "$file" in
+        *.gz)
+            if   command -v gzcat >/dev/null 2>&1; then reader=(gzcat --)
+            elif command -v zcat  >/dev/null 2>&1; then reader=(zcat  --)
+            else echo -e "${R}gzcat/zcat needed for .gz files${NC}" >&2; return 1
+            fi
+            ;;
+        *.bz2)
+            command -v bzcat >/dev/null 2>&1 \
+                || { echo -e "${R}bzcat needed for .bz2 files${NC}" >&2; return 1; }
+            reader=(bzcat --)
+            ;;
+    esac
+
+    echo -e "\n${W}── MiLog: Replay — ${file} ──${NC}\n"
+
+    # Pass 1: lines, first/last timestamp, status-class tallies.
+    local summary n first last e2 e3 e4 e5
+    summary=$("${reader[@]}" "$file" 2>/dev/null | awk '
+        {
+            n++
+            if (match($0, /\[[0-9]{2}\/[A-Za-z]+\/[0-9]{4}:[0-9]{2}:[0-9]{2}/)) {
+                t = substr($0, RSTART+1, 20)
+                if (first == "") first = t
+                last = t
+            }
+            if (match($0, / [1-5][0-9][0-9] /)) {
+                cls = substr($0, RSTART+1, 1)
+                if      (cls == "2") e2++
+                else if (cls == "3") e3++
+                else if (cls == "4") e4++
+                else if (cls == "5") e5++
+            }
+        }
+        END { printf "%d\t%s\t%s\t%d\t%d\t%d\t%d\n", n+0, first, last, e2+0, e3+0, e4+0, e5+0 }')
+    IFS=$'\t' read -r n first last e2 e3 e4 e5 <<< "$summary"
+
+    if [[ -z "$n" || "$n" -eq 0 ]]; then
+        echo -e "  ${D}(empty or unreadable)${NC}\n"
+        return 0
+    fi
+
+    printf "  %-10s  %d\n"           "lines"   "$n"
+    printf "  %-10s  %s  →  %s\n"    "range"   "${first:--}" "${last:--}"
+    printf "  %-10s  2xx=%s  3xx=%s  ${Y}4xx=%s${NC}  ${R}5xx=%s${NC}\n" \
+           "status"  "$e2" "$e3" "$e4" "$e5"
+
+    # Pass 2: percentiles, only if any line has a numeric final field.
+    local sorted
+    sorted=$("${reader[@]}" "$file" 2>/dev/null \
+        | awk '$NF ~ /^[0-9]+(\.[0-9]+)?$/ { print int($NF * 1000 + 0.5) }' \
+        | sort -n)
+    if [[ -n "$sorted" ]]; then
+        local pct p50 p95 p99
+        pct=$(printf '%s\n' "$sorted" | awk '
+            { a[NR]=$1; n=NR }
+            END {
+                i50=int((n*50+99)/100); if (i50<1) i50=1; if (i50>n) i50=n
+                i95=int((n*95+99)/100); if (i95<1) i95=1; if (i95>n) i95=n
+                i99=int((n*99+99)/100); if (i99<1) i99=1; if (i99>n) i99=n
+                printf "%d %d %d\n", a[i50], a[i95], a[i99]
+            }')
+        read -r p50 p95 p99 <<< "$pct"
+        printf "  %-10s  p50=%dms  p95=%dms  p99=%dms\n" "response" "$p50" "$p95" "$p99"
+    fi
+
+    # Pass 3: top 10 source IPs.
+    echo
+    echo -e "  ${W}Top source IPs:${NC}"
+    "${reader[@]}" "$file" 2>/dev/null \
+        | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 \
+        | awk -v Y="$Y" -v R="$R" -v NC="$NC" '{
+              col = ""
+              if      (NR == 1) col = R
+              else if (NR <= 3) col = Y
+              printf "    %s#%-3d%s  %-18s  %d requests\n", col, NR, NC, $2, $1
+          }'
+    echo
+}
+
+# ==============================================================================
+# MODE: slow — top N endpoints by p95 response time
+# Requires the extended (combined_timed) log format — see README.
+# Pipeline: tail -> extract (path, ms) -> sort by path -> per-path p95
+#           -> sort by p95 desc -> head N. All portable POSIX awk; no
+#           gawk-only features (asort / PROCINFO) required.
+# ==============================================================================
+mode_slow() {
+    local n="${1:-10}"
+    local window="${SLOW_WINDOW:-1000}"
+
+    # Basic arg validation — integers only, otherwise later arithmetic trips.
+    [[ "$n"      =~ ^[0-9]+$ ]] || { echo -e "${R}slow: N must be numeric${NC}" >&2; return 1; }
+    [[ "$window" =~ ^[0-9]+$ ]] || { echo -e "${R}slow: SLOW_WINDOW must be numeric${NC}" >&2; return 1; }
+
+    echo -e "\n${W}── MiLog: Top ${n} slow endpoints (window=${window} lines/app) ──${NC}\n"
+
+    local files=() name
+    for name in "${LOGS[@]}"; do
+        local f="$LOG_DIR/$name.access.log"
+        [[ -f "$f" ]] && files+=("$f")
+    done
+
+    if (( ${#files[@]} == 0 )); then
+        echo -e "${R}No log files found in ${LOG_DIR}${NC}"
+        return 1
+    fi
+
+    # Stream through two awk stages with sort in between so per-path p95 can
+    # be computed without multi-dim arrays.
+    local top_rows
+    top_rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
+        | awk '
+            $NF ~ /^[0-9]+(\.[0-9]+)?$/ && NF >= 8 {
+                path = $7
+                q = index(path, "?")
+                if (q > 0) path = substr(path, 1, q - 1)
+                if (length(path) > 0) {
+                    printf "%s\t%d\n", path, int($NF * 1000 + 0.5)
+                }
+            }' \
+        | sort -t $'\t' -k1,1 -k2,2n \
+        | awk -F'\t' '
+            function emit(   pi) {
+                if (n > 0) {
+                    pi = int((n * 95 + 99) / 100)
+                    if (pi < 1) pi = 1
+                    if (pi > n) pi = n
+                    printf "%s\t%d\t%d\n", cur, v[pi], n
+                }
+            }
+            BEGIN { cur = ""; n = 0 }
+            {
+                if ($1 != cur) {
+                    emit()
+                    cur = $1; n = 0; delete v
+                }
+                n++
+                v[n] = $2
+            }
+            END { emit() }' \
+        | sort -t $'\t' -k2,2 -rn \
+        | head -n "$n")
+
+    if [[ -z "$top_rows" ]]; then
+        echo -e "${D}No timed samples in window — is \$request_time in your log_format?${NC}"
+        echo
+        return 0
+    fi
+
+    printf "%-5s  %-9s  %7s  %s\n" "RANK" "P95"     "COUNT" "PATH"
+    printf "%-5s  %-9s  %7s  %s\n" "────" "────────" "───────" "────────────────────"
+
+    local i=1 path p95 count col
+    while IFS=$'\t' read -r path p95 count; do
+        col=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
+        # Truncate absurdly long paths so the table stays aligned. URL paths
+        # are ASCII, so ${#path} is safe for width math.
+        local display="$path"
+        if (( ${#display} > 80 )); then
+            display="${display:0:77}..."
+        fi
+        printf "#%-4d  %b%-9s${NC}  %7d  %s\n" "$i" "$col" "${p95}ms" "$count" "$display"
+        i=$((i+1))
+    done <<< "$top_rows"
+    echo
+}
+
+# ==============================================================================
+# MODE: stats
+# ==============================================================================
+mode_stats() {
+    local name="${1:-}"
+    [[ -z "$name" || ! " ${LOGS[*]} " =~ " $name " ]] && {
+        echo -e "${R}Usage: $0 stats <app>${NC}  Apps: ${LOGS[*]}"; exit 1; }
+    local file="$LOG_DIR/$name.access.log"
+    [[ -f "$file" ]] || { echo -e "${R}Not found: $file${NC}"; exit 1; }
+    echo -e "\n${W}── MiLog: Hourly breakdown — ${name} ──${NC}\n"
+    awk '{match($4,/\[([0-9]{2}\/[A-Za-z]+\/[0-9]{4}):([0-9]{2})/,a)
+         if(a[2]!="")h[a[2]]++}
+         END{for(x in h)print x,h[x]}' "$file" | sort | \
+    awk -v g="$G" -v y="$Y" -v r="$R" -v nc="$NC" '
+    BEGIN{max=0}{if($2>max)max=$2;d[NR]=$0;n=NR}
+    END{for(i=1;i<=n;i++){split(d[i],a," ")
+        b=int((a[2]/max)*40); bars=""
+        for(j=0;j<b;j++) bars=bars"|"
+        col=g; if(a[2]/max>0.6)col=y; if(a[2]/max>0.85)col=r
+        printf "%s:00  %s%-40s%s  %d\n",a[1],col,bars,nc,a[2]}}'
+    echo ""
+}
+
+# ==============================================================================
+# MODE: suspects — heuristic IP ranking (behavioral, not just UA)
+# Scores each IP in the last N log lines across all apps, using:
+#   4xx hits      × 2   (probing non-existent paths)
+#   5xx hits      × 3   (causing errors)
+#   missing UA    × 1   (scripted requests often send "-")
+#   scanner UA    + 10  (flat bonus if UA matches known tool)
+#   unique paths  / 5   (scanning behavior — many endpoints from one IP)
+# Prints top N with flags explaining why.
+# ==============================================================================
+mode_suspects() {
+    local topn="${1:-20}"
+    local window="${2:-2000}"
+
+    echo -e "\n${W}── MiLog: Suspicious IPs (last ${window} lines/app, top ${topn}) ──${NC}\n"
+
+    local show_geo=0
+    [[ "${GEOIP_ENABLED:-0}" == "1" && -f "$MMDB_PATH" ]] && show_geo=1
+
+    if (( show_geo )); then
+        printf "%-6s  %-18s  %-7s  %6s  %5s  %5s  %6s  %s\n" \
+            "SCORE" "IP" "COUNTRY" "REQ" "4XX" "5XX" "PATHS" "FLAGS"
+        printf "%-6s  %-18s  %-7s  %6s  %5s  %5s  %6s  %s\n" \
+            "─────" "─────────────────" "───────" "──────" "─────" "─────" "──────" "──────────"
+    else
+        printf "%-6s  %-18s  %6s  %5s  %5s  %6s  %s\n" \
+            "SCORE" "IP" "REQ" "4XX" "5XX" "PATHS" "FLAGS"
+        printf "%-6s  %-18s  %6s  %5s  %5s  %6s  %s\n" \
+            "─────" "─────────────────" "──────" "─────" "─────" "──────" "──────────"
+    fi
+
+    local tmp; tmp=$(mktemp)
+    local name
+    for name in "${LOGS[@]}"; do
+        local file="$LOG_DIR/$name.access.log"
+        [[ -f "$file" ]] && tail -n "$window" "$file" >> "$tmp"
+    done
+
+    # Score + top-N in one awk+sort pipeline. Post-aggregation, we pretty-
+    # print in bash so we can slot in an optional per-IP country lookup
+    # (mmdblookup runs at most $topn times — never per-line).
+    local ranked
+    ranked=$(awk '
+        BEGIN { FS = "\"" }
+        NF >= 6 {
+            split($1, a, " ");  ip = a[1]
+            gsub(/^ +| +$/, "", $3);  split($3, s, " ");  status = s[1]
+            req = $2;  ua = $6
+
+            reqs[ip]++
+            if (status ~ /^4/) e4[ip]++
+            if (status ~ /^5/) e5[ip]++
+            if (ua == "-" || ua == "") no_ua[ip]++
+
+            key = ip "|" req
+            if (!(key in seen)) { seen[key] = 1;  paths[ip]++ }
+
+            ual = tolower(ua)
+            if (ual ~ /masscan|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|ffuf|wfuzz|feroxbuster|libredtail|l9explore|shodan|censysinspect|expanseinc|httpx|python-requests|go-http-client|okhttp|libwww-perl|scanner|fuzzer|leakix/) {
+                scanner_ua[ip] = 1
+            }
+        }
+        END {
+            for (ip in reqs) {
+                sc = e4[ip]*2 + e5[ip]*3 + no_ua[ip] + (scanner_ua[ip]?10:0) + int(paths[ip]/5)
+                if (sc < 3) continue
+                f = ""
+                if (scanner_ua[ip])    f = f " SCANNER"
+                if (no_ua[ip] > 0)     f = f " NO-UA"
+                if (e4[ip] >= 20)      f = f " HIGH-4XX"
+                if (e5[ip] >= 5)       f = f " HIGH-5XX"
+                if (paths[ip] >= 10)   f = f " MANY-PATHS"
+                sub(/^ /, "", f)
+                printf "%d\t%s\t%d\t%d\t%d\t%d\t%s\n", sc, ip, reqs[ip], e4[ip]+0, e5[ip]+0, paths[ip]+0, f
+            }
+        }' "$tmp" | sort -t$'\t' -k1,1 -rn | head -n "$topn")
+
+    rm -f "$tmp"
+
+    [[ -z "$ranked" ]] && { echo; return 0; }
+
+    local sc ip req e4 e5 p_count flags c country
+    while IFS=$'\t' read -r sc ip req e4 e5 p_count flags; do
+        c=$G
+        (( sc >= 10 )) && c=$Y
+        (( sc >= 30 )) && c=$R
+        if (( show_geo )); then
+            country=$(geoip_country "$ip")
+            printf "%b%-6s%b  %-18s  %-7s  %6s  %5s  %5s  %6s  %s\n" \
+                "$c" "$sc" "$NC" "$ip" "$country" "$req" "$e4" "$e5" "$p_count" "$flags"
+        else
+            printf "%b%-6s%b  %-18s  %6s  %5s  %5s  %6s  %s\n" \
+                "$c" "$sc" "$NC" "$ip" "$req" "$e4" "$e5" "$p_count" "$flags"
+        fi
+    done <<< "$ranked"
+
+    echo
+}
+
+# ==============================================================================
+# MODE: top-paths — aggregate URLs across all app logs, show per-path stats
+#
+# The single most useful incident question ("what URL is eating traffic?" or
+# "what URL is spiking 5xx?") isn't well served by `top` (IPs) or `slow`
+# (p95). This surfaces REQ + 4xx + 5xx + p95 per path. Query string is
+# stripped so /search?q=x and /search?q=y collapse into one row.
+#
+# Pipeline mirrors mode_slow: awk emit → external sort by path → group awk
+# → sort by count → head N. p95 requires the extended log format; shows
+# "—" when $request_time is absent.
+# ==============================================================================
+mode_top_paths() {
+    local n="${1:-20}"
+    local window="${SLOW_WINDOW:-2000}"
+
+    [[ "$n"      =~ ^[0-9]+$ ]] || { echo -e "${R}top-paths: N must be numeric${NC}" >&2; return 1; }
+    [[ "$window" =~ ^[0-9]+$ ]] || { echo -e "${R}top-paths: SLOW_WINDOW must be numeric${NC}" >&2; return 1; }
+
+    echo -e "\n${W}── MiLog: Top ${n} paths (window=${window} lines/app) ──${NC}\n"
+
+    local files=() name f
+    for name in "${LOGS[@]}"; do
+        f="$LOG_DIR/$name.access.log"
+        [[ -f "$f" ]] && files+=("$f")
+    done
+    if (( ${#files[@]} == 0 )); then
+        echo -e "${R}No log files found in ${LOG_DIR}${NC}"
+        return 1
+    fi
+
+    # awk pass 1: extract (path, status, ms-or-"-") per line.
+    #   $7  = request URI  (nginx combined: `"GET /path HTTP/1.1"` is fields 6-8)
+    #   $9  = status code
+    #   $NF = $request_time when combined_timed is in use (plain number)
+    # Query string is stripped so /x?a=1 + /x?a=2 collapse to /x.
+    #
+    # awk pass 2: sort by path + ms-numeric, group, emit count/4xx/5xx/p95.
+    # Numeric sort with "-" present: gawk/sort put "-" first (treated as 0),
+    # numeric values follow in ascending order — our group-awk only counts
+    # numerics into v[], so the p95 position is computed against just the
+    # timed samples for each path.
+    local rows
+    rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
+        | awk '
+            NF >= 9 {
+                path = $7
+                q = index(path, "?")
+                if (q > 0) path = substr(path, 1, q - 1)
+                if (length(path) == 0) next
+                status = $9
+                if (status !~ /^[0-9]+$/) next
+                lf = $NF
+                if (lf ~ /^[0-9]+(\.[0-9]+)?$/ && NF >= 12) {
+                    printf "%s\t%s\t%d\n", path, status, int(lf * 1000 + 0.5)
+                } else {
+                    printf "%s\t%s\t-\n", path, status
+                }
+            }' \
+        | sort -t $'\t' -k1,1 -k3,3n \
+        | awk -F'\t' '
+            function emit(   pi, p95) {
+                if (cur == "") return
+                if (nt > 0) {
+                    pi = int((nt * 95 + 99) / 100)
+                    if (pi < 1) pi = 1
+                    if (pi > nt) pi = nt
+                    p95 = v[pi]
+                } else {
+                    p95 = "-"
+                }
+                printf "%s\t%d\t%d\t%d\t%s\n", cur, count, c4, c5, p95
+            }
+            BEGIN { cur = ""; count = 0; c4 = 0; c5 = 0; nt = 0 }
+            {
+                if ($1 != cur) {
+                    emit()
+                    cur = $1; count = 0; c4 = 0; c5 = 0; nt = 0; delete v
+                }
+                count++
+                if ($2 ~ /^4/) c4++
+                if ($2 ~ /^5/) c5++
+                if ($3 != "-") { nt++; v[nt] = $3 }
+            }
+            END { emit() }' \
+        | sort -t $'\t' -k2,2 -rn \
+        | head -n "$n")
+
+    if [[ -z "$rows" ]]; then
+        echo -e "${D}No loglines matched in window.${NC}\n"
+        return 0
+    fi
+
+    printf "%-5s  %7s  %5s  %5s  %9s  %s\n" "RANK" "REQ" "4XX" "5XX" "P95" "PATH"
+    printf "%-5s  %7s  %5s  %5s  %9s  %s\n" "────" "───────" "─────" "─────" "─────────" "────────────────────"
+
+    local i=1 path count c4 c5 p95 col_err col_p95 p95_disp display
+    while IFS=$'\t' read -r path count c4 c5 p95; do
+        col_err=""
+        (( c5 > 0 )) && col_err="$R"
+        col_err+=""    # no-op but keeps the colour local
+        if [[ "$p95" == "-" ]]; then
+            # ASCII placeholder so printf byte-width == visual width. Unicode
+            # em-dash is 3 bytes / 1 column → throws off alignment.
+            p95_disp=$(printf "%b%9s%b" "$D" "n/a" "$NC")
+            col_p95=""
+        else
+            col_p95=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
+            # 7-wide number + "ms" = 9 visible chars (matches %9s header)
+            p95_disp=$(printf "%b%7sms%b" "$col_p95" "$p95" "$NC")
+        fi
+        display="$path"
+        if (( ${#display} > 60 )); then
+            display="${display:0:57}..."
+        fi
+        printf "#%-4d  %7d  %b%5d%b  %b%5d%b  %b  %s\n" \
+            "$i" "$count" \
+            "$Y" "$c4" "$NC" \
+            "$R" "$c5" "$NC" \
+            "$p95_disp" "$display"
+        i=$(( i + 1 ))
+    done <<< "$rows"
+    echo
+}
+
+# ==============================================================================
+# MODE: top
+# ==============================================================================
+mode_top() {
+    local n="${1:-10}"
+    echo -e "\n${W}── MiLog: Top ${n} IPs ──${NC}\n"
+
+    local show_geo=0
+    [[ "${GEOIP_ENABLED:-0}" == "1" && -f "$MMDB_PATH" ]] && show_geo=1
+
+    if (( show_geo )); then
+        printf "%-5s  %-18s  %-7s  %10s\n" "RANK" "IP" "COUNTRY" "REQUESTS"
+        printf "%-5s  %-18s  %-7s  %10s\n" "────" "─────────────────" "───────" "────────"
+    else
+        printf "%-5s  %-18s  %10s\n" "RANK" "IP" "REQUESTS"
+        printf "%-5s  %-18s  %10s\n" "────" "─────────────────" "────────"
+    fi
+
+    local tmp; tmp=$(mktemp)
+    local name
+    for name in "${LOGS[@]}"; do
+        [[ -f "$LOG_DIR/$name.access.log" ]] \
+            && awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
+    done
+
+    # Geo lookup happens here — after uniq has already collapsed the IP set
+    # to at most $n rows, so we fork mmdblookup $n times, not once per line.
+    local i=1 count ip col country
+    while read -r count ip; do
+        col=""
+        (( i == 1 ))             && col="$R"
+        (( i > 1 && i <= 3 ))    && col="$Y"
+        if (( show_geo )); then
+            country=$(geoip_country "$ip")
+            printf "%-5s  %-18s  %-7s  %b%10s%b\n" \
+                "#$i" "$ip" "$country" "$col" "$count" "$NC"
+        else
+            printf "%-5s  %-18s  %b%10s%b\n" \
+                "#$i" "$ip" "$col" "$count" "$NC"
+        fi
+        i=$((i+1))
+    done < <(sort "$tmp" | uniq -c | sort -rn | head -n "$n")
+
+    rm -f "$tmp"
+    echo
+}
+
+# ==============================================================================
+# MODE: trend — ASCII sparkline chart from metrics_minute history
+# Requires HISTORY_ENABLED daemon to have written the DB. Renders two rows
+# per app: req/min (green) and 4xx+5xx errors (red). Bucket-aggregates so
+# the sparkline fits the fixed 60-char width.
+# ==============================================================================
+_render_trend_one() {
+    local app="$1" since="$2" window_sec="$3" width="$4"
+
+    # SQL buckets row timestamps into exactly `width` columns across the
+    # window. Empty columns (no samples) won't appear in output — we fill
+    # them in with zeros on the shell side below.
+    local rows
+    rows=$(sqlite3 -separator $'\t' "$HISTORY_DB" <<SQL 2>/dev/null
+SELECT CAST((ts - $since) * $width / $window_sec AS INTEGER) AS col,
+       COALESCE(SUM(req), 0),
+       COALESCE(SUM(c4xx + c5xx), 0)
+FROM metrics_minute
+WHERE app = $(_sql_quote "$app") AND ts >= $since
+GROUP BY col
+ORDER BY col;
+SQL
+)
+    if [[ -z "$rows" ]]; then
+        printf "  ${D}%-10s  no data in window${NC}\n\n" "$app"
+        return
+    fi
+
+    local -a req_samples=() err_samples=()
+    local i
+    for (( i = 0; i < width; i++ )); do
+        req_samples+=(0)
+        err_samples+=(0)
+    done
+
+    local col req err
+    while IFS=$'\t' read -r col req err; do
+        [[ "$col" =~ ^[0-9]+$ ]] || continue
+        if (( col >= 0 && col < width )); then
+            req_samples[$col]="${req:-0}"
+            err_samples[$col]="${err:-0}"
+        fi
+    done <<< "$rows"
+
+    local req_spark err_spark v peak=0 total=0
+    req_spark=$(sparkline_render "${req_samples[*]}")
+    err_spark=$(sparkline_render "${err_samples[*]}")
+    for v in "${req_samples[@]}"; do (( v > peak  )) && peak=$v; done
+    for v in "${err_samples[@]}"; do total=$(( total + v )); done
+
+    printf "  ${W}%-10s${NC}  req ${G}%s${NC}  peak=%d/bucket\n" "$app" "$req_spark" "$peak"
+    printf "  %-10s  err ${R}%s${NC}  total=%d\n" "" "$err_spark" "$total"
+    echo
+}
+
+mode_trend() {
+    local app_arg="${1:-}" hours="${2:-24}"
+    [[ "$hours" =~ ^[1-9][0-9]*$ ]] \
+        || { echo -e "${R}trend: hours must be a positive integer${NC}" >&2; return 1; }
+
+    _history_precheck || return 1
+
+    # Sparkline width scales with terminal: 40-char floor so short terms
+    # still show something useful; each bucket maps to window_sec/width seconds.
+    milog_update_geometry
+    local now since width window_sec
+    width=$(( INNER - 40 ))
+    (( width < 40 )) && width=40
+    now=$(date +%s)
+    window_sec=$(( hours * 3600 ))
+    since=$(( now - window_sec ))
+
+    local -a apps
+    if [[ -n "$app_arg" ]]; then
+        # Reject app names that can't appear in LOGS, so a typo doesn't
+        # render "no data" forever.
+        local ok=0 name
+        for name in "${LOGS[@]}"; do
+            [[ "$name" == "$app_arg" ]] && { ok=1; break; }
+        done
+        if (( ! ok )); then
+            echo -e "${R}trend: unknown app '$app_arg'${NC}  Apps: ${LOGS[*]}" >&2
+            return 1
+        fi
+        apps=("$app_arg")
+    else
+        apps=("${LOGS[@]}")
+    fi
+
+    echo -e "\n${W}── MiLog: Trend (last ${hours}h, ${width} buckets) ──${NC}\n"
+
+    local a
+    for a in "${apps[@]}"; do
+        _render_trend_one "$a" "$since" "$window_sec" "$width"
+    done
+}
+
+mode_web() {
+    # Subcommand dispatch — treats a leading --flag as implicit 'start' so
+    # `milog web --port 9000` works without the redundant literal 'start'.
+    local sub="start"
+    case "${1:-}" in
+        stop)     _web_stop;   return ;;
+        status)   _web_status; return ;;
+        start)    shift ;;
+        ""|--*)   : ;;
+        *)        echo -e "${R}usage: milog web [start|stop|status] [--port N] [--bind ADDR] [--trust]${NC}" >&2
+                  return 1 ;;
+    esac
+
+    # Parse flags
+    local trust=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port)  WEB_PORT="${2:?}"; shift 2 ;;
+            --bind)  WEB_BIND="${2:?}"; shift 2 ;;
+            --trust) trust=1; shift ;;
+            *)       echo -e "${R}unknown option: $1${NC}" >&2; return 1 ;;
+        esac
+    done
+
+    [[ "$WEB_PORT" =~ ^[0-9]+$ ]] \
+        || { echo -e "${R}--port must be numeric${NC}" >&2; return 1; }
+
+    # Expose-to-network guard — forces explicit consent.
+    if [[ "$WEB_BIND" != "127.0.0.1" && "$WEB_BIND" != "localhost" && "$WEB_BIND" != "::1" ]] && (( ! trust )); then
+        printf '%b' "
+${R}refusing --bind $WEB_BIND without --trust${NC}
+${D}  this exposes the dashboard beyond loopback. Safer transports:${NC}
+${D}    1. SSH tunnel:     ssh -L $WEB_PORT:localhost:$WEB_PORT $USER@<host>${NC}
+${D}    2. Tailscale/WG:   --bind <overlay-ip> (only reachable on your tailnet)${NC}
+${D}    3. Cloudflare:     cloudflared tunnel --url http://localhost:$WEB_PORT${NC}
+${D}  If you really mean it:  milog web --bind $WEB_BIND --port $WEB_PORT --trust${NC}
+" >&2
+        return 1
+    fi
+
+    # Already running?
+    if _web_status >/dev/null 2>&1; then
+        echo -e "${Y}milog web is already running (milog web status).${NC}"
+        return 1
+    fi
+
+    # Token + state dirs.
+    _web_token_ensure || return 1
+    mkdir -p "$WEB_STATE_DIR" 2>/dev/null
+
+    # Pick a listener.
+    local listener=""
+    if command -v socat >/dev/null 2>&1; then
+        listener="socat"
+    elif command -v ncat >/dev/null 2>&1; then
+        listener="ncat"
+    else
+        printf '%b' "
+${R}milog web needs socat or ncat to accept connections.${NC}
+${D}  sudo apt install -y socat    (Debian/Ubuntu)${NC}
+${D}  sudo dnf install -y socat    (RHEL/Fedora/Rocky)${NC}
+${D}  sudo pacman -S socat         (Arch)${NC}
+" >&2
+        return 1
+    fi
+
+    # Resolve the milog script path so the per-connection child can re-exec
+    # us through the `__web_handler` internal dispatch target. Works whether
+    # milog is installed at /usr/local/bin/milog or run from a clone.
+    local self="${BASH_SOURCE[0]}"
+    [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+
+    local token; token=$(_web_token_read)
+    local scheme="http"
+    local url="${scheme}://${WEB_BIND}:${WEB_PORT}/?t=${token}"
+
+    # printf '%b' interprets the \033[…] escape sequences in $W / $G / $C /
+    # $D / $NC. `cat <<EOF` would pass them through literally (you'd see
+    # "\033[1;37m" text in the terminal).
+    printf '%b' "
+${W}MiLog web${NC}  listening on ${G}${WEB_BIND}:${WEB_PORT}${NC}  (${listener}, loopback-only by default)
+
+  ${W}URL:${NC} ${C}${url}${NC}
+
+  ${D}Phone/laptop from another machine:${NC}
+    ssh -L ${WEB_PORT}:localhost:${WEB_PORT} \$USER@<this-host>
+    open http://localhost:${WEB_PORT}/?t=${token}
+
+  ${D}token:${NC}      ${WEB_TOKEN_FILE}
+  ${D}access log:${NC} ${WEB_ACCESS_LOG}
+  ${D}stop:${NC}       milog web stop    (or Ctrl+C)
+
+"
+
+    echo $$ > "$(_web_pid_file)"
+    trap 'rm -f "$(_web_pid_file)"' EXIT
+
+    # Exec the listener. Both spawn the handler per connection, passing the
+    # parsed socket to stdin/stdout.
+    case "$listener" in
+        socat)
+            exec socat "TCP-LISTEN:${WEB_PORT},reuseaddr,fork,bind=${WEB_BIND}" \
+                       "EXEC:$self __web_handler"
+            ;;
+        ncat)
+            exec ncat -lk --sh-exec "$self __web_handler" \
+                      "$WEB_BIND" "$WEB_PORT"
+            ;;
+    esac
+}
+
 # ==============================================================================
 show_help() {
     echo -e "
