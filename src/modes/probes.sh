@@ -48,7 +48,11 @@ mode_probes() {
                     grep --line-buffered -Ei "$pat" | \
                 while IFS= read -r line; do
                     printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$line"
-                    if alert_should_fire "probe:$app"; then
+                    # Fingerprint gate runs AFTER cooldown — see exploits.sh
+                    # for rationale. Scanner hits commonly match both rules.
+                    fp=$(alert_fingerprint_from_line "$line")
+                    if alert_should_fire "probe:$app" \
+                       && alert_fingerprint_fresh "$fp"; then
                         alert_discord "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 &
                     fi
                 done

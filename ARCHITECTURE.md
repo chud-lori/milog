@@ -189,6 +189,39 @@ Atomic `mv` is the concurrency story. Multiple backgrounded modes
 last write wins. Worst case is a lost update — acceptable for dedup
 purposes.
 
+### Cross-rule event dedup
+
+A single scanner logline often matches both `exploits` (by URL) and
+`probes` (by user-agent). The per-rule cooldown above doesn't help —
+each rule has a distinct key and both fire independently on the same
+event. The fingerprint gate stops that:
+
+- **State file:** `$ALERT_STATE_DIR/alerts.fingerprints`, same tabbed
+  format as `alerts.state`.
+- **Fingerprint shape:** `<ip>:<path>` with query string stripped
+  (`alert_fingerprint_from_line` extracts it).
+- **TTL:** `ALERT_DEDUP_WINDOW` (default 300s, tunable separately from
+  `ALERT_COOLDOWN`).
+- **Helper:** `alert_fingerprint_fresh <fp>` — returns 0 (fire) if fp is
+  new or its last record has expired AND atomically records `<fp>\t<now>`;
+  returns 1 (suppress) otherwise. Empty fp opts-out (used when the log
+  line can't be parsed).
+- **Wire-up:** call AFTER `alert_should_fire` with `&&` so the common
+  case (quiet server) short-circuits without touching the fingerprint
+  file. Example from `mode_exploits`:
+
+  ```bash
+  fp=$(alert_fingerprint_from_line "$line")
+  if alert_should_fire "exploit:$app:$cat_slug" \
+     && alert_fingerprint_fresh "$fp"; then
+      alert_discord "..." "..." 15158332 &
+  fi
+  ```
+
+The entry-expiry in `alert_fingerprint_fresh` (drops rows older than
+`2×TTL` on every write) keeps the file bounded on long uptimes —
+unlike `alerts.state` which has a fixed key space.
+
 ### Rule keys
 
 Stable, grep-friendly strings used by the cooldown gate:

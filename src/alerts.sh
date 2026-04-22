@@ -65,6 +65,66 @@ alert_should_fire() {
     return 0
 }
 
+# Cross-rule dedup. Same log-line can match both `exploits` (by path) and
+# `probes` (by user-agent); without this gate both rules fire a Discord
+# embed on the same event.
+#
+# Contract: identical to `alert_should_fire` but keyed on a *fingerprint*
+# (e.g. "<ip>:<path>") with its own TTL `ALERT_DEDUP_WINDOW`. Returns 0
+# (fire) if the fingerprint is new or its last record has expired;
+# atomically records the current epoch on that success. Returns 1
+# (suppress) if the fingerprint was recorded within the dedup window.
+#
+# Call AFTER `alert_should_fire` — both gates must pass. Putting rule
+# cooldown first short-circuits the common case (quiet server) without
+# touching the fingerprint file.
+#
+# State file: $ALERT_STATE_DIR/alerts.fingerprints (same format as
+# alerts.state, tabbed). Kept separate from alerts.state so the two
+# concerns — rule rate-limit vs event dedup — can have independent TTLs
+# and be inspected / purged independently.
+alert_fingerprint_fresh() {
+    local fp="$1"
+    [[ -n "$fp" ]] || return 0   # no fingerprint → pass through, dedup opt-in
+    local state_file="$ALERT_STATE_DIR/alerts.fingerprints"
+    local now last tmp
+    mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
+    now=$(date +%s)
+    last=$(awk -v k="$fp" -F'\t' '$1==k {print $2; exit}' "$state_file" 2>/dev/null)
+    if [[ -n "$last" ]] && (( now - last < ALERT_DEDUP_WINDOW )); then
+        return 1
+    fi
+    tmp=$(mktemp "$ALERT_STATE_DIR/alerts.fingerprints.tmp.XXXXXX" 2>/dev/null) || return 0
+    {
+        # Drop the old entry for this fingerprint AND any whose last-seen has
+        # already expired — keeps the file from growing unbounded on long
+        # uptimes. 2×TTL gives a small safety margin.
+        awk -v k="$fp" -v cutoff=$(( now - ALERT_DEDUP_WINDOW * 2 )) \
+            -F'\t' 'BEGIN{OFS="\t"} $1!=k && $2>cutoff' "$state_file" 2>/dev/null
+        printf '%s\t%s\n' "$fp" "$now"
+    } > "$tmp" && mv "$tmp" "$state_file" 2>/dev/null
+    [[ -f "$tmp" ]] && rm -f "$tmp"
+    return 0
+}
+
+# Extract an `<ip>:<path>` fingerprint from a combined-format nginx logline.
+# Query string stripped so /x?a=1 and /x?a=2 collapse into one event.
+# Returns empty on unparseable input — callers treat empty as "no dedup".
+alert_fingerprint_from_line() {
+    local line="$1"
+    local ip path
+    # $1 = IP (first whitespace-separated field), $7 inside the quoted
+    # request = URL. Extract via awk because bash string split on the whole
+    # line is painful.
+    read -r ip path <<< "$(awk '{
+        p = $7
+        sub(/\?.*/, "", p)
+        print $1, p
+    }' <<< "$line")"
+    [[ -n "$ip" && -n "$path" ]] || { printf ''; return; }
+    printf '%s:%s' "$ip" "$path"
+}
+
 # Classify an exploit match into a category slug used in the alert rule key.
 # Substring-based (case-insensitive via shopt) — classification only needs to
 # be good enough for grouping, not exact regex parity with the match pattern.

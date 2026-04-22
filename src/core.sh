@@ -13,6 +13,12 @@ REFRESH=5
 DISCORD_WEBHOOK=""
 ALERTS_ENABLED=0
 ALERT_COOLDOWN=300
+# Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
+# the same logline, only the first to fire records the (ip, path) fingerprint;
+# the second sees it fresh and suppresses. Tunes how long one event remains
+# "already reported" across distinct rules. Kept separate from ALERT_COOLDOWN
+# so rule-level and event-level suppression can evolve independently.
+ALERT_DEDUP_WINDOW=300
 ALERT_STATE_DIR="$HOME/.cache/milog"
 
 # Response-time percentile thresholds (milliseconds) — used to colour the p95
@@ -72,6 +78,7 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_DISCORD_WEBHOOK:-}" ]] && DISCORD_WEBHOOK="$MILOG_DISCORD_WEBHOOK"
 [[ -n "${MILOG_ALERTS_ENABLED:-}"  ]] && ALERTS_ENABLED="$MILOG_ALERTS_ENABLED"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
+[[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_GEOIP_ENABLED:-}"   ]] && GEOIP_ENABLED="$MILOG_GEOIP_ENABLED"
 [[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
 [[ -n "${MILOG_HISTORY_ENABLED:-}" ]] && HISTORY_ENABLED="$MILOG_HISTORY_ENABLED"
