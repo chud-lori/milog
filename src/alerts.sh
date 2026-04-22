@@ -14,6 +14,28 @@ json_escape() {
     printf '"%s"' "$s"
 }
 
+# Append one alert record to ALERT_STATE_DIR/alerts.log for later inspection
+# via `milog alerts`. Silent on error — we never want a disk-full or
+# permission blip to crash the caller.
+#
+# Format: TSV, one line per alert. Fields:
+#   <epoch>  <rule_key>  <color_int>  <title>  <body_truncated>
+# Body is tab/newline-stripped and capped at 300 chars so each record stays
+# on a single line. Reader parses by \t — chosen over CSV to dodge quote
+# escaping entirely (log lines often contain quotes, rarely tabs).
+_alert_record() {
+    local log_file="$ALERT_STATE_DIR/alerts.log"
+    mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
+    local now; now=$(date +%s)
+    local body="${3:-}"
+    body="${body//$'\t'/ }"
+    body="${body//$'\r'/ }"
+    body="${body//$'\n'/ }"
+    body="${body:0:300}"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$now" "${1:-unknown}" "${4:-0}" "${2:-?}" "$body" \
+        >> "$log_file" 2>/dev/null || true
+}
+
 # Fire a Discord webhook embed. Silently no-ops when alerts are disabled,
 # no webhook is configured, or curl is missing. Never crashes callers —
 # on any error the TUI must keep rendering.
@@ -23,12 +45,21 @@ json_escape() {
 # embedded `@everyone` or `<@&roleid>` never produces a real ping. The
 # triple-backtick code block protects markdown rendering; allowed_mentions
 # protects the Discord pings surface.
-#   $1 title   $2 body   $3 color_int  (decimal; default 15158332 = red)
+#
+# Signature: alert_discord <title> <body> [color] [rule_key]
+# The rule_key is optional-but-preferred: it's the `<type>:<scope>` string
+# passed to alert_should_fire and gets recorded in alerts.log so
+# `milog alerts` can group / count by rule.
 alert_discord() {
     [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
-    [[ -z "${DISCORD_WEBHOOK:-}" ]]     && return 0
-    command -v curl >/dev/null 2>&1     || return 0
-    local title="$1" body="$2" color="${3:-15158332}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    # Record every fired alert to the local log — even if the Discord POST
+    # below fails (rate limit, network blip, webhook deleted). The log is
+    # the source of truth for "what fired", separate from "what got
+    # delivered to Discord."
+    _alert_record "$rule_key" "$title" "$body" "$color"
+    [[ -z "${DISCORD_WEBHOOK:-}" ]] && return 0
+    command -v curl >/dev/null 2>&1 || return 0
     local payload
     payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")

@@ -139,6 +139,28 @@ json_escape() {
     printf '"%s"' "$s"
 }
 
+# Append one alert record to ALERT_STATE_DIR/alerts.log for later inspection
+# via `milog alerts`. Silent on error — we never want a disk-full or
+# permission blip to crash the caller.
+#
+# Format: TSV, one line per alert. Fields:
+#   <epoch>  <rule_key>  <color_int>  <title>  <body_truncated>
+# Body is tab/newline-stripped and capped at 300 chars so each record stays
+# on a single line. Reader parses by \t — chosen over CSV to dodge quote
+# escaping entirely (log lines often contain quotes, rarely tabs).
+_alert_record() {
+    local log_file="$ALERT_STATE_DIR/alerts.log"
+    mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
+    local now; now=$(date +%s)
+    local body="${3:-}"
+    body="${body//$'\t'/ }"
+    body="${body//$'\r'/ }"
+    body="${body//$'\n'/ }"
+    body="${body:0:300}"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$now" "${1:-unknown}" "${4:-0}" "${2:-?}" "$body" \
+        >> "$log_file" 2>/dev/null || true
+}
+
 # Fire a Discord webhook embed. Silently no-ops when alerts are disabled,
 # no webhook is configured, or curl is missing. Never crashes callers —
 # on any error the TUI must keep rendering.
@@ -148,12 +170,21 @@ json_escape() {
 # embedded `@everyone` or `<@&roleid>` never produces a real ping. The
 # triple-backtick code block protects markdown rendering; allowed_mentions
 # protects the Discord pings surface.
-#   $1 title   $2 body   $3 color_int  (decimal; default 15158332 = red)
+#
+# Signature: alert_discord <title> <body> [color] [rule_key]
+# The rule_key is optional-but-preferred: it's the `<type>:<scope>` string
+# passed to alert_should_fire and gets recorded in alerts.log so
+# `milog alerts` can group / count by rule.
 alert_discord() {
     [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
-    [[ -z "${DISCORD_WEBHOOK:-}" ]]     && return 0
-    command -v curl >/dev/null 2>&1     || return 0
-    local title="$1" body="$2" color="${3:-15158332}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    # Record every fired alert to the local log — even if the Discord POST
+    # below fails (rate limit, network blip, webhook deleted). The log is
+    # the source of truth for "what fired", separate from "what got
+    # delivered to Discord."
+    _alert_record "$rule_key" "$title" "$body" "$color"
+    [[ -z "${DISCORD_WEBHOOK:-}" ]] && return 0
+    command -v curl >/dev/null 2>&1 || return 0
     local payload
     payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")
@@ -748,10 +779,10 @@ _p95_cached() {
 nginx_check_http_alerts() {
     local name="$1" c4="$2" c5="$3"
     if (( c5 >= THRESH_5XX_WARN )) && alert_should_fire "5xx:$name"; then
-        alert_discord "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 &
+        alert_discord "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 "5xx:$name" &
     fi
     if (( c4 >= THRESH_4XX_WARN )) && alert_should_fire "4xx:$name"; then
-        alert_discord "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 &
+        alert_discord "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 "4xx:$name" &
     fi
 }
 
@@ -761,16 +792,16 @@ sys_check_alerts() {
     local cpu="$1" mem_pct="$2" mem_used="$3" mem_total="$4"
     local disk_pct="$5" disk_used="$6" disk_total="$7" worker_count="$8"
     if (( cpu >= THRESH_CPU_CRIT )) && alert_should_fire "cpu"; then
-        alert_discord "CPU critical" "CPU at ${cpu}% (crit=${THRESH_CPU_CRIT}%)" 15158332 &
+        alert_discord "CPU critical" "CPU at ${cpu}% (crit=${THRESH_CPU_CRIT}%)" 15158332 "cpu" &
     fi
     if (( mem_pct >= THRESH_MEM_CRIT )) && alert_should_fire "mem"; then
-        alert_discord "Memory critical" "MEM at ${mem_pct}% — used ${mem_used}MB of ${mem_total}MB (crit=${THRESH_MEM_CRIT}%)" 15158332 &
+        alert_discord "Memory critical" "MEM at ${mem_pct}% — used ${mem_used}MB of ${mem_total}MB (crit=${THRESH_MEM_CRIT}%)" 15158332 "mem" &
     fi
     if (( disk_pct >= THRESH_DISK_CRIT )) && alert_should_fire "disk:/"; then
-        alert_discord "Disk critical" "Disk at ${disk_pct}% on / — ${disk_used}GB of ${disk_total}GB used (crit=${THRESH_DISK_CRIT}%)" 15158332 &
+        alert_discord "Disk critical" "Disk at ${disk_pct}% on / — ${disk_used}GB of ${disk_total}GB used (crit=${THRESH_DISK_CRIT}%)" 15158332 "disk:/" &
     fi
     if (( worker_count == 0 )) && alert_should_fire "workers"; then
-        alert_discord "Nginx workers down" "Zero nginx worker processes detected on $(hostname 2>/dev/null || echo host)" 15158332 &
+        alert_discord "Nginx workers down" "Zero nginx worker processes detected on $(hostname 2>/dev/null || echo host)" 15158332 "workers" &
     fi
 }
 
@@ -1559,7 +1590,7 @@ alert_test() {
     echo "Firing test alert to Discord..."
     alert_discord "MiLog test alert" \
         "Manual test from \`$(hostname 2>/dev/null || echo host)\` at $(date -Iseconds 2>/dev/null || date)" \
-        3447003
+        3447003 "alert:test"
 
     ALERTS_ENABLED="$_saved_enabled"
     DISCORD_WEBHOOK="$_saved_webhook"
@@ -1601,6 +1632,152 @@ mode_alert() {
     esac
 }
 
+# ==============================================================================
+# MODE: alerts — read the local alert history log
+#
+# The log itself is appended to by `_alert_record` (called from
+# `alert_discord`) — one TSV row per fired alert. This mode presents the
+# "what fired overnight? / this week?" view that was previously
+# unanswerable (the cooldown state file tracks last-fire per rule but
+# not history).
+#
+# Window grammar:
+#   today        since local midnight today
+#   yesterday    24h window ending at today's midnight
+#   all          no cutoff
+#   <N>h         last N hours
+#   <N>d         last N days
+#   <N>w         last N weeks
+# Default: today.
+#
+# Log file:       $ALERT_STATE_DIR/alerts.log
+# Rotation:       none (grows ~1 line per unique alert within cooldown
+#                 window; negligible on most deployments). Prune manually
+#                 if it ever matters:  `> ~/.cache/milog/alerts.log`
+# ==============================================================================
+
+# Parse a window spec (today/yesterday/all/Nh/Nd/Nw) to a Unix epoch cutoff.
+# Echoes the cutoff on success; non-zero exit + stderr message on invalid
+# input. Separated from mode_alerts so tests can exercise it independently.
+_alerts_window_to_epoch() {
+    local w="$1"
+    local now; now=$(date +%s)
+    case "$w" in
+        today)
+            # Local midnight today — (now % 86400) is seconds since UTC
+            # midnight, not local, but on most servers localtime=UTC and it
+            # doesn't meaningfully drift. Precise-to-the-timezone is overkill
+            # for an "alerts today" view.
+            echo $(( now - (now % 86400) ))
+            ;;
+        yesterday)
+            echo $(( now - (now % 86400) - 86400 ))
+            ;;
+        all)
+            echo 0
+            ;;
+        *[hH])
+            local n="${w%[hH]}"
+            [[ "$n" =~ ^[0-9]+$ ]] || { echo "invalid window: $w" >&2; return 1; }
+            echo $(( now - n * 3600 ))
+            ;;
+        *[dD])
+            local n="${w%[dD]}"
+            [[ "$n" =~ ^[0-9]+$ ]] || { echo "invalid window: $w" >&2; return 1; }
+            echo $(( now - n * 86400 ))
+            ;;
+        *[wW])
+            local n="${w%[wW]}"
+            [[ "$n" =~ ^[0-9]+$ ]] || { echo "invalid window: $w" >&2; return 1; }
+            echo $(( now - n * 7 * 86400 ))
+            ;;
+        *)
+            echo "invalid window: $w (valid: today / yesterday / all / Nh / Nd / Nw)" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Human-readable timestamp from epoch, portable across GNU/BSD date.
+# Used for the WHEN column in the table.
+_alerts_fmt_epoch() {
+    date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || date -r  "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || printf '%s' "$1"
+}
+
+mode_alerts() {
+    local window="${1:-today}"
+    local log_file="$ALERT_STATE_DIR/alerts.log"
+
+    if [[ ! -f "$log_file" ]]; then
+        echo -e "${D}No alerts logged yet at $log_file${NC}"
+        echo -e "${D}  log entries appear here the first time an alert fires with ALERTS_ENABLED=1${NC}"
+        return 0
+    fi
+
+    local cutoff cutoff_fmt
+    cutoff=$(_alerts_window_to_epoch "$window") || return 1
+    cutoff_fmt=$(_alerts_fmt_epoch "$cutoff")
+
+    echo -e "\n${W}── MiLog: Alerts since ${cutoff_fmt} (window=$window) ──${NC}\n"
+
+    # Filter once by epoch, feed the result to both the list and the summary.
+    local filtered; filtered=$(mktemp -t milog_alerts.XXXXXX) || return 1
+    # shellcheck disable=SC2064
+    trap "rm -f '$filtered'" RETURN
+
+    awk -F'\t' -v cutoff="$cutoff" '$1 >= cutoff' "$log_file" > "$filtered"
+
+    local total; total=$(wc -l < "$filtered" | tr -d ' ')
+    total=${total:-0}
+
+    if (( total == 0 )); then
+        echo -e "  ${D}no alerts in window${NC}\n"
+        return 0
+    fi
+
+    # --- Timeline (last ~30 rows, chronological) ---------------------------
+    # Most recent is most relevant, but humans read top-down and expect
+    # chronological order. Cap at 30 so the table stays glanceable.
+    local list_cap=30
+    local shown=$total
+    (( shown > list_cap )) && shown=$list_cap
+    echo -e "  ${W}timeline${NC} ${D}(showing latest ${shown} of ${total})${NC}"
+    printf "  %-16s  %-28s  %s\n" "WHEN" "RULE" "TITLE"
+    printf "  %-16s  %-28s  %s\n" "────────────────" "────────────────────────────" "──────"
+
+    # Per-row format in bash — calling _alerts_fmt_epoch (which forks date)
+    # inside awk's strftime is gawk-only; BSD awk on macOS lacks strftime.
+    # 30 row cap keeps the fork count trivial.
+    local epoch rule color title body when rule_disp title_disp col
+    while IFS=$'\t' read -r epoch rule color title body; do
+        [[ -z "$epoch" ]] && continue
+        when=$(_alerts_fmt_epoch "$epoch")
+        rule_disp="$rule"
+        (( ${#rule_disp} > 28 )) && rule_disp="${rule_disp:0:25}..."
+        title_disp="$title"
+        (( ${#title_disp} > 50 )) && title_disp="${title_disp:0:47}..."
+        # Color the rule column by severity (derived from Discord color int):
+        #   15158332 / 16711680 → crit  (red)    — exploits, 5xx, sys crit
+        #   16753920 / 15844367 → warn  (yellow) — 4xx spike, probes
+        #   other               → info  (green)  — test alert etc.
+        case "$color" in
+            15158332|16711680)    col="$R" ;;
+            16753920|15844367)    col="$Y" ;;
+            *)                    col="$G" ;;
+        esac
+        printf "  %-16s  %b%-28s%b  %s\n" "$when" "$col" "$rule_disp" "$NC" "$title_disp"
+    done < <(tail -n "$list_cap" "$filtered")
+
+    # --- Summary by rule ----------------------------------------------------
+    echo -e "\n  ${W}by rule (top 10)${NC}"
+    awk -F'\t' '{c[$2]++} END {for (r in c) printf "%d\t%s\n", c[r], r}' "$filtered" \
+        | sort -rn | head -n 10 \
+        | awk -F'\t' '{printf "    %5d  %s\n", $1, $2}'
+
+    echo -e "\n  ${D}total: $total alert(s) in window — log at $log_file${NC}\n"
+}
 # ==============================================================================
 # MODE: attacker <IP> — forensic view of one IP's activity across all apps
 #
@@ -2584,10 +2761,21 @@ mode_doctor() {
         esac
     fi
     if [[ "${ALERTS_ENABLED:-0}" == "1" ]]; then
-        _doc_ok "ALERTS_ENABLED=1  (cooldown=${ALERT_COOLDOWN}s)"
+        _doc_ok "ALERTS_ENABLED=1  (cooldown=${ALERT_COOLDOWN}s, dedup=${ALERT_DEDUP_WINDOW}s)"
     else
         _doc_warn "ALERTS_ENABLED=0" "alerts are armed but disabled — 'milog alert on' to flip"
         warn=$(( warn + 1 ))
+    fi
+    # Alert history log — surface count since "today" so users know it works.
+    local alog="$ALERT_STATE_DIR/alerts.log"
+    if [[ -f "$alog" ]]; then
+        local now_epoch today_cutoff today_count total_count
+        now_epoch=$(date +%s)
+        today_cutoff=$(( now_epoch - (now_epoch % 86400) ))
+        today_count=$(awk -F'\t' -v c="$today_cutoff" '$1 >= c' "$alog" | wc -l | tr -d ' ')
+        total_count=$(wc -l < "$alog" | tr -d ' ')
+        _doc_ok "alerts.log: ${total_count} total, ${today_count} today" \
+                "view with: milog alerts [today|Nh|Nd|all]"
     fi
 
     # ---- history DB ---------------------------------------------------------
@@ -2761,7 +2949,7 @@ mode_exploits() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "exploit:$app:$cat_slug" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_discord "Exploit attempt: $app / $cat_slug" "\`\`\`${line:0:1800}\`\`\`" 15158332 &
+                        alert_discord "Exploit attempt: $app / $cat_slug" "\`\`\`${line:0:1800}\`\`\`" 15158332 "exploit:$app:$cat_slug" &
                     fi
                 done
             ) &
@@ -3030,7 +3218,7 @@ mode_probes() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_discord "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 &
+                        alert_discord "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 "probe:$app" &
                     fi
                 done
             ) &
@@ -3791,6 +3979,7 @@ ${W}ALERTING${NC}
   ${C}alert off${NC}          disable alerts + stop service
   ${C}alert status${NC}       webhook / service / recent-fire state
   ${C}alert test${NC}         send a test Discord embed right now
+  ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
 
 ${W}DIAGNOSTICS${NC}
   ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
@@ -3856,6 +4045,7 @@ case "${1:-}" in
     suspects) mode_suspects "${2:-20}" "${3:-2000}" ;;
     config)   shift; mode_config "$@" ;;
     alert)    shift; mode_alert  "$@" ;;
+    alerts)   mode_alerts "${2:-today}" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
     __web_handler) _web_handle ;;

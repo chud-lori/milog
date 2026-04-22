@@ -162,10 +162,21 @@ mode_doctor() {
         esac
     fi
     if [[ "${ALERTS_ENABLED:-0}" == "1" ]]; then
-        _doc_ok "ALERTS_ENABLED=1  (cooldown=${ALERT_COOLDOWN}s)"
+        _doc_ok "ALERTS_ENABLED=1  (cooldown=${ALERT_COOLDOWN}s, dedup=${ALERT_DEDUP_WINDOW}s)"
     else
         _doc_warn "ALERTS_ENABLED=0" "alerts are armed but disabled — 'milog alert on' to flip"
         warn=$(( warn + 1 ))
+    fi
+    # Alert history log — surface count since "today" so users know it works.
+    local alog="$ALERT_STATE_DIR/alerts.log"
+    if [[ -f "$alog" ]]; then
+        local now_epoch today_cutoff today_count total_count
+        now_epoch=$(date +%s)
+        today_cutoff=$(( now_epoch - (now_epoch % 86400) ))
+        today_count=$(awk -F'\t' -v c="$today_cutoff" '$1 >= c' "$alog" | wc -l | tr -d ' ')
+        total_count=$(wc -l < "$alog" | tr -d ' ')
+        _doc_ok "alerts.log: ${total_count} total, ${today_count} today" \
+                "view with: milog alerts [today|Nh|Nd|all]"
     fi
 
     # ---- history DB ---------------------------------------------------------

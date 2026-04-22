@@ -252,7 +252,7 @@ alert_test() {
     echo "Firing test alert to Discord..."
     alert_discord "MiLog test alert" \
         "Manual test from \`$(hostname 2>/dev/null || echo host)\` at $(date -Iseconds 2>/dev/null || date)" \
-        3447003
+        3447003 "alert:test"
 
     ALERTS_ENABLED="$_saved_enabled"
     DISCORD_WEBHOOK="$_saved_webhook"

@@ -28,6 +28,7 @@ ${W}ALERTING${NC}
   ${C}alert off${NC}          disable alerts + stop service
   ${C}alert status${NC}       webhook / service / recent-fire state
   ${C}alert test${NC}         send a test Discord embed right now
+  ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
 
 ${W}DIAGNOSTICS${NC}
   ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
@@ -93,6 +94,7 @@ case "${1:-}" in
     suspects) mode_suspects "${2:-20}" "${3:-2000}" ;;
     config)   shift; mode_config "$@" ;;
     alert)    shift; mode_alert  "$@" ;;
+    alerts)   mode_alerts "${2:-today}" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
     __web_handler) _web_handle ;;

@@ -222,6 +222,36 @@ The entry-expiry in `alert_fingerprint_fresh` (drops rows older than
 `2×TTL` on every write) keeps the file bounded on long uptimes —
 unlike `alerts.state` which has a fixed key space.
 
+### Alert history log
+
+Every fire goes through `alert_discord`, which calls `_alert_record`
+before the curl. The log at `$ALERT_STATE_DIR/alerts.log` is append-only
+TSV:
+
+```
+<epoch>  <rule_key>  <color_int>  <title>  <body_truncated>
+```
+
+- `rule_key` is the 4th argument to `alert_discord` — callers pass the
+  same string they gave `alert_should_fire`. Optional but highly
+  preferred; default is the literal `unknown` which makes the record
+  harder to filter later.
+- Body is tab/newline-stripped and capped at 300 chars so each record
+  stays on one line (greppable, awk-splittable by `\t`).
+- Recording happens **before** the Discord POST, so entries exist even
+  when the webhook is unreachable. Useful for "did anything fire but not
+  deliver?" investigations.
+- No rotation. One line per fire, bounded by `ALERT_COOLDOWN` per rule
+  and `ALERT_DEDUP_WINDOW` cross-rule — negligible growth on most
+  deployments. Truncate manually if it ever matters:
+  `> ~/.cache/milog/alerts.log`
+
+`milog alerts [window]` reads this file. Window grammar is
+`today / yesterday / all / Nh / Nd / Nw` (parsed by
+`_alerts_window_to_epoch` in `src/modes/alerts.sh`). The timeline table
+colors rules by severity using the recorded color int — red for crit,
+yellow for warn, green for info.
+
 ### Rule keys
 
 Stable, grep-friendly strings used by the cooldown gate:

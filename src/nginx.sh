@@ -128,10 +128,10 @@ _p95_cached() {
 nginx_check_http_alerts() {
     local name="$1" c4="$2" c5="$3"
     if (( c5 >= THRESH_5XX_WARN )) && alert_should_fire "5xx:$name"; then
-        alert_discord "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 &
+        alert_discord "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 "5xx:$name" &
     fi
     if (( c4 >= THRESH_4XX_WARN )) && alert_should_fire "4xx:$name"; then
-        alert_discord "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 &
+        alert_discord "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 "4xx:$name" &
     fi
 }
 
@@ -141,16 +141,16 @@ sys_check_alerts() {
     local cpu="$1" mem_pct="$2" mem_used="$3" mem_total="$4"
     local disk_pct="$5" disk_used="$6" disk_total="$7" worker_count="$8"
     if (( cpu >= THRESH_CPU_CRIT )) && alert_should_fire "cpu"; then
-        alert_discord "CPU critical" "CPU at ${cpu}% (crit=${THRESH_CPU_CRIT}%)" 15158332 &
+        alert_discord "CPU critical" "CPU at ${cpu}% (crit=${THRESH_CPU_CRIT}%)" 15158332 "cpu" &
     fi
     if (( mem_pct >= THRESH_MEM_CRIT )) && alert_should_fire "mem"; then
-        alert_discord "Memory critical" "MEM at ${mem_pct}% — used ${mem_used}MB of ${mem_total}MB (crit=${THRESH_MEM_CRIT}%)" 15158332 &
+        alert_discord "Memory critical" "MEM at ${mem_pct}% — used ${mem_used}MB of ${mem_total}MB (crit=${THRESH_MEM_CRIT}%)" 15158332 "mem" &
     fi
     if (( disk_pct >= THRESH_DISK_CRIT )) && alert_should_fire "disk:/"; then
-        alert_discord "Disk critical" "Disk at ${disk_pct}% on / — ${disk_used}GB of ${disk_total}GB used (crit=${THRESH_DISK_CRIT}%)" 15158332 &
+        alert_discord "Disk critical" "Disk at ${disk_pct}% on / — ${disk_used}GB of ${disk_total}GB used (crit=${THRESH_DISK_CRIT}%)" 15158332 "disk:/" &
     fi
     if (( worker_count == 0 )) && alert_should_fire "workers"; then
-        alert_discord "Nginx workers down" "Zero nginx worker processes detected on $(hostname 2>/dev/null || echo host)" 15158332 &
+        alert_discord "Nginx workers down" "Zero nginx worker processes detected on $(hostname 2>/dev/null || echo host)" 15158332 "workers" &
     fi
 }
 
