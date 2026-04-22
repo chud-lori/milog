@@ -271,6 +271,70 @@ and suggest threshold values based on your actual traffic (instead of having
 you guess). It prints a ready-to-paste block of `milog config set …`
 commands — re-run whenever traffic patterns change.
 
+## Web dashboard (optional)
+
+`milog web` starts a tiny local HTTP server (powered by `socat`) that serves
+a read-only JSON + HTML view of the current system + per-app state. Useful
+when you want to glance at your server from a phone or laptop without
+SSHing in.
+
+```bash
+# One-time install of the listener (skip if already present)
+sudo apt install -y socat        # or: sudo dnf install -y socat
+# or, via the installer:
+curl -fsSL https://.../install.sh | sudo bash -s -- --with-web
+
+milog web            # prints a URL with an auto-generated ?t=TOKEN
+milog web status     # is it running? on what port?
+milog web stop       # kill it
+```
+
+**Security defaults — read before exposing:**
+
+- Binds to `127.0.0.1` only. Non-loopback binds (`--bind 0.0.0.0`) require
+  `--trust` to acknowledge the attack surface.
+- Every request is token-gated. Token is 32 bytes of urandom in
+  `~/.config/milog/web.token` (mode 600). The page JS stores the token in
+  `sessionStorage` and strips it from the URL on first load.
+- All routes are **read-only** — no endpoint mutates config, webhook,
+  history, or systemd state.
+- Headers set: `Content-Security-Policy` (no external fetches),
+  `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`, `Cache-Control: no-store`.
+- `DISCORD_WEBHOOK` is redacted (`…/webhooks/ID/****`) in any response.
+- Access log at `~/.cache/milog/web.access.log` — `ip → method → path → status`.
+
+### Three access patterns (ranked by blast radius)
+
+**1. SSH port-forward** — simplest, zero public exposure.
+
+```bash
+# On your laptop:
+ssh -L 8080:localhost:8080 <host>
+# then open http://localhost:8080/?t=<TOKEN-from-server-banner>
+```
+
+**2. Tailscale / WireGuard overlay** — phone-friendly.
+
+```bash
+# One-time: install Tailscale on server + phone/laptop, join the tailnet.
+milog web --bind 100.x.y.z   # the server's tailscale IP
+# Open the printed URL from any device on your tailnet.
+```
+
+**3. Cloudflare Tunnel** — public HTTPS URL, no domain / port / cert needed.
+
+```bash
+# One-time: install cloudflared (see https://github.com/cloudflare/cloudflared)
+milog web                                   # starts local listener
+cloudflared tunnel --url http://localhost:8080
+# cloudflared prints a https://<random>.trycloudflare.com URL — paste in browser.
+# Stack Cloudflare Access on top for SSO + MFA (free on Zero Trust tier).
+```
+
+All three patterns keep MiLog itself bound to loopback — the tunnel/forward
+is what crosses the network, which is exactly the property you want.
+
 ## `milog daemon`
 
 ### What is it for

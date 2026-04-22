@@ -139,9 +139,10 @@ EOF
 # ---- install ----------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: install.sh [--with-geoip] [--bin PATH] [--script-url URL] [--uninstall]
+Usage: install.sh [--with-geoip] [--with-web] [--bin PATH] [--script-url URL] [--uninstall]
 
   --with-geoip      install mmdblookup (for GeoIP enrichment in top/suspects)
+  --with-web        install socat (for the 'milog web' dashboard)
   --bin PATH        install destination (default: /usr/local/bin/milog)
   --script-url URL  override milog.sh download URL (pipe-install mode)
   --uninstall       remove installed binary (keeps config and state dirs)
@@ -198,11 +199,12 @@ resolve_script_src() {
 }
 
 main() {
-    local with_geoip=0 do_uninstall=0
+    local with_geoip=0 with_web=0 do_uninstall=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --with-geoip)   with_geoip=1;   shift ;;
+            --with-web)     with_web=1;     shift ;;
             --with-history) shift ;;   # deprecated no-op; sqlite3 is default
             --bin)          BIN_DST="${2:?--bin needs a path}"; shift 2 ;;
             --script-url)   SCRIPT_URL="${2:?--script-url needs a URL}"; shift 2 ;;
@@ -227,6 +229,7 @@ main() {
     # always install. mmdblookup stays opt-in (needs a MaxMind account).
     local deps=(gawk curl sqlite3)
     (( with_geoip )) && deps+=(mmdblookup)
+    (( with_web ))   && deps+=(socat)
 
     # Only install what's missing — idempotent reruns stay fast.
     local need_install=() tool resolved
