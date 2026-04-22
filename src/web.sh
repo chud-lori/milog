@@ -201,7 +201,7 @@ _web_route_index() {
   table { width:100%; border-collapse:collapse; font-size:.9rem; }
   th, td { text-align:left; padding:.45rem .6rem; border-bottom:1px solid #1b1f24; }
   th { color:#8b949e; font-weight:500; font-size:.75rem; text-transform:uppercase; letter-spacing:.1em; }
-  td.n { text-align:right; font-variant-numeric: tabular-nums; }
+  th.n, td.n { text-align:right; font-variant-numeric: tabular-nums; }
   td.err4 { color:#d29922; }
   td.err5 { color:#f85149; }
   footer { padding:1rem 1.2rem; color:#6b7177; font-size:.75rem; text-align:center; }
