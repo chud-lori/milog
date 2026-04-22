@@ -530,6 +530,283 @@ See `ARCHITECTURE.md` for the full list and how the classifier works.
 
 ---
 
+## Step 15 — Reactive hardening: what to do when MiLog flags a suspect
+
+Steps 0-14 build the baseline. This one's different: it's what to do
+**after** MiLog surfaces a specific bad actor or attack pattern. Not
+everything here applies on day one — pick the subsection that matches
+the signal you're reacting to.
+
+### 15a. Triage before blocking
+
+Two minutes of triage beats three hours rolling back a wrong ban. Given
+an IP from `milog suspects` / `attacker` / `top`, answer three
+questions:
+
+```bash
+# 1. What did this IP actually do here?
+milog attacker 13.86.116.180
+milog search "13.86.116.180" --archives
+
+# 2. Who owns it and what's its reputation?
+curl -s "https://ipinfo.io/13.86.116.180/json" | jq '.org,.asn,.country'
+# Browser: https://www.abuseipdb.com/check/13.86.116.180
+# Or with a free AbuseIPDB API key:
+curl -sH "Key: $ABUSEIPDB_KEY" -H "Accept: application/json" \
+     "https://api.abuseipdb.com/api/v2/check?ipAddress=13.86.116.180&maxAgeInDays=90" \
+  | jq '.data | {abuseConfidenceScore, totalReports, countryCode, usageType, isp}'
+
+# 3. What's the scope — one IP or a subnet?
+milog top 50 | grep -E '^\s*(13\.86\.116\.)'
+```
+
+Decision shortcuts:
+
+| Signal                             | Action                                      |
+| ---------------------------------- | ------------------------------------------- |
+| ASN = hosting/cloud (DO, OVH, AWS) | Block the /24 indefinitely — throwaway VMs  |
+| ASN = residential ISP              | 24-48h ban only (IP rotates, long bans rot) |
+| AbuseIPDB confidence ≥ 50          | Block with high confidence                  |
+| Single 404 / no probe pattern      | Do nothing — false positive                 |
+| Pattern matches MiLog `exploits`   | Block + consider the class-level fixes 15b  |
+
+### 15b. Block common probe paths at nginx
+
+One nginx include makes 90% of scanner probes land on a `404` before
+hitting your app — no logs bloat, no PHP fork, no framework 500.
+
+```bash
+sudo tee /etc/nginx/conf.d/block-common-probes.conf > /dev/null <<'EOF'
+# Dotfile / VCS / secrets leaks
+location ~* /\.(env|git|aws|ssh|docker|npm|DS_Store)(/|$)   { access_log off; return 404; }
+
+# PHP / WordPress probe paths
+location ~* /(wp-admin|wp-login|wp-content/plugins|xmlrpc\.php|phpmyadmin|pma) { return 404; }
+
+# Admin consoles + device-CGI fingerprints
+location ~* /(actuator|server-status|druid|console|containers/json|HNAP1|boaform|cgi-bin) { return 404; }
+
+# Log4Shell-style JNDI — even in paths (URL-encoded too)
+location ~* (\$\{jndi:|%24%7bjndi)  { return 444; }  # 444 = close without response
+EOF
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Applies globally (`conf.d/*.conf` is included in `http {}`). Effect:
+
+- Noise drop in MiLog's `exploits` / `probes` tails (they still match the
+  pattern, but the server spends zero work on them — and `444` on JNDI
+  denies the scanner even a status-code signal).
+- Real users never hit these; legit apps don't use them either.
+
+### 15c. fail2ban jail for nginx scanners
+
+Step 2 set up fail2ban for sshd. Add a parallel jail that watches nginx
+for the same pattern MiLog's `exploits` classifier uses, and auto-bans
+repeat offenders.
+
+```bash
+sudo tee /etc/fail2ban/filter.d/nginx-scanner.conf > /dev/null <<'EOF'
+[Definition]
+failregex = ^<HOST> .* "(GET|POST|HEAD) [^"]*(/\.env|/\.git/|/wp-login|/wp-admin|/xmlrpc\.php|/actuator|/\.aws/|/phpmyadmin|/boaform|/HNAP1|/cgi-bin)[^"]*" (4\d\d|5\d\d)
+ignoreregex =
+EOF
+
+sudo tee /etc/fail2ban/jail.d/nginx-scanner.local > /dev/null <<'EOF'
+[nginx-scanner]
+enabled  = true
+port     = http,https
+filter   = nginx-scanner
+logpath  = /var/log/nginx/*.access.log
+maxretry = 5
+findtime = 300           # 5 req matching pattern in 5 min...
+bantime  = 86400         # ...gets a 24 h ban. Don't go longer.
+EOF
+
+sudo systemctl restart fail2ban
+sudo fail2ban-client status nginx-scanner
+```
+
+**Behind Cloudflare?** fail2ban must see the real client IP, not the CF
+edge. Step 6 (real-IP restoration) handles that at nginx — verify with
+`tail -1 /var/log/nginx/*.access.log` that the first field is the real
+IP, not `172.x` / `104.x`. Without that, fail2ban would ban Cloudflare.
+
+Check bans over time: `sudo fail2ban-client status nginx-scanner`.
+
+### 15d. Threat-intel IP lists (Spamhaus DROP / FireHOL)
+
+Curated lists of known-hostile networks — hijacked space, confirmed
+C2, bulletproof hosting. Drop them at the kernel, zero per-request
+cost.
+
+```bash
+sudo apt install -y ipset      # Debian/Ubuntu
+# sudo dnf install -y ipset    # RHEL/Fedora/Rocky
+
+sudo ipset create spamhaus-drop hash:net maxelem 131072 2>/dev/null || true
+sudo iptables -C INPUT -m set --match-set spamhaus-drop src -j DROP 2>/dev/null \
+  || sudo iptables -I INPUT -m set --match-set spamhaus-drop src -j DROP
+
+# Hourly refresh
+sudo tee /usr/local/sbin/refresh-spamhaus > /dev/null <<'EOF'
+#!/bin/sh
+set -eu
+ipset create spamhaus-drop-new hash:net maxelem 131072 2>/dev/null || ipset flush spamhaus-drop-new
+curl -fsSL https://www.spamhaus.org/drop/drop.txt https://www.spamhaus.org/drop/edrop.txt \
+  | awk '/^[0-9]/ {print $1}' \
+  | while read cidr; do ipset add spamhaus-drop-new "$cidr" 2>/dev/null || true; done
+ipset swap spamhaus-drop-new spamhaus-drop
+ipset destroy spamhaus-drop-new 2>/dev/null || true
+EOF
+sudo chmod +x /usr/local/sbin/refresh-spamhaus
+
+sudo tee /etc/systemd/system/spamhaus-refresh.service > /dev/null <<'EOF'
+[Unit]
+Description=Refresh Spamhaus DROP/eDROP ipset
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/refresh-spamhaus
+EOF
+
+sudo tee /etc/systemd/system/spamhaus-refresh.timer > /dev/null <<'EOF'
+[Unit]
+Description=Refresh Spamhaus ipset hourly
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now spamhaus-refresh.timer
+sudo systemctl start  spamhaus-refresh.service
+sudo ipset list spamhaus-drop | head -5
+```
+
+Make the iptables rule survive reboot: `iptables-persistent` (Debian) or
+`iptables-services` (RHEL), plus `ipset save spamhaus-drop > /etc/ipset.conf`
+in a oneshot unit that runs after refresh.
+
+Want more aggressive? Swap `drop.txt` for FireHOL Level 1
+(`https://iplists.firehol.org/files/firehol_level1.netset`). Test on a
+staging host first — Level 1 includes some broad cloud ranges that may
+block legitimate users.
+
+### 15e. Cloudflare WAF rules — block at the edge
+
+If you're already behind Cloudflare, the edge is the correct layer to
+block. Origin-side bans still cost you TLS handshake + TCP accept; edge
+bans are free.
+
+**Custom rule (Free plan: 5 allowed)** — Security → WAF → Custom rules →
+Create rule:
+
+```
+Expression:
+(http.request.uri.path contains "/.env") or
+(http.request.uri.path contains "/.git/") or
+(http.request.uri.path contains "/wp-login") or
+(http.request.uri.path contains "/wp-admin") or
+(http.request.uri.path contains "/xmlrpc.php") or
+(http.request.uri.path contains "/actuator") or
+(http.request.uri.path contains "/boaform") or
+(http.request.uri.path contains "/HNAP1") or
+(http.request.uri.path contains "/phpmyadmin")
+
+Action: Managed Challenge
+```
+
+Managed Challenge rather than Block — real users occasionally type
+these URLs (dev exploring an API); scanners fail the challenge and move
+on. Zero false-positive ceilings this way.
+
+**IP Access Rules** — Security → WAF → Tools. Paste single IPs, /24s,
+/16s; pick Block or Challenge. Applies zone-wide, survives origin
+migrations. Good spot for the residential-rotator IPs that fail2ban
+would churn on.
+
+**Country-level Managed Challenge**:
+
+```
+Expression:  (ip.geoip.country in {"RU" "CN" "KP" "IR"}) and
+             (http.request.uri.path contains "/admin")
+Action: Managed Challenge
+```
+
+Never blanket-block countries on the public site (real users travel,
+VPN, use exit nodes) — scope to admin paths only.
+
+### 15f. Zero-internet admin surface
+
+For anything with a login (`/admin`, `/wp-admin`, the MiLog web panel,
+phpMyAdmin) the right move isn't "block bad IPs" — it's "don't be
+reachable from the internet at all". Three patterns, pick one:
+
+**Cloudflare Access** — SSO + optional MFA before the request ever
+reaches your origin. Free for ≤50 seats. Policy example:
+
+- Application: `https://your-site.example.com/admin/*`
+- Policy: email ends in `@yourcompany.com` **and** identity provider is
+  Google/GitHub **and** country is your home country.
+- Require: Multi-factor (TOTP / WebAuthn).
+
+After enabling, direct requests to `/admin` redirect through a
+Cloudflare login page; only authenticated users continue to origin. Your
+nginx still sees the request but every one is pre-authenticated.
+
+**Tailscale-only admin** — install Tailscale on server + your
+devices, bind admin surface to the tailnet IP:
+
+```bash
+# On the server
+sudo tailscale up
+# Get the tailnet IP, e.g. 100.64.1.2
+milog web --bind 100.64.1.2 --trust
+```
+
+Anyone off the tailnet can't route to `100.64.1.2`, period. No open
+port, no WAF rule, no exposure. Zero-config MFA comes via your identity
+provider at the tailscale login step. Tradeoff: every admin needs the
+tailscale client installed (free on ≤3 users, cheap above that).
+
+**Turnstile on login endpoints** — if you must leave a login form
+public, drop Cloudflare Turnstile in front:
+
+```html
+<div class="cf-turnstile" data-sitekey="0x4AAAAA..."></div>
+```
+
+Server-side verify the token before accepting the login. Replaces
+reCAPTCHA with no user-visible CAPTCHA in the normal case; only suspicious
+traffic gets a challenge.
+
+### 15g. Putting it together — response playbook
+
+A worked example: MiLog fires `probes: /actuator/health (12/min)` from
+IP `139.162.xxx.yyy`. Do in order:
+
+1. **Triage** (2 min): `milog attacker 139.162.xxx.yyy` shows 40
+   requests across 6 paths, all /actuator/*. `ipinfo.io` → Linode ASN
+   14061 (hosting). AbuseIPDB score 94 across 200 reports. → **Confirmed
+   bad, cloud ASN → block /24 permanently.**
+2. **Block at edge** (30 s): Cloudflare IP Access Rule for
+   `139.162.0.0/16` (all of Linode ATL-02), action Block. This is the
+   whole fix for this IP.
+3. **Prevent class of issue** (5 min, one-time): confirm
+   `block-common-probes.conf` is loaded and has `/actuator` in it (15b).
+   If yes, you're done — no one else can exploit this route again.
+4. **Let automation carry residual churn** — fail2ban + Spamhaus pick
+   up the tail of IPs you didn't manually block.
+5. **Audit**: `milog alerts 7d` a week later, confirm the pattern has
+   tapered off.
+
+Don't dwell on manual IP bans. Your time goes on steps 2 and 3; 4 is
+the autopilot that keeps step 1 from needing to happen again.
+
+---
+
 ## Verification checklist
 
 Run after each major step or at the end:
@@ -546,6 +823,10 @@ sudo nginx -t                                      # no warnings
 sudo journalctl --disk-usage                       # ~200 MB
 sudo sysctl net.ipv4.tcp_syncookies                # = 1
 milog alert status                                 # alerts enabled + daemon running
+# Reactive layer (Step 15) — optional, skip if 15 not done:
+sudo fail2ban-client status nginx-scanner          # jail active, recent bans listed
+sudo ipset list spamhaus-drop | head -3            # shows entry count (~300+)
+curl -I "https://your-site.example.com/.env"       # 404 from block-common-probes.conf
 ```
 
 ---
@@ -557,3 +838,8 @@ Everything after is hygiene — important, but not urgent.
 
 If you only have 5 minutes: Step 1b (disable password + root SSH) and
 Step 14 (install MiLog + turn on alerts).
+
+Already firefighting a live attacker? Jump to **Step 15** — triage
+flow + edge blocks + fail2ban nginx jail. Steps 15b (block-common-probes)
+and 15e (Cloudflare WAF) together take under 10 minutes and stop 95% of
+probe traffic from returning.
