@@ -1,0 +1,13 @@
+# Local working doc — not merged to main.
+plan.md
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Test fixtures left behind by ad-hoc runs
+/tmp-milog-*/
