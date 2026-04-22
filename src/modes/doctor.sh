@@ -167,6 +167,14 @@ mode_doctor() {
         _doc_warn "ALERTS_ENABLED=0" "alerts are armed but disabled — 'milog alert on' to flip"
         warn=$(( warn + 1 ))
     fi
+    # Report other destinations when configured — each is opt-in, so
+    # "not configured" is informational (not a warning).
+    [[ -n "${SLACK_WEBHOOK:-}" ]] \
+        && _doc_ok "Slack webhook configured  (${SLACK_WEBHOOK:0:40}…)"
+    [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] \
+        && _doc_ok "Telegram bot configured  (chat=$TELEGRAM_CHAT_ID)"
+    [[ -n "${MATRIX_HOMESERVER:-}" && -n "${MATRIX_TOKEN:-}" && -n "${MATRIX_ROOM:-}" ]] \
+        && _doc_ok "Matrix configured  (${MATRIX_HOMESERVER} room=$MATRIX_ROOM)"
     # Alert history log — surface count since "today" so users know it works.
     local alog="$ALERT_STATE_DIR/alerts.log"
     if [[ -f "$alog" ]]; then

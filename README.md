@@ -152,10 +152,11 @@ timed samples exist for the current minute).
 `/var/log/nginx` is usually owned by `root` or `adm`. Either run with `sudo`
 or add your user to the `adm` group: `sudo usermod -aG adm $USER`.
 
-## Discord alerts
+## Alerts (Discord, Slack, Telegram, Matrix)
 
-MiLog can POST to a Discord webhook when a threshold trips or an exploit/probe
-pattern hits. Off by default.
+MiLog can POST to Discord, Slack, Telegram, and/or Matrix when a threshold
+trips or an exploit/probe pattern hits. Off by default. Configure one or
+more — the dispatcher fires every alert to every configured destination.
 
 ### One-command setup
 
@@ -188,8 +189,31 @@ milog config set ALERTS_ENABLED 1
 
 # Optional tuning
 milog config set ALERT_COOLDOWN 300            # seconds between repeats
+milog config set ALERT_DEDUP_WINDOW 300        # cross-rule (ip,path) dedup TTL
 milog config set ALERT_STATE_DIR /var/lib/milog
 ```
+
+### Other destinations (configure any combination)
+
+Every alert fires to every configured destination. Set the vars, no reload
+needed — the daemon picks them up on next tick.
+
+```bash
+# Slack incoming webhook (Apps → Incoming Webhooks → Add to Channel)
+milog config set SLACK_WEBHOOK "https://hooks.slack.com/services/T.../B.../XXX"
+
+# Telegram (BotFather → /newbot for token; @userinfobot for chat_id)
+milog config set TELEGRAM_BOT_TOKEN "123456789:AAH..."
+milog config set TELEGRAM_CHAT_ID   "-100123456789"
+
+# Matrix (homeserver URL + access token + room ID like "!abc:matrix.org")
+milog config set MATRIX_HOMESERVER "https://matrix.example.com"
+milog config set MATRIX_TOKEN      "syt_..."
+milog config set MATRIX_ROOM       "!abc123:matrix.example.com"
+```
+
+All destinations share `ALERT_COOLDOWN` and the cross-rule `(ip, path)`
+dedup gate — one real event produces one alert per destination, not N.
 
 For env-var overrides (systemd units, one-shot runs), see the env table
 in the [Configuration](#configuration) section above.

@@ -9,8 +9,22 @@ LOG_DIR="/var/log/nginx"
 LOGS=("dolanan" "ethok" "finance" "ldr" "profile" "sinepil")
 REFRESH=5
 
-# Discord alerts (off by default; set DISCORD_WEBHOOK + ALERTS_ENABLED=1)
+# Alerts — configure ONE or MORE destinations; alert_fire() fans out to
+# everything that's set. ALERTS_ENABLED=1 is the master switch. Each
+# destination silently no-ops when its config is missing, so adding a
+# second one doesn't require touching anything else.
+#
+#   Discord:  DISCORD_WEBHOOK
+#   Slack:    SLACK_WEBHOOK
+#   Telegram: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+#   Matrix:   MATRIX_HOMESERVER + MATRIX_TOKEN + MATRIX_ROOM
 DISCORD_WEBHOOK=""
+SLACK_WEBHOOK=""
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+MATRIX_HOMESERVER=""
+MATRIX_TOKEN=""
+MATRIX_ROOM=""
 ALERTS_ENABLED=0
 ALERT_COOLDOWN=300
 # Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
@@ -79,6 +93,12 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERTS_ENABLED:-}"  ]] && ALERTS_ENABLED="$MILOG_ALERTS_ENABLED"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
+[[ -n "${MILOG_SLACK_WEBHOOK:-}"      ]] && SLACK_WEBHOOK="$MILOG_SLACK_WEBHOOK"
+[[ -n "${MILOG_TELEGRAM_BOT_TOKEN:-}" ]] && TELEGRAM_BOT_TOKEN="$MILOG_TELEGRAM_BOT_TOKEN"
+[[ -n "${MILOG_TELEGRAM_CHAT_ID:-}"   ]] && TELEGRAM_CHAT_ID="$MILOG_TELEGRAM_CHAT_ID"
+[[ -n "${MILOG_MATRIX_HOMESERVER:-}"  ]] && MATRIX_HOMESERVER="$MILOG_MATRIX_HOMESERVER"
+[[ -n "${MILOG_MATRIX_TOKEN:-}"       ]] && MATRIX_TOKEN="$MILOG_MATRIX_TOKEN"
+[[ -n "${MILOG_MATRIX_ROOM:-}"        ]] && MATRIX_ROOM="$MILOG_MATRIX_ROOM"
 [[ -n "${MILOG_GEOIP_ENABLED:-}"   ]] && GEOIP_ENABLED="$MILOG_GEOIP_ENABLED"
 [[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
 [[ -n "${MILOG_HISTORY_ENABLED:-}" ]] && HISTORY_ENABLED="$MILOG_HISTORY_ENABLED"

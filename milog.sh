@@ -9,8 +9,22 @@ LOG_DIR="/var/log/nginx"
 LOGS=("dolanan" "ethok" "finance" "ldr" "profile" "sinepil")
 REFRESH=5
 
-# Discord alerts (off by default; set DISCORD_WEBHOOK + ALERTS_ENABLED=1)
+# Alerts — configure ONE or MORE destinations; alert_fire() fans out to
+# everything that's set. ALERTS_ENABLED=1 is the master switch. Each
+# destination silently no-ops when its config is missing, so adding a
+# second one doesn't require touching anything else.
+#
+#   Discord:  DISCORD_WEBHOOK
+#   Slack:    SLACK_WEBHOOK
+#   Telegram: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+#   Matrix:   MATRIX_HOMESERVER + MATRIX_TOKEN + MATRIX_ROOM
 DISCORD_WEBHOOK=""
+SLACK_WEBHOOK=""
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+MATRIX_HOMESERVER=""
+MATRIX_TOKEN=""
+MATRIX_ROOM=""
 ALERTS_ENABLED=0
 ALERT_COOLDOWN=300
 # Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
@@ -79,6 +93,12 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERTS_ENABLED:-}"  ]] && ALERTS_ENABLED="$MILOG_ALERTS_ENABLED"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
+[[ -n "${MILOG_SLACK_WEBHOOK:-}"      ]] && SLACK_WEBHOOK="$MILOG_SLACK_WEBHOOK"
+[[ -n "${MILOG_TELEGRAM_BOT_TOKEN:-}" ]] && TELEGRAM_BOT_TOKEN="$MILOG_TELEGRAM_BOT_TOKEN"
+[[ -n "${MILOG_TELEGRAM_CHAT_ID:-}"   ]] && TELEGRAM_CHAT_ID="$MILOG_TELEGRAM_CHAT_ID"
+[[ -n "${MILOG_MATRIX_HOMESERVER:-}"  ]] && MATRIX_HOMESERVER="$MILOG_MATRIX_HOMESERVER"
+[[ -n "${MILOG_MATRIX_TOKEN:-}"       ]] && MATRIX_TOKEN="$MILOG_MATRIX_TOKEN"
+[[ -n "${MILOG_MATRIX_ROOM:-}"        ]] && MATRIX_ROOM="$MILOG_MATRIX_ROOM"
 [[ -n "${MILOG_GEOIP_ENABLED:-}"   ]] && GEOIP_ENABLED="$MILOG_GEOIP_ENABLED"
 [[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
 [[ -n "${MILOG_HISTORY_ENABLED:-}" ]] && HISTORY_ENABLED="$MILOG_HISTORY_ENABLED"
@@ -139,6 +159,35 @@ json_escape() {
     printf '"%s"' "$s"
 }
 
+# Escape a string for safe embedding inside HTML text content. Emits the
+# escaped bytes WITHOUT surrounding quotes — caller assembles the tags.
+# Used by Telegram (parse_mode=HTML) and Matrix (formatted_body) so an
+# attacker-controlled log line can't inject <b>, <a>, or other tags into
+# the rendered alert card.
+html_escape() {
+    local s="${1-}"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    printf '%s' "$s"
+}
+
+# Percent-encode a string for safe use in a URL path or query. ASCII
+# alphanumerics and the unreserved set (-._~) pass through; everything
+# else becomes %HH. Used for the Matrix room ID (contains `!` and `:`)
+# and the transaction token that goes into the PUT path.
+_url_encode() {
+    local s="${1-}" out="" i c
+    for (( i=0; i<${#s}; i++ )); do
+        c="${s:$i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~-]) out+="$c" ;;
+            *)               out+=$(printf '%%%02X' "'$c") ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
 # Append one alert record to ALERT_STATE_DIR/alerts.log for later inspection
 # via `milog alerts`. Silent on error — we never want a disk-full or
 # permission blip to crash the caller.
@@ -161,36 +210,133 @@ _alert_record() {
         >> "$log_file" 2>/dev/null || true
 }
 
-# Fire a Discord webhook embed. Silently no-ops when alerts are disabled,
-# no webhook is configured, or curl is missing. Never crashes callers —
-# on any error the TUI must keep rendering.
+# --- Per-destination senders --------------------------------------------------
 #
-# Security: bodies frequently contain attacker-controlled log-line bytes
-# (User-Agent, URL path, headers). We set allowed_mentions.parse=[] so an
-# embedded `@everyone` or `<@&roleid>` never produces a real ping. The
-# triple-backtick code block protects markdown rendering; allowed_mentions
-# protects the Discord pings surface.
+# Each `_alert_send_*` is a private sender for one destination. Contract:
+#   - silently return 0 when its config is absent (opt-in)
+#   - never propagate errors back to the caller (always `|| true` the curl)
+#   - apply the right encoding for its wire format (JSON / HTML / URL)
 #
-# Signature: alert_discord <title> <body> [color] [rule_key]
-# The rule_key is optional-but-preferred: it's the `<type>:<scope>` string
-# passed to alert_should_fire and gets recorded in alerts.log so
-# `milog alerts` can group / count by rule.
-alert_discord() {
-    [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
-    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
-    # Record every fired alert to the local log — even if the Discord POST
-    # below fails (rate limit, network blip, webhook deleted). The log is
-    # the source of truth for "what fired", separate from "what got
-    # delivered to Discord."
-    _alert_record "$rule_key" "$title" "$body" "$color"
+# Attacker-controlled inputs to watch for:
+#   - User-Agent, URL path, request headers appear in `body` — any
+#     mrkdwn/HTML active in the destination needs escaping.
+#   - Mentions (@channel, @everyone, <@role>) must not render: each sender
+#     explicitly disables them at the API level where possible.
+
+# Discord incoming-webhook embed. `allowed_mentions.parse=[]` blocks any
+# @everyone / <@role> etc. from producing pings. Triple-backtick wraps the
+# body so markdown (bold, links) renders as literal text.
+_alert_send_discord() {
     [[ -z "${DISCORD_WEBHOOK:-}" ]] && return 0
-    command -v curl >/dev/null 2>&1 || return 0
+    local title="$1" body="$2" color="${3:-15158332}"
     local payload
     payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")
     curl -sS -m 5 -H "Content-Type: application/json" \
          -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
 }
+
+# Slack incoming-webhook message. Uses mrkdwn with the body wrapped in a
+# triple-backtick code block. link_names=0 keeps `<@channel>` literal, not
+# a ping.
+_alert_send_slack() {
+    [[ -z "${SLACK_WEBHOOK:-}" ]] && return 0
+    local title="$1" body="$2"
+    # body wrapped in ```…``` as a code block — Slack renders it literal.
+    local text
+    text="*$(json_escape "$title" | sed 's/^"//; s/"$//')*\n\`\`\`$(printf '%s' "$body" | sed 's/`/'\''/g')\`\`\`"
+    # json_escape of the whole composed text (keeps \n literal in the
+    # payload, Slack interprets \n itself).
+    local payload
+    payload=$(printf '{"text":%s,"mrkdwn":true,"link_names":0}' \
+        "$(json_escape "$text")")
+    curl -sS -m 5 -H "Content-Type: application/json" \
+         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || true
+}
+
+# Telegram Bot API sendMessage. parse_mode=HTML + html_escape on every
+# value blocks <b>/<a>/<script> injection via log lines. Bot tokens look
+# like `123456789:ABC-DEF…`; the path is /bot<TOKEN>/sendMessage.
+_alert_send_telegram() {
+    [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
+    local title="$1" body="$2"
+    local safe_title safe_body
+    safe_title=$(html_escape "$title")
+    safe_body=$(html_escape "$body")
+    # Build the HTML body inline — we control the tags, attacker controls
+    # only the escaped text inside them.
+    local text="<b>${safe_title}</b>
+<pre>${safe_body}</pre>"
+    local payload
+    payload=$(printf '{"chat_id":%s,"text":%s,"parse_mode":"HTML","disable_web_page_preview":true,"disable_notification":false}' \
+        "$(json_escape "$TELEGRAM_CHAT_ID")" "$(json_escape "$text")")
+    curl -sS -m 5 -H "Content-Type: application/json" \
+         -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+         >/dev/null 2>&1 || true
+}
+
+# Matrix m.room.message (m.text + custom.html). PUT to
+#   <homeserver>/_matrix/client/v3/rooms/<room>/send/m.room.message/<txn>
+# Room IDs contain `!` and `:` — both must be percent-encoded. Txn is a
+# unique-enough epoch+rand combo (deduped server-side for ~5 min by the
+# Matrix spec). HTML body is escaped same as Telegram.
+_alert_send_matrix() {
+    [[ -z "${MATRIX_HOMESERVER:-}" || -z "${MATRIX_TOKEN:-}" || -z "${MATRIX_ROOM:-}" ]] && return 0
+    local title="$1" body="$2"
+    local safe_title safe_body
+    safe_title=$(html_escape "$title")
+    safe_body=$(html_escape "$body")
+    local formatted="<b>${safe_title}</b><br/><pre>${safe_body}</pre>"
+    local plain="${title}
+
+${body}"
+    local payload
+    payload=$(printf '{"msgtype":"m.text","body":%s,"format":"org.matrix.custom.html","formatted_body":%s}' \
+        "$(json_escape "$plain")" "$(json_escape "$formatted")")
+    local room_enc txn_id
+    room_enc=$(_url_encode "$MATRIX_ROOM")
+    txn_id="milog-$(date +%s)-$RANDOM"
+    # Strip a possible trailing slash from homeserver so the join is clean.
+    local hs="${MATRIX_HOMESERVER%/}"
+    curl -sS -m 5 -X PUT \
+         -H "Authorization: Bearer ${MATRIX_TOKEN}" \
+         -H "Content-Type: application/json" \
+         -d "$payload" \
+         "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}" \
+         >/dev/null 2>&1 || true
+}
+
+# --- Fanout dispatcher --------------------------------------------------------
+#
+# Fire one alert to every configured destination. Silently no-ops when
+# alerts are disabled; each destination no-ops on missing config.
+#
+# Signature: alert_fire <title> <body> [color] [rule_key]
+#   color    — Discord's color int, reused as severity hint for the alert
+#              log (red=crit, yellow=warn, green=info).
+#   rule_key — optional `<type>:<scope>` string; logged for `milog alerts`.
+#
+# Delivery is sequential (milliseconds each); callers that want
+# non-blocking fanout pattern `alert_fire "..." "..." color key &`.
+alert_fire() {
+    [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    # Record before delivery — the log captures "what fired" even if the
+    # webhooks fail (network blip, rate limit, rotated token).
+    _alert_record "$rule_key" "$title" "$body" "$color"
+    command -v curl >/dev/null 2>&1 || return 0
+    # Each destination backgrounded so a slow one doesn't delay the others.
+    # Callers also typically background `alert_fire &` — the resulting
+    # grandchild sends are orphaned to init on exit, which is fine.
+    _alert_send_discord  "$title" "$body" "$color" &
+    _alert_send_slack    "$title" "$body" "$color" &
+    _alert_send_telegram "$title" "$body" "$color" &
+    _alert_send_matrix   "$title" "$body" "$color" &
+}
+
+# Back-compat alias for `alert_discord`. Drop-in replacement for code that
+# hasn't been updated to the new name yet. Prefer `alert_fire` in new code.
+alert_discord() { alert_fire "$@"; }
 
 # Cooldown gate. Returns 0 (fire) if no prior fire for $1 is within
 # ALERT_COOLDOWN seconds, 1 (suppress) otherwise. On fire, rewrites the
@@ -779,10 +925,10 @@ _p95_cached() {
 nginx_check_http_alerts() {
     local name="$1" c4="$2" c5="$3"
     if (( c5 >= THRESH_5XX_WARN )) && alert_should_fire "5xx:$name"; then
-        alert_discord "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 "5xx:$name" &
+        alert_fire "5xx spike: $name" "${c5} 5xx responses in the last minute (threshold ${THRESH_5XX_WARN})" 15158332 "5xx:$name" &
     fi
     if (( c4 >= THRESH_4XX_WARN )) && alert_should_fire "4xx:$name"; then
-        alert_discord "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 "4xx:$name" &
+        alert_fire "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${THRESH_4XX_WARN})" 16753920 "4xx:$name" &
     fi
 }
 
@@ -792,16 +938,16 @@ sys_check_alerts() {
     local cpu="$1" mem_pct="$2" mem_used="$3" mem_total="$4"
     local disk_pct="$5" disk_used="$6" disk_total="$7" worker_count="$8"
     if (( cpu >= THRESH_CPU_CRIT )) && alert_should_fire "cpu"; then
-        alert_discord "CPU critical" "CPU at ${cpu}% (crit=${THRESH_CPU_CRIT}%)" 15158332 "cpu" &
+        alert_fire "CPU critical" "CPU at ${cpu}% (crit=${THRESH_CPU_CRIT}%)" 15158332 "cpu" &
     fi
     if (( mem_pct >= THRESH_MEM_CRIT )) && alert_should_fire "mem"; then
-        alert_discord "Memory critical" "MEM at ${mem_pct}% — used ${mem_used}MB of ${mem_total}MB (crit=${THRESH_MEM_CRIT}%)" 15158332 "mem" &
+        alert_fire "Memory critical" "MEM at ${mem_pct}% — used ${mem_used}MB of ${mem_total}MB (crit=${THRESH_MEM_CRIT}%)" 15158332 "mem" &
     fi
     if (( disk_pct >= THRESH_DISK_CRIT )) && alert_should_fire "disk:/"; then
-        alert_discord "Disk critical" "Disk at ${disk_pct}% on / — ${disk_used}GB of ${disk_total}GB used (crit=${THRESH_DISK_CRIT}%)" 15158332 "disk:/" &
+        alert_fire "Disk critical" "Disk at ${disk_pct}% on / — ${disk_used}GB of ${disk_total}GB used (crit=${THRESH_DISK_CRIT}%)" 15158332 "disk:/" &
     fi
     if (( worker_count == 0 )) && alert_should_fire "workers"; then
-        alert_discord "Nginx workers down" "Zero nginx worker processes detected on $(hostname 2>/dev/null || echo host)" 15158332 "workers" &
+        alert_fire "Nginx workers down" "Zero nginx worker processes detected on $(hostname 2>/dev/null || echo host)" 15158332 "workers" &
     fi
 }
 
@@ -1620,7 +1766,7 @@ alert_test() {
     DISCORD_WEBHOOK="$webhook"
 
     echo "Firing test alert to Discord..."
-    alert_discord "MiLog test alert" \
+    alert_fire "MiLog test alert" \
         "Manual test from \`$(hostname 2>/dev/null || echo host)\` at $(date -Iseconds 2>/dev/null || date)" \
         3447003 "alert:test"
 
@@ -2798,6 +2944,14 @@ mode_doctor() {
         _doc_warn "ALERTS_ENABLED=0" "alerts are armed but disabled — 'milog alert on' to flip"
         warn=$(( warn + 1 ))
     fi
+    # Report other destinations when configured — each is opt-in, so
+    # "not configured" is informational (not a warning).
+    [[ -n "${SLACK_WEBHOOK:-}" ]] \
+        && _doc_ok "Slack webhook configured  (${SLACK_WEBHOOK:0:40}…)"
+    [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] \
+        && _doc_ok "Telegram bot configured  (chat=$TELEGRAM_CHAT_ID)"
+    [[ -n "${MATRIX_HOMESERVER:-}" && -n "${MATRIX_TOKEN:-}" && -n "${MATRIX_ROOM:-}" ]] \
+        && _doc_ok "Matrix configured  (${MATRIX_HOMESERVER} room=$MATRIX_ROOM)"
     # Alert history log — surface count since "today" so users know it works.
     local alog="$ALERT_STATE_DIR/alerts.log"
     if [[ -f "$alog" ]]; then
@@ -2994,7 +3148,7 @@ mode_exploits() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "exploit:$app:$cat_slug" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_discord "Exploit attempt: $app / $cat_slug" "\`\`\`${line:0:1800}\`\`\`" 15158332 "exploit:$app:$cat_slug" &
+                        alert_fire "Exploit attempt: $app / $cat_slug" "\`\`\`${line:0:1800}\`\`\`" 15158332 "exploit:$app:$cat_slug" &
                     fi
                 done
             ) &
@@ -3263,7 +3417,7 @@ mode_probes() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_discord "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 "probe:$app" &
+                        alert_fire "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 "probe:$app" &
                     fi
                 done
             ) &

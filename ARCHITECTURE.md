@@ -153,21 +153,59 @@ Sparklines use 8 Unicode block characters (`▁▂▃…█`). Each app's ring b
 lives in a global associative array `HIST`. When paused (`p` key), the
 sampler skips pushing new samples so the displayed line freezes.
 
-## Discord alerts
+## Alerts
+
+### Fanout
+
+`alert_fire <title> <body> [color] [rule_key]` is the one public entry
+point. It records to `alerts.log` (see below) and then dispatches to
+every configured destination:
+
+| Destination | Config                                    | Format       |
+| ----------- | ----------------------------------------- | ------------ |
+| Discord     | `DISCORD_WEBHOOK`                          | embed JSON   |
+| Slack       | `SLACK_WEBHOOK`                           | mrkdwn JSON  |
+| Telegram    | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | HTML in JSON |
+| Matrix      | `MATRIX_HOMESERVER` + `_TOKEN` + `_ROOM`  | html + text  |
+
+Each `_alert_send_<dest>` silently no-ops when its own config is missing
+(opt-in), so configuring Slack doesn't require touching Discord and vice
+versa. All destinations share the cooldown + `(ip, path)` dedup gate — one
+logical event produces one alert per destination, not N.
+
+Backwards compat: `alert_discord` is kept as a thin alias to
+`alert_fire`. New code should call `alert_fire`.
 
 ### Wire-level
 
-`alert_discord` does one `curl -sS -m 5 -d '<payload>' "$DISCORD_WEBHOOK"`.
-Fire-and-forget: error output is swallowed, return always 0. Callers always
-background it with `&` so a slow Discord never stalls a render tick.
+Each sender does one `curl -sS -m 5 …` with the wire format for its
+service. Fire-and-forget: error output is swallowed, return always 0.
+Callers background the whole `alert_fire` call with `&` so a slow
+webhook never stalls a render tick, and the dispatcher further
+backgrounds each per-destination send so one laggy service doesn't
+delay the others.
 
-JSON string literals are built via `json_escape`, which wraps its input in
-double quotes and escapes `\`, `"`, `\n`, `\r`, `\t`. The full payload is
-constructed with `printf` field by field so a log line with embedded quotes
-never breaks the JSON.
+### Injection defenses
+
+Log lines embedded in `body` are attacker-controlled (User-Agent, URL,
+headers). Each destination applies the right encoding:
+
+- **Discord**: `json_escape` on every string. `"allowed_mentions":
+  {"parse":[]}` blocks `@everyone` / `<@role>` pings from log content.
+  Triple-backtick wrap renders markdown as literal text.
+- **Slack**: `json_escape` on the composed text; body's own backticks
+  are rewritten to single quotes so an attacker can't close the code
+  block early. `"link_names": 0` keeps `<@channel>` literal.
+- **Telegram**: `parse_mode: "HTML"`, so every user value goes through
+  `html_escape` before assembly into `<b>…</b><pre>…</pre>`. Tags in log
+  lines (`<script>`, `<a>`) render as `&lt;script&gt;`.
+  `disable_web_page_preview: true` blocks unfurls on log-embedded URLs.
+- **Matrix**: plain `body` is literal (no HTML rendering). The
+  `formatted_body` uses `html_escape` same as Telegram. Room ID with `!`
+  and `:` is passed through `_url_encode` before landing in the PUT path.
 
 Discord's server-side rate limit is ~30 req/min per webhook. The cooldown
-gate (default 300s) keeps us well under in normal operation.
++ dedup gates keep us well under in normal operation.
 
 ### Cooldown state
 
