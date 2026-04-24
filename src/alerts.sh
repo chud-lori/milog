@@ -188,6 +188,150 @@ ${body}"
          >/dev/null 2>&1 || true
 }
 
+# --- Silence / ack ------------------------------------------------------------
+#
+# Muting rules while an on-call operator is already working on the underlying
+# cause. Separate from cooldown (rate-limits repeats of the same rule) and
+# from dedup (cross-rule same-event suppression): silence is an explicit
+# user action, outranks both, and carries attribution.
+#
+# State file: $ALERT_STATE_DIR/alerts.silences
+#   Format:   <rule_key_or_glob>\t<until_epoch>\t<added_epoch>\t<added_by>\t<message>
+#   Globs:    bash glob syntax — `exploits:*` silences every exploits:<cat>
+#             rule. Literal matches are checked first, then globs.
+#   Expiry:   passive — compared on each check; the prune path lazily removes
+#             rows whose until_epoch has passed. No cron needed.
+
+# Convert a duration like 30s / 5m / 2h / 1d to seconds. Echoes the result;
+# returns 1 on unparseable input so callers can surface a clean error.
+alert_silence_parse_duration() {
+    local s="${1:-}"
+    [[ -n "$s" ]] || return 1
+    local n="${s%[smhdSMHD]}" unit="${s: -1}"
+    # Bare integer → treat as seconds (no unit).
+    if [[ "$s" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$s"
+        return 0
+    fi
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    # Accept upper- and lower-case unit letters. `${unit,,}` would be cleaner
+    # but it's bash-4+ only — milog.sh runs on bash 3.2 macOS dev boxes too.
+    case "$unit" in
+        s|S) printf '%s' "$n" ;;
+        m|M) printf '%s' $(( n * 60 )) ;;
+        h|H) printf '%s' $(( n * 3600 )) ;;
+        d|D) printf '%s' $(( n * 86400 )) ;;
+        *) return 1 ;;
+    esac
+}
+
+# Strip expired rows in place. Silent on missing file / read error — the
+# worst case is we carry a stale row until the next write, which the
+# _is_silenced path ignores anyway.
+alert_silence_prune() {
+    local f="$ALERT_STATE_DIR/alerts.silences"
+    [[ -f "$f" ]] || return 0
+    local now; now=$(date +%s)
+    local tmp
+    tmp=$(mktemp "$f.prune.XXXXXX" 2>/dev/null) || return 0
+    awk -F'\t' -v now="$now" 'BEGIN{OFS="\t"} $2+0 > now' "$f" 2>/dev/null > "$tmp"
+    mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+}
+
+# True (0) if rule_key matches an unexpired silence row. Checks literal
+# match first, then glob patterns. Echoes the full row of the matching
+# silence on stdout so callers (e.g. alert_fire) can include attribution
+# in their telemetry.
+#
+# Bash `[[ $x == $pat ]]` does glob matching (not regex), which is exactly
+# what we want: `exploits:*` matches `exploits:log4shell` / `exploits:sqli`.
+alert_is_silenced() {
+    local rule="${1:-}"
+    [[ -n "$rule" ]] || return 1
+    local f="$ALERT_STATE_DIR/alerts.silences"
+    [[ -f "$f" ]] || return 1
+    local now; now=$(date +%s)
+    local key until_epoch added_epoch added_by message
+    while IFS=$'\t' read -r key until_epoch added_epoch added_by message; do
+        [[ -z "$key" ]] && continue
+        [[ "$until_epoch" =~ ^[0-9]+$ ]] || continue
+        (( until_epoch > now )) || continue
+        # Literal match OR glob match.
+        # shellcheck disable=SC2053
+        if [[ "$rule" == "$key" || "$rule" == $key ]]; then
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+                "$key" "$until_epoch" "$added_epoch" "$added_by" "$message"
+            return 0
+        fi
+    done < "$f"
+    return 1
+}
+
+# Add / replace a silence row. Callers (mode_silence) pre-validate
+# duration_seconds; this function just writes the file.
+#
+# Replace semantics: an existing row for the same key is overwritten, so
+# `milog silence 5xx:api 2h` followed by `milog silence 5xx:api 4h` extends
+# the mute rather than stacking two rows.
+alert_silence_add() {
+    local key="$1" duration_seconds="$2" message="${3:-}"
+    local f="$ALERT_STATE_DIR/alerts.silences"
+    mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 1
+    local now until_epoch who
+    now=$(date +%s)
+    until_epoch=$(( now + duration_seconds ))
+    # $USER is set by login shells; fall back to `id -un` for systemd/daemon
+    # contexts. Fine to be empty if somehow both miss.
+    who="${USER:-$(id -un 2>/dev/null || echo unknown)}"
+    # Tab/newline strip on message — silence rows live on a single line.
+    message="${message//$'\t'/ }"
+    message="${message//$'\r'/ }"
+    message="${message//$'\n'/ }"
+    message="${message:0:200}"
+    local tmp
+    tmp=$(mktemp "$f.add.XXXXXX" 2>/dev/null) || return 1
+    {
+        # Drop any existing row with the same key, then append the fresh one.
+        # Also drop any already-expired rows so the file doesn't grow.
+        awk -F'\t' -v k="$key" -v now="$now" 'BEGIN{OFS="\t"} $1 != k && $2+0 > now' \
+            "$f" 2>/dev/null
+        printf '%s\t%s\t%s\t%s\t%s\n' "$key" "$until_epoch" "$now" "$who" "$message"
+    } > "$tmp" && mv "$tmp" "$f" 2>/dev/null
+    [[ -f "$tmp" ]] && rm -f "$tmp"
+    printf '%s' "$until_epoch"
+}
+
+# Remove a silence row by exact key. Returns 0 if a row was removed, 1 if
+# no match (so callers can print an honest "nothing to clear" message).
+alert_silence_remove() {
+    local key="$1"
+    local f="$ALERT_STATE_DIR/alerts.silences"
+    [[ -f "$f" ]] || return 1
+    # Existence check via awk — `grep -P` / `grep -E "^X\t"` is portable-
+    # problematic (BSD grep, some minimal shells). awk field compare is
+    # unambiguous and POSIX.
+    awk -F'\t' -v k="$key" 'BEGIN{found=1} $1==k {found=0; exit} END{exit found}' \
+        "$f" 2>/dev/null \
+        || return 1
+    local tmp
+    tmp=$(mktemp "$f.rm.XXXXXX" 2>/dev/null) || return 1
+    awk -F'\t' -v k="$key" 'BEGIN{OFS="\t"} $1 != k' "$f" 2>/dev/null > "$tmp" \
+        && mv "$tmp" "$f" 2>/dev/null
+    [[ -f "$tmp" ]] && rm -f "$tmp"
+    return 0
+}
+
+# Echo active silences as TSV rows, newest-first (by added_epoch).
+# Callers format for display; we keep this function raw so tests can parse.
+alert_silence_list_active() {
+    local f="$ALERT_STATE_DIR/alerts.silences"
+    [[ -f "$f" ]] || return 0
+    local now; now=$(date +%s)
+    # Sort by added_epoch desc so freshest silences render first.
+    awk -F'\t' -v now="$now" 'BEGIN{OFS="\t"} $2+0 > now' "$f" 2>/dev/null \
+        | sort -t $'\t' -k3,3 -rn
+}
+
 # --- Fanout dispatcher --------------------------------------------------------
 #
 # Fire one alert to every configured destination. Silently no-ops when
@@ -203,6 +347,14 @@ ${body}"
 alert_fire() {
     [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
     local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    # Silence gate — explicit user action outranks cooldown + dedup + delivery.
+    # Silenced fires are NOT recorded to alerts.log: the user said "I'm on it,
+    # stop telling me", and echoing the same rule repeatedly to history would
+    # just be a different kind of noise. The silence row itself (in
+    # alerts.silences) is the durable audit trail.
+    if [[ -n "$rule_key" ]] && alert_is_silenced "$rule_key" >/dev/null; then
+        return 0
+    fi
     # Record before delivery — the log captures "what fired" even if the
     # webhooks fail (network blip, rate limit, rotated token).
     _alert_record "$rule_key" "$title" "$body" "$color"
