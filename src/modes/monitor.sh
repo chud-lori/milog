@@ -1,6 +1,53 @@
 # ==============================================================================
-# MODE: monitor
+# MODE: monitor  +  tui
+#
+# `milog monitor` runs the bash refresh-and-redraw dashboard (works on any
+# POSIX box, no extra binary). `milog tui` execs the Go bubbletea TUI
+# when available — richer UI, same data source. Both coexist.
 # ==============================================================================
+
+# Locate milog-tui, the Go bubbletea binary. Preference order mirrors
+# _web_go_binary so install layouts stay consistent across companions.
+_tui_go_binary() {
+    if [[ -n "${MILOG_TUI_BIN:-}" && -x "$MILOG_TUI_BIN" ]]; then
+        printf '%s' "$MILOG_TUI_BIN"; return 0
+    fi
+    local candidate
+    for candidate in \
+        /usr/local/libexec/milog/milog-tui \
+        /usr/local/bin/milog-tui; do
+        [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+    done
+    local self="${BASH_SOURCE[0]}"
+    [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+    local self_dir; self_dir=$(cd "$(dirname "$self")" && pwd)
+    for candidate in "$self_dir/go/bin/milog-tui" "$self_dir/../go/bin/milog-tui" "$self_dir/../../go/bin/milog-tui"; do
+        [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# `milog tui` — run the Go bubbletea TUI. Separate subcommand from
+# `milog monitor` so both coexist and users pick. Clear install hint
+# when the binary is missing.
+mode_tui() {
+    local go_bin
+    if ! go_bin=$(_tui_go_binary); then
+        echo -e "${R}milog-tui is not installed.${NC}" >&2
+        echo -e "${D}  it builds alongside milog-web. From a clone:${NC}" >&2
+        echo -e "${D}    bash build.sh${NC}" >&2
+        echo -e "${D}  until packaged releases arrive, \`milog monitor\` (bash)" >&2
+        echo -e "${D}  gives the same data with a simpler render loop.${NC}" >&2
+        return 1
+    fi
+    # Pass the MILOG_* surface through so config stays single-source.
+    export MILOG_LOG_DIR="$LOG_DIR" \
+           MILOG_APPS="${LOGS[*]}" \
+           MILOG_REFRESH="${REFRESH:-5}" \
+           MILOG_ALERT_STATE_DIR="${ALERT_STATE_DIR:-$HOME/.cache/milog}"
+    exec "$go_bin" "$@"
+}
+
 mode_monitor() {
     # Async CPU sampler — reads /proc/stat in a background loop, writes the
     # latest % to a tmpfile. Keeps the render loop from blocking on sleep 0.2.

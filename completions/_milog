@@ -6,7 +6,8 @@ _milog() {
     local -a commands config_subs config_keys alert_subs silence_subs web_subs window_vals
 
     commands=(
-        'monitor:full TUI (nginx + system)'
+        'monitor:bash dashboard (nginx + system)'
+        'tui:bubbletea TUI (Go binary)'
         'daemon:headless alerter — no TUI'
         'rate:nginx-only req/min dashboard'
         'health:2xx/3xx/4xx/5xx per app'

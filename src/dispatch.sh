@@ -5,8 +5,9 @@ ${W}MiLog${NC} — nginx + system monitor
 ${W}USAGE${NC}  $0 [command] [args]
 
 ${W}DASHBOARDS${NC}
-  ${C}monitor${NC}            full TUI: nginx + CPU/MEM/DISK/NET + workers
+  ${C}monitor${NC}            bash dashboard: nginx + CPU/MEM/DISK + workers
                      ${D}keys: q=quit  p=pause  r=refresh  +/-=rate${NC}
+  ${C}tui${NC}                rich bubbletea TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
   ${C}rate${NC}               nginx-only req/min dashboard
   ${C}daemon${NC}             headless alerter — no TUI, fires Discord webhooks
 
@@ -84,9 +85,16 @@ _cmd_help() {
     local cmd="$1"
     case "$cmd" in
         monitor)
-            echo -e "${W}milog monitor${NC} — full-screen dashboard"
+            echo -e "${W}milog monitor${NC} — bash dashboard (refresh-and-redraw)"
             echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- change rate"
             echo -e "  ${D}Tunes:${NC} REFRESH, THRESH_* (see \`milog config\`)"
+            echo -e "  ${D}Richer view:${NC} \`milog tui\` (Go bubbletea, same data)"
+            ;;
+        tui)
+            echo -e "${W}milog tui${NC} — bubbletea TUI (Go binary)"
+            echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- change rate  ? help"
+            echo -e "  ${D}Tunes:${NC} MILOG_REFRESH env / REFRESH config key"
+            echo -e "  ${D}Install:${NC} \`bash build.sh\` in a clone; distro packages land later."
             ;;
         rate)     echo -e "${W}milog rate${NC} — nginx-only req/min dashboard" ;;
         daemon)
@@ -176,6 +184,7 @@ fi
 
 case "${1:-}" in
     monitor)  mode_monitor ;;
+    tui)      shift; mode_tui "$@" ;;
     daemon)   mode_daemon ;;
     rate)     mode_rate ;;
     health)   mode_health ;;

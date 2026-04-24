@@ -11,7 +11,7 @@ _milog_complete() {
         cword=$COMP_CWORD
     }
 
-    local cmds="monitor daemon rate health top top-paths attacker slow ws stats trend replay search diff auto-tune grep errors exploits probes suspects config alert alerts silence digest doctor web help"
+    local cmds="monitor tui daemon rate health top top-paths attacker slow ws stats trend replay search diff auto-tune grep errors exploits probes suspects config alert alerts silence digest doctor web help"
     local config_subs="show path init edit add rm dir set validate"
     local config_keys="LOG_DIR LOGS REFRESH SPARK_LEN DISCORD_WEBHOOK SLACK_WEBHOOK TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR ALERT_LOG_MAX_BYTES ALERT_ROUTES HOOKS_DIR ALERT_HOOK_TIMEOUT P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS GEOIP_ENABLED MMDB_PATH HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS WEB_PORT WEB_BIND THRESH_REQ_WARN THRESH_REQ_CRIT THRESH_CPU_WARN THRESH_CPU_CRIT THRESH_MEM_WARN THRESH_MEM_CRIT THRESH_DISK_WARN THRESH_DISK_CRIT THRESH_4XX_WARN THRESH_5XX_WARN"
     local alert_subs="on off status test"
