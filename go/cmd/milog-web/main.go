@@ -31,6 +31,7 @@ import (
 	"github.com/chud-lori/milog/internal/promtext"
 	"github.com/chud-lori/milog/internal/sysinfo"
 	"github.com/chud-lori/milog/internal/sysstat"
+	"github.com/chud-lori/milog/internal/tail"
 	"github.com/chud-lori/milog/internal/token"
 )
 
@@ -63,6 +64,7 @@ func main() {
 	mux.Handle("/api/logs.json", auth(logsHandler(cfg)))       // token-gated
 	mux.Handle("/api/logs/histogram.json", auth(logsHistogramHandler(cfg)))
 	mux.Handle("/api/stream", auth(streamHandler(cfg)))
+	mux.Handle("/api/logs/stream", auth(logsStreamHandler(cfg)))
 	mux.Handle("/metrics", auth(metricsHandler(cfg)))
 	mux.Handle("/api/latency.json", auth(latencyHandler(cfg)))
 	mux.Handle("/debug", auth(debugHandler(cfg)))
@@ -342,6 +344,156 @@ func metricsHandler(cfg *config.Config) http.HandlerFunc {
 	}
 }
 
+// logsStreamHandler streams new nginx log lines for one app as SSE
+// events, with optional grep / path / class filtering applied
+// server-side. A ring-buffer replay of the last N matching lines
+// fires on connect so reconnects don't visibly drop context.
+//
+// Protocol:
+//
+//	event: log
+//	data: {"ts":…,"ip":…,"method":…,"path":…,"status":200,"ua":…,"class":"2xx"}
+//
+// Ping every 15s keeps proxies from closing the connection when an
+// app is quiet.
+//
+// Query params (all optional):
+//
+//	app=<name>        required — must be an nginx source in LOGS
+//	limit=<N>         initial replay depth, default 200, max 500
+//	grep=<substring>  case-sensitive substring filter
+//	path=<prefix>     path-prefix filter, must start with '/'
+//	class=<2xx|3xx|4xx|5xx|any>
+//
+// Parsing reuses nginxlog.ParseLine so this stream matches the shape
+// of /api/logs.json exactly — same fields, same filter semantics.
+func logsStreamHandler(cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		app := q.Get("app")
+		if app == "" {
+			http.Error(w, "app is required", http.StatusBadRequest)
+			return
+		}
+		file := filepath.Join(cfg.LogDir, app+".access.log")
+		if !fileExists(file) {
+			http.Error(w, "no such app", http.StatusNotFound)
+			return
+		}
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		if limit <= 0 {
+			limit = 200
+		}
+		if limit > 500 {
+			limit = 500
+		}
+		grep := q.Get("grep")
+		pathPfx := q.Get("path")
+		cls := q.Get("class")
+
+		// Shared predicate for both replay and live lines.
+		matches := func(l nginxlog.Line, raw string) bool {
+			if grep != "" && !strings.Contains(raw, grep) {
+				return false
+			}
+			if l.Path == "" || l.Status == 0 {
+				return false
+			}
+			if pathPfx != "" && !strings.HasPrefix(l.Path, pathPfx) {
+				return false
+			}
+			if cls != "" && cls != "any" && l.Class != cls {
+				return false
+			}
+			return true
+		}
+
+		h := w.Header()
+		h.Set("Content-Type", "text/event-stream; charset=utf-8")
+		h.Set("Cache-Control", "no-store")
+		h.Set("Connection", "keep-alive")
+		h.Set("X-Accel-Buffering", "no")
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		emit := func(line nginxlog.Line) bool {
+			b, err := json.Marshal(line)
+			if err != nil {
+				return true
+			}
+			if _, err := fmt.Fprintf(w, "event: log\ndata: %s\n\n", b); err != nil {
+				return false
+			}
+			flusher.Flush()
+			return true
+		}
+
+		// Replay — read last `limit*3` lines, filter, emit up to `limit`.
+		// Gives reconnecting clients immediate context without hitting
+		// /api/logs.json separately.
+		raw, _ := nginxlog.TailLines(file, limit*3)
+		var replayed []nginxlog.Line
+		for _, rline := range raw {
+			l := nginxlog.ParseLine(rline)
+			if matches(l, rline) {
+				replayed = append(replayed, l)
+				if len(replayed) > limit {
+					replayed = replayed[1:]
+				}
+			}
+		}
+		for _, l := range replayed {
+			if !emit(l) {
+				return
+			}
+		}
+		// Marker so the client can distinguish replay-complete from a
+		// quiet stream. Client uses this to flip the "loading" badge.
+		if _, err := fmt.Fprintf(w, "event: ready\ndata: {\"replayed\":%d}\n\n", len(replayed)); err != nil {
+			return
+		}
+		flusher.Flush()
+
+		// Live stream — tailer runs for the request lifetime.
+		ctx := r.Context()
+		tl, err := tail.Open(ctx, file)
+		if err != nil {
+			log.Printf("milog-web: tail.Open(%s): %v", file, err)
+			return
+		}
+
+		ping := time.NewTicker(15 * time.Second)
+		defer ping.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ping.C:
+				if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			case raw, ok := <-tl.Lines():
+				if !ok {
+					return
+				}
+				l := nginxlog.ParseLine(raw)
+				if !matches(l, raw) {
+					continue
+				}
+				if !emit(l) {
+					return
+				}
+			}
+		}
+	}
+}
+
 // streamHandler pushes the same snapshot `/api/summary.json` returns via
 // Server-Sent Events, every REFRESH seconds. No polling; the browser
 // holds a single connection open and renders on each `summary` event.
@@ -604,7 +756,8 @@ func debugHandler(cfg *config.Config) http.HandlerFunc {
 		sb.WriteString("  /api/logs.json           log viewer tier 1\n")
 		sb.WriteString("  /api/logs/histogram.json timeline strip\n")
 		sb.WriteString("  /api/latency.json        request-time percentiles (requires combined_timed)\n")
-		sb.WriteString("  /api/stream              SSE live push\n")
+		sb.WriteString("  /api/stream              SSE live summary push\n")
+		sb.WriteString("  /api/logs/stream         SSE live log tail (per app, with filters)\n")
 		sb.WriteString("  /metrics                 Prometheus plaintext 0.0.4\n")
 		_, _ = w.Write([]byte(sb.String()))
 	}
