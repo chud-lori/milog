@@ -80,3 +80,23 @@ fi
 
 lines=$(wc -l < "$OUT" | tr -d ' ')
 echo "built $OUT  (${lines} lines, bash -n clean)"
+
+# ---- Optional Go companion build ---------------------------------------------
+# Phase 5 introduces go/cmd/milog-web (currently scaffolding only). If a Go
+# toolchain is available we compile it alongside the bash bundle; if not we
+# skip silently — users without Go still get a working milog.sh. Version is
+# stamped via -ldflags to match the bash MILOG_VERSION embedding.
+if [[ -d go && -f go/go.mod ]]; then
+    if command -v go >/dev/null 2>&1; then
+        mkdir -p go/bin
+        # Build inside go/ so go.mod is picked up from the right directory.
+        ( cd go && go build \
+            -ldflags "-X main.buildVersion=${MILOG_VERSION}" \
+            -o bin/milog-web \
+            ./cmd/milog-web ) \
+            && echo "built go/bin/milog-web  (version ${MILOG_VERSION})" \
+            || echo "build.sh: go build failed — milog.sh still usable, milog-web skipped" >&2
+    else
+        echo "build.sh: go toolchain not found — skipping milog-web (install.sh fallback stays)" >&2
+    fi
+fi

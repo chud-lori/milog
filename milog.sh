@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=7e0b6a8-dirty
-# MILOG_BUILT=2026-04-24T07:55:32Z
+# MILOG_VERSION=bd79b39-dirty
+# MILOG_BUILT=2026-04-24T08:41:48Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -6709,6 +6709,55 @@ _web_service_uninstall() {
     fi
 }
 
+# Locate milog-web, the Go companion binary. Preference order:
+#   1. $MILOG_WEB_BIN (explicit override)
+#   2. /usr/local/libexec/milog/milog-web (package install location)
+#   3. /usr/local/bin/milog-web
+#   4. <dir of this script>/../../go/bin/milog-web (clone / dev)
+# Echoes the path on success, empty + non-zero on miss.
+_web_go_binary() {
+    if [[ -n "${MILOG_WEB_BIN:-}" && -x "$MILOG_WEB_BIN" ]]; then
+        printf '%s' "$MILOG_WEB_BIN"; return 0
+    fi
+    local candidate
+    for candidate in \
+        /usr/local/libexec/milog/milog-web \
+        /usr/local/bin/milog-web; do
+        [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+    done
+    # Dev/clone path — relative to this script's bundled/unbundled location.
+    local self="${BASH_SOURCE[0]}"
+    [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+    local self_dir; self_dir=$(cd "$(dirname "$self")" && pwd)
+    # milog bundle is at repo root; go binary at repo/go/bin/milog-web.
+    for candidate in "$self_dir/go/bin/milog-web" "$self_dir/../go/bin/milog-web"; do
+        [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# Exec milog-web with the bash-env MiLog vars mapped through. The Go
+# binary reads the same MILOG_* env set bash exposes, so configuration
+# stays single-source. Prints the URL + token once, then hands off.
+_web_start_go() {
+    local go_bin="$1"
+    local token; token=$(_web_token_read)
+    local url="http://${WEB_BIND}:${WEB_PORT}/?t=${token}"
+    echo -e "${G}✓${NC} starting milog-web (Go)  ${D}${go_bin}${NC}"
+    echo -e "${W}  URL:${NC}  ${url}"
+    echo -e "${D}  Ctrl+C to stop. --socat forces the legacy bash handler.${NC}"
+    # Export the full MILOG_* surface — Go reads these via config.Load().
+    export MILOG_WEB_BIND="$WEB_BIND" \
+           MILOG_WEB_PORT="$WEB_PORT" \
+           MILOG_LOG_DIR="$LOG_DIR" \
+           MILOG_APPS="${LOGS[*]}" \
+           MILOG_REFRESH="${REFRESH:-5}" \
+           MILOG_ALERTS_ENABLED="${ALERTS_ENABLED:-0}" \
+           MILOG_DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}" \
+           MILOG_ALERT_STATE_DIR="${ALERT_STATE_DIR:-$HOME/.cache/milog}"
+    exec "$go_bin"
+}
+
 mode_web() {
     # Subcommand dispatch — treats a leading --flag as implicit 'start' so
     # `milog web --port 9000` works without the redundant literal 'start'.
@@ -6721,18 +6770,21 @@ mode_web() {
         uninstall-service) _web_service_uninstall; return ;;
         rotate-token)      _web_rotate_token;      return ;;
         ""|--*)   : ;;
-        *)        echo -e "${R}usage: milog web [start|stop|status|install-service|uninstall-service|rotate-token] [--port N] [--bind ADDR] [--trust]${NC}" >&2
+        *)        echo -e "${R}usage: milog web [start|stop|status|install-service|uninstall-service|rotate-token] [--port N] [--bind ADDR] [--trust] [--socat]${NC}" >&2
                   return 1 ;;
     esac
 
-    # Parse flags
-    local trust=0
+    # Parse flags. `--socat` forces the legacy bash handler even when the
+    # Go binary is present — useful for A/B debugging during the Phase 5
+    # rollout and for distros that intentionally don't want the Go binary.
+    local trust=0 force_socat=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --port)  WEB_PORT="${2:?}"; shift 2 ;;
-            --bind)  WEB_BIND="${2:?}"; shift 2 ;;
-            --trust) trust=1; shift ;;
-            *)       echo -e "${R}unknown option: $1${NC}" >&2; return 1 ;;
+            --port)   WEB_PORT="${2:?}"; shift 2 ;;
+            --bind)   WEB_BIND="${2:?}"; shift 2 ;;
+            --trust)  trust=1; shift ;;
+            --socat)  force_socat=1; shift ;;
+            *)        echo -e "${R}unknown option: $1${NC}" >&2; return 1 ;;
         esac
     done
 
@@ -6765,6 +6817,19 @@ ${D}  If you really mean it:  milog web --bind $WEB_BIND --port $WEB_PORT --trus
     # Token + state dirs.
     _web_token_ensure || return 1
     mkdir -p "$WEB_STATE_DIR" 2>/dev/null
+
+    # Prefer the Go binary when available — it handles long-lived SSE
+    # connections, serves the same dashboard HTML, and supports the same
+    # routes. Falls back to the bash socat handler when the binary isn't
+    # installed or when --socat is passed explicitly.
+    if (( ! force_socat )); then
+        local go_bin
+        go_bin=$(_web_go_binary) || go_bin=""
+        if [[ -n "$go_bin" ]]; then
+            _web_start_go "$go_bin"
+            return $?
+        fi
+    fi
 
     # Pick a listener.
     local listener=""
