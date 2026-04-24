@@ -68,7 +68,8 @@ prints a one-line fix for each degraded piece.
 ## 5-minute quick start
 
 ```bash
-milog monitor              # full TUI — CPU/MEM/DISK + per-app nginx table
+milog monitor              # bash dashboard — CPU/MEM/DISK + per-app nginx table
+milog tui                  # richer bubbletea TUI (same data; needs milog-tui Go binary)
 # q quit   p pause   r refresh   +/- change refresh rate
 
 # Turn on Discord alerts in one command (installs systemd service too)
@@ -93,7 +94,8 @@ Full command list: `milog help`.
 
 ```
 milog              # merged color-prefixed tail of all apps
-milog monitor      # full TUI
+milog monitor      # bash dashboard (refresh-and-redraw, POSIX-everywhere)
+milog tui          # bubbletea TUI (Go binary; richer panels, same data)
 milog rate         # nginx-only req/min dashboard
 milog daemon       # headless — fire alerts, no TUI
 

@@ -10,7 +10,8 @@ end
 
 # Top-level commands
 set -l cmds \
-    "monitor:full TUI" \
+    "monitor:bash dashboard" \
+    "tui:bubbletea TUI (Go binary)" \
     "daemon:headless alerter" \
     "rate:nginx req/min dashboard" \
     "health:2xx/3xx/4xx/5xx per app" \

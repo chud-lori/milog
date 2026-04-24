@@ -11,6 +11,8 @@ quick start; this directory has everything else.
   cooldown + dedup, rule catalog, how `milog alerts` history works
 - [**Web dashboard**](web-dashboard.md) — `milog web`, systemd user
   service, three exposure patterns (SSH tunnel, Tailscale, Cloudflare)
+- [**TUI (`milog tui`)**](tui.md) — bubbletea Go binary, when to pick
+  it over bash `milog monitor`
 - [**Historical metrics**](historical-metrics.md) — SQLite-backed
   `metrics_minute` + `top_ip_hour` tables, `trend` / `diff` / `auto-tune`
 - [**`milog daemon`**](daemon.md) — headless mode, systemd wiring,

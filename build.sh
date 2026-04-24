@@ -81,23 +81,31 @@ fi
 lines=$(wc -l < "$OUT" | tr -d ' ')
 echo "built $OUT  (${lines} lines, bash -n clean)"
 
-# ---- Optional Go companion build ---------------------------------------------
-# go/cmd/milog-web is the Go implementation of `milog web`. When a Go
-# toolchain is available we compile it alongside the bash bundle; if not
-# we skip silently — users without Go still get a working milog.sh.
-# Version is stamped via -ldflags to match the bash MILOG_VERSION
-# embedding so the Go binary and the bash script report the same SHA.
+# ---- Optional Go companion binaries ------------------------------------------
+# go/cmd/milog-web   — HTTP + SSE dashboard daemon
+# go/cmd/milog-tui   — bubbletea TUI
+#
+# When a Go toolchain is available we compile both alongside the bash
+# bundle; if not we skip silently — users without Go still get a working
+# milog.sh. Version is stamped via -ldflags to match the bash
+# MILOG_VERSION embedding so every artifact reports the same SHA.
 if [[ -d go && -f go/go.mod ]]; then
     if command -v go >/dev/null 2>&1; then
         mkdir -p go/bin
-        # Build inside go/ so go.mod is picked up from the right directory.
-        ( cd go && go build \
-            -ldflags "-X main.buildVersion=${MILOG_VERSION}" \
-            -o bin/milog-web \
-            ./cmd/milog-web ) \
-            && echo "built go/bin/milog-web  (version ${MILOG_VERSION})" \
-            || echo "build.sh: go build failed — milog.sh still usable, milog-web skipped" >&2
+        # Single cd so GOPATH / module cache is resolved once.
+        ( cd go
+            for bin in milog-web milog-tui; do
+                if go build \
+                    -ldflags "-X main.buildVersion=${MILOG_VERSION}" \
+                    -o "bin/${bin}" \
+                    "./cmd/${bin}"; then
+                    echo "built go/bin/${bin}  (version ${MILOG_VERSION})"
+                else
+                    echo "build.sh: go build ${bin} failed — milog.sh still usable" >&2
+                fi
+            done
+        )
     else
-        echo "build.sh: go toolchain not found — skipping milog-web (install.sh fallback stays)" >&2
+        echo "build.sh: go toolchain not found — skipping milog-web + milog-tui (install.sh fallback stays)" >&2
     fi
 fi

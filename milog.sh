@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=ba7444c-dirty
-# MILOG_BUILT=2026-04-24T08:58:45Z
+# MILOG_VERSION=a7c73fe-dirty
+# MILOG_BUILT=2026-04-24T09:30:11Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -5300,8 +5300,55 @@ later additions without rerunning install.sh.${NC}
 "
 }
 # ==============================================================================
-# MODE: monitor
+# MODE: monitor  +  tui
+#
+# `milog monitor` runs the bash refresh-and-redraw dashboard (works on any
+# POSIX box, no extra binary). `milog tui` execs the Go bubbletea TUI
+# when available — richer UI, same data source. Both coexist.
 # ==============================================================================
+
+# Locate milog-tui, the Go bubbletea binary. Preference order mirrors
+# _web_go_binary so install layouts stay consistent across companions.
+_tui_go_binary() {
+    if [[ -n "${MILOG_TUI_BIN:-}" && -x "$MILOG_TUI_BIN" ]]; then
+        printf '%s' "$MILOG_TUI_BIN"; return 0
+    fi
+    local candidate
+    for candidate in \
+        /usr/local/libexec/milog/milog-tui \
+        /usr/local/bin/milog-tui; do
+        [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+    done
+    local self="${BASH_SOURCE[0]}"
+    [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+    local self_dir; self_dir=$(cd "$(dirname "$self")" && pwd)
+    for candidate in "$self_dir/go/bin/milog-tui" "$self_dir/../go/bin/milog-tui" "$self_dir/../../go/bin/milog-tui"; do
+        [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# `milog tui` — run the Go bubbletea TUI. Separate subcommand from
+# `milog monitor` so both coexist and users pick. Clear install hint
+# when the binary is missing.
+mode_tui() {
+    local go_bin
+    if ! go_bin=$(_tui_go_binary); then
+        echo -e "${R}milog-tui is not installed.${NC}" >&2
+        echo -e "${D}  it builds alongside milog-web. From a clone:${NC}" >&2
+        echo -e "${D}    bash build.sh${NC}" >&2
+        echo -e "${D}  until packaged releases arrive, \`milog monitor\` (bash)" >&2
+        echo -e "${D}  gives the same data with a simpler render loop.${NC}" >&2
+        return 1
+    fi
+    # Pass the MILOG_* surface through so config stays single-source.
+    export MILOG_LOG_DIR="$LOG_DIR" \
+           MILOG_APPS="${LOGS[*]}" \
+           MILOG_REFRESH="${REFRESH:-5}" \
+           MILOG_ALERT_STATE_DIR="${ALERT_STATE_DIR:-$HOME/.cache/milog}"
+    exec "$go_bin" "$@"
+}
+
 mode_monitor() {
     # Async CPU sampler — reads /proc/stat in a background loop, writes the
     # latest % to a tmpfile. Keeps the render loop from blocking on sleep 0.2.
@@ -7094,8 +7141,9 @@ ${W}MiLog${NC} — nginx + system monitor
 ${W}USAGE${NC}  $0 [command] [args]
 
 ${W}DASHBOARDS${NC}
-  ${C}monitor${NC}            full TUI: nginx + CPU/MEM/DISK/NET + workers
+  ${C}monitor${NC}            bash dashboard: nginx + CPU/MEM/DISK + workers
                      ${D}keys: q=quit  p=pause  r=refresh  +/-=rate${NC}
+  ${C}tui${NC}                rich bubbletea TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
   ${C}rate${NC}               nginx-only req/min dashboard
   ${C}daemon${NC}             headless alerter — no TUI, fires Discord webhooks
 
@@ -7173,9 +7221,16 @@ _cmd_help() {
     local cmd="$1"
     case "$cmd" in
         monitor)
-            echo -e "${W}milog monitor${NC} — full-screen dashboard"
+            echo -e "${W}milog monitor${NC} — bash dashboard (refresh-and-redraw)"
             echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- change rate"
             echo -e "  ${D}Tunes:${NC} REFRESH, THRESH_* (see \`milog config\`)"
+            echo -e "  ${D}Richer view:${NC} \`milog tui\` (Go bubbletea, same data)"
+            ;;
+        tui)
+            echo -e "${W}milog tui${NC} — bubbletea TUI (Go binary)"
+            echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- change rate  ? help"
+            echo -e "  ${D}Tunes:${NC} MILOG_REFRESH env / REFRESH config key"
+            echo -e "  ${D}Install:${NC} \`bash build.sh\` in a clone; distro packages land later."
             ;;
         rate)     echo -e "${W}milog rate${NC} — nginx-only req/min dashboard" ;;
         daemon)
@@ -7265,6 +7320,7 @@ fi
 
 case "${1:-}" in
     monitor)  mode_monitor ;;
+    tui)      shift; mode_tui "$@" ;;
     daemon)   mode_daemon ;;
     rate)     mode_rate ;;
     health)   mode_health ;;
