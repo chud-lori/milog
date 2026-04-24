@@ -58,6 +58,16 @@ ALERT_STATE_DIR="$HOME/.cache/milog"
 # disable rotation entirely.
 ALERT_LOG_MAX_BYTES=10485760  # 10 MB
 
+# Hook scripts — user escape hatch. Every executable under HOOKS_DIR/on_alert.d/
+# runs once per fire, with MILOG_RULE_KEY / MILOG_TITLE / MILOG_BODY /
+# MILOG_SEV / MILOG_COLOR / MILOG_TS in its env. Runs AFTER the silence
+# gate (so silenced fires skip hooks too) and in parallel with delivery.
+# Errors are logged to $ALERT_STATE_DIR/hooks.log and NEVER propagate —
+# a broken hook can't wedge the daemon. Individual hook run time is
+# capped by ALERT_HOOK_TIMEOUT so a hanging script doesn't leak forever.
+HOOKS_DIR="$HOME/.config/milog/hooks"
+ALERT_HOOK_TIMEOUT=10
+
 # --- Alert routing ------------------------------------------------------------
 # Per-rule destination mapping. Default (empty) = fan out to every configured
 # destination — exactly today's behavior, so existing users see no change.
@@ -153,6 +163,8 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
+[[ -n "${MILOG_HOOKS_DIR:-}"           ]] && HOOKS_DIR="$MILOG_HOOKS_DIR"
+[[ -n "${MILOG_ALERT_HOOK_TIMEOUT:-}"  ]] && ALERT_HOOK_TIMEOUT="$MILOG_ALERT_HOOK_TIMEOUT"
 [[ -n "${MILOG_ALERT_ROUTES+x}"         ]] && ALERT_ROUTES="$MILOG_ALERT_ROUTES"
 [[ -n "${MILOG_WEBHOOK_URL:-}"          ]] && WEBHOOK_URL="$MILOG_WEBHOOK_URL"
 [[ -n "${MILOG_WEBHOOK_TEMPLATE+x}"     ]] && WEBHOOK_TEMPLATE="$MILOG_WEBHOOK_TEMPLATE"

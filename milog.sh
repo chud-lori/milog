@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=2ba455a-dirty
-# MILOG_BUILT=2026-04-24T05:45:07Z
+# MILOG_VERSION=1d9b0a3-dirty
+# MILOG_BUILT=2026-04-24T07:28:20Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -59,6 +59,16 @@ ALERT_STATE_DIR="$HOME/.cache/milog"
 # carry the recent-fire state the rest of MiLog cares about). Set to 0 to
 # disable rotation entirely.
 ALERT_LOG_MAX_BYTES=10485760  # 10 MB
+
+# Hook scripts — user escape hatch. Every executable under HOOKS_DIR/on_alert.d/
+# runs once per fire, with MILOG_RULE_KEY / MILOG_TITLE / MILOG_BODY /
+# MILOG_SEV / MILOG_COLOR / MILOG_TS in its env. Runs AFTER the silence
+# gate (so silenced fires skip hooks too) and in parallel with delivery.
+# Errors are logged to $ALERT_STATE_DIR/hooks.log and NEVER propagate —
+# a broken hook can't wedge the daemon. Individual hook run time is
+# capped by ALERT_HOOK_TIMEOUT so a hanging script doesn't leak forever.
+HOOKS_DIR="$HOME/.config/milog/hooks"
+ALERT_HOOK_TIMEOUT=10
 
 # --- Alert routing ------------------------------------------------------------
 # Per-rule destination mapping. Default (empty) = fan out to every configured
@@ -155,6 +165,8 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
+[[ -n "${MILOG_HOOKS_DIR:-}"           ]] && HOOKS_DIR="$MILOG_HOOKS_DIR"
+[[ -n "${MILOG_ALERT_HOOK_TIMEOUT:-}"  ]] && ALERT_HOOK_TIMEOUT="$MILOG_ALERT_HOOK_TIMEOUT"
 [[ -n "${MILOG_ALERT_ROUTES+x}"         ]] && ALERT_ROUTES="$MILOG_ALERT_ROUTES"
 [[ -n "${MILOG_WEBHOOK_URL:-}"          ]] && WEBHOOK_URL="$MILOG_WEBHOOK_URL"
 [[ -n "${MILOG_WEBHOOK_TEMPLATE+x}"     ]] && WEBHOOK_TEMPLATE="$MILOG_WEBHOOK_TEMPLATE"
@@ -671,6 +683,87 @@ _alert_route_for() {
     fi
 }
 
+# --- User hook scripts --------------------------------------------------------
+#
+# Run every executable file under HOOKS_DIR/on_alert.d/ with alert metadata
+# in env. The /etc/cron.hourly/-style "execute-all-files-in-dir" pattern —
+# users add or remove scripts without touching MiLog internals. Useful for
+# custom integrations (SMS, PagerDuty, a local audit log, whatever) that
+# don't fit into the destination-adapter model.
+#
+# Called AFTER the silence gate, so silenced fires skip hooks — same
+# semantics as destinations. Runs backgrounded per-hook so a slow script
+# doesn't delay the others; wrapped in `timeout` (ALERT_HOOK_TIMEOUT) so
+# a hung script doesn't leak forever. All failures are logged to
+# hooks.log, never propagated. The alert path is never blocked by a
+# broken hook.
+#
+# Env passed to each hook:
+#   MILOG_RULE_KEY   the rule that fired (e.g. `5xx:api`, `exploits:sqli`)
+#   MILOG_TITLE      short alert title
+#   MILOG_BODY       longer alert body (may contain newlines stripped to spaces)
+#   MILOG_SEV        "crit" | "warn" | "info"
+#   MILOG_COLOR      the raw Discord-compatible color int
+#   MILOG_TS         fire epoch seconds
+_alert_run_hooks() {
+    local hook_dir="${HOOKS_DIR:-$HOME/.config/milog/hooks}/on_alert.d"
+    [[ -d "$hook_dir" ]] || return 0
+
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local sev
+    case "$color" in
+        15158332|16711680)  sev=crit ;;
+        16753920|15844367)  sev=warn ;;
+        *)                  sev=info ;;
+    esac
+
+    local hook_log="${ALERT_STATE_DIR:-$HOME/.cache/milog}/hooks.log"
+    mkdir -p "$(dirname "$hook_log")" 2>/dev/null || true
+    local ts; ts=$(date +%s)
+    local timeout_s="${ALERT_HOOK_TIMEOUT:-10}"
+    local have_timeout=0
+    command -v timeout >/dev/null 2>&1 && have_timeout=1
+
+    local hook
+    # Iterate in deterministic order — users can prefix numbers for
+    # priority (`10-log`, `20-notify`), classic /etc/cron.d pattern.
+    for hook in "$hook_dir"/*; do
+        [[ -x "$hook" && -f "$hook" ]] || continue
+        # Run each hook in its own subshell so failures don't propagate.
+        # Backgrounded: the four delivery senders already background too,
+        # and alert_fire callers typically background the whole fire.
+        (
+            local rc out
+            if (( have_timeout )); then
+                out=$(MILOG_RULE_KEY="$rule_key" \
+                      MILOG_TITLE="$title"       \
+                      MILOG_BODY="$body"         \
+                      MILOG_SEV="$sev"           \
+                      MILOG_COLOR="$color"       \
+                      MILOG_TS="$ts"             \
+                      timeout "$timeout_s" "$hook" 2>&1)
+                rc=$?
+            else
+                out=$(MILOG_RULE_KEY="$rule_key" \
+                      MILOG_TITLE="$title"       \
+                      MILOG_BODY="$body"         \
+                      MILOG_SEV="$sev"           \
+                      MILOG_COLOR="$color"       \
+                      MILOG_TS="$ts"             \
+                      "$hook" 2>&1)
+                rc=$?
+            fi
+            if (( rc != 0 )); then
+                # TSV row: epoch \t hook-basename \t exit-code \t output-first-line
+                local base; base=$(basename "$hook")
+                local first; first=$(printf '%s' "$out" | head -1 | tr -d '\t\r')
+                printf '%s\t%s\t%d\t%s\n' "$ts" "$base" "$rc" "${first:0:200}" \
+                    >> "$hook_log" 2>/dev/null || true
+            fi
+        ) &
+    done
+}
+
 # --- Fanout dispatcher --------------------------------------------------------
 #
 # Fire one alert to every configured destination — or, if ALERT_ROUTES
@@ -698,6 +791,13 @@ alert_fire() {
     # Record before delivery — the log captures "what fired" even if the
     # webhooks fail (network blip, rate limit, rotated token).
     _alert_record "$rule_key" "$title" "$body" "$color"
+
+    # User hook scripts — run before delivery so custom integrations see the
+    # event regardless of whether any destination is configured. Hooks do
+    # NOT require curl; they're arbitrary executables under
+    # HOOKS_DIR/on_alert.d/. Safe to run even if `curl` is missing.
+    _alert_run_hooks "$title" "$body" "$color" "$rule_key"
+
     command -v curl >/dev/null 2>&1 || return 0
 
     # Resolve routing — empty = today's behavior (fan out to every configured
