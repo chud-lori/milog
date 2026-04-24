@@ -12,6 +12,9 @@ plan.md
 # Test fixtures left behind by ad-hoc runs
 /tmp-milog-*/
 
-# Go build artifacts — compiled per-platform, not committed. Binary is
-# distributed via GitHub Releases once Phase 6 (packaging) lands.
+# Go build artifacts — compiled per-platform, not committed. Binaries
+# are distributed via GitHub Releases.
 /go/bin/
+
+# goreleaser output — only exists during a release run or local snapshot.
+/dist/

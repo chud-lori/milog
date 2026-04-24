@@ -7,18 +7,26 @@ laptop without SSHing in.
 
 ## One-time install
 
-The listener needs `socat` (or `ncat` as a fallback). Either via the
-milog installer or direct apt:
+The curl installer auto-downloads the `milog-web` Go binary from the
+matching GitHub Release for your arch — no Go toolchain needed on
+the server. If no prebuilt asset matches your arch (or no release is
+published yet), the installer falls back to the bash socat handler;
+that needs `socat` (or `ncat`):
 
 ```bash
-# Via the installer (also brings gawk / curl / sqlite3 if you're starting fresh)
+# Installer — pulls prebuilt milog-web when available, socat fallback otherwise
 curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
   | sudo bash -s -- --with-web
 
-# Or direct
+# If you ended up on the socat fallback path, install it directly:
 sudo apt install -y socat        # Debian / Ubuntu
 sudo dnf install -y socat        # Fedora / Rocky / RHEL
 ```
+
+The Go binary gives SSE live push, HDR latency percentiles, and the
+`/metrics` Prometheus endpoint. The socat fallback serves the same
+dashboard via the polling-based bash routes — same data, no live
+stream.
 
 ## Run it
 
