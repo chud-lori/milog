@@ -1,0 +1,59 @@
+# Release workflow — runs goreleaser on tag push.
+#
+# Trigger:  git tag v1.2.3 && git push --tags
+# Produces: attached binaries (milog-web, milog-tui per arch) + tarballs
+#           + checksums.txt on a draft GitHub Release. A human flips the
+#           draft to published after reviewing the auto-generated notes.
+#
+# install.sh's curl-pipe path then fetches the matching tarball / raw
+# binaries at install time — no toolchain needed on the user's host.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual trigger for dry-runs from the Actions tab (uses --snapshot).
+  workflow_dispatch: {}
+
+permissions:
+  # `contents: write` is needed so goreleaser can attach artifacts to
+  # the GitHub Release it creates.
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so goreleaser's auto-changelog can diff against
+          # the previous tag.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache: true
+          cache-dependency-path: go/go.sum
+
+      - name: Run goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          # Real release on tag push; snapshot on manual dispatch.
+          args: >-
+            ${{ startsWith(github.ref, 'refs/tags/') && 'release --clean' || 'release --snapshot --clean --skip=publish' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload snapshot artifacts (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: milog-snapshot
+          path: dist/*
+          retention-days: 7

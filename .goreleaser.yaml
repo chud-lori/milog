@@ -1,0 +1,100 @@
+# goreleaser config — cross-compile milog-web + milog-tui + ship tarball
+# with the bash bundle.
+#
+# Trigger: push a tag matching `v*` → .github/workflows/release.yml runs
+# goreleaser, uploads artifacts to the matching GitHub Release.
+#
+# Test locally without tagging:
+#   goreleaser release --snapshot --clean
+#
+# Docs: https://goreleaser.com/customization/
+version: 2
+
+project_name: milog
+
+before:
+  hooks:
+    # Regenerate the bash bundle so the tarball carries a milog.sh
+    # whose MILOG_VERSION line matches the Go binaries' stamp.
+    - bash build.sh
+
+builds:
+  # --- milog-web: HTTP + SSE dashboard daemon ---
+  - id: milog-web
+    main: ./cmd/milog-web
+    dir: go
+    binary: milog-web
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # Only build arm64 for linux (most VPS) and darwin (Apple Silicon);
+    # skip the rarer combos to keep the artifact list tight.
+    ignore:
+      - goos: darwin
+        goarch: 386
+    ldflags:
+      - -s -w -X main.buildVersion={{.Version}}
+  # --- milog-tui: bubbletea terminal UI ---
+  - id: milog-tui
+    main: ./cmd/milog-tui
+    dir: go
+    binary: milog-tui
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.buildVersion={{.Version}}
+
+archives:
+  # One tarball per (os, arch) carrying the Go binaries + bash bundle +
+  # install.sh + LICENSE + README. install.sh's curl-pipe path can
+  # fetch just the raw binaries, but distros + manual users who prefer
+  # a single download get everything.
+  - id: default
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - milog.sh
+      - install.sh
+      - README.md
+      - SERVER_HARDENING.md
+      - docs/*.md
+      # LICENSE is omitted while the project doesn't ship one; re-add
+      # `LICENSE*` here once a LICENSE file exists in the repo root.
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+# Release notes are auto-generated from commits between the previous
+# tag and this one. Filters cut the noise from merge commits + chores.
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge pull request"
+      - "^Merge branch"
+      - "^chore:"
+      - "^docs: typo"
+
+# Don't auto-publish — the workflow creates the Release and goreleaser
+# attaches to it, so a human still flips it from draft → published.
+release:
+  draft: true
+  prerelease: auto

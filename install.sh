@@ -38,6 +38,15 @@ SCRIPT_URL="${MILOG_SCRIPT_URL:-https://raw.githubusercontent.com/chud-lori/milo
 SCRIPT_SRC=""           # populated by resolve_script_src
 _CLEANUP_TMP=""         # set if we downloaded — trap removes on exit
 
+# GitHub repo that hosts prebuilt Go binaries (milog-web, milog-tui)
+# under its Releases. Overridable for forks. The "latest" tag follows
+# the most recent non-draft release automatically.
+MILOG_RELEASE_REPO="${MILOG_RELEASE_REPO:-chud-lori/milog}"
+# Default to the tracking `latest` endpoint — GitHub resolves it to
+# whichever release is currently marked Latest. Pin to an exact tag
+# (e.g. MILOG_RELEASE_TAG=v0.1.0) for reproducible installs in CI.
+MILOG_RELEASE_TAG="${MILOG_RELEASE_TAG:-latest}"
+
 # Cache-bust GitHub's raw-content CDN by default. Appends `?t=<epoch>` to
 # the fetch URL (respecting any existing query string). Disable by setting
 # MILOG_NO_CACHE_BUST=1 — primarily for reproducibility in CI, where an
@@ -129,6 +138,109 @@ _md5() {
         md5sum "$f" 2>/dev/null | awk '{print $1}'
     elif command -v md5 >/dev/null 2>&1; then
         md5 -q "$f" 2>/dev/null
+    fi
+}
+
+# ---- prebuilt-binary download (Go companion path) --------------------------
+# Fetches milog-web / milog-tui from a GitHub Release asset that matches
+# the host OS + architecture. Used in the curl-pipe install flow so end
+# users don't need Go on their server — the toolchain work happens in CI.
+#
+# Silent no-op when the release doesn't publish a matching asset (e.g.
+# the project hasn't cut its first binary release yet, or the arch isn't
+# covered). Bash milog.sh still installs normally either way.
+
+# Map `uname -m` to the arch slug goreleaser emits in artifact names.
+# Covers the pairs .goreleaser.yaml ships: amd64 + arm64 on linux + darwin.
+_release_arch_slug() {
+    case "$(uname -m)" in
+        x86_64|amd64)   echo amd64 ;;
+        aarch64|arm64)  echo arm64 ;;
+        *)              echo "unsupported" ;;
+    esac
+}
+
+_release_os_slug() {
+    case "$(uname -s)" in
+        Linux)   echo linux ;;
+        Darwin)  echo darwin ;;
+        *)       echo unsupported ;;
+    esac
+}
+
+# Resolve the "latest" tag to a concrete `vX.Y.Z` so we can build a stable
+# archive URL. When MILOG_RELEASE_TAG is already a concrete tag, no-op.
+# Prints empty + returns 0 when no release exists yet (fresh repo before
+# the first tag); caller treats that as "skip prebuilt download".
+_release_resolve_tag() {
+    local tag="$MILOG_RELEASE_TAG"
+    if [[ "$tag" != "latest" ]]; then
+        printf '%s' "$tag"; return 0
+    fi
+    # GitHub's /releases/latest endpoint redirects to the concrete tag.
+    # Parse the Location header without needing jq — single curl + awk.
+    local loc
+    loc=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+        "https://github.com/${MILOG_RELEASE_REPO}/releases/latest" 2>/dev/null) || return 0
+    # loc looks like: https://github.com/<owner>/<repo>/releases/tag/vX.Y.Z
+    [[ "$loc" =~ /tag/([^/?#]+) ]] || { printf ''; return 0; }
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# Download one companion binary from the Release matching the resolved
+# OS + arch. Writes to <dir>/<name> atomically. Silent return on any
+# failure — prebuilt install is best-effort, bash milog.sh is the
+# primary install path.
+_release_download_binary() {
+    local name="$1" dst_dir="$2" tag="$3" os="$4" arch="$5"
+    local archive="milog_${tag#v}_${os}_${arch}.tar.gz"
+    local url="https://github.com/${MILOG_RELEASE_REPO}/releases/download/${tag}/${archive}"
+    local tmp
+    tmp=$(mktemp -d) || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" RETURN
+
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/a.tar.gz" "$url" 2>/dev/null; then
+        return 1
+    fi
+    tar -xzf "$tmp/a.tar.gz" -C "$tmp" "$name" 2>/dev/null || return 1
+    [[ -f "$tmp/$name" ]] || return 1
+
+    local dst_tmp
+    dst_tmp=$(mktemp "${dst_dir}/.${name}.install.XXXXXX") || return 1
+    cp "$tmp/$name" "$dst_tmp"
+    chmod 0755 "$dst_tmp"
+    mv "$dst_tmp" "${dst_dir}/${name}"
+    info "Installed ${name} → ${dst_dir}/${name} (from ${tag})"
+}
+
+# Top-level entry: try to fetch milog-web + milog-tui from the latest
+# release. Prints one line per binary; silent when a binary isn't
+# published for this arch. Never fails hard — bash milog.sh already
+# installed, and a missing Go binary just means `milog tui` will print
+# its install hint.
+_release_install_companions() {
+    local dst_dir="$1"
+    local os arch tag
+    os=$(_release_os_slug)
+    arch=$(_release_arch_slug)
+    if [[ "$os" == "unsupported" || "$arch" == "unsupported" ]]; then
+        info "prebuilt binaries: skipped ($(uname -s)/$(uname -m) not in the release matrix)"
+        return 0
+    fi
+    tag=$(_release_resolve_tag)
+    if [[ -z "$tag" ]]; then
+        info "prebuilt binaries: no release tagged yet — skipping (milog monitor / bash-only install still works)"
+        return 0
+    fi
+    local downloaded=0 name
+    for name in milog-web milog-tui; do
+        if _release_download_binary "$name" "$dst_dir" "$tag" "$os" "$arch"; then
+            downloaded=$((downloaded + 1))
+        fi
+    done
+    if (( downloaded == 0 )); then
+        info "prebuilt binaries: no matching assets on ${tag} for ${os}/${arch} — skipping"
     fi
 }
 
@@ -401,6 +513,13 @@ main() {
     }
     install_go_companion milog-web
     install_go_companion milog-tui
+
+    # Prebuilt binaries from GitHub Releases — only runs if the clone
+    # path didn't already place them (the companion check above is
+    # silent when go/bin/* doesn't exist, matching the curl-pipe flow).
+    if [[ ! -x "${dst_dir}/milog-web" || ! -x "${dst_dir}/milog-tui" ]]; then
+        _release_install_companions "$dst_dir"
+    fi
 
     info "MiLog installed. Try:"
     cat <<'NEXT'

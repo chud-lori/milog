@@ -17,54 +17,31 @@ Both pull the same numbers — if they disagree, that's a bug.
 
 ## Install
 
-**Today, `milog tui` is contributor-only.** There's no prebuilt-binary
-distribution yet (that's the packaging / release-engineering chunk
-still on the roadmap). The standard user path — the `curl install.sh
-| sudo bash` one-liner — installs bash `milog monitor` only; `milog
-tui` will print an install hint.
-
-Three ways to get the binary today, ordered by who they're for:
-
-### 1. Copy a pre-built binary to your server
-
-Build on any machine that has Go (your laptop, a CI runner):
+`milog tui` ships as a Go binary (`milog-tui`). The standard
+curl-pipe installer downloads it automatically from the matching
+GitHub Release — no Go toolchain on your server.
 
 ```bash
-git clone https://github.com/chud-lori/milog.git
-cd milog
-bash build.sh                          # produces go/bin/milog-tui
+curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
+  | sudo bash
 ```
 
-Then ship it to the server:
+On a host with a published release for your arch, the installer prints
+`Installed milog-tui → /usr/local/bin/milog-tui (from vX.Y.Z)` and
+you're done.
 
-```bash
-scp go/bin/milog-tui tencent:/tmp/
-ssh tencent 'sudo install -m 0755 /tmp/milog-tui /usr/local/bin/milog-tui'
-```
+If no release is published yet for your arch (or at all), the
+installer prints `prebuilt binaries: no matching asset … — skipping`
+and only the bash `milog.sh` lands. `milog monitor` still works;
+`milog tui` prints an install hint.
 
-No Go toolchain on the server. Next `milog tui` picks the binary up
-automatically via the lookup below.
+**Pinning to a specific release** (useful for CI / reproducible
+deploys): `MILOG_RELEASE_TAG=v0.3.2 curl … install.sh | sudo bash`.
 
-### 2. Clone + build on the server itself (contributor layout)
-
-Install Go and build on the box:
-
-```bash
-sudo apt install -y golang-go
-git clone https://github.com/chud-lori/milog.git /opt/milog
-cd /opt/milog && bash build.sh
-sudo ./install.sh                      # copies milog + milog-tui to /usr/local/bin
-```
-
-`install.sh` auto-copies the binaries when they're sitting in
-`go/bin/` next to the script. No separate step.
-
-### 3. Wait for packaged releases
-
-Once the roadmap's release-engineering work lands (goreleaser + `.deb`
-/ `.rpm` / `.apk` / Homebrew), `curl install.sh | sudo bash` will
-download prebuilt binaries alongside `milog.sh` by arch. For now, 1
-or 2 are the paths.
+**Contributor path** (cloning + building locally): `bash build.sh`
+produces `go/bin/milog-tui`. Re-running `sudo ./install.sh` from the
+clone picks those up instead of downloading — clone wins over Release
+so contributor builds stay authoritative.
 
 ## Binary lookup order
 
