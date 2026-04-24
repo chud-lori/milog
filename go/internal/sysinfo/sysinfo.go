@@ -1,8 +1,8 @@
 // Package sysinfo exposes tiny OS primitives that don't warrant a dep.
 //
 // The broader /proc readers (CPU %, mem, disk) live separately in
-// internal/sysstat when the Phase 5 summary.json port lands. This file
-// only covers what /api/meta.json needs right now: uptime + hostname.
+// internal/sysstat. This file only covers uptime + hostname — the bits
+// /api/meta.json needs.
 package sysinfo
 
 import (

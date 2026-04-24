@@ -166,6 +166,7 @@ Metric surface:
 | `milog_mem_percent` / `_used_bytes` / `_total_bytes` | gauge | —                 |
 | `milog_disk_percent` / `_used_bytes` / `_total_bytes` | gauge | `path`            |
 | `milog_requests_last_minute`                  | gauge | `app`, `class` (`2xx`…`5xx`) |
+| `milog_request_latency_ms`                    | gauge | `app`, `quantile` (`p50`/`p75`/`p90`/`p95`/`p99`/`p99.9`) |
 | `milog_alerts_fired_total`                    | gauge | `rule`, `sev` (`crit`/`warn`/`info`) |
 
 **Scrape config** (read the web token once and keep it in your
@@ -192,6 +193,38 @@ because MiLog re-reads the log for each scrape — use PromQL's
 `alerts.log`; it resets if the log is truncated but otherwise
 grows monotonically within a retention window — safe to treat as
 a counter for `increase()`.
+
+`milog_request_latency_ms` only emits for apps using the nginx
+`combined_timed` log format (with `$request_time` as the final
+field). Apps still on plain `combined` produce no latency series.
+Percentiles are computed over the tail of the access log on each
+scrape, so the `lines=` scan window applies — default 2000 lines
+per app per scrape. For apps with heavy traffic, increase
+`/api/latency.json?lines=` up to the 10k cap, or decrease scrape
+interval to 15s and accept more CPU per scrape.
+
+### Per-app latency endpoint
+
+Alongside the Prom surface, the raw JSON is available at
+`/api/latency.json?app=<name>`:
+
+```json
+{
+  "app": "api",
+  "window_lines": 2000,
+  "count": 1834,
+  "min_ms": 3,
+  "max_ms": 4271,
+  "pct": {
+    "p50": 42, "p75": 58, "p90": 120,
+    "p95": 240, "p99": 1200, "p99.9": 3800
+  }
+}
+```
+
+Useful for ad-hoc investigation (`curl … | jq`) without waiting
+for a Prom scrape. `count: 0` with empty `pct` = no timed samples
+in the tail window (either no traffic or missing `$request_time`).
 
 ## Custom port
 

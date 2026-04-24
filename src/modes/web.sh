@@ -187,8 +187,8 @@ mode_web() {
     esac
 
     # Parse flags. `--socat` forces the legacy bash handler even when the
-    # Go binary is present — useful for A/B debugging during the Phase 5
-    # rollout and for distros that intentionally don't want the Go binary.
+    # Go binary is present — useful for A/B debugging and for distros that
+    # intentionally don't want the Go binary.
     local trust=0 force_socat=0
     while [[ $# -gt 0 ]]; do
         case "$1" in

@@ -6,16 +6,16 @@
 # a different flag set. Idempotent: `install <feature>` is safe to re-run.
 #
 # Each feature is a declarative spec — package-manager deps + optional
-# post-install hint. Actual binary downloads (for the Go-binary features
-# from Phase 5+) will plug into the same shape.
+# post-install hint. Binary downloads (for Go-binary features) will plug
+# into the same shape once those land.
 #
 # Usage:
 #   milog install list                   # matrix of features + installed status
 #   milog install <feature>              # install feature + its system deps
 #   milog install remove <feature>       # uninstall (keeps config/data)
 #
-# Scope today: geoip, web, history. Future: ebpf, audit, sse (need the Go
-# binaries from Phase 5+ to land first).
+# Scope today: geoip, web, history. Future: ebpf, audit, sse — they need
+# the corresponding Go binaries to land first.
 # ==============================================================================
 
 # Feature catalog. Each feature is a colon-separated record:

@@ -1,9 +1,7 @@
 // milog-web — optional Go implementation of `milog web`.
 //
-// Phase 5 foundation + the first actually-functional route. `/healthz`
-// is public; everything under `/api/*` and `/` is token-gated by the same
-// web.token file the bash handler uses. More routes (summary, alerts,
-// logs, SSE stream) land in subsequent commits.
+// `/healthz` is public; everything under `/api/*` and `/` is token-gated
+// by the same web.token file the bash handler uses.
 //
 // Intentionally scoped to the Go standard library — no third-party deps —
 // to keep the binary buildable from any Go 1.22+ toolchain with no module
@@ -28,6 +26,7 @@ import (
 
 	"github.com/chud-lori/milog/internal/alertlog"
 	"github.com/chud-lori/milog/internal/config"
+	"github.com/chud-lori/milog/internal/latency"
 	"github.com/chud-lori/milog/internal/nginxlog"
 	"github.com/chud-lori/milog/internal/promtext"
 	"github.com/chud-lori/milog/internal/sysinfo"
@@ -65,6 +64,7 @@ func main() {
 	mux.Handle("/api/logs/histogram.json", auth(logsHistogramHandler(cfg)))
 	mux.Handle("/api/stream", auth(streamHandler(cfg)))
 	mux.Handle("/metrics", auth(metricsHandler(cfg)))
+	mux.Handle("/api/latency.json", auth(latencyHandler(cfg)))
 	mux.Handle("/debug", auth(debugHandler(cfg)))
 	mux.Handle("/", auth(rootHandler(cfg)))
 
@@ -172,6 +172,63 @@ func alertsHandler(cfg *config.Config) http.HandlerFunc {
 	}
 }
 
+// latencyHandler returns p50/p75/p90/p95/p99/p99.9 for one app, computed
+// over the tail of its access log. Requires the combined_timed nginx
+// format (with $request_time as the last field); without it, returns
+// {"app":…,"count":0,…} so clients render "no samples" cleanly rather
+// than a misleading zero-latency row.
+//
+// Query params:
+//
+//	app=<name>    required — must be an nginx source in LOGS
+//	lines=<N>     default 2000, max 10000 — how much tail to scan
+//
+// The Go binary tails once per call — no live streaming yet. At MiLog's
+// single-host scale (tens of thousands of requests per day, not millions)
+// this is cheap enough for a 30-second scrape interval.
+func latencyHandler(cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		app := q.Get("app")
+		lineN, _ := strconv.Atoi(q.Get("lines"))
+		if lineN <= 0 {
+			lineN = 2000
+		}
+		if lineN > 10000 {
+			lineN = 10000
+		}
+
+		file := filepath.Join(cfg.LogDir, app+".access.log")
+		if app == "" || !fileExists(file) {
+			http.Error(w, `{"app":"","count":0,"error":"no such app"}`, http.StatusNotFound)
+			return
+		}
+
+		raw, err := nginxlog.TailLines(file, lineN)
+		if err != nil {
+			log.Printf("milog-web: latency tail %s: %v", file, err)
+		}
+		samples := make([]int64, 0, len(raw))
+		for _, line := range raw {
+			if ms := latency.ExtractRequestTimeMs(line); ms >= 0 {
+				samples = append(samples, ms)
+			}
+		}
+		stats := latency.Percentiles(samples, latency.DefaultQuantiles)
+		writeJSON(w, struct {
+			App    string              `json:"app"`
+			Window int                 `json:"window_lines"`
+			Count  int                 `json:"count"`
+			MinMs  int64               `json:"min_ms"`
+			MaxMs  int64               `json:"max_ms"`
+			Pct    map[string]int64    `json:"pct"`
+		}{
+			App: app, Window: lineN, Count: stats.Count,
+			MinMs: stats.MinMs, MaxMs: stats.MaxMs, Pct: stats.Pct,
+		})
+	}
+}
+
 // metricsHandler emits a Prometheus plaintext 0.0.4 /metrics payload.
 // Metric surface:
 //
@@ -213,6 +270,32 @@ func metricsHandler(cfg *config.Config) http.HandlerFunc {
 			)
 		}
 
+		// Latency percentiles per app (if $request_time present). Tails
+		// 2000 lines per app — same default as /api/latency.json. On
+		// servers with combined (no $request_time), samples=0 and no
+		// sample rows emit at all, which is correct for Prom.
+		var latencySamples []promtext.Sample
+		for _, a := range cfg.Apps {
+			file := filepath.Join(cfg.LogDir, a+".access.log")
+			raw, _ := nginxlog.TailLines(file, 2000)
+			var ms []int64
+			for _, line := range raw {
+				if v := latency.ExtractRequestTimeMs(line); v >= 0 {
+					ms = append(ms, v)
+				}
+			}
+			if len(ms) == 0 {
+				continue
+			}
+			stats := latency.Percentiles(ms, latency.DefaultQuantiles)
+			for _, qLabel := range latency.DefaultQuantiles {
+				latencySamples = append(latencySamples, promtext.Sample{
+					Labels: map[string]string{"app": a, "quantile": qLabel},
+					Value:  float64(stats.Pct[qLabel]),
+				})
+			}
+		}
+
 		// Alert fires — total count per rule across the whole alerts.log.
 		// Read cheaply; bucket in memory.
 		alertRows, _ := alertlog.Load(filepath.Join(cfg.AlertStateDir, "alerts.log"), 0, 0)
@@ -250,6 +333,8 @@ func metricsHandler(cfg *config.Config) http.HandlerFunc {
 				Samples: []promtext.Sample{{Labels: diskLabel, Value: float64(disk.TotalGB) * 1024 * 1024 * 1024}}},
 			{Name: "milog_requests_last_minute", Help: "Nginx request count in the current minute, per app + status class.",
 				Type: "gauge", Samples: reqSamples},
+			{Name: "milog_request_latency_ms", Help: "Request-time percentile in milliseconds, per app + quantile.",
+				Type: "gauge", Samples: latencySamples},
 			{Name: "milog_alerts_fired_total", Help: "Total alerts in alerts.log, per rule + severity.",
 				Type: "gauge", Samples: alertSamples},
 		}
@@ -257,11 +342,10 @@ func metricsHandler(cfg *config.Config) http.HandlerFunc {
 	}
 }
 
-// streamHandler is the Phase 5 marquee — Server-Sent Events push of the
-// same snapshot `/api/summary.json` returns, every REFRESH seconds. No
-// polling; the browser holds a single connection open and renders on
-// each `summary` event. Request volume drops by ~10× versus the
-// previous 3-second poll loop.
+// streamHandler pushes the same snapshot `/api/summary.json` returns via
+// Server-Sent Events, every REFRESH seconds. No polling; the browser
+// holds a single connection open and renders on each `summary` event.
+// Request volume drops by ~10× versus a 3-second poll loop.
 //
 // Protocol: text/event-stream with named events. A `ping` event every
 // 15s keeps proxies / CF Tunnel from closing the connection on idle.
@@ -519,6 +603,7 @@ func debugHandler(cfg *config.Config) http.HandlerFunc {
 		sb.WriteString("  /api/alerts.json         fire history\n")
 		sb.WriteString("  /api/logs.json           log viewer tier 1\n")
 		sb.WriteString("  /api/logs/histogram.json timeline strip\n")
+		sb.WriteString("  /api/latency.json        request-time percentiles (requires combined_timed)\n")
 		sb.WriteString("  /api/stream              SSE live push\n")
 		sb.WriteString("  /metrics                 Prometheus plaintext 0.0.4\n")
 		_, _ = w.Write([]byte(sb.String()))

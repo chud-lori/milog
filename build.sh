@@ -82,10 +82,11 @@ lines=$(wc -l < "$OUT" | tr -d ' ')
 echo "built $OUT  (${lines} lines, bash -n clean)"
 
 # ---- Optional Go companion build ---------------------------------------------
-# Phase 5 introduces go/cmd/milog-web (currently scaffolding only). If a Go
-# toolchain is available we compile it alongside the bash bundle; if not we
-# skip silently — users without Go still get a working milog.sh. Version is
-# stamped via -ldflags to match the bash MILOG_VERSION embedding.
+# go/cmd/milog-web is the Go implementation of `milog web`. When a Go
+# toolchain is available we compile it alongside the bash bundle; if not
+# we skip silently — users without Go still get a working milog.sh.
+# Version is stamped via -ldflags to match the bash MILOG_VERSION
+# embedding so the Go binary and the bash script report the same SHA.
 if [[ -d go && -f go/go.mod ]]; then
     if command -v go >/dev/null 2>&1; then
         mkdir -p go/bin

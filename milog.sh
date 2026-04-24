@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=82af6c2-dirty
-# MILOG_BUILT=2026-04-24T08:48:42Z
+# MILOG_VERSION=ba7444c-dirty
+# MILOG_BUILT=2026-04-24T08:58:45Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -5096,16 +5096,16 @@ mode_health() {
 # a different flag set. Idempotent: `install <feature>` is safe to re-run.
 #
 # Each feature is a declarative spec — package-manager deps + optional
-# post-install hint. Actual binary downloads (for the Go-binary features
-# from Phase 5+) will plug into the same shape.
+# post-install hint. Binary downloads (for Go-binary features) will plug
+# into the same shape once those land.
 #
 # Usage:
 #   milog install list                   # matrix of features + installed status
 #   milog install <feature>              # install feature + its system deps
 #   milog install remove <feature>       # uninstall (keeps config/data)
 #
-# Scope today: geoip, web, history. Future: ebpf, audit, sse (need the Go
-# binaries from Phase 5+ to land first).
+# Scope today: geoip, web, history. Future: ebpf, audit, sse — they need
+# the corresponding Go binaries to land first.
 # ==============================================================================
 
 # Feature catalog. Each feature is a colon-separated record:
@@ -6775,8 +6775,8 @@ mode_web() {
     esac
 
     # Parse flags. `--socat` forces the legacy bash handler even when the
-    # Go binary is present — useful for A/B debugging during the Phase 5
-    # rollout and for distros that intentionally don't want the Go binary.
+    # Go binary is present — useful for A/B debugging and for distros that
+    # intentionally don't want the Go binary.
     local trust=0 force_socat=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
