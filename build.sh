@@ -6,7 +6,9 @@
 #   - `src/core.sh` must come first. It owns the shebang, `set -euo pipefail`,
 #     the default config vars, the MILOG_CONFIG file sourcing, env overrides,
 #     and auto-discovery — all of which execute at source time, not inside
-#     functions.
+#     functions. We emit its shebang first, inject two `# MILOG_VERSION=…`
+#     and `# MILOG_BUILT=…` header lines so tooling can see what's running,
+#     then append the rest of core.sh.
 #   - Helper libraries (alerts, ui, system, history, nginx, web) come next.
 #     These are function-only; order doesn't matter for correctness.
 #   - `src/modes/*.sh` follow, glob order (alphabetic). Again, functions only.
@@ -32,10 +34,29 @@ for required in src/core.sh src/dispatch.sh src/modes; do
     [[ -e "$required" ]] || { echo "build.sh: missing $required — is the repo split into src/ yet?" >&2; exit 1; }
 done
 
+# Version fingerprint embedded into milog.sh. install.sh + `milog doctor`
+# read these lines to tell the user exactly what code is running. Format
+# is stable — two lines, each `# <KEY>=<value>`, immediately after the
+# shebang. Grep-friendly, no parsing heroics.
+#
+# MILOG_VERSION resolves via `git describe --always --dirty`:
+#   abc1234             — clean checkout at commit abc1234
+#   abc1234-dirty       — uncommitted changes in the working tree
+#   unknown             — not in a git repo (e.g. release tarball)
+# Uncommitted work gets the `-dirty` suffix so users know they're running
+# an in-progress build, not the published code. Honesty over neatness.
+MILOG_VERSION=$(git describe --always --dirty 2>/dev/null || echo unknown)
+MILOG_BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u 2>/dev/null || echo unknown)
+
 {
     # core.sh already starts with #!/usr/bin/env bash + set -euo pipefail.
-    # Do NOT re-add them here.
-    cat src/core.sh
+    # Emit the shebang line first, then our version header, THEN the rest
+    # of core.sh. Preserves the shebang's position 1 so `bash` / kernel
+    # exec still work, while letting install.sh `grep ^# MILOG_` early.
+    head -1 src/core.sh
+    printf '# MILOG_VERSION=%s\n' "$MILOG_VERSION"
+    printf '# MILOG_BUILT=%s\n'   "$MILOG_BUILT"
+    tail -n +2 src/core.sh
     cat src/alerts.sh
     cat src/ui.sh
     cat src/system.sh

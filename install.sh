@@ -38,6 +38,12 @@ SCRIPT_URL="${MILOG_SCRIPT_URL:-https://raw.githubusercontent.com/chud-lori/milo
 SCRIPT_SRC=""           # populated by resolve_script_src
 _CLEANUP_TMP=""         # set if we downloaded — trap removes on exit
 
+# Cache-bust GitHub's raw-content CDN by default. Appends `?t=<epoch>` to
+# the fetch URL (respecting any existing query string). Disable by setting
+# MILOG_NO_CACHE_BUST=1 — primarily for reproducibility in CI, where an
+# undetermined URL defeats artifact signing.
+MILOG_NO_CACHE_BUST="${MILOG_NO_CACHE_BUST:-0}"
+
 # ---- tiny logging -----------------------------------------------------------
 _green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
 _yellow() { printf '\033[0;33m%s\033[0m\n' "$*" >&2; }
@@ -86,6 +92,44 @@ pkg_install() {
         pacman) pacman -S --noconfirm "$@" ;;
         none)   die "no supported package manager found — install manually: $*" ;;
     esac
+}
+
+# ---- version + fingerprint helpers ------------------------------------------
+# build.sh embeds `# MILOG_VERSION=…` and `# MILOG_BUILT=…` right after the
+# shebang. These helpers extract them so the installer can report exactly
+# what code it placed (or: whether it placed anything new at all).
+
+# Print the embedded version line from a milog.sh file. Silent + empty on
+# any error — callers treat missing fingerprint as "unknown" rather than
+# failing. Only reads the first 10 lines so we don't grep 5000+ LOC just
+# for a header that's always line 2.
+_read_milog_version() {
+    local f="$1"
+    [[ -r "$f" ]] || { printf 'unknown'; return; }
+    local v
+    v=$(head -10 "$f" | awk -F= '/^# MILOG_VERSION=/ {print $2; exit}')
+    printf '%s' "${v:-unknown}"
+}
+
+_read_milog_built() {
+    local f="$1"
+    [[ -r "$f" ]] || return 0
+    local b
+    b=$(head -10 "$f" | awk -F= '/^# MILOG_BUILT=/ {print $2; exit}')
+    printf '%s' "$b"
+}
+
+# Portable md5 — GNU coreutils has md5sum, macOS has md5. Used for the
+# "same bytes" check: if the already-installed milog and the fetched one
+# hash identically, report "no change" instead of lying about an upgrade.
+_md5() {
+    local f="$1"
+    [[ -r "$f" ]] || { printf ''; return; }
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum "$f" 2>/dev/null | awk '{print $1}'
+    elif command -v md5 >/dev/null 2>&1; then
+        md5 -q "$f" 2>/dev/null
+    fi
 }
 
 # ---- guards -----------------------------------------------------------------
@@ -176,14 +220,27 @@ resolve_script_src() {
     # Pipe-install path: we need curl (which got us here) to fetch milog.sh.
     command -v curl >/dev/null 2>&1 \
         || die "curl not available and no local milog.sh found — install curl first"
-    info "Downloading milog.sh from $SCRIPT_URL"
+
+    # Cache-bust by default — GitHub's raw CDN caches for a few minutes, which
+    # made "I just pushed but install didn't pull the new code" a recurring
+    # support question. Appending `?t=<epoch>` forces a fresh fetch.
+    local fetch_url="$SCRIPT_URL"
+    if [[ "$MILOG_NO_CACHE_BUST" != "1" ]]; then
+        if [[ "$fetch_url" == *"?"* ]]; then
+            fetch_url="${fetch_url}&t=$(date +%s)"
+        else
+            fetch_url="${fetch_url}?t=$(date +%s)"
+        fi
+    fi
+
+    info "Downloading milog.sh from $fetch_url"
     local tmp
     tmp=$(mktemp) || die "mktemp failed"
     _CLEANUP_TMP="$tmp"
     trap 'rm -f "${_CLEANUP_TMP:-}"' EXIT
     if ! curl -fsSL --retry 3 --retry-delay 1 --max-time 30 \
-            -o "$tmp" "$SCRIPT_URL"; then
-        die "download failed from $SCRIPT_URL"
+            -o "$tmp" "$fetch_url"; then
+        die "download failed from $fetch_url"
     fi
 
     # Sanity: the downloaded file must look like our script. Size guard
@@ -264,6 +321,15 @@ main() {
     # until now so a pipe-install has curl installed before we try to use it.
     resolve_script_src
 
+    # Read the fingerprint of the existing install (if any) and the fetched
+    # source, so we can tell the user exactly what's happening.
+    local old_version old_md5 new_version new_built new_md5
+    old_version=$(_read_milog_version "$BIN_DST")
+    old_md5=$(_md5 "$BIN_DST")
+    new_version=$(_read_milog_version "$SCRIPT_SRC")
+    new_built=$(_read_milog_built  "$SCRIPT_SRC")
+    new_md5=$(_md5 "$SCRIPT_SRC")
+
     # Atomic-ish copy: write to a sibling temp then mv to avoid a partial
     # binary if the user ctrl-Cs mid-install.
     info "Installing milog → $BIN_DST"
@@ -274,6 +340,20 @@ main() {
     cp "$SCRIPT_SRC" "$tmp"
     chmod 0755 "$tmp"
     mv "$tmp" "$BIN_DST"
+
+    # Loud version signal — answers "did it actually update?" without
+    # forcing the user to grep the binary afterwards.
+    if [[ ! -e "$BIN_DST" ]] || [[ -z "$old_md5" ]]; then
+        # (Shouldn't happen — we just mv'd — but don't lie if for some
+        # reason the binary vanished.)
+        info "Installed milog v=${new_version} (built ${new_built:-unknown})"
+    elif [[ "$new_md5" == "$old_md5" ]]; then
+        info "Already at milog v=${new_version} — no change"
+    elif [[ "$old_version" == "unknown" ]]; then
+        info "Installed milog v=${new_version} (built ${new_built:-unknown})  ${old_md5:0:7} → ${new_md5:0:7}"
+    else
+        info "Upgraded milog v=${old_version} → v=${new_version} (built ${new_built:-unknown})  ${old_md5:0:7} → ${new_md5:0:7}"
+    fi
 
     info "MiLog installed. Try:"
     cat <<'NEXT'
