@@ -152,10 +152,18 @@ hand to a non-technical user.
   — alerts don't move at the 3-second summary cadence and the log
   file scan is negligible but pointless at that rate. Source is the
   same `$ALERT_STATE_DIR/alerts.log` that `milog alerts` reads.
+- **Logs (live tail)** — streams new nginx access-log lines via SSE
+  (`/api/logs/stream`) with a ~200 ms tail delay. Filter by app,
+  status class, and grep substring server-side. Shows a rolling
+  `req/s` rate meter and a `live` / `poll` mode badge (it falls
+  back to a 5 s poll loop if the browser or server can't do SSE).
+  Pause/resume button freezes rendering without dropping the
+  connection — useful for reading a page that's scrolling too fast
+  to parse. Initial render replays the last 200 matching lines from
+  the log before switching to the live stream.
 
 Deeper investigation (top paths, p95 per app, per-IP drilldown)
-still lives in the CLI. Historical charts are planned — see the
-plan doc if you're on the contributor path.
+still lives in the CLI.
 
 ## Prometheus `/metrics` (Go binary only)
 
