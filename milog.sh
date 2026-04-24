@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=71aa2c4-dirty
-# MILOG_BUILT=2026-04-24T10:17:02Z
+# MILOG_VERSION=88abce8-dirty
+# MILOG_BUILT=2026-04-24T11:04:28Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -207,33 +207,44 @@ fi
 # MiLog usable on non-nginx logs too:
 #
 #   LOGS=(api web text:myapp:/var/log/myapp/error.log)
+#   LOGS=(api journal:mybot.service docker:postgres-prod)
 #   LOGS=(api text:rails:/var/log/rails/production.log nginx:gateway)
 #
 # Resolution:
-#   bare `api`                    → nginx type, path = $LOG_DIR/api.access.log
-#   `nginx:api`                   → same (explicit)
-#   `text:<name>:<absolute path>` → any text file, path = <absolute path>
+#   bare `api`                          → nginx type, $LOG_DIR/api.access.log
+#   `nginx:api`                         → same (explicit)
+#   `text:<name>:<absolute path>`       → any text file
+#   `journal:<unit>`                    → systemd journal for <unit>
+#   `docker:<container>`                → docker JSON-log for <container>
 #
 # Parser-free modes (logs, grep, search, <name> tail) work for every source
-# type. Parsing modes (monitor, top, slow, top-paths, etc.) skip non-nginx
-# sources gracefully — they need combined log format to work.
+# type via `_log_reader_cmd` below. Parsing modes (monitor, top, slow,
+# top-paths, etc.) skip non-nginx sources gracefully — they need the
+# combined log format to work.
 
 # Return the file path for a LOGS entry — bare name or typed prefix.
+# `journal:` and `docker:` entries have no stable path (journal is a
+# streaming command, docker's path is looked up dynamically); prefer
+# `_log_reader_cmd` for anything that reads lines.
 _log_path_for() {
     local entry="${1-}"
     case "$entry" in
-        text:*:*) printf '%s' "${entry#text:*:}" ;;
-        nginx:*)  printf '%s/%s.access.log' "$LOG_DIR" "${entry#nginx:}" ;;
-        *)        printf '%s/%s.access.log' "$LOG_DIR" "$entry" ;;
+        text:*:*)   printf '%s' "${entry#text:*:}" ;;
+        nginx:*)    printf '%s/%s.access.log' "$LOG_DIR" "${entry#nginx:}" ;;
+        journal:*)  printf '' ;;                           # no file
+        docker:*)   _log_docker_path "${entry#docker:}" ;; # looked up
+        *)          printf '%s/%s.access.log' "$LOG_DIR" "$entry" ;;
     esac
 }
 
 # Return the type for a LOGS entry.
 _log_type_for() {
     case "${1-}" in
-        text:*) printf 'text' ;;
-        nginx:*) printf 'nginx' ;;
-        *) printf 'nginx' ;;
+        text:*)     printf 'text' ;;
+        nginx:*)    printf 'nginx' ;;
+        journal:*)  printf 'journal' ;;
+        docker:*)   printf 'docker' ;;
+        *)          printf 'nginx' ;;
     esac
 }
 
@@ -241,9 +252,11 @@ _log_type_for() {
 _log_name_for() {
     local entry="${1-}"
     case "$entry" in
-        text:*:*) local rest="${entry#text:}"; printf '%s' "${rest%%:*}" ;;
-        nginx:*)  printf '%s' "${entry#nginx:}" ;;
-        *)        printf '%s' "$entry" ;;
+        text:*:*)   local rest="${entry#text:}"; printf '%s' "${rest%%:*}" ;;
+        nginx:*)    printf '%s' "${entry#nginx:}" ;;
+        journal:*)  printf '%s' "${entry#journal:}" ;;
+        docker:*)   printf '%s' "${entry#docker:}" ;;
+        *)          printf '%s' "$entry" ;;
     esac
 }
 
@@ -259,6 +272,100 @@ _log_entry_by_name() {
         fi
     done
     return 1
+}
+
+# Resolve a docker container name to the local path of its JSON log.
+# Fast path: `docker inspect` if the CLI is available. Fallback: glob
+# /var/lib/docker/containers/*/config.v2.json and grep for the name —
+# works even when the docker socket isn't accessible to this user.
+#
+# Returns empty on no-match; callers treat that as "container not
+# running right now" and skip.
+_log_docker_path() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && return 0
+    # Preferred: `docker inspect` gives us the exact LogPath.
+    if command -v docker >/dev/null 2>&1; then
+        local path
+        path=$(docker inspect --format '{{.LogPath}}' "$name" 2>/dev/null)
+        [[ -n "$path" && -r "$path" ]] && { printf '%s' "$path"; return 0; }
+    fi
+    # Fallback: scan container config files for the matching Name. Needs
+    # read perm on /var/lib/docker; silently no-ops if we can't see it.
+    local default_root="${MILOG_DOCKER_ROOT:-/var/lib/docker}"
+    [[ -d "$default_root/containers" ]] || return 0
+    local cfg cid
+    # shellcheck disable=SC2044
+    for cfg in "$default_root"/containers/*/config.v2.json; do
+        [[ -r "$cfg" ]] || continue
+        # Matches both `"/name"` and `"name"`. Cheap — no JSON parser.
+        if grep -q "\"Name\":\"/$name\"" "$cfg" 2>/dev/null \
+           || grep -q "\"Name\":\"$name\"" "$cfg" 2>/dev/null; then
+            cid=$(basename "$(dirname "$cfg")")
+            local log_path="$default_root/containers/$cid/$cid-json.log"
+            [[ -r "$log_path" ]] && { printf '%s' "$log_path"; return 0; }
+        fi
+    done
+    return 0
+}
+
+# Return a shell command (suitable for `eval` / process substitution)
+# that streams RAW log lines from the source entry on stdout. This is
+# the abstraction that lets `color_prefix`, `mode_grep`, and `milog
+# <name>` tail work uniformly across source types without each mode
+# reinventing "how do I read this".
+#
+#   nginx:/bare   → tail -F <file>
+#   text:         → tail -F <file>
+#   journal:      → journalctl -u <unit> -f --no-pager --since now
+#                   (on non-Linux / no journalctl: emits a `#` diag
+#                   line and exits, so callers don't hang)
+#   docker:       → tail -F <container-log> | python3 json-unwrap
+#
+# Prints the command on stdout; caller wraps in `bash -c "$cmd"` or
+# equivalent. On unresolvable entries (docker name not running, etc.)
+# prints empty and returns 1 so callers can skip.
+_log_reader_cmd() {
+    local entry="${1:-}"
+    local type; type=$(_log_type_for "$entry")
+    case "$type" in
+        nginx|text)
+            local path; path=$(_log_path_for "$entry")
+            [[ -n "$path" ]] || return 1
+            printf 'tail -F -n 0 %q 2>/dev/null' "$path"
+            ;;
+        journal)
+            local unit; unit=$(_log_name_for "$entry")
+            if ! command -v journalctl >/dev/null 2>&1; then
+                # Emit a diagnostic and exit so callers' stdout consumers
+                # still see something (preferable to a silent hang).
+                printf "printf '#journal unavailable: journalctl not on PATH\\n'"
+                return 0
+            fi
+            printf 'journalctl -u %q -f --no-pager --since now -o short-iso 2>/dev/null' "$unit"
+            ;;
+        docker)
+            local path; path=$(_log_path_for "$entry")
+            if [[ -z "$path" ]]; then
+                printf "printf '#docker unavailable: container %s not found\\n'" \
+                    "$(_log_name_for "$entry")"
+                return 0
+            fi
+            # Unwrap docker's JSON-per-line format. jq is the robust
+            # option (proper JSON parser). Sed fallback handles typical
+            # plaintext payloads; pathological lines with embedded
+            # quotes/backslashes may render imperfectly.
+            if command -v jq >/dev/null 2>&1; then
+                printf 'tail -F -n 0 %q 2>/dev/null | jq -rj .log 2>/dev/null' "$path"
+            else
+                printf 'tail -F -n 0 %q 2>/dev/null | sed -E %q' "$path" \
+                    's/^\{"log":"(.*)","stream".*/\1/; s/\\n$//; s/\\"/"/g; s/\\\\/\\/g'
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 # Alert thresholds
@@ -4079,8 +4186,23 @@ config_add() {
     cur+=("$name")
     _cfg_write_line "LOGS=(${cur[*]})"
     echo -e "${G}Added${NC} '$name' → LOGS=(${cur[*]})"
-    local f="$LOG_DIR/$name.access.log"
-    [[ -f "$f" ]] || echo -e "${D}  note: $f does not exist yet${NC}"
+    # Type-aware existence hint. Only surfaces when we can check cheaply;
+    # docker/journal liveness is better diagnosed at stream time.
+    local _type; _type=$(_log_type_for "$name")
+    case "$_type" in
+        nginx|text)
+            local f; f=$(_log_path_for "$name")
+            [[ -f "$f" ]] || echo -e "${D}  note: $f does not exist yet${NC}"
+            ;;
+        journal)
+            command -v journalctl >/dev/null 2>&1 \
+                || echo -e "${D}  note: journalctl not on PATH — journal sources need Linux + systemd${NC}"
+            ;;
+        docker)
+            command -v docker >/dev/null 2>&1 \
+                || echo -e "${D}  note: docker CLI not on PATH — will fall back to scanning \$MILOG_DOCKER_ROOT${NC}"
+            ;;
+    esac
 }
 
 config_rm() {
@@ -4298,50 +4420,73 @@ config_validate() {
 color_prefix() {
     local pids=()
     local colors=("$B" "$C" "$G" "$M" "$Y" "$R")
-    local -a F_files=() F_cols=() F_labels=()
+    # File-based sources (nginx / text) can participate in the initial
+    # merged-by-timestamp dump. Streaming-only sources (journal /
+    # docker) skip it — their commands come through separately.
+    local -a F_files=() F_fcols=() F_flabels=()
+    local -a S_cmds=()  S_cols=()  S_labels=()
     local i=0
+    local entry
     for entry in "${LOGS[@]}"; do
-        local file; file=$(_log_path_for "$entry")
-        local name; name=$(_log_name_for "$entry")
-        local col="${colors[$i]}"
-        local label; label=$(printf "%-8s" "$name")
-        if [[ -f "$file" ]]; then
-            F_files+=("$file")
-            F_cols+=("$col")
-            F_labels+=("$label")
+        local name;  name=$(_log_name_for "$entry")
+        local type;  type=$(_log_type_for "$entry")
+        local col="${colors[$(( i % ${#colors[@]} ))]}"
+        local label; label=$(printf "%-10s" "$name")
+
+        local cmd
+        cmd=$(_log_reader_cmd "$entry") || { (( i++ )) || true; continue; }
+        [[ -z "$cmd" ]] && { (( i++ )) || true; continue; }
+        S_cmds+=("$cmd")
+        S_cols+=("$col")
+        S_labels+=("$label")
+
+        # Gather file-type sources for the initial merged-dump pass.
+        if [[ "$type" == "nginx" || "$type" == "text" ]]; then
+            local file; file=$(_log_path_for "$entry")
+            if [[ -f "$file" ]]; then
+                F_files+=("$file")
+                F_fcols+=("$col")
+                F_flabels+=("$label")
+            fi
         fi
         (( i++ )) || true
     done
 
-    # Initial dump: last 10 lines from every file, merged and sorted by log timestamp
-    # so output is globally by recency rather than grouped per app.
-    {
-        local idx
-        for idx in "${!F_files[@]}"; do
-            tail -n 10 "${F_files[$idx]}" 2>/dev/null | \
-                awk -v col="${F_cols[$idx]}" -v lbl="${F_labels[$idx]}" -v nc="$NC" '
-                {
-                    if (match($0, /\[[0-9]{2}\/[A-Za-z]+\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
-                        d     = substr($0, RSTART+1,  2)
-                        mname = substr($0, RSTART+4,  3)
-                        y     = substr($0, RSTART+8,  4)
-                        hms   = substr($0, RSTART+13, 8)
-                        mi = index("JanFebMarAprMayJunJulAugSepOctNovDec", mname)
-                        mo = int((mi + 2) / 3)
-                        key = sprintf("%s%02d%s%s", y, mo, d, hms)
-                    } else {
-                        key = "00000000000000000"
-                    }
-                    printf "%s\t%s[%s]%s %s\n", key, col, lbl, nc, $0
-                }'
-        done
-    } | sort -k1,1 | cut -f2-
+    # Initial dump: last 10 lines from every FILE source, merged and
+    # sorted by log timestamp. Streaming sources (journal / docker)
+    # stream live-only — no retrospective view since their readers don't
+    # cheaply support "last N matching lines".
+    if (( ${#F_files[@]} > 0 )); then
+        {
+            local idx
+            for idx in "${!F_files[@]}"; do
+                tail -n 10 "${F_files[$idx]}" 2>/dev/null | \
+                    awk -v col="${F_fcols[$idx]}" -v lbl="${F_flabels[$idx]}" -v nc="$NC" '
+                    {
+                        if (match($0, /\[[0-9]{2}\/[A-Za-z]+\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+                            d     = substr($0, RSTART+1,  2)
+                            mname = substr($0, RSTART+4,  3)
+                            y     = substr($0, RSTART+8,  4)
+                            hms   = substr($0, RSTART+13, 8)
+                            mi = index("JanFebMarAprMayJunJulAugSepOctNovDec", mname)
+                            mo = int((mi + 2) / 3)
+                            key = sprintf("%s%02d%s%s", y, mo, d, hms)
+                        } else {
+                            key = "00000000000000000"
+                        }
+                        printf "%s\t%s[%s]%s %s\n", key, col, lbl, nc, $0
+                    }'
+            done
+        } | sort -k1,1 | cut -f2-
+    fi
 
-    # Live tails: parallel, naturally interleaved by arrival time.
-    # -n 0 suppresses each tail's own initial dump (we already emitted a merged one).
-    for idx in "${!F_files[@]}"; do
-        tail -n 0 -F "${F_files[$idx]}" 2>/dev/null | \
-            awk -v col="${F_cols[$idx]}" -v lbl="${F_labels[$idx]}" -v nc="$NC" \
+    # Live tails from every source — files via tail -F, journal via
+    # journalctl -f, docker via the unwrap pipeline. All reach stdout
+    # the same way; awk prefixes each with the coloured app label.
+    local idx
+    for idx in "${!S_cmds[@]}"; do
+        bash -c "${S_cmds[$idx]}" 2>/dev/null | \
+            awk -v col="${S_cols[$idx]}" -v lbl="${S_labels[$idx]}" -v nc="$NC" \
                 '{print col"["lbl"]"nc" "$0; fflush()}' &
         pids+=($!)
     done
@@ -5051,14 +5196,25 @@ mode_exploits() {
 }
 
 # ==============================================================================
-# MODE: grep
+# MODE: grep — filter-tail one source (any type: nginx / text / journal / docker)
 # ==============================================================================
 mode_grep() {
     local name="${1:-}" pattern="${2:-.}"
-    [[ -z "$name" || ! " ${LOGS[*]} " =~ " $name " ]] && {
-        echo -e "${R}Usage: $0 grep <app> <pattern>${NC}  Apps: ${LOGS[*]}"; exit 1; }
-    echo -e "${D}tail -F $LOG_DIR/$name.access.log | grep '$pattern'  (Ctrl+C)${NC}\n"
-    tail -F "$LOG_DIR/$name.access.log" | grep --line-buffered -i "$pattern"
+    if [[ -z "$name" ]]; then
+        local apps=""
+        for entry in "${LOGS[@]}"; do apps+="$(_log_name_for "$entry") "; done
+        echo -e "${R}Usage: $0 grep <app> <pattern>${NC}  Apps: ${apps% }"
+        exit 1
+    fi
+    local matching
+    matching=$(_log_entry_by_name "$name") || {
+        echo -e "${R}unknown source: $name${NC}" >&2; exit 1; }
+    local cmd
+    cmd=$(_log_reader_cmd "$matching") || {
+        echo -e "${R}cannot build reader for $name${NC}" >&2; exit 1; }
+    [[ -z "$cmd" ]] && { echo -e "${R}reader empty for $name${NC}" >&2; exit 1; }
+    echo -e "${D}stream $matching | grep '$pattern'  (Ctrl+C)${NC}\n"
+    bash -c "$cmd" 2>/dev/null | grep --line-buffered -i "$pattern"
 }
 
 # ==============================================================================
@@ -7354,11 +7510,16 @@ case "${1:-}" in
     -h|--help|help) show_help ;;
     ""|logs)  color_prefix ;;
     *)
-        # Resolve against LOGS — supports bare names, `nginx:<name>`, and
-        # `text:<name>:<path>` entries.
+        # Resolve against LOGS — supports bare names plus `nginx:<name>`,
+        # `text:<name>:<path>`, `journal:<unit>`, `docker:<container>`.
         _matching_entry=$(_log_entry_by_name "$1" 2>/dev/null) || _matching_entry=""
         if [[ -n "$_matching_entry" ]]; then
-            tail -F "$(_log_path_for "$_matching_entry")"
+            _reader_cmd=$(_log_reader_cmd "$_matching_entry") || _reader_cmd=""
+            if [[ -n "$_reader_cmd" ]]; then
+                bash -c "$_reader_cmd"
+            else
+                echo -e "${R}cannot stream $_matching_entry${NC}"; exit 1
+            fi
         else
             echo -e "${R}Unknown command: '$1'${NC}"; show_help; exit 1
         fi ;;

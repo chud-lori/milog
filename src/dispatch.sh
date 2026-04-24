@@ -218,11 +218,16 @@ case "${1:-}" in
     -h|--help|help) show_help ;;
     ""|logs)  color_prefix ;;
     *)
-        # Resolve against LOGS — supports bare names, `nginx:<name>`, and
-        # `text:<name>:<path>` entries.
+        # Resolve against LOGS — supports bare names plus `nginx:<name>`,
+        # `text:<name>:<path>`, `journal:<unit>`, `docker:<container>`.
         _matching_entry=$(_log_entry_by_name "$1" 2>/dev/null) || _matching_entry=""
         if [[ -n "$_matching_entry" ]]; then
-            tail -F "$(_log_path_for "$_matching_entry")"
+            _reader_cmd=$(_log_reader_cmd "$_matching_entry") || _reader_cmd=""
+            if [[ -n "$_reader_cmd" ]]; then
+                bash -c "$_reader_cmd"
+            else
+                echo -e "${R}cannot stream $_matching_entry${NC}"; exit 1
+            fi
         else
             echo -e "${R}Unknown command: '$1'${NC}"; show_help; exit 1
         fi ;;
