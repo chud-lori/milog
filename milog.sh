@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=d551c6f-dirty
-# MILOG_BUILT=2026-04-24T05:37:28Z
+# MILOG_VERSION=2ba455a-dirty
+# MILOG_BUILT=2026-04-24T05:45:07Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -20,6 +20,7 @@ REFRESH=5
 #   Slack:    SLACK_WEBHOOK
 #   Telegram: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 #   Matrix:   MATRIX_HOMESERVER + MATRIX_TOKEN + MATRIX_ROOM
+#   Webhook:  WEBHOOK_URL (+ optional WEBHOOK_TEMPLATE / WEBHOOK_CONTENT_TYPE)
 DISCORD_WEBHOOK=""
 SLACK_WEBHOOK=""
 TELEGRAM_BOT_TOKEN=""
@@ -27,6 +28,22 @@ TELEGRAM_CHAT_ID=""
 MATRIX_HOMESERVER=""
 MATRIX_TOKEN=""
 MATRIX_ROOM=""
+
+# Generic webhook destination — any POST-accepting endpoint (ntfy.sh,
+# Mattermost, Rocket.Chat, custom ingest). Distinct from the discord/slack
+# adapters which know each API's specific payload shape; this is free-form.
+#
+# Template placeholders (all json_escape'd → quoted JSON string literals,
+# so the default template below is valid JSON after substitution):
+#   %TITLE%  alert title      %SEV%   severity word (crit / warn / info)
+#   %BODY%   alert body       %RULE%  rule key     (e.g. `5xx:api`)
+#
+# For `text/plain` ingest, override the template to a bare string and set
+# WEBHOOK_CONTENT_TYPE accordingly — the placeholder values will still be
+# quoted, but that's acceptable for most plain-text receivers.
+WEBHOOK_URL=""
+WEBHOOK_TEMPLATE='{"title":%TITLE%,"body":%BODY%,"severity":%SEV%,"rule":%RULE%}'
+WEBHOOK_CONTENT_TYPE="application/json"
 ALERTS_ENABLED=0
 ALERT_COOLDOWN=300
 # Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
@@ -139,6 +156,9 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
 [[ -n "${MILOG_ALERT_ROUTES+x}"         ]] && ALERT_ROUTES="$MILOG_ALERT_ROUTES"
+[[ -n "${MILOG_WEBHOOK_URL:-}"          ]] && WEBHOOK_URL="$MILOG_WEBHOOK_URL"
+[[ -n "${MILOG_WEBHOOK_TEMPLATE+x}"     ]] && WEBHOOK_TEMPLATE="$MILOG_WEBHOOK_TEMPLATE"
+[[ -n "${MILOG_WEBHOOK_CONTENT_TYPE:-}" ]] && WEBHOOK_CONTENT_TYPE="$MILOG_WEBHOOK_CONTENT_TYPE"
 [[ -n "${MILOG_SLACK_WEBHOOK:-}"      ]] && SLACK_WEBHOOK="$MILOG_SLACK_WEBHOOK"
 [[ -n "${MILOG_TELEGRAM_BOT_TOKEN:-}" ]] && TELEGRAM_BOT_TOKEN="$MILOG_TELEGRAM_BOT_TOKEN"
 [[ -n "${MILOG_TELEGRAM_CHAT_ID:-}"   ]] && TELEGRAM_CHAT_ID="$MILOG_TELEGRAM_CHAT_ID"
@@ -375,6 +395,36 @@ _alert_send_telegram() {
     curl -sS -m 5 -H "Content-Type: application/json" \
          -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
          >/dev/null 2>&1 || true
+}
+
+# Generic webhook — POST any JSON (or text) template to an arbitrary URL.
+# Used for ntfy.sh, Mattermost, Rocket.Chat, internal triggers, or any other
+# POST-accepting endpoint that doesn't have a dedicated adapter. The
+# discord/slack/telegram/matrix senders know their API's specific payload
+# shape; this one is free-form driven by WEBHOOK_TEMPLATE.
+#
+# Severity derivation mirrors the alerts.log / web panel convention so the
+# same color int means the same severity word everywhere.
+_alert_send_webhook() {
+    [[ -z "${WEBHOOK_URL:-}" ]] && return 0
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local sev
+    case "$color" in
+        15158332|16711680)  sev=crit ;;
+        16753920|15844367)  sev=warn ;;
+        *)                  sev=info ;;
+    esac
+    # Template substitution. json_escape returns the value wrapped in
+    # surrounding double-quotes, so the default template's `%TITLE%` etc.
+    # expand to valid JSON string literals without additional quoting.
+    local payload="${WEBHOOK_TEMPLATE:-\"%TITLE%\"}"
+    payload="${payload//%TITLE%/$(json_escape "$title")}"
+    payload="${payload//%BODY%/$(json_escape "$body")}"
+    payload="${payload//%SEV%/$(json_escape "$sev")}"
+    payload="${payload//%RULE%/$(json_escape "$rule_key")}"
+    local ctype="${WEBHOOK_CONTENT_TYPE:-application/json}"
+    curl -sS -m 5 -H "Content-Type: ${ctype}" \
+         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || true
 }
 
 # Matrix m.room.message (m.text + custom.html). PUT to
@@ -659,19 +709,21 @@ alert_fire() {
         # Each destination backgrounded so a slow one doesn't delay the
         # others. Callers also typically background `alert_fire &` — the
         # resulting grandchild sends are orphaned to init on exit, which is
-        # fine.
+        # fine. Webhook takes rule_key as a 4th arg for template
+        # substitution; other senders don't need it.
         _alert_send_discord  "$title" "$body" "$color" &
         _alert_send_slack    "$title" "$body" "$color" &
         _alert_send_telegram "$title" "$body" "$color" &
         _alert_send_matrix   "$title" "$body" "$color" &
+        _alert_send_webhook  "$title" "$body" "$color" "$rule_key" &
         return 0
     fi
 
     # Routed fire: dispatch only to the listed destination types. Unknown
     # tokens are silently ignored so a forward-looking config (e.g. naming
-    # `webhook` before that adapter lands) doesn't break existing rules.
-    # `skip` is an explicit "do not fire this class" — useful for noise
-    # rules you want to keep recording in alerts.log but not page on.
+    # an adapter before it lands) doesn't break existing rules. `skip` is
+    # an explicit "do not fire this class" — useful for noise rules you
+    # want to keep recording in alerts.log but not page on.
     local dest
     for dest in $route; do
         case "$dest" in
@@ -679,6 +731,7 @@ alert_fire() {
             slack)     _alert_send_slack    "$title" "$body" "$color" & ;;
             telegram)  _alert_send_telegram "$title" "$body" "$color" & ;;
             matrix)    _alert_send_matrix   "$title" "$body" "$color" & ;;
+            webhook)   _alert_send_webhook  "$title" "$body" "$color" "$rule_key" & ;;
             skip|none) : ;;
             *)         : ;;   # unknown type — silently drop (forward-compat)
         esac
@@ -732,15 +785,28 @@ _alert_redact_matrix() {
     printf '%s  room=%s  token=****' "${hs%/}" "$room"
 }
 
+# Generic webhook URL — free-form target, so we don't know which part is the
+# secret. Preserve scheme + host + first path segment (usually identifies
+# the tool / channel), mask the tail. Falls back to a prefix truncation.
+_alert_redact_webhook() {
+    local w="${1:-}"
+    [[ -z "$w" ]] && return 0
+    if [[ "$w" =~ ^(https?://[^/]+/[^/?]+) ]]; then
+        printf '%s/****' "${BASH_REMATCH[1]}"
+    else
+        printf '%.40s…' "$w"
+    fi
+}
+
 # --- Destinations status line renderer ---------------------------------------
 # Prints one line per configured-or-not destination. Accepts ALL values as
 # positional args so callers can feed either env vars (process-state view,
 # used by `config`) or values pre-read from a specific config file (target-
 # user view, used by `alert status` under sudo).
 #
-# Args: discord_url slack_url tg_token tg_chat matrix_hs matrix_token matrix_room
+# Args: discord_url slack_url tg_token tg_chat matrix_hs matrix_token matrix_room webhook_url
 _alert_destinations_status() {
-    local d="${1:-}" s="${2:-}" tt="${3:-}" tc="${4:-}" mh="${5:-}" mt="${6:-}" mr="${7:-}"
+    local d="${1:-}" s="${2:-}" tt="${3:-}" tc="${4:-}" mh="${5:-}" mt="${6:-}" mr="${7:-}" wh="${8:-}"
     local preview
 
     if [[ -n "$d" ]]; then
@@ -773,6 +839,13 @@ _alert_destinations_status() {
         printf "    %-10s ${Y}partial${NC} need MATRIX_HOMESERVER + MATRIX_TOKEN + MATRIX_ROOM\n" "matrix"
     else
         printf "    %-10s ${D}—${NC}\n" "matrix"
+    fi
+
+    if [[ -n "$wh" ]]; then
+        preview=$(_alert_redact_webhook "$wh")
+        printf "    %-10s ${G}✓ set${NC}   %s\n" "webhook" "$preview"
+    else
+        printf "    %-10s ${D}—${NC}\n" "webhook"
     fi
 }
 
@@ -2345,7 +2418,7 @@ alert_status() {
     # Read all destinations from the target config. Done via _alert_read_key
     # (not env) so `sudo milog alert status` shows alice's real config,
     # not root's. Empty strings when unset.
-    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room
+    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url
     d_url=$(_alert_read_webhook "$target_config")
     s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
     tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
@@ -2353,6 +2426,7 @@ alert_status() {
     mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
     mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
     mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+    wh_url=$(  _alert_read_key "$target_config" "WEBHOOK_URL")
 
     local enabled svc_state
     enabled=$(_alert_read_key "$target_config" "ALERTS_ENABLED")
@@ -2371,7 +2445,7 @@ alert_status() {
     echo -e "\n${W}── MiLog: Alert status ──${NC}\n"
 
     echo -e "  ${W}destinations${NC}"
-    _alert_destinations_status "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room"
+    _alert_destinations_status "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room" "$wh_url"
     echo
 
     printf "  %-18s %s\n"  "ALERTS_ENABLED"  "$enabled"
@@ -2433,16 +2507,19 @@ alert_test() {
 
     # Pull every destination from the target-user's config file, not the
     # env this process started with. Makes `sudo milog alert test` test
-    # alice's full fanout (Discord + Slack + Telegram + Matrix), not just
-    # whatever happens to live in root's env.
-    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room
-    d_url=$(   _alert_read_webhook "$target_config")
-    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
-    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
-    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
-    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
-    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
-    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+    # alice's full fanout (Discord + Slack + Telegram + Matrix + Webhook),
+    # not just whatever happens to live in root's env.
+    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url wh_template wh_ctype
+    d_url=$(      _alert_read_webhook "$target_config")
+    s_url=$(      _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    tg_token=$(   _alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$(    _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(      _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(   _alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$(    _alert_read_key "$target_config" "MATRIX_ROOM")
+    wh_url=$(     _alert_read_key "$target_config" "WEBHOOK_URL")
+    wh_template=$(_alert_read_key "$target_config" "WEBHOOK_TEMPLATE")
+    wh_ctype=$(   _alert_read_key "$target_config" "WEBHOOK_CONTENT_TYPE")
 
     # Track which destinations will actually fire so we can print a
     # per-destination line. Mirrors the readiness logic in each
@@ -2454,6 +2531,7 @@ alert_test() {
     elif [[ -n "$tg_token" || -n "$tg_chat" ]]; then dests_partial+=("telegram"); fi
     if   [[ -n "$mx_hs" && -n "$mx_token" && -n "$mx_room" ]]; then dests_ok+=("matrix")
     elif [[ -n "$mx_hs" || -n "$mx_token" || -n "$mx_room" ]]; then dests_partial+=("matrix"); fi
+    [[ -n "$wh_url"   ]] && dests_ok+=("webhook")
 
     if (( ${#dests_ok[@]} == 0 )); then
         echo -e "${R}no alert destinations configured in $target_config${NC}" >&2
@@ -2472,11 +2550,16 @@ alert_test() {
     local _s_enabled="$ALERTS_ENABLED" _s_dw="$DISCORD_WEBHOOK" _s_sw="$SLACK_WEBHOOK"
     local _s_tt="$TELEGRAM_BOT_TOKEN" _s_tc="$TELEGRAM_CHAT_ID"
     local _s_mh="$MATRIX_HOMESERVER"  _s_mt="$MATRIX_TOKEN"    _s_mr="$MATRIX_ROOM"
+    local _s_wu="${WEBHOOK_URL:-}"    _s_wt="${WEBHOOK_TEMPLATE:-}"  _s_wc="${WEBHOOK_CONTENT_TYPE:-}"
     ALERTS_ENABLED=1
     DISCORD_WEBHOOK="$d_url"
     SLACK_WEBHOOK="$s_url"
     TELEGRAM_BOT_TOKEN="$tg_token"; TELEGRAM_CHAT_ID="$tg_chat"
     MATRIX_HOMESERVER="$mx_hs";     MATRIX_TOKEN="$mx_token";  MATRIX_ROOM="$mx_room"
+    WEBHOOK_URL="$wh_url"
+    # Empty template / ctype from target config → keep the process defaults.
+    [[ -n "$wh_template" ]] && WEBHOOK_TEMPLATE="$wh_template"
+    [[ -n "$wh_ctype"    ]] && WEBHOOK_CONTENT_TYPE="$wh_ctype"
 
     echo -e "Firing test alert to: ${G}${dests_ok[*]}${NC}"
     if (( ${#dests_partial[@]} > 0 )); then
@@ -2491,6 +2574,7 @@ alert_test() {
     DISCORD_WEBHOOK="$_s_dw";       SLACK_WEBHOOK="$_s_sw"
     TELEGRAM_BOT_TOKEN="$_s_tt";    TELEGRAM_CHAT_ID="$_s_tc"
     MATRIX_HOMESERVER="$_s_mh";     MATRIX_TOKEN="$_s_mt";     MATRIX_ROOM="$_s_mr"
+    WEBHOOK_URL="$_s_wu";           WEBHOOK_TEMPLATE="$_s_wt"; WEBHOOK_CONTENT_TYPE="$_s_wc"
     echo -e "${G}✓${NC} fanout dispatched — check each channel; any silent dest is a wire issue, not a config issue"
 }
 
@@ -3113,7 +3197,8 @@ config_show() {
         "${DISCORD_WEBHOOK:-}" \
         "${SLACK_WEBHOOK:-}" \
         "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" \
-        "${MATRIX_HOMESERVER:-}" "${MATRIX_TOKEN:-}" "${MATRIX_ROOM:-}"
+        "${MATRIX_HOMESERVER:-}" "${MATRIX_TOKEN:-}" "${MATRIX_ROOM:-}" \
+        "${WEBHOOK_URL:-}"
 }
 
 config_init() {

@@ -157,6 +157,36 @@ _alert_send_telegram() {
          >/dev/null 2>&1 || true
 }
 
+# Generic webhook — POST any JSON (or text) template to an arbitrary URL.
+# Used for ntfy.sh, Mattermost, Rocket.Chat, internal triggers, or any other
+# POST-accepting endpoint that doesn't have a dedicated adapter. The
+# discord/slack/telegram/matrix senders know their API's specific payload
+# shape; this one is free-form driven by WEBHOOK_TEMPLATE.
+#
+# Severity derivation mirrors the alerts.log / web panel convention so the
+# same color int means the same severity word everywhere.
+_alert_send_webhook() {
+    [[ -z "${WEBHOOK_URL:-}" ]] && return 0
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local sev
+    case "$color" in
+        15158332|16711680)  sev=crit ;;
+        16753920|15844367)  sev=warn ;;
+        *)                  sev=info ;;
+    esac
+    # Template substitution. json_escape returns the value wrapped in
+    # surrounding double-quotes, so the default template's `%TITLE%` etc.
+    # expand to valid JSON string literals without additional quoting.
+    local payload="${WEBHOOK_TEMPLATE:-\"%TITLE%\"}"
+    payload="${payload//%TITLE%/$(json_escape "$title")}"
+    payload="${payload//%BODY%/$(json_escape "$body")}"
+    payload="${payload//%SEV%/$(json_escape "$sev")}"
+    payload="${payload//%RULE%/$(json_escape "$rule_key")}"
+    local ctype="${WEBHOOK_CONTENT_TYPE:-application/json}"
+    curl -sS -m 5 -H "Content-Type: ${ctype}" \
+         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || true
+}
+
 # Matrix m.room.message (m.text + custom.html). PUT to
 #   <homeserver>/_matrix/client/v3/rooms/<room>/send/m.room.message/<txn>
 # Room IDs contain `!` and `:` — both must be percent-encoded. Txn is a
@@ -439,19 +469,21 @@ alert_fire() {
         # Each destination backgrounded so a slow one doesn't delay the
         # others. Callers also typically background `alert_fire &` — the
         # resulting grandchild sends are orphaned to init on exit, which is
-        # fine.
+        # fine. Webhook takes rule_key as a 4th arg for template
+        # substitution; other senders don't need it.
         _alert_send_discord  "$title" "$body" "$color" &
         _alert_send_slack    "$title" "$body" "$color" &
         _alert_send_telegram "$title" "$body" "$color" &
         _alert_send_matrix   "$title" "$body" "$color" &
+        _alert_send_webhook  "$title" "$body" "$color" "$rule_key" &
         return 0
     fi
 
     # Routed fire: dispatch only to the listed destination types. Unknown
     # tokens are silently ignored so a forward-looking config (e.g. naming
-    # `webhook` before that adapter lands) doesn't break existing rules.
-    # `skip` is an explicit "do not fire this class" — useful for noise
-    # rules you want to keep recording in alerts.log but not page on.
+    # an adapter before it lands) doesn't break existing rules. `skip` is
+    # an explicit "do not fire this class" — useful for noise rules you
+    # want to keep recording in alerts.log but not page on.
     local dest
     for dest in $route; do
         case "$dest" in
@@ -459,6 +491,7 @@ alert_fire() {
             slack)     _alert_send_slack    "$title" "$body" "$color" & ;;
             telegram)  _alert_send_telegram "$title" "$body" "$color" & ;;
             matrix)    _alert_send_matrix   "$title" "$body" "$color" & ;;
+            webhook)   _alert_send_webhook  "$title" "$body" "$color" "$rule_key" & ;;
             skip|none) : ;;
             *)         : ;;   # unknown type — silently drop (forward-compat)
         esac
@@ -512,15 +545,28 @@ _alert_redact_matrix() {
     printf '%s  room=%s  token=****' "${hs%/}" "$room"
 }
 
+# Generic webhook URL — free-form target, so we don't know which part is the
+# secret. Preserve scheme + host + first path segment (usually identifies
+# the tool / channel), mask the tail. Falls back to a prefix truncation.
+_alert_redact_webhook() {
+    local w="${1:-}"
+    [[ -z "$w" ]] && return 0
+    if [[ "$w" =~ ^(https?://[^/]+/[^/?]+) ]]; then
+        printf '%s/****' "${BASH_REMATCH[1]}"
+    else
+        printf '%.40s…' "$w"
+    fi
+}
+
 # --- Destinations status line renderer ---------------------------------------
 # Prints one line per configured-or-not destination. Accepts ALL values as
 # positional args so callers can feed either env vars (process-state view,
 # used by `config`) or values pre-read from a specific config file (target-
 # user view, used by `alert status` under sudo).
 #
-# Args: discord_url slack_url tg_token tg_chat matrix_hs matrix_token matrix_room
+# Args: discord_url slack_url tg_token tg_chat matrix_hs matrix_token matrix_room webhook_url
 _alert_destinations_status() {
-    local d="${1:-}" s="${2:-}" tt="${3:-}" tc="${4:-}" mh="${5:-}" mt="${6:-}" mr="${7:-}"
+    local d="${1:-}" s="${2:-}" tt="${3:-}" tc="${4:-}" mh="${5:-}" mt="${6:-}" mr="${7:-}" wh="${8:-}"
     local preview
 
     if [[ -n "$d" ]]; then
@@ -553,6 +599,13 @@ _alert_destinations_status() {
         printf "    %-10s ${Y}partial${NC} need MATRIX_HOMESERVER + MATRIX_TOKEN + MATRIX_ROOM\n" "matrix"
     else
         printf "    %-10s ${D}—${NC}\n" "matrix"
+    fi
+
+    if [[ -n "$wh" ]]; then
+        preview=$(_alert_redact_webhook "$wh")
+        printf "    %-10s ${G}✓ set${NC}   %s\n" "webhook" "$preview"
+    else
+        printf "    %-10s ${D}—${NC}\n" "webhook"
     fi
 }
 
