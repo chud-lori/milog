@@ -1,9 +1,7 @@
 // milog-web — optional Go implementation of `milog web`.
 //
-// Phase 5 foundation + the first actually-functional route. `/healthz`
-// is public; everything under `/api/*` and `/` is token-gated by the same
-// web.token file the bash handler uses. More routes (summary, alerts,
-// logs, SSE stream) land in subsequent commits.
+// `/healthz` is public; everything under `/api/*` and `/` is token-gated
+// by the same web.token file the bash handler uses.
 //
 // Intentionally scoped to the Go standard library — no third-party deps —
 // to keep the binary buildable from any Go 1.22+ toolchain with no module
@@ -344,11 +342,10 @@ func metricsHandler(cfg *config.Config) http.HandlerFunc {
 	}
 }
 
-// streamHandler is the Phase 5 marquee — Server-Sent Events push of the
-// same snapshot `/api/summary.json` returns, every REFRESH seconds. No
-// polling; the browser holds a single connection open and renders on
-// each `summary` event. Request volume drops by ~10× versus the
-// previous 3-second poll loop.
+// streamHandler pushes the same snapshot `/api/summary.json` returns via
+// Server-Sent Events, every REFRESH seconds. No polling; the browser
+// holds a single connection open and renders on each `summary` event.
+// Request volume drops by ~10× versus a 3-second poll loop.
 //
 // Protocol: text/event-stream with named events. A `ping` event every
 // 15s keeps proxies / CF Tunnel from closing the connection on idle.
