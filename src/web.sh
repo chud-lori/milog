@@ -273,11 +273,25 @@ _web_route_index() {
   .sev-info { color:#3fb950; font-weight:600; }
   .alerts-head { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:.6rem; gap:.8rem; }
   .alerts-head h2 { margin:0; }
+  .alerts-head .meta { color:#6b7177; font-size:.75rem; margin-left:auto; }
   .alerts-head select { background:#10141a; color:#d6d9dc; border:1px solid #30363d; border-radius:.3rem; padding:.15rem .4rem; font:inherit; font-size:.8rem; }
   td.rule { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space:nowrap; }
   td.when { color:#8b949e; white-space:nowrap; font-variant-numeric: tabular-nums; }
   td.title { color:#d6d9dc; overflow:hidden; text-overflow:ellipsis; max-width:48ch; }
   .empty { color:#6b7177; padding:.6rem 0; }
+  /* Scroll the alerts table inside its own box instead of growing the page.
+     Max ~14 rows visible; header stays pinned while scrolling. */
+  .table-scroll { max-height: 26rem; overflow-y: auto; border:1px solid #1b1f24; border-radius:.4rem; }
+  .table-scroll table { border-collapse: separate; border-spacing: 0; }
+  .table-scroll thead th { position: sticky; top: 0; background:#10141a; z-index: 1; border-bottom:1px solid #1b1f24; }
+  .table-scroll tbody tr:last-child td { border-bottom: none; }
+  /* Webkit scrollbar styling — matches the dark palette. Firefox uses
+     scrollbar-color below. */
+  .table-scroll::-webkit-scrollbar { width: 10px; }
+  .table-scroll::-webkit-scrollbar-track { background: #0b0d10; }
+  .table-scroll::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; }
+  .table-scroll::-webkit-scrollbar-thumb:hover { background: #484f58; }
+  .table-scroll { scrollbar-color: #30363d #0b0d10; scrollbar-width: thin; }
   footer { padding:1rem 1.2rem; color:#6b7177; font-size:.75rem; text-align:center; }
   .err { color:#f85149; padding:.6rem; border:1px solid #da3633; border-radius:.3rem; background:#2a1215; }
 </style>
@@ -306,6 +320,7 @@ _web_route_index() {
   <section>
     <div class="alerts-head">
       <h2>Recent alerts</h2>
+      <span class="meta" id="alerts-count">—</span>
       <select id="alerts-window" aria-label="alerts window">
         <option value="1h">last 1h</option>
         <option value="24h" selected>last 24h</option>
@@ -314,10 +329,12 @@ _web_route_index() {
         <option value="all">all</option>
       </select>
     </div>
-    <table id="alerts">
-      <thead><tr><th>WHEN</th><th>SEV</th><th>RULE</th><th>TITLE</th></tr></thead>
-      <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
-    </table>
+    <div class="table-scroll">
+      <table id="alerts">
+        <thead><tr><th>WHEN</th><th>SEV</th><th>RULE</th><th>TITLE</th></tr></thead>
+        <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+      </table>
+    </div>
   </section>
   <section id="err-section" hidden><div class="err" id="err">&nbsp;</div></section>
 </main>
@@ -413,12 +430,15 @@ _web_route_index() {
   }
   function renderAlerts(d) {
     var tbody = document.querySelector('#alerts tbody');
+    var meta = document.getElementById('alerts-count');
     tbody.innerHTML = '';
     var list = (d && d.alerts) || [];
     if (!list.length) {
       tbody.innerHTML = '<tr><td colspan="4" class="empty">no alerts in window</td></tr>';
+      meta.textContent = '0 alerts';
       return;
     }
+    meta.textContent = list.length + ' alert' + (list.length === 1 ? '' : 's');
     // Chronological order: server returns oldest→newest; reverse so newest first.
     list.slice().reverse().forEach(function(a){
       var tr = document.createElement('tr');
