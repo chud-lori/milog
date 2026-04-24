@@ -29,6 +29,7 @@ import (
 	"github.com/chud-lori/milog/internal/alertlog"
 	"github.com/chud-lori/milog/internal/config"
 	"github.com/chud-lori/milog/internal/nginxlog"
+	"github.com/chud-lori/milog/internal/promtext"
 	"github.com/chud-lori/milog/internal/sysinfo"
 	"github.com/chud-lori/milog/internal/sysstat"
 	"github.com/chud-lori/milog/internal/token"
@@ -63,6 +64,7 @@ func main() {
 	mux.Handle("/api/logs.json", auth(logsHandler(cfg)))       // token-gated
 	mux.Handle("/api/logs/histogram.json", auth(logsHistogramHandler(cfg)))
 	mux.Handle("/api/stream", auth(streamHandler(cfg)))
+	mux.Handle("/metrics", auth(metricsHandler(cfg)))
 	mux.Handle("/debug", auth(debugHandler(cfg)))
 	mux.Handle("/", auth(rootHandler(cfg)))
 
@@ -167,6 +169,91 @@ func alertsHandler(cfg *config.Config) http.HandlerFunc {
 			Window string          `json:"window"`
 			Alerts []alertlog.Row  `json:"alerts"`
 		}{Window: window, Alerts: rows})
+	}
+}
+
+// metricsHandler emits a Prometheus plaintext 0.0.4 /metrics payload.
+// Metric surface:
+//
+//	milog_up                                                gauge, always 1
+//	milog_cpu_percent                                       gauge
+//	milog_mem_percent / milog_mem_used_bytes / _total_bytes gauge
+//	milog_disk_percent{path=…} + used_bytes + total_bytes   gauge
+//	milog_requests_last_minute{app=…,class=…}               gauge
+//	milog_alerts_fired_total{rule=…,sev=…}                  gauge (running sum from alerts.log)
+//	milog_apps_configured                                   gauge
+//
+// Token-gated like the other routes — Prom scrapers pass the token via
+// Authorization header in their scrape_config. Alternatively, they pull
+// via `?t=TOKEN` but keeping it off the URL is preferable.
+func metricsHandler(cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+
+		// Collect once — same snapshot function other routes use, so the
+		// metrics line up with the dashboard numbers.
+		cpu, _ := sysstat.CPU()
+		mem, _ := sysstat.Mem()
+		disk, _ := sysstat.DiskAt("/")
+		diskLabel := map[string]string{"path": "/"}
+
+		// Per-app request counts by class.
+		minute := nginxlog.CurrentMinutePrefix(time.Now())
+		var reqSamples []promtext.Sample
+		for _, a := range cfg.Apps {
+			file := filepath.Join(cfg.LogDir, a+".access.log")
+			c, _ := nginxlog.MinuteCounts(file, minute)
+			// Emit one sample per class so PromQL can slice with `class=~"4xx|5xx"`.
+			reqSamples = append(reqSamples,
+				promtext.Sample{Labels: map[string]string{"app": a, "class": "2xx"}, Value: float64(c.C2xx)},
+				promtext.Sample{Labels: map[string]string{"app": a, "class": "3xx"}, Value: float64(c.C3xx)},
+				promtext.Sample{Labels: map[string]string{"app": a, "class": "4xx"}, Value: float64(c.C4xx)},
+				promtext.Sample{Labels: map[string]string{"app": a, "class": "5xx"}, Value: float64(c.C5xx)},
+			)
+		}
+
+		// Alert fires — total count per rule across the whole alerts.log.
+		// Read cheaply; bucket in memory.
+		alertRows, _ := alertlog.Load(filepath.Join(cfg.AlertStateDir, "alerts.log"), 0, 0)
+		type rk struct{ rule, sev string }
+		alertCount := map[rk]int{}
+		for _, r := range alertRows {
+			alertCount[rk{r.Rule, r.Sev}]++
+		}
+		var alertSamples []promtext.Sample
+		for k, n := range alertCount {
+			alertSamples = append(alertSamples, promtext.Sample{
+				Labels: map[string]string{"rule": k.rule, "sev": k.sev},
+				Value:  float64(n),
+			})
+		}
+
+		metrics := []promtext.Metric{
+			{Name: "milog_up", Help: "1 when milog-web is reachable.", Type: "gauge",
+				Samples: []promtext.Sample{{Value: 1}}},
+			{Name: "milog_apps_configured", Help: "Number of nginx apps MiLog is watching.", Type: "gauge",
+				Samples: []promtext.Sample{{Value: float64(len(cfg.Apps))}}},
+			{Name: "milog_cpu_percent", Help: "Current CPU busy percent (instant sample, Linux only).", Type: "gauge",
+				Samples: []promtext.Sample{{Value: float64(cpu)}}},
+			{Name: "milog_mem_percent", Help: "Memory used as percent of total.", Type: "gauge",
+				Samples: []promtext.Sample{{Value: float64(mem.Pct)}}},
+			{Name: "milog_mem_used_bytes", Help: "Memory used in bytes.", Type: "gauge",
+				Samples: []promtext.Sample{{Value: float64(mem.UsedMB) * 1024 * 1024}}},
+			{Name: "milog_mem_total_bytes", Help: "Memory total in bytes.", Type: "gauge",
+				Samples: []promtext.Sample{{Value: float64(mem.TotalMB) * 1024 * 1024}}},
+			{Name: "milog_disk_percent", Help: "Disk used percent, by mount point.", Type: "gauge",
+				Samples: []promtext.Sample{{Labels: diskLabel, Value: float64(disk.Pct)}}},
+			{Name: "milog_disk_used_bytes", Help: "Disk used in bytes, by mount point.", Type: "gauge",
+				Samples: []promtext.Sample{{Labels: diskLabel, Value: float64(disk.UsedGB) * 1024 * 1024 * 1024}}},
+			{Name: "milog_disk_total_bytes", Help: "Disk total in bytes, by mount point.", Type: "gauge",
+				Samples: []promtext.Sample{{Labels: diskLabel, Value: float64(disk.TotalGB) * 1024 * 1024 * 1024}}},
+			{Name: "milog_requests_last_minute", Help: "Nginx request count in the current minute, per app + status class.",
+				Type: "gauge", Samples: reqSamples},
+			{Name: "milog_alerts_fired_total", Help: "Total alerts in alerts.log, per rule + severity.",
+				Type: "gauge", Samples: alertSamples},
+		}
+		_ = promtext.Encode(w, metrics)
 	}
 }
 
@@ -433,6 +520,7 @@ func debugHandler(cfg *config.Config) http.HandlerFunc {
 		sb.WriteString("  /api/logs.json           log viewer tier 1\n")
 		sb.WriteString("  /api/logs/histogram.json timeline strip\n")
 		sb.WriteString("  /api/stream              SSE live push\n")
+		sb.WriteString("  /metrics                 Prometheus plaintext 0.0.4\n")
 		_, _ = w.Write([]byte(sb.String()))
 	}
 }
