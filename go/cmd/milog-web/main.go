@@ -19,12 +19,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/chud-lori/milog/internal/config"
+	"github.com/chud-lori/milog/internal/nginxlog"
 	"github.com/chud-lori/milog/internal/sysinfo"
+	"github.com/chud-lori/milog/internal/sysstat"
 	"github.com/chud-lori/milog/internal/token"
 )
 
@@ -41,8 +44,9 @@ func main() {
 	auth := token.Middleware(tokenPath)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthz)                  // public
-	mux.Handle("/api/meta.json", auth(metaHandler(cfg))) // token-gated
+	mux.HandleFunc("/healthz", healthz)                        // public
+	mux.Handle("/api/meta.json", auth(metaHandler(cfg)))       // token-gated
+	mux.Handle("/api/summary.json", auth(summaryHandler(cfg))) // token-gated
 	mux.Handle("/", auth(rootHandler(cfg)))
 
 	// Security headers on every response — match bash `_web_respond`.
@@ -107,6 +111,73 @@ func metaHandler(cfg *config.Config) http.HandlerFunc {
 	}
 }
 
+// summaryHandler assembles the live dashboard payload: system metrics +
+// per-app nginx counts for the current minute. Matches the bash
+// `_web_route_summary` output shape so the existing HTML/JS keeps
+// working once the dashboard is served from Go.
+func summaryHandler(cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		type appRow struct {
+			Name string `json:"name"`
+			Req  int    `json:"req"`
+			C2xx int    `json:"c2xx"`
+			C3xx int    `json:"c3xx"`
+			C4xx int    `json:"c4xx"`
+			C5xx int    `json:"c5xx"`
+		}
+		type sys struct {
+			CPU         int   `json:"cpu"`
+			MemPct      int   `json:"mem_pct"`
+			MemUsedMB   int64 `json:"mem_used_mb"`
+			MemTotalMB  int64 `json:"mem_total_mb"`
+			DiskPct     int   `json:"disk_pct"`
+			DiskUsedGB  int64 `json:"disk_used_gb"`
+			DiskTotalGB int64 `json:"disk_total_gb"`
+		}
+		type payload struct {
+			TS       string   `json:"ts"`
+			System   sys      `json:"system"`
+			TotalReq int      `json:"total_req"`
+			Apps     []appRow `json:"apps"`
+		}
+
+		// System metrics — /proc-based on Linux, zeros on darwin dev.
+		cpu, _ := sysstat.CPU()
+		mem, _ := sysstat.Mem()
+		disk, _ := sysstat.DiskAt("/")
+
+		// Per-app counts. Minute prefix scoped to NOW so the count
+		// matches what `milog monitor` is showing in the terminal.
+		minute := nginxlog.CurrentMinutePrefix(time.Now())
+		apps := make([]appRow, 0, len(cfg.Apps))
+		total := 0
+		for _, a := range cfg.Apps {
+			path := filepath.Join(cfg.LogDir, a+".access.log")
+			c, _ := nginxlog.MinuteCounts(path, minute)
+			apps = append(apps, appRow{
+				Name: a, Req: c.Total,
+				C2xx: c.C2xx, C3xx: c.C3xx, C4xx: c.C4xx, C5xx: c.C5xx,
+			})
+			total += c.Total
+		}
+
+		writeJSON(w, payload{
+			TS: time.Now().Format(time.RFC3339),
+			System: sys{
+				CPU:         cpu,
+				MemPct:      mem.Pct,
+				MemUsedMB:   mem.UsedMB,
+				MemTotalMB:  mem.TotalMB,
+				DiskPct:     disk.Pct,
+				DiskUsedGB:  disk.UsedGB,
+				DiskTotalGB: disk.TotalGB,
+			},
+			TotalReq: total,
+			Apps:     apps,
+		})
+	}
+}
+
 // rootHandler is the placeholder index until the dashboard HTML gets
 // ported. Returns a short plain-text page so curl smoke tests still show
 // something meaningful.
@@ -124,8 +195,8 @@ func rootHandler(cfg *config.Config) http.HandlerFunc {
 		fmt.Fprintf(&sb, "bind:     %s:%s\n", cfg.Bind, cfg.Port)
 		fmt.Fprintf(&sb, "log_dir:  %s\n", cfg.LogDir)
 		fmt.Fprintf(&sb, "apps:     %s\n", strings.Join(cfg.Apps, " "))
-		sb.WriteString("\nPorted routes:\n  /healthz        public liveness\n  /api/meta.json  apps + alerts status + uptime\n")
-		sb.WriteString("\nStill bash-served (next commits):\n  /api/summary.json  system + nginx counts\n  /api/alerts.json   fire history\n  /api/logs.json     log viewer tier 1\n  /api/stream        SSE live push\n")
+		sb.WriteString("\nPorted routes:\n  /healthz           public liveness\n  /api/meta.json     apps + alerts status + uptime\n  /api/summary.json  system + nginx counts (current minute)\n")
+		sb.WriteString("\nStill bash-served (next commits):\n  /api/alerts.json   fire history\n  /api/logs.json     log viewer tier 1\n  /api/stream        SSE live push\n")
 		_, _ = w.Write([]byte(sb.String()))
 	}
 }
