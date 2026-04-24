@@ -23,17 +23,23 @@ type Config struct {
 	Refresh        int    // seconds between TUI / daemon ticks
 	AlertsEnabled  bool
 	DiscordWebhook string // raw; use RedactedDiscordWebhook() for display
+	AlertStateDir  string // where alerts.log + alerts.state live
 }
 
 // Load resolves the Config from env vars, falling back to documented
 // defaults. Returns an error if any provided value is syntactically
 // invalid (e.g. a non-numeric port).
 func Load() (*Config, error) {
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = "/root"
+	}
 	c := &Config{
 		Bind:           getEnv("MILOG_WEB_BIND", "127.0.0.1"),
 		Port:           getEnv("MILOG_WEB_PORT", "8765"),
 		LogDir:         getEnv("MILOG_LOG_DIR", "/var/log/nginx"),
 		DiscordWebhook: os.Getenv("MILOG_DISCORD_WEBHOOK"),
+		AlertStateDir:  getEnv("MILOG_ALERT_STATE_DIR", home+"/.cache/milog"),
 	}
 	if _, err := strconv.Atoi(c.Port); err != nil {
 		return nil, fmt.Errorf("MILOG_WEB_PORT must be numeric, got %q", c.Port)
