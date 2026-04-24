@@ -172,8 +172,23 @@ config_add() {
     cur+=("$name")
     _cfg_write_line "LOGS=(${cur[*]})"
     echo -e "${G}Added${NC} '$name' → LOGS=(${cur[*]})"
-    local f="$LOG_DIR/$name.access.log"
-    [[ -f "$f" ]] || echo -e "${D}  note: $f does not exist yet${NC}"
+    # Type-aware existence hint. Only surfaces when we can check cheaply;
+    # docker/journal liveness is better diagnosed at stream time.
+    local _type; _type=$(_log_type_for "$name")
+    case "$_type" in
+        nginx|text)
+            local f; f=$(_log_path_for "$name")
+            [[ -f "$f" ]] || echo -e "${D}  note: $f does not exist yet${NC}"
+            ;;
+        journal)
+            command -v journalctl >/dev/null 2>&1 \
+                || echo -e "${D}  note: journalctl not on PATH — journal sources need Linux + systemd${NC}"
+            ;;
+        docker)
+            command -v docker >/dev/null 2>&1 \
+                || echo -e "${D}  note: docker CLI not on PATH — will fall back to scanning \$MILOG_DOCKER_ROOT${NC}"
+            ;;
+    esac
 }
 
 config_rm() {
@@ -391,50 +406,73 @@ config_validate() {
 color_prefix() {
     local pids=()
     local colors=("$B" "$C" "$G" "$M" "$Y" "$R")
-    local -a F_files=() F_cols=() F_labels=()
+    # File-based sources (nginx / text) can participate in the initial
+    # merged-by-timestamp dump. Streaming-only sources (journal /
+    # docker) skip it — their commands come through separately.
+    local -a F_files=() F_fcols=() F_flabels=()
+    local -a S_cmds=()  S_cols=()  S_labels=()
     local i=0
+    local entry
     for entry in "${LOGS[@]}"; do
-        local file; file=$(_log_path_for "$entry")
-        local name; name=$(_log_name_for "$entry")
-        local col="${colors[$i]}"
-        local label; label=$(printf "%-8s" "$name")
-        if [[ -f "$file" ]]; then
-            F_files+=("$file")
-            F_cols+=("$col")
-            F_labels+=("$label")
+        local name;  name=$(_log_name_for "$entry")
+        local type;  type=$(_log_type_for "$entry")
+        local col="${colors[$(( i % ${#colors[@]} ))]}"
+        local label; label=$(printf "%-10s" "$name")
+
+        local cmd
+        cmd=$(_log_reader_cmd "$entry") || { (( i++ )) || true; continue; }
+        [[ -z "$cmd" ]] && { (( i++ )) || true; continue; }
+        S_cmds+=("$cmd")
+        S_cols+=("$col")
+        S_labels+=("$label")
+
+        # Gather file-type sources for the initial merged-dump pass.
+        if [[ "$type" == "nginx" || "$type" == "text" ]]; then
+            local file; file=$(_log_path_for "$entry")
+            if [[ -f "$file" ]]; then
+                F_files+=("$file")
+                F_fcols+=("$col")
+                F_flabels+=("$label")
+            fi
         fi
         (( i++ )) || true
     done
 
-    # Initial dump: last 10 lines from every file, merged and sorted by log timestamp
-    # so output is globally by recency rather than grouped per app.
-    {
-        local idx
-        for idx in "${!F_files[@]}"; do
-            tail -n 10 "${F_files[$idx]}" 2>/dev/null | \
-                awk -v col="${F_cols[$idx]}" -v lbl="${F_labels[$idx]}" -v nc="$NC" '
-                {
-                    if (match($0, /\[[0-9]{2}\/[A-Za-z]+\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
-                        d     = substr($0, RSTART+1,  2)
-                        mname = substr($0, RSTART+4,  3)
-                        y     = substr($0, RSTART+8,  4)
-                        hms   = substr($0, RSTART+13, 8)
-                        mi = index("JanFebMarAprMayJunJulAugSepOctNovDec", mname)
-                        mo = int((mi + 2) / 3)
-                        key = sprintf("%s%02d%s%s", y, mo, d, hms)
-                    } else {
-                        key = "00000000000000000"
-                    }
-                    printf "%s\t%s[%s]%s %s\n", key, col, lbl, nc, $0
-                }'
-        done
-    } | sort -k1,1 | cut -f2-
+    # Initial dump: last 10 lines from every FILE source, merged and
+    # sorted by log timestamp. Streaming sources (journal / docker)
+    # stream live-only — no retrospective view since their readers don't
+    # cheaply support "last N matching lines".
+    if (( ${#F_files[@]} > 0 )); then
+        {
+            local idx
+            for idx in "${!F_files[@]}"; do
+                tail -n 10 "${F_files[$idx]}" 2>/dev/null | \
+                    awk -v col="${F_fcols[$idx]}" -v lbl="${F_flabels[$idx]}" -v nc="$NC" '
+                    {
+                        if (match($0, /\[[0-9]{2}\/[A-Za-z]+\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+                            d     = substr($0, RSTART+1,  2)
+                            mname = substr($0, RSTART+4,  3)
+                            y     = substr($0, RSTART+8,  4)
+                            hms   = substr($0, RSTART+13, 8)
+                            mi = index("JanFebMarAprMayJunJulAugSepOctNovDec", mname)
+                            mo = int((mi + 2) / 3)
+                            key = sprintf("%s%02d%s%s", y, mo, d, hms)
+                        } else {
+                            key = "00000000000000000"
+                        }
+                        printf "%s\t%s[%s]%s %s\n", key, col, lbl, nc, $0
+                    }'
+            done
+        } | sort -k1,1 | cut -f2-
+    fi
 
-    # Live tails: parallel, naturally interleaved by arrival time.
-    # -n 0 suppresses each tail's own initial dump (we already emitted a merged one).
-    for idx in "${!F_files[@]}"; do
-        tail -n 0 -F "${F_files[$idx]}" 2>/dev/null | \
-            awk -v col="${F_cols[$idx]}" -v lbl="${F_labels[$idx]}" -v nc="$NC" \
+    # Live tails from every source — files via tail -F, journal via
+    # journalctl -f, docker via the unwrap pipeline. All reach stdout
+    # the same way; awk prefixes each with the coloured app label.
+    local idx
+    for idx in "${!S_cmds[@]}"; do
+        bash -c "${S_cmds[$idx]}" 2>/dev/null | \
+            awk -v col="${S_cols[$idx]}" -v lbl="${S_labels[$idx]}" -v nc="$NC" \
                 '{print col"["lbl"]"nc" "$0; fflush()}' &
         pids+=($!)
     done

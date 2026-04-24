@@ -53,7 +53,7 @@ its default.
 | Variable        | Default                     | Purpose                                   |
 | --------------- | --------------------------- | ----------------------------------------- |
 | `LOG_DIR`       | `/var/log/nginx`            | Where to find `<app>.access.log` files    |
-| `LOGS`          | auto-discover               | Array of app names; becomes `LOG_DIR/<name>.access.log` |
+| `LOGS`          | auto-discover               | Array of log sources; bare names = nginx apps, or prefixed: `text:<name>:<path>`, `journal:<unit>`, `docker:<container>`. See [LOGS — source types](#logs--source-types). |
 | `REFRESH`       | `5`                         | Seconds between TUI / daemon ticks        |
 | `SPARK_LEN`     | `30`                        | Sparkline history length in `monitor`     |
 
@@ -178,6 +178,48 @@ systemd units, one-shot runs, or CI:
 | `MILOG_WEB_PORT`              | `WEB_PORT`              |
 | `MILOG_WEB_BIND`              | `WEB_BIND`              |
 | `MILOG_SLOW_EXCLUDE_PATHS`    | `SLOW_EXCLUDE_PATHS`    |
+| `MILOG_DOCKER_ROOT`           | Docker state dir for `docker:` sources when `docker inspect` is unavailable (default `/var/lib/docker`) |
+
+## `LOGS` — source types
+
+Each entry in the `LOGS` array names a log source. Four prefixes are
+recognised; bare names default to nginx.
+
+| Entry form                     | Type    | Resolved to                                         |
+| ------------------------------ | ------- | --------------------------------------------------- |
+| `api`                          | nginx   | `$LOG_DIR/api.access.log`                           |
+| `nginx:api`                    | nginx   | same as bare (explicit)                             |
+| `text:<name>:<absolute path>`  | text    | `<absolute path>`                                   |
+| `journal:<unit>`               | journal | `journalctl -u <unit> -f` (Linux + systemd)         |
+| `docker:<container>`           | docker  | container's JSON log file, unwrapped on read        |
+
+Example:
+
+```bash
+LOGS=(
+    api                                  # nginx app — /var/log/nginx/api.access.log
+    nginx:gateway                        # nginx, explicit form
+    text:rails:/var/log/rails/production.log
+    journal:mybot.service                # streams via journalctl
+    docker:postgres-prod                 # streams docker container stdout
+)
+```
+
+### What works on each type
+
+- **Streaming / filtering** (`milog logs`, `milog grep`, `milog search`, raw `milog <name>` tail) works uniformly across all four source types.
+- **Parsing** (`monitor`, `top`, `slow`, `top-paths`, alerts, web dashboard, daemon metrics) requires nginx combined format — non-nginx sources are skipped gracefully.
+
+### Docker source notes
+
+- `milog` resolves the container's log path via `docker inspect --format '{{.LogPath}}'` when the docker CLI is available; otherwise it falls back to scanning `$MILOG_DOCKER_ROOT/containers/*/config.v2.json` (default `/var/lib/docker`, override via `MILOG_DOCKER_ROOT`).
+- The container must be running at the time the command starts — stopped containers emit a `#docker unavailable: ...` diagnostic line and exit cleanly.
+- JSON-per-line unwrap uses `jq` when present, falling back to a `sed` rewrite. Install `jq` if your logs contain embedded quotes or backslashes.
+
+### Journal source notes
+
+- Requires `journalctl` on `PATH` (Linux + systemd). On macOS / other platforms MiLog emits a `#journal unavailable: ...` diagnostic and exits.
+- Uses `--since now` so only lines produced after the command starts are shown — matches `tail -F -n 0` semantics for the other types.
 
 ## nginx log format
 
