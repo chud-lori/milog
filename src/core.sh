@@ -41,6 +41,34 @@ ALERT_STATE_DIR="$HOME/.cache/milog"
 # disable rotation entirely.
 ALERT_LOG_MAX_BYTES=10485760  # 10 MB
 
+# --- Alert routing ------------------------------------------------------------
+# Per-rule destination mapping. Default (empty) = fan out to every configured
+# destination — exactly today's behavior, so existing users see no change.
+#
+# Format: one `key: destinations` pair per line. Whitespace-tolerant, `#`
+# begins a comment. Keys:
+#   - exact rule (`cpu`, `mem`, `workers`, `5xx:api`, `exploits:log4shell`)
+#   - prefix before the first `:` (`5xx`, `exploits`, `probes`)
+#   - `default`     — fallback when no other key matches
+# Resolution order: exact → prefix → default → empty. Leftmost wins.
+#
+# Destinations are space-separated types from: discord slack telegram matrix
+# (plus `skip` meaning "silently drop — no fire at all" for noise classes).
+# Unknown destinations are silently ignored for forward-compatibility.
+#
+# Example — route exploits to security, system alerts to ops, rest to discord:
+#   ALERT_ROUTES="
+#     exploits: slack telegram
+#     audit:    slack
+#     cpu:      discord
+#     mem:      discord
+#     disk:/:   discord
+#     5xx:      slack discord
+#     probes:   skip
+#     default:  discord
+#   "
+ALERT_ROUTES=""
+
 # Response-time percentile thresholds (milliseconds) — used to colour the p95
 # tag in the monitor dashboard. Requires nginx to log $request_time; see
 # README → "Response-time percentiles".
@@ -100,6 +128,7 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
+[[ -n "${MILOG_ALERT_ROUTES+x}"         ]] && ALERT_ROUTES="$MILOG_ALERT_ROUTES"
 [[ -n "${MILOG_SLACK_WEBHOOK:-}"      ]] && SLACK_WEBHOOK="$MILOG_SLACK_WEBHOOK"
 [[ -n "${MILOG_TELEGRAM_BOT_TOKEN:-}" ]] && TELEGRAM_BOT_TOKEN="$MILOG_TELEGRAM_BOT_TOKEN"
 [[ -n "${MILOG_TELEGRAM_CHAT_ID:-}"   ]] && TELEGRAM_CHAT_ID="$MILOG_TELEGRAM_CHAT_ID"

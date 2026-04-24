@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=f469b81-dirty
-# MILOG_BUILT=2026-04-24T05:06:11Z
+# MILOG_VERSION=b72b062-dirty
+# MILOG_BUILT=2026-04-24T05:24:54Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -42,6 +42,34 @@ ALERT_STATE_DIR="$HOME/.cache/milog"
 # carry the recent-fire state the rest of MiLog cares about). Set to 0 to
 # disable rotation entirely.
 ALERT_LOG_MAX_BYTES=10485760  # 10 MB
+
+# --- Alert routing ------------------------------------------------------------
+# Per-rule destination mapping. Default (empty) = fan out to every configured
+# destination — exactly today's behavior, so existing users see no change.
+#
+# Format: one `key: destinations` pair per line. Whitespace-tolerant, `#`
+# begins a comment. Keys:
+#   - exact rule (`cpu`, `mem`, `workers`, `5xx:api`, `exploits:log4shell`)
+#   - prefix before the first `:` (`5xx`, `exploits`, `probes`)
+#   - `default`     — fallback when no other key matches
+# Resolution order: exact → prefix → default → empty. Leftmost wins.
+#
+# Destinations are space-separated types from: discord slack telegram matrix
+# (plus `skip` meaning "silently drop — no fire at all" for noise classes).
+# Unknown destinations are silently ignored for forward-compatibility.
+#
+# Example — route exploits to security, system alerts to ops, rest to discord:
+#   ALERT_ROUTES="
+#     exploits: slack telegram
+#     audit:    slack
+#     cpu:      discord
+#     mem:      discord
+#     disk:/:   discord
+#     5xx:      slack discord
+#     probes:   skip
+#     default:  discord
+#   "
+ALERT_ROUTES=""
 
 # Response-time percentile thresholds (milliseconds) — used to colour the p95
 # tag in the monitor dashboard. Requires nginx to log $request_time; see
@@ -102,6 +130,7 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
+[[ -n "${MILOG_ALERT_ROUTES+x}"         ]] && ALERT_ROUTES="$MILOG_ALERT_ROUTES"
 [[ -n "${MILOG_SLACK_WEBHOOK:-}"      ]] && SLACK_WEBHOOK="$MILOG_SLACK_WEBHOOK"
 [[ -n "${MILOG_TELEGRAM_BOT_TOKEN:-}" ]] && TELEGRAM_BOT_TOKEN="$MILOG_TELEGRAM_BOT_TOKEN"
 [[ -n "${MILOG_TELEGRAM_CHAT_ID:-}"   ]] && TELEGRAM_CHAT_ID="$MILOG_TELEGRAM_CHAT_ID"
@@ -514,9 +543,79 @@ alert_silence_list_active() {
         | sort -t $'\t' -k3,3 -rn
 }
 
+# --- Alert routing ------------------------------------------------------------
+#
+# Resolve a rule_key to its destination list by consulting ALERT_ROUTES.
+# See `ALERT_ROUTES` in core.sh for the config-file format.
+#
+# Resolution:
+#   1. Exact match on rule_key  (e.g. `5xx:api` → line `5xx:api: slack`)
+#   2. Prefix match (first segment before `:`)  (e.g. `exploits:sqli` → `exploits:`)
+#   3. `default:` line
+#   4. No match → empty string → caller fans out to all configured dests
+#      (back-compat: today's behavior when ALERT_ROUTES is unset)
+#
+# Echoes the resolved destination list on stdout. Empty output means "no
+# routing configured for this key; fan out".
+_alert_route_for() {
+    local rule_key="${1:-}"
+    local routes="${ALERT_ROUTES:-}"
+    [[ -z "$routes" ]] && return 0     # unset → empty → fan-out path
+
+    local prefix="${rule_key%%:*}"
+    local default_val="" exact_val="" prefix_val=""
+    local line key val
+
+    # Parse the multiline config block. Tolerates leading/trailing whitespace
+    # and `#` comments. Only the first occurrence of each key wins (so
+    # `exploits: slack` before `exploits: discord` in the config means slack).
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        # trim whitespace both sides
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        # Only split on the FIRST `:` so values can contain colons (e.g.
+        # `disk:/: discord` — key is `disk:/`, value is `discord`). Find the
+        # last `:` followed by space; that's the separator.
+        # Simpler: anchor-split — the key/value separator is ": " (colon+space)
+        # and unambiguous since neither keys nor destination tokens contain
+        # that literal sequence.
+        if [[ "$line" == *": "* ]]; then
+            key="${line%%: *}"
+            val="${line#*: }"
+        else
+            # Tolerate `key:value` without space too.
+            key="${line%%:*}"
+            val="${line#*:}"
+            # strip one leading space if present
+            val="${val# }"
+        fi
+        # trim both sides (value can still have trailing whitespace)
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+
+        if   [[ "$key" == "default" ]]; then
+            [[ -z "$default_val" ]] && default_val="$val"
+        elif [[ "$key" == "$rule_key" ]]; then
+            [[ -z "$exact_val"   ]] && exact_val="$val"
+        elif [[ "$key" == "$prefix" ]]; then
+            [[ -z "$prefix_val"  ]] && prefix_val="$val"
+        fi
+    done <<< "$routes"
+
+    if   [[ -n "$exact_val"   ]]; then printf '%s' "$exact_val"
+    elif [[ -n "$prefix_val"  ]]; then printf '%s' "$prefix_val"
+    elif [[ -n "$default_val" ]]; then printf '%s' "$default_val"
+    fi
+}
+
 # --- Fanout dispatcher --------------------------------------------------------
 #
-# Fire one alert to every configured destination. Silently no-ops when
+# Fire one alert to every configured destination — or, if ALERT_ROUTES
+# matched this rule, just the destinations it lists. Silently no-ops when
 # alerts are disabled; each destination no-ops on missing config.
 #
 # Signature: alert_fire <title> <body> [color] [rule_key]
@@ -541,13 +640,40 @@ alert_fire() {
     # webhooks fail (network blip, rate limit, rotated token).
     _alert_record "$rule_key" "$title" "$body" "$color"
     command -v curl >/dev/null 2>&1 || return 0
-    # Each destination backgrounded so a slow one doesn't delay the others.
-    # Callers also typically background `alert_fire &` — the resulting
-    # grandchild sends are orphaned to init on exit, which is fine.
-    _alert_send_discord  "$title" "$body" "$color" &
-    _alert_send_slack    "$title" "$body" "$color" &
-    _alert_send_telegram "$title" "$body" "$color" &
-    _alert_send_matrix   "$title" "$body" "$color" &
+
+    # Resolve routing — empty = today's behavior (fan out to every configured
+    # destination). Non-empty = only the destination types listed here fire.
+    local route
+    route=$(_alert_route_for "$rule_key")
+
+    if [[ -z "$route" ]]; then
+        # Each destination backgrounded so a slow one doesn't delay the
+        # others. Callers also typically background `alert_fire &` — the
+        # resulting grandchild sends are orphaned to init on exit, which is
+        # fine.
+        _alert_send_discord  "$title" "$body" "$color" &
+        _alert_send_slack    "$title" "$body" "$color" &
+        _alert_send_telegram "$title" "$body" "$color" &
+        _alert_send_matrix   "$title" "$body" "$color" &
+        return 0
+    fi
+
+    # Routed fire: dispatch only to the listed destination types. Unknown
+    # tokens are silently ignored so a forward-looking config (e.g. naming
+    # `webhook` before that adapter lands) doesn't break existing rules.
+    # `skip` is an explicit "do not fire this class" — useful for noise
+    # rules you want to keep recording in alerts.log but not page on.
+    local dest
+    for dest in $route; do
+        case "$dest" in
+            discord)   _alert_send_discord  "$title" "$body" "$color" & ;;
+            slack)     _alert_send_slack    "$title" "$body" "$color" & ;;
+            telegram)  _alert_send_telegram "$title" "$body" "$color" & ;;
+            matrix)    _alert_send_matrix   "$title" "$body" "$color" & ;;
+            skip|none) : ;;
+            *)         : ;;   # unknown type — silently drop (forward-compat)
+        esac
+    done
 }
 
 # Back-compat alias for `alert_discord`. Drop-in replacement for code that
@@ -2070,6 +2196,20 @@ _alert_read_webhook() {
     return 0
 }
 
+# Read the (possibly multiline) ALERT_ROUTES value from a config file.
+# Sources the file in a subshell to get the real bash-parsed value, then
+# echoes it. `_alert_read_key` grep-hack can't handle heredoc-style
+# multiline assignments, so routing gets its own helper.
+#
+# Silent + empty on any error — caller treats empty as "no routing".
+_alert_read_routes() {
+    local file="$1"
+    [[ -r "$file" ]] || return 0
+    # Subshell insulation: ALERT_ROUTES from the target config overrides
+    # any env-loaded value only for the duration of this subshell.
+    ( set +u; ALERT_ROUTES=""; . "$file" 2>/dev/null; printf '%s' "$ALERT_ROUTES" ) || true
+}
+
 # Read a simple KEY's value from the config file — same no-fail contract.
 _alert_read_key() {
     local file="$1" key="$2"
@@ -2231,6 +2371,36 @@ alert_status() {
     printf "  %-18s %s\n"  "state dir"       "${ALERT_STATE_DIR:-$HOME/.cache/milog}"
     printf "  %-18s %s\n"  "config"          "$target_config"
     printf "  %-18s %b\n"  "systemd service" "$svc_state"
+
+    # Routing block — only shown when ALERT_ROUTES is configured. Reads the
+    # full block from the target config (not env) for the same sudo-vs-user
+    # reason as destinations above.
+    local routes_raw
+    routes_raw=$(_alert_read_routes "$target_config")
+    if [[ -n "$routes_raw" ]]; then
+        echo
+        echo -e "  ${W}routing${NC}"
+        printf "    %-18s  %s\n" "RULE / PREFIX" "DESTINATIONS"
+        printf "    %-18s  %s\n" "──────────────────" "────────────────────────"
+        local line key val
+        while IFS= read -r line; do
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" ]] && continue
+            if [[ "$line" == *": "* ]]; then
+                key="${line%%: *}"; val="${line#*: }"
+            else
+                key="${line%%:*}"; val="${line#*:}"; val="${val# }"
+            fi
+            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+            val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+            printf "    ${Y}%-18s${NC}  %s\n" "$key" "$val"
+        done <<< "$routes_raw"
+    else
+        echo
+        echo -e "  ${W}routing${NC}   ${D}— (not configured; fires fan out to every configured destination)${NC}"
+    fi
 
     local state_file="${ALERT_STATE_DIR:-$HOME/.cache/milog}/alerts.state"
     if [[ -s "$state_file" ]]; then
