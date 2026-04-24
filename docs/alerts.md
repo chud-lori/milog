@@ -244,6 +244,59 @@ Limitations today:
 - Changes take effect for new fires; running daemon picks it up on
   the next tick.
 
+## Hook scripts — custom integrations without a PR
+
+For anything MiLog's built-in destinations don't cover (local audit
+file, SMS via a modem, PagerDuty, an internal dispatcher), drop an
+executable into `~/.config/milog/hooks/on_alert.d/`. Every fire runs
+every executable there, in filename order, with alert context in env.
+
+```bash
+mkdir -p ~/.config/milog/hooks/on_alert.d
+cat > ~/.config/milog/hooks/on_alert.d/10-log <<'EOF'
+#!/usr/bin/env bash
+# Append every fire to a local audit trail.
+printf '%s  %s  %s  %s\n' \
+    "$(date -Iseconds)" "$MILOG_SEV" "$MILOG_RULE_KEY" "$MILOG_TITLE" \
+    >> "$HOME/milog-audit.log"
+EOF
+chmod +x ~/.config/milog/hooks/on_alert.d/10-log
+```
+
+**Environment variables** passed to each hook:
+
+| Var                | Value                                          |
+| ------------------ | ---------------------------------------------- |
+| `MILOG_RULE_KEY`   | `5xx:api`, `exploits:sqli`, `cpu`, ...         |
+| `MILOG_TITLE`      | alert title (`"5xx spike: api"`)               |
+| `MILOG_BODY`       | alert body (newlines stripped to spaces)       |
+| `MILOG_SEV`        | `crit` / `warn` / `info`                       |
+| `MILOG_COLOR`      | raw Discord color int (for custom severity maps) |
+| `MILOG_TS`         | fire epoch seconds                             |
+
+Run order is deterministic alphabetical, so name with a priority
+prefix (`10-log`, `20-notify`, `99-cleanup`) — classic
+`/etc/cron.d/` pattern.
+
+**Guarantees:**
+- Hook errors never crash the alert path. Non-zero exit + first 200
+  chars of stderr land in `~/.cache/milog/hooks.log` as TSV.
+- Each hook is capped at `ALERT_HOOK_TIMEOUT` seconds (default 10).
+  A hung script can't leak forever or wedge the daemon.
+- Hooks run in parallel (each backgrounded), so one slow script
+  doesn't delay the others.
+- Silence + cooldown + dedup still gate: if the fire is suppressed
+  before delivery, hooks don't run either. The semantics match:
+  "this event did not fire."
+- No `curl` dependency — hooks are arbitrary executables, shell
+  scripts being the most common but anything with `+x` works.
+
+Debug a misbehaving hook:
+
+```bash
+tail ~/.cache/milog/hooks.log     # TSV: epoch, basename, exit-code, first stderr line
+```
+
 ## Fire history log
 
 Every fire appends one row to `~/.cache/milog/alerts.log` as TSV:
