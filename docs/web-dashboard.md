@@ -149,6 +149,50 @@ Deeper investigation (top paths, p95 per app, per-IP drilldown)
 still lives in the CLI. Historical charts are planned — see the
 plan doc if you're on the contributor path.
 
+## Prometheus `/metrics` (Go binary only)
+
+When `milog web` runs via the Go binary (default when `milog-web`
+is installed), it exposes Prometheus plaintext 0.0.4 at `/metrics`.
+Same token auth as every other route — Prom scrapers read it via
+the `Authorization: Bearer …` header.
+
+Metric surface:
+
+| Metric                                        | Type  | Labels                   |
+| --------------------------------------------- | ----- | ------------------------ |
+| `milog_up`                                    | gauge | —                        |
+| `milog_apps_configured`                       | gauge | —                        |
+| `milog_cpu_percent`                           | gauge | —                        |
+| `milog_mem_percent` / `_used_bytes` / `_total_bytes` | gauge | —                 |
+| `milog_disk_percent` / `_used_bytes` / `_total_bytes` | gauge | `path`            |
+| `milog_requests_last_minute`                  | gauge | `app`, `class` (`2xx`…`5xx`) |
+| `milog_alerts_fired_total`                    | gauge | `rule`, `sev` (`crit`/`warn`/`info`) |
+
+**Scrape config** (read the web token once and keep it in your
+prometheus.yml or a secret):
+
+```yaml
+scrape_configs:
+  - job_name: milog
+    scrape_interval: 30s
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials: __MILOG_WEB_TOKEN__       # cat ~/.config/milog/web.token
+    static_configs:
+      - targets: ['milog-host:8765']
+```
+
+The `milog_requests_last_minute` series is a gauge (not a counter)
+because MiLog re-reads the log for each scrape — use PromQL's
+`sum by (app) (milog_requests_last_minute)` directly, not `rate()`.
+
+`milog_alerts_fired_total` is the cumulative count from
+`alerts.log`; it resets if the log is truncated but otherwise
+grows monotonically within a retention window — safe to treat as
+a counter for `increase()`.
+
 ## Custom port
 
 `milog web` defaults to `127.0.0.1:8765`. Override per-run or
