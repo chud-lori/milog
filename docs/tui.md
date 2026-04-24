@@ -17,26 +17,65 @@ Both pull the same numbers — if they disagree, that's a bug.
 
 ## Install
 
-The Go binary (`milog-tui`) is built by `bash build.sh` when a Go
-toolchain is on `$PATH`. From a clone:
+**Today, `milog tui` is contributor-only.** There's no prebuilt-binary
+distribution yet (that's the packaging / release-engineering chunk
+still on the roadmap). The standard user path — the `curl install.sh
+| sudo bash` one-liner — installs bash `milog monitor` only; `milog
+tui` will print an install hint.
+
+Three ways to get the binary today, ordered by who they're for:
+
+### 1. Copy a pre-built binary to your server
+
+Build on any machine that has Go (your laptop, a CI runner):
 
 ```bash
-git clone https://github.com/chud-lori/milog.git /opt/milog
-cd /opt/milog
-bash build.sh          # builds milog.sh + go/bin/milog-web + go/bin/milog-tui
+git clone https://github.com/chud-lori/milog.git
+cd milog
+bash build.sh                          # produces go/bin/milog-tui
 ```
 
-`go/bin/milog-tui` is picked up automatically by `milog tui` when any
-of these exist (first match wins):
+Then ship it to the server:
+
+```bash
+scp go/bin/milog-tui tencent:/tmp/
+ssh tencent 'sudo install -m 0755 /tmp/milog-tui /usr/local/bin/milog-tui'
+```
+
+No Go toolchain on the server. Next `milog tui` picks the binary up
+automatically via the lookup below.
+
+### 2. Clone + build on the server itself (contributor layout)
+
+Install Go and build on the box:
+
+```bash
+sudo apt install -y golang-go
+git clone https://github.com/chud-lori/milog.git /opt/milog
+cd /opt/milog && bash build.sh
+sudo ./install.sh                      # copies milog + milog-tui to /usr/local/bin
+```
+
+`install.sh` auto-copies the binaries when they're sitting in
+`go/bin/` next to the script. No separate step.
+
+### 3. Wait for packaged releases
+
+Once the roadmap's release-engineering work lands (goreleaser + `.deb`
+/ `.rpm` / `.apk` / Homebrew), `curl install.sh | sudo bash` will
+download prebuilt binaries alongside `milog.sh` by arch. For now, 1
+or 2 are the paths.
+
+## Binary lookup order
+
+`milog tui` looks for the binary in this order (first match wins):
 
 - `$MILOG_TUI_BIN` (explicit override)
-- `/usr/local/libexec/milog/milog-tui` (package layout)
-- `/usr/local/bin/milog-tui`
-- `go/bin/milog-tui` (dev layout relative to the script)
+- `/usr/local/libexec/milog/milog-tui` (future package layout)
+- `/usr/local/bin/milog-tui` ← where path 1 / 2 install it
+- `go/bin/milog-tui` (dev layout, relative to the script)
 
-If none are present, `milog tui` prints a one-line install hint and
-tells the user to fall back to `milog monitor` until packaged releases
-arrive.
+If none are present, the "not installed" hint points at this page.
 
 ## Run it
 

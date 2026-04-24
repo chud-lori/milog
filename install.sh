@@ -205,6 +205,12 @@ Usage: install.sh [--with-geoip] [--with-web] [--bin PATH] [--script-url URL] [-
 
 Core deps (gawk, curl, sqlite3) are always installed.
 The --with-history flag is accepted silently for backward compatibility.
+
+Go companion binaries (milog-web, milog-tui) are OPTIONAL. They get
+picked up automatically when they're sitting next to install.sh — which
+happens if you cloned the repo and ran \`bash build.sh\` yourself (the
+contributor path). There's no prebuilt-binary distribution yet; that's
+the 'goreleaser' chunk still on the roadmap.
 EOF
 }
 
