@@ -51,6 +51,14 @@ P95_CRIT_MS=1500
 # but slower reads. Hour-of-traffic is a reasonable default on most sites.
 SLOW_WINDOW=1000
 
+# Path globs to EXCLUDE from `slow` + `top-paths`. Nginx's `$request_time`
+# for a WebSocket-upgraded connection is the full session lifetime, not
+# request latency — a healthy 22-minute chat session otherwise tops the
+# "slowest endpoints" list. Space-separated glob list; matched against the
+# leading path segment. `milog ws` presents WS session metrics separately.
+# Set to empty string ("") to include WS paths again.
+SLOW_EXCLUDE_PATHS="/ws/* /socket.io/*"
+
 # GeoIP enrichment (off by default). Requires `mmdblookup` and a MaxMind
 # GeoLite2-Country MMDB file. Enable both flags only after the MMDB is in
 # place — `milog top` and `milog suspects` add a COUNTRY column when on.
@@ -112,6 +120,7 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_HISTORY_DB:-}"      ]] && HISTORY_DB="$MILOG_HISTORY_DB"
 [[ -n "${MILOG_WEB_PORT:-}"        ]] && WEB_PORT="$MILOG_WEB_PORT"
 [[ -n "${MILOG_WEB_BIND:-}"        ]] && WEB_BIND="$MILOG_WEB_BIND"
+[[ -n "${MILOG_SLOW_EXCLUDE_PATHS+x}" ]] && SLOW_EXCLUDE_PATHS="$MILOG_SLOW_EXCLUDE_PATHS"
 
 # Auto-discover: if no apps ended up configured, glob *.access.log in LOG_DIR
 if [[ ${#LOGS[@]} -eq 0 ]]; then
