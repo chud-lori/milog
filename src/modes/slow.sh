@@ -30,11 +30,34 @@ mode_slow() {
     # be computed without multi-dim arrays.
     local top_rows
     top_rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
-        | awk '
+        | awk -v EXCLUDE_LIST="${SLOW_EXCLUDE_PATHS:-}" '
+            BEGIN {
+                # Pre-process the exclude glob list: strip trailing "/*" to
+                # leave a plain prefix, then match by string equality at the
+                # start. Space-separated input, empty entries ignored.
+                n_excl = split(EXCLUDE_LIST, excl, " ")
+                for (i = 1; i <= n_excl; i++) { sub(/\/\*$/, "/", excl[i]) }
+            }
+            function path_excluded(p,   i) {
+                for (i = 1; i <= n_excl; i++) {
+                    if (excl[i] == "") continue
+                    if (index(p, excl[i]) == 1) return 1
+                }
+                return 0
+            }
             $NF ~ /^[0-9]+(\.[0-9]+)?$/ && NF >= 8 {
                 path = $7
                 q = index(path, "?")
                 if (q > 0) path = substr(path, 1, q - 1)
+                # Defensive: URL paths start with "/". Malformed request
+                # lines (garbage that awk field-split wrongly) can yield
+                # rows like PATH="400" — skip before they pollute the p95
+                # table.
+                if (substr(path, 1, 1) != "/") next
+                # WebSocket / configured-exclude filter — WS $request_time
+                # is session lifetime, not latency; excluding prevents a
+                # healthy 22-minute chat from topping the slowest list.
+                if (path_excluded(path)) next
                 if (length(path) > 0) {
                     printf "%s\t%d\n", path, int($NF * 1000 + 0.5)
                 }

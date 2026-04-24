@@ -136,6 +136,7 @@ See [alerts.md](alerts.md) for full destination setup.
 | `WEB_PORT`               | `8765`                                  | `milog web` listen port         |
 | `WEB_BIND`               | `127.0.0.1`                             | `milog web` bind address        |
 | `SLOW_WINDOW`            | `1000`                                  | Lines/app scanned by `milog slow` |
+| `SLOW_EXCLUDE_PATHS`     | `"/ws/* /socket.io/*"`                   | Path globs excluded from `slow` + `top-paths` (WebSocket sessions). Same list identifies WS paths for `milog ws`. Empty = include everything. |
 
 ## Env-var overrides
 
@@ -166,6 +167,7 @@ systemd units, one-shot runs, or CI:
 | `MILOG_HISTORY_DB`            | `HISTORY_DB`            |
 | `MILOG_WEB_PORT`              | `WEB_PORT`              |
 | `MILOG_WEB_BIND`              | `WEB_BIND`              |
+| `MILOG_SLOW_EXCLUDE_PATHS`    | `SLOW_EXCLUDE_PATHS`    |
 
 ## nginx log format
 

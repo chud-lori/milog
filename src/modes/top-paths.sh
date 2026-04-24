@@ -42,12 +42,32 @@ mode_top_paths() {
     # timed samples for each path.
     local rows
     rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
-        | awk '
+        | awk -v EXCLUDE_LIST="${SLOW_EXCLUDE_PATHS:-}" '
+            BEGIN {
+                # Shared with mode_slow: strip trailing "/*" from each glob
+                # and prefix-match. WebSocket paths would otherwise poison
+                # both the p95 column AND the request-count table (WS
+                # connections can be very long-lived, so they accumulate
+                # inflated per-path counts).
+                n_excl = split(EXCLUDE_LIST, excl, " ")
+                for (i = 1; i <= n_excl; i++) { sub(/\/\*$/, "/", excl[i]) }
+            }
+            function path_excluded(p,   i) {
+                for (i = 1; i <= n_excl; i++) {
+                    if (excl[i] == "") continue
+                    if (index(p, excl[i]) == 1) return 1
+                }
+                return 0
+            }
             NF >= 9 {
                 path = $7
                 q = index(path, "?")
                 if (q > 0) path = substr(path, 1, q - 1)
                 if (length(path) == 0) next
+                # Defensive path guard — drop malformed request lines that
+                # yield non-absolute "paths" like PATH="400".
+                if (substr(path, 1, 1) != "/") next
+                if (path_excluded(path)) next
                 status = $9
                 if (status !~ /^[0-9]+$/) next
                 lf = $NF
