@@ -171,6 +171,18 @@ uninstall() {
         info "Nothing at $BIN_DST — already clean"
     fi
 
+    # Companion Go binaries (installed by install_go_companion() above
+    # when a clone with built binaries was present).
+    local companion_dir; companion_dir=$(dirname "$BIN_DST")
+    local name
+    for name in milog-web milog-tui; do
+        local path="${companion_dir}/${name}"
+        if [[ -e "$path" ]]; then
+            info "Removing $path"
+            rm -f "$path"
+        fi
+    done
+
     cat <<EOF
 
 Uninstalled MiLog binary + systemd unit. Left in place (delete manually if desired):
@@ -354,6 +366,35 @@ main() {
     else
         info "Upgraded milog v=${old_version} → v=${new_version} (built ${new_built:-unknown})  ${old_md5:0:7} → ${new_md5:0:7}"
     fi
+
+    # Install Go companion binaries (milog-web, milog-tui) when they're
+    # sitting alongside this script — typical for a clone that ran
+    # `bash build.sh` first. Placed next to milog at the same
+    # dir as BIN_DST so the bash dispatcher's path walk finds them.
+    #
+    # Pipe-installs don't have these files; the block no-ops silently.
+    install_go_companion() {
+        local name="$1" src
+        # Probe next to install.sh (clone layout).
+        local self_path="${BASH_SOURCE[0]:-}"
+        local self_dir=""
+        if [[ "$self_path" == /* || "$self_path" == */* ]] && [[ -f "$self_path" ]]; then
+            self_dir=$(cd -P "$(dirname "$self_path")" 2>/dev/null && pwd) || self_dir=""
+        fi
+        [[ -z "$self_dir" ]] && return 0
+        src="$self_dir/go/bin/$name"
+        [[ -x "$src" ]] || return 0
+
+        local dst="${dst_dir}/${name}"
+        local tmp_bin
+        tmp_bin="$(mktemp "${dst_dir}/.${name}.install.XXXXXX")"
+        cp "$src" "$tmp_bin"
+        chmod 0755 "$tmp_bin"
+        mv "$tmp_bin" "$dst"
+        info "Installed ${name} → ${dst}"
+    }
+    install_go_companion milog-web
+    install_go_companion milog-tui
 
     info "MiLog installed. Try:"
     cat <<'NEXT'
