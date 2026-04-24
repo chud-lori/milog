@@ -30,6 +30,7 @@ ${W}ALERTING${NC}
   ${C}alert status${NC}       webhook / service / recent-fire state
   ${C}alert test${NC}         send a test Discord embed right now
   ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
+  ${C}silence ...${NC}        mute a rule while on-call works the fix ${D}(milog silence --help)${NC}
 
 ${W}DIAGNOSTICS${NC}
   ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
@@ -99,6 +100,7 @@ case "${1:-}" in
     config)   shift; mode_config "$@" ;;
     alert)    shift; mode_alert  "$@" ;;
     alerts)   mode_alerts "${2:-today}" ;;
+    silence)  shift; mode_silence "$@" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
     __web_handler) _web_handle ;;
