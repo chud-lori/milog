@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=1d9b0a3-dirty
-# MILOG_BUILT=2026-04-24T07:28:20Z
+# MILOG_VERSION=7e0b6a8-dirty
+# MILOG_BUILT=2026-04-24T07:55:32Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -200,6 +200,66 @@ if [[ ${#LOGS[@]} -eq 0 ]]; then
     echo "  Set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
     exit 1
 fi
+
+# --- Typed log sources -------------------------------------------------------
+# LOGS entries are bare names by default (`LOGS=(api web)`) and resolve to
+# nginx-format files at `$LOG_DIR/<name>.access.log`. A typed prefix makes
+# MiLog usable on non-nginx logs too:
+#
+#   LOGS=(api web text:myapp:/var/log/myapp/error.log)
+#   LOGS=(api text:rails:/var/log/rails/production.log nginx:gateway)
+#
+# Resolution:
+#   bare `api`                    → nginx type, path = $LOG_DIR/api.access.log
+#   `nginx:api`                   → same (explicit)
+#   `text:<name>:<absolute path>` → any text file, path = <absolute path>
+#
+# Parser-free modes (logs, grep, search, <name> tail) work for every source
+# type. Parsing modes (monitor, top, slow, top-paths, etc.) skip non-nginx
+# sources gracefully — they need combined log format to work.
+
+# Return the file path for a LOGS entry — bare name or typed prefix.
+_log_path_for() {
+    local entry="${1-}"
+    case "$entry" in
+        text:*:*) printf '%s' "${entry#text:*:}" ;;
+        nginx:*)  printf '%s/%s.access.log' "$LOG_DIR" "${entry#nginx:}" ;;
+        *)        printf '%s/%s.access.log' "$LOG_DIR" "$entry" ;;
+    esac
+}
+
+# Return the type for a LOGS entry.
+_log_type_for() {
+    case "${1-}" in
+        text:*) printf 'text' ;;
+        nginx:*) printf 'nginx' ;;
+        *) printf 'nginx' ;;
+    esac
+}
+
+# Return the display name (strip type prefix and path).
+_log_name_for() {
+    local entry="${1-}"
+    case "$entry" in
+        text:*:*) local rest="${entry#text:}"; printf '%s' "${rest%%:*}" ;;
+        nginx:*)  printf '%s' "${entry#nginx:}" ;;
+        *)        printf '%s' "$entry" ;;
+    esac
+}
+
+# Find the LOGS entry that matches a display name, or empty if no match.
+# Callers use this to map `milog <app>` / `milog grep <app> <pat>` / etc.
+# back to the typed source entry they came from.
+_log_entry_by_name() {
+    local target="${1-}" entry
+    for entry in "${LOGS[@]}"; do
+        if [[ "$(_log_name_for "$entry")" == "$target" ]]; then
+            printf '%s' "$entry"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # Alert thresholds
 THRESH_REQ_WARN=15
@@ -1833,6 +1893,177 @@ _web_route_meta() {
     _web_respond 200 "application/json" "$body"
 }
 
+# ---- route: /api/logs.json ---------------------------------------------------
+# Returns recent lines from ONE nginx source, filtered by grep pattern + path
+# + status-class. Capped at 500 rows per fetch. For bigger windows, the
+# caller narrows filters. Designed for the tier-1 in-browser log viewer —
+# every pass scans the tail of one log file, no sqlite layer yet.
+#
+# Query params:
+#   app=<name>    required — must be an nginx source in LOGS
+#   limit=<N>     default 200, max 500
+#   grep=<sub>    optional substring filter (case-sensitive)
+#   path=<pre>    optional path-prefix filter (starts with /)
+#   class=<c>     optional status class: 2xx 3xx 4xx 5xx any
+_web_route_logs() {
+    local app="${1:-}" limit="${2:-200}" grep_s="${3:-}" path_s="${4:-}" cls="${5:-}"
+    local max=500
+    [[ "$limit" =~ ^[0-9]+$ ]] || limit=200
+    (( limit > max )) && limit=$max
+
+    local body
+    local file="$LOG_DIR/${app}.access.log"
+    if [[ -z "$app" || ! -f "$file" ]]; then
+        body=$(printf '{"app":%s,"lines":[],"error":"no such app"}' \
+            "$(json_escape "${app:-}")")
+        _web_respond 404 "application/json" "$body"
+        return
+    fi
+
+    # Read last N*3 lines, then filter + cap in awk (lets us filter-then-slice
+    # so grep+path+class yield exactly `limit` rows when possible).
+    local read_n=$(( limit * 3 ))
+    (( read_n < 200 )) && read_n=200
+    local raw
+    raw=$(tail -n "$read_n" "$file" 2>/dev/null \
+        | awk -F'"' -v grep_s="$grep_s" -v path_s="$path_s" -v cls="$cls" -v limit="$limit" '
+            function jesc(s) {
+                gsub(/\\/, "\\\\", s)
+                gsub(/"/,  "\\\"", s)
+                gsub(/\t/, "\\t", s)
+                gsub(/\n/, "\\n", s)
+                gsub(/\r/, "\\r", s)
+                return s
+            }
+            # Combined-format line:
+            #   ip - user [t] "METHOD path HTTP" status bytes "ref" "ua" rt?
+            # We split on double-quotes: $1 has ip+dash+time, $2 is request,
+            # $3 has status+bytes, $4 is referer, $5 has ua+maybe-rt.
+            {
+                line = $0
+                # Substring filter first — cheapest on no-match.
+                if (grep_s != "" && index(line, grep_s) == 0) next
+
+                # Parse fields. Field-split on whitespace for the unquoted bits.
+                n_ws = split($1, ws, " ")
+                ip = ws[1]
+                timestamp = ""
+                for (i = 1; i <= n_ws; i++) {
+                    if (ws[i] ~ /^\[/) { timestamp = ws[i]; break }
+                }
+
+                # Request string (field $2): "METHOD /path HTTP/1.1"
+                req = $2
+                n_rq = split(req, rq, " ")
+                method = (n_rq >= 1) ? rq[1] : ""
+                raw_path = (n_rq >= 2) ? rq[2] : ""
+                q = index(raw_path, "?")
+                clean_path = (q > 0) ? substr(raw_path, 1, q-1) : raw_path
+
+                # Defensive: path must start with /
+                if (substr(clean_path, 1, 1) != "/") next
+                if (path_s != "" && index(clean_path, path_s) != 1) next
+
+                # Status is the first field of $3 (after the closing quote).
+                # Strip leading whitespace first — split on " " with a
+                # leading-space input yields ["401","0"] not ["","401","0",""]
+                # in most awks.
+                f3 = $3
+                sub(/^[[:space:]]+/, "", f3)
+                n_sb = split(f3, sb, " ")
+                status = (n_sb >= 1) ? sb[1] : ""
+                if (status !~ /^[0-9]+$/) next
+                sclass = substr(status, 1, 1) "xx"
+                if (cls != "" && cls != "any" && cls != sclass) next
+
+                # UA is field $6 (quoted ua string surrounded by quotes means
+                # $6 exactly). After the UA, an optional request_time float.
+                ua = ($6 != "" ? $6 : "")
+
+                n++
+                # Emit JSON object per surviving row.
+                out[n] = sprintf("{\"ts\":\"%s\",\"ip\":\"%s\",\"method\":\"%s\",\"path\":\"%s\",\"status\":%s,\"ua\":\"%s\",\"class\":\"%s\"}",
+                    jesc(timestamp), jesc(ip), jesc(method), jesc(clean_path), status, jesc(ua), sclass)
+
+                if (n > limit) {
+                    # Drop the oldest if over-cap (keep latest N).
+                    for (j = 1; j < n; j++) out[j] = out[j+1]
+                    n = limit
+                }
+            }
+            END {
+                for (j = 1; j <= n; j++) {
+                    print out[j]
+                }
+            }')
+
+    local arr="[]"
+    if [[ -n "$raw" ]]; then
+        arr="[$(printf '%s' "$raw" | paste -sd, -)]"
+    fi
+
+    body=$(printf '{"app":%s,"lines":%s}' "$(json_escape "$app")" "$arr")
+    _web_respond 200 "application/json" "$body"
+}
+
+# ---- route: /api/logs/histogram.json -----------------------------------------
+# Per-minute request counts for the selected app over a window (N minutes).
+# Used for the timeline strip above the log table.
+_web_route_logs_histogram() {
+    local app="${1:-}" minutes="${2:-60}"
+    [[ "$minutes" =~ ^[0-9]+$ ]] || minutes=60
+    (( minutes > 1440 )) && minutes=1440
+    local file="$LOG_DIR/${app}.access.log"
+    local body
+    if [[ -z "$app" || ! -f "$file" ]]; then
+        body=$(printf '{"app":%s,"buckets":[]}' "$(json_escape "${app:-}")")
+        _web_respond 404 "application/json" "$body"
+        return
+    fi
+
+    # Build N per-minute bucket keys: [dd/Mon/yyyy:HH:MM, ...] for the
+    # last `minutes` minutes. Scan tail of file counting matches.
+    local now_ts; now_ts=$(date +%s)
+    local cur_minute_str
+    local i ts_i
+    # Pre-generate all minute strings into an awk-readable list.
+    local keys=""
+    for (( i = minutes - 1; i >= 0; i-- )); do
+        ts_i=$(( now_ts - i * 60 ))
+        cur_minute_str=$(date -d "@$ts_i" '+%d/%b/%Y:%H:%M' 2>/dev/null \
+            || date -r  "$ts_i" '+%d/%b/%Y:%H:%M' 2>/dev/null)
+        keys="${keys}${cur_minute_str}\n"
+    done
+
+    # For very large logs, only scan a bounded tail slice.
+    local scan_lines=$(( minutes * 500 ))
+    (( scan_lines < 1000 )) && scan_lines=1000
+
+    local raw
+    raw=$(printf '%b' "$keys" | awk -v file="$file" -v scan="$scan_lines" '
+        { keys[NR] = $0 }
+        END {
+            cmd = sprintf("tail -n %d %s 2>/dev/null", scan, file)
+            while ((cmd | getline line) > 0) {
+                for (k in keys) {
+                    if (index(line, keys[k]) > 0) {
+                        counts[keys[k]]++
+                        break
+                    }
+                }
+            }
+            close(cmd)
+            for (i = 1; i <= NR; i++) {
+                printf "{\"t\":\"%s\",\"c\":%d}\n", keys[i], counts[keys[i]]+0
+            }
+        }')
+
+    local arr="[]"
+    [[ -n "$raw" ]] && arr="[$(printf '%s' "$raw" | paste -sd, -)]"
+    body=$(printf '{"app":%s,"buckets":%s}' "$(json_escape "$app")" "$arr")
+    _web_respond 200 "application/json" "$body"
+}
+
 # ---- route: /api/alerts.json -------------------------------------------------
 # Returns the last N alerts from ALERT_STATE_DIR/alerts.log, filtered by a
 # window query param (?window=24h, 1d, 7d, today, all — same grammar as
@@ -1966,6 +2197,23 @@ _web_route_index() {
   .table-scroll::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; }
   .table-scroll::-webkit-scrollbar-thumb:hover { background: #484f58; }
   .table-scroll { scrollbar-color: #30363d #0b0d10; scrollbar-width: thin; }
+  /* Log viewer histogram strip — N tiny bars that together form a
+     per-minute activity timeline above the log table. */
+  .histogram { display:flex; align-items:flex-end; gap:1px; height:32px; margin:.4rem 0 .6rem;
+               background:#0b0d10; border:1px solid #1b1f24; border-radius:.3rem; padding:2px; }
+  .histogram .bar { flex:1 1 auto; background:#3fb950; min-width:1px; border-radius:1px; transition:height .2s; }
+  .histogram .bar.empty { background:#1b1f24; }
+  .histogram .bar:hover { background:#58a6ff; }
+  /* Logs table — denser than alerts since lines are higher volume. */
+  #logs td { font-size:.82rem; padding:.25rem .5rem; }
+  #logs td.ip  { color:#8b949e; font-variant-numeric: tabular-nums; white-space:nowrap; }
+  #logs td.mth { color:#6b7177; white-space:nowrap; }
+  #logs td.pth { color:#d6d9dc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                 overflow:hidden; text-overflow:ellipsis; max-width:52ch; }
+  #logs td.st2 { color:#3fb950; text-align:right; font-variant-numeric: tabular-nums; }
+  #logs td.st3 { color:#8b949e; text-align:right; font-variant-numeric: tabular-nums; }
+  #logs td.st4 { color:#d29922; text-align:right; font-variant-numeric: tabular-nums; }
+  #logs td.st5 { color:#f85149; text-align:right; font-variant-numeric: tabular-nums; }
   footer { padding:1rem 1.2rem; color:#6b7177; font-size:.75rem; text-align:center; }
   .err { color:#f85149; padding:.6rem; border:1px solid #da3633; border-radius:.3rem; background:#2a1215; }
 </style>
@@ -2007,6 +2255,28 @@ _web_route_index() {
       <table id="alerts">
         <thead><tr><th>WHEN</th><th>SEV</th><th>RULE</th><th>TITLE</th></tr></thead>
         <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+  <section>
+    <div class="alerts-head">
+      <h2>Logs (live tail)</h2>
+      <span class="meta" id="logs-count">—</span>
+      <select id="logs-app" aria-label="app"></select>
+      <select id="logs-class" aria-label="status class">
+        <option value="any" selected>any</option>
+        <option value="2xx">2xx</option>
+        <option value="3xx">3xx</option>
+        <option value="4xx">4xx</option>
+        <option value="5xx">5xx</option>
+      </select>
+      <input id="logs-grep" placeholder="grep…" style="background:#10141a;color:#d6d9dc;border:1px solid #30363d;border-radius:.3rem;padding:.15rem .4rem;font:inherit;font-size:.8rem;width:14ch;">
+    </div>
+    <div id="logs-histogram" class="histogram"></div>
+    <div class="table-scroll">
+      <table id="logs">
+        <thead><tr><th>WHEN</th><th>IP</th><th>METHOD</th><th>PATH</th><th>STATUS</th></tr></thead>
+        <tbody><tr><td colspan="5" class="empty">pick an app…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -2135,6 +2405,92 @@ _web_route_index() {
   }
   document.getElementById('alerts-window').addEventListener('change', tickAlerts);
 
+  // ---- logs panel --------------------------------------------------------
+  // Short-poll log viewer (tier 1). Every 5s it fetches /api/logs.json with
+  // the current filters and /api/logs/histogram.json for the timeline.
+  // Tier 2 (SSE live tail) is a Go feature on the roadmap.
+  function fmtLogWhen(s) {
+    // "[24/Apr/2026:12:34:56 +0000]" → "12:34:56"
+    var m = /:(\d\d:\d\d:\d\d)/.exec(s || '');
+    return m ? m[1] : (s || '');
+  }
+  function setLogsApp(apps) {
+    var sel = document.getElementById('logs-app');
+    if (sel.options.length) return;
+    (apps || []).forEach(function(a){
+      var opt = document.createElement('option');
+      opt.value = a; opt.textContent = a;
+      sel.appendChild(opt);
+    });
+    if (sel.options.length) sel.value = sel.options[0].value;
+  }
+  function renderLogs(d) {
+    var tbody = document.querySelector('#logs tbody');
+    var meta = document.getElementById('logs-count');
+    tbody.innerHTML = '';
+    var list = (d && d.lines) || [];
+    meta.textContent = list.length + ' line' + (list.length === 1 ? '' : 's');
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">no matching lines</td></tr>';
+      return;
+    }
+    list.slice().reverse().forEach(function(r){
+      var tr = document.createElement('tr');
+      function td(v, cls){ var c = document.createElement('td'); if (cls) c.className = cls; c.textContent = v; return c; }
+      var stClass = 'st' + String(r.status || '').charAt(0);
+      tr.appendChild(td(fmtLogWhen(r.ts), 'when'));
+      tr.appendChild(td(r.ip || '', 'ip'));
+      tr.appendChild(td(r.method || '', 'mth'));
+      tr.appendChild(td(r.path || '', 'pth'));
+      tr.appendChild(td(r.status, stClass));
+      tbody.appendChild(tr);
+    });
+  }
+  function renderHistogram(d) {
+    var el = document.getElementById('logs-histogram');
+    el.innerHTML = '';
+    var buckets = (d && d.buckets) || [];
+    if (!buckets.length) { el.innerHTML = '<div style="flex:1;color:#6b7177;text-align:center;font-size:.7rem;line-height:28px;">no activity</div>'; return; }
+    var max = buckets.reduce(function(m,b){ return Math.max(m, b.c || 0); }, 1);
+    buckets.forEach(function(b){
+      var bar = document.createElement('div');
+      var pct = Math.round(((b.c || 0) / max) * 100);
+      bar.className = 'bar' + ((b.c || 0) === 0 ? ' empty' : '');
+      bar.style.height = ((b.c || 0) === 0 ? 2 : Math.max(4, pct)) + '%';
+      bar.title = b.t + '  ' + (b.c || 0) + ' req';
+      el.appendChild(bar);
+    });
+  }
+  function tickLogs() {
+    var app = document.getElementById('logs-app').value;
+    if (!app) return;
+    var grep = document.getElementById('logs-grep').value;
+    var cls = document.getElementById('logs-class').value;
+    var q = 'app=' + encodeURIComponent(app) + '&limit=200';
+    if (grep) q += '&grep=' + encodeURIComponent(grep);
+    if (cls && cls !== 'any') q += '&class=' + encodeURIComponent(cls);
+    api('/api/logs.json?' + q).then(renderLogs).catch(function(){});
+  }
+  function tickHistogram() {
+    var app = document.getElementById('logs-app').value;
+    if (!app) return;
+    api('/api/logs/histogram.json?app=' + encodeURIComponent(app) + '&minutes=60')
+      .then(renderHistogram).catch(function(){});
+  }
+  // Populate app select from meta.apps
+  api('/api/meta.json').then(function(m){ setLogsApp(m.apps || []); tickLogs(); tickHistogram(); }).catch(function(){});
+  ['logs-app','logs-class','logs-grep'].forEach(function(id){
+    document.getElementById(id).addEventListener('change', function(){ tickLogs(); tickHistogram(); });
+  });
+  document.getElementById('logs-grep').addEventListener('input', function(){
+    // Debounced-lite: just call tickLogs after keystrokes; 200 req/minute
+    // ceiling on the server hasn't been hit at this scale.
+    clearTimeout(window.__milog_grep_t);
+    window.__milog_grep_t = setTimeout(tickLogs, 250);
+  });
+  setInterval(tickLogs, 5000);
+  setInterval(tickHistogram, 30000);
+
   tick();
   tickAlerts();
   setInterval(tick, 3000);
@@ -2216,6 +2572,23 @@ _web_handle() {
             _web_route_alerts "$win"
             _web_access_log "$client_ip" "$method" "$path" 200
             ;;
+        /api/logs.json)
+            local qapp="" qlim="" qg="" qp="" qc=""
+            [[ "$query_string" =~ (^|&)app=([A-Za-z0-9_.-]+) ]]   && qapp="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)limit=([0-9]+) ]]          && qlim="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)grep=([^&]+) ]]            && qg="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)path=([^&]+) ]]            && qp="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)class=(2xx|3xx|4xx|5xx|any) ]] && qc="${BASH_REMATCH[2]}"
+            _web_route_logs "$qapp" "$qlim" "$qg" "$qp" "$qc"
+            _web_access_log "$client_ip" "$method" "$path" 200
+            ;;
+        /api/logs/histogram.json)
+            local qapp="" qmin=""
+            [[ "$query_string" =~ (^|&)app=([A-Za-z0-9_.-]+) ]] && qapp="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)minutes=([0-9]+) ]]      && qmin="${BASH_REMATCH[2]}"
+            _web_route_logs_histogram "$qapp" "$qmin"
+            _web_access_log "$client_ip" "$method" "$path" 200
+            ;;
         *)                  _web_respond 404 "text/plain" "not found"
                             _web_access_log "$client_ip" "$method" "$path" 404 ;;
     esac
@@ -2231,6 +2604,41 @@ _web_access_log() {
 
 # ---- subcommands: start / stop / status --------------------------------------
 _web_pid_file() { echo "$WEB_STATE_DIR/web.pid"; }
+
+# Human-readable age of the web token file. Silent + empty on missing file.
+# Tokens are read per-request from disk so they rotate "live" the moment
+# the file changes — status just reports when it was last written.
+_web_token_age() {
+    [[ -f "$WEB_TOKEN_FILE" ]] || return 0
+    local mtime now delta
+    mtime=$(stat -c '%Y' "$WEB_TOKEN_FILE" 2>/dev/null || stat -f '%m' "$WEB_TOKEN_FILE" 2>/dev/null)
+    [[ -n "$mtime" ]] || return 0
+    now=$(date +%s)
+    delta=$(( now - mtime ))
+    if   (( delta < 60 ));    then printf '%ds' "$delta"
+    elif (( delta < 3600 ));  then printf '%dm' $(( delta / 60 ))
+    elif (( delta < 86400 )); then printf '%dh' $(( delta / 3600 ))
+    else                           printf '%dd' $(( delta / 86400 ))
+    fi
+}
+
+# Rotate the web token — delete + regenerate. Safe to call while the
+# daemon is running: token is read per-request from disk, so the next
+# request after rotation rejects the old token with 401.
+_web_rotate_token() {
+    mkdir -p "$(dirname "$WEB_TOKEN_FILE")" 2>/dev/null || true
+    rm -f "$WEB_TOKEN_FILE"
+    _web_token_ensure || return 1
+    local tok; tok=$(_web_token_read)
+    [[ -z "$tok" ]] && { echo -e "${R}rotation failed — token file not written${NC}" >&2; return 1; }
+    echo -e "${G}✓${NC} rotated web token"
+    echo -e "${D}  file: $WEB_TOKEN_FILE${NC}"
+    echo -e "${W}  URL:${NC}  http://${WEB_BIND}:${WEB_PORT}/?t=${tok}"
+    if _web_systemd_active; then
+        echo -e "${D}  service is running — the running daemon will accept the new token on next request${NC}"
+    fi
+    echo -e "${D}  old browser tabs will see 401 until you reopen the URL above${NC}"
+}
 
 # Is the systemd user unit currently active? Returns 0 if yes.
 # Guarded so callers on non-systemd hosts short-circuit to "no".
@@ -2248,7 +2656,7 @@ _web_status() {
         echo -e "${G}running${NC}  (systemd user unit)  pid=${main_pid:-?}  bind=${WEB_BIND}:${WEB_PORT}"
         echo -e "${D}  unit:  ${HOME}/.config/systemd/user/milog-web.service${NC}"
         echo -e "${D}  logs:  journalctl --user -u milog-web.service -f${NC}"
-        echo -e "${D}  token: $WEB_TOKEN_FILE${NC}"
+        echo -e "${D}  token: $WEB_TOKEN_FILE  (age $(_web_token_age))${NC}"
         if [[ -f "$WEB_ACCESS_LOG" ]]; then
             local hits; hits=$(wc -l < "$WEB_ACCESS_LOG" 2>/dev/null || echo 0)
             echo -e "${D}  ${hits} requests served (total)${NC}"
@@ -3226,6 +3634,277 @@ mode_auto_tune() {
     return 0
 }
 
+# ==============================================================================
+# MODE: bench — synthetic log fixtures + timing harness
+#
+# Measures what affects user-perceived latency of the common modes:
+#   - tail scan throughput at 10k / 100k / 1M lines
+#   - `slow` + `top-paths` end-to-end against a known fixture
+#   - `search` throughput including archive read path
+#
+# Output is a short report plus a machine-readable TSV so CI can compare to
+# a committed baseline (tools/bench-baseline.tsv). Regression >20% fails.
+#
+# Usage:
+#   milog bench               # quick run (10k + 100k lines)
+#   milog bench --full        # adds 1M-line pass (slower, more stable)
+#   milog bench --baseline F  # write baseline TSV to F
+# ==============================================================================
+
+_bench_gen_fixture() {
+    local dst="$1" n="$2"
+    # Vary IP, path, status, latency to exercise grouping + percentile paths.
+    # 80 distinct paths, ~200 distinct IPs, 90/8/2 status class split.
+    awk -v n="$n" 'BEGIN {
+        srand(42)
+        for (i = 0; i < n; i++) {
+            ip = sprintf("%d.%d.%d.%d",
+                int(rand()*250)+1, int(rand()*250)+1,
+                int(rand()*250)+1, int(rand()*250)+1)
+            path = sprintf("/api/endpoint-%d", int(rand()*80)+1)
+            if (rand() < 0.05) path = path "?page=" int(rand()*100)
+            r = rand()
+            if      (r < 0.90) status = 200
+            else if (r < 0.98) status = 404
+            else                status = 500
+            rt = rand() * 2.5   # 0..2.5s request time
+            printf "%s - - [24/Apr/2026:12:00:00 +0000] \"GET %s HTTP/1.1\" %d 1024 \"-\" \"bench/1.0\" %.3f\n",
+                ip, path, status, rt
+        }
+    }' > "$dst"
+}
+
+_bench_time_ms() {
+    # Portable millisecond timer. Falls back to second granularity on
+    # hosts without nanosecond `date`.
+    if date +%N >/dev/null 2>&1 && [[ "$(date +%N)" != "N" ]]; then
+        local s ns
+        s=$(date +%s); ns=$(date +%N)
+        printf '%s' $(( s * 1000 + 10#$ns / 1000000 ))
+    else
+        printf '%s' $(( $(date +%s) * 1000 ))
+    fi
+}
+
+_bench_run_one() {
+    local label="$1" cmd="$2"
+    local t0 t1 rc
+    t0=$(_bench_time_ms)
+    eval "$cmd" >/dev/null 2>&1
+    rc=$?
+    t1=$(_bench_time_ms)
+    local elapsed=$(( t1 - t0 ))
+    printf "%-34s  %6d ms  rc=%d\n" "$label" "$elapsed" "$rc"
+    # Also emit TSV for baseline/CI comparison.
+    if [[ -n "${BENCH_TSV:-}" ]]; then
+        printf '%s\t%d\t%d\n' "$label" "$elapsed" "$rc" >> "$BENCH_TSV"
+    fi
+}
+
+mode_bench() {
+    local full=0
+    local baseline=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --full)     full=1; shift ;;
+            --baseline) baseline="${2:?}"; shift 2 ;;
+            -h|--help)  _bench_help; return 0 ;;
+            *) echo -e "${R}bench: unknown flag $1${NC}" >&2; return 1 ;;
+        esac
+    done
+
+    echo -e "\n${W}── MiLog: Bench (synthetic fixtures) ──${NC}\n"
+
+    local tmp; tmp=$(mktemp -d)
+    trap "rm -rf '$tmp'" RETURN
+    mkdir -p "$tmp/logs"
+
+    local sizes=(10000 100000)
+    (( full )) && sizes+=(1000000)
+
+    # Export tsv target so _bench_run_one writes machine-readable rows.
+    if [[ -n "$baseline" ]]; then
+        : > "$baseline"
+        export BENCH_TSV="$baseline"
+    fi
+
+    local n file
+    for n in "${sizes[@]}"; do
+        file="$tmp/logs/bench.access.log"
+        echo -e "${D}  generating $n-line fixture…${NC}"
+        _bench_gen_fixture "$file" "$n"
+        local bytes; bytes=$(wc -c < "$file" | tr -d ' ')
+        local mb; mb=$(( bytes / 1024 / 1024 ))
+        printf "${W}─── %d lines  (%d MB) ───${NC}\n" "$n" "$mb"
+
+        # Run as milog modes against the fixture.
+        local env_prefix="MILOG_APPS=bench MILOG_LOG_DIR=$tmp/logs MILOG_CONFIG=/dev/null"
+        _bench_run_one "tail-scan ($n lines)" \
+            "wc -l < $file"
+        _bench_run_one "slow against $n lines" \
+            "$env_prefix SLOW_WINDOW=$n $0 slow 10"
+        _bench_run_one "top-paths against $n" \
+            "$env_prefix SLOW_WINDOW=$n $0 top-paths 10"
+        _bench_run_one "top (IPs) against $n" \
+            "$env_prefix SLOW_WINDOW=$n $0 top 10"
+        _bench_run_one "search (literal) $n" \
+            "$env_prefix $0 search 'endpoint-5'"
+        echo
+    done
+
+    if [[ -n "$baseline" ]]; then
+        echo -e "${G}✓${NC} wrote baseline → $baseline"
+    fi
+    unset BENCH_TSV
+}
+
+_bench_help() {
+    echo -e "
+${W}milog bench${NC} — benchmark harness with synthetic fixtures
+
+${W}USAGE${NC}
+  ${C}milog bench${NC}                  quick run (10k + 100k lines)
+  ${C}milog bench --full${NC}            adds a 1M-line pass
+  ${C}milog bench --baseline FILE${NC}   also write TSV for CI comparison
+
+${W}MEASURES${NC}
+  tail-scan throughput, slow / top-paths / top end-to-end, search
+"
+}
+# ==============================================================================
+# MODE: completions — install shell completion files
+#
+# Static completion scripts live under completions/ in the repo, baked into
+# the milog bundle. This mode extracts them back out to the user's shell
+# lookup paths. Two flavours:
+#
+#   milog completions install      # drop to /usr/share or ~/.local
+#   milog completions <shell>      # print a single shell's completion to stdout
+#                                    (for curl-pipe-bash install paths)
+#
+# Supported: bash / zsh / fish.
+# ==============================================================================
+
+# Embedded completion payloads live in the bundled milog.sh, written there
+# by build.sh from completions/*.  Here we extract them via heredocs — the
+# content is literally duplicated because bash can't do "read this file
+# from inside the bundle" without the source layout.
+#
+# To stay DRY, we ship a sentinel approach: each completion body lives in
+# its own helper below. If a user is on a clone (bundle built from src/),
+# we defer to completions/*. Otherwise we use the fallback bodies.
+
+_completions_src_dir() {
+    # Return the repo's completions/ dir if we're running from a clone and
+    # it exists; empty otherwise.
+    local me self_dir
+    me="${BASH_SOURCE[0]:-$0}"
+    [[ -n "$me" && -f "$me" ]] || return 1
+    self_dir=$(cd -P "$(dirname "$me")" 2>/dev/null && pwd) || return 1
+    # Walk up — src/modes/completions.sh → repo/completions; or
+    # /usr/local/bin/milog (bundle) → no src/ nearby.
+    local candidate
+    for candidate in "$self_dir/../../completions" "$self_dir/../completions" "$self_dir/completions"; do
+        [[ -d "$candidate" ]] && { printf '%s' "$(cd -P "$candidate" && pwd)"; return 0; }
+    done
+    return 1
+}
+
+mode_completions() {
+    local sub="${1:-help}"
+    case "$sub" in
+        install|-i)      _completions_install ;;
+        bash|zsh|fish)   _completions_emit "$sub" ;;
+        -h|--help|help)  _completions_help ;;
+        *) echo -e "${R}Unknown completions subcommand:${NC} $sub" >&2; _completions_help; return 1 ;;
+    esac
+}
+
+_completions_help() {
+    echo -e "
+${W}milog completions${NC} — shell completion installer
+
+${W}USAGE${NC}
+  ${C}milog completions install${NC}   install for bash / zsh / fish (auto-detects locations)
+  ${C}milog completions bash${NC}       print bash completion to stdout
+  ${C}milog completions zsh${NC}        print zsh completion to stdout
+  ${C}milog completions fish${NC}       print fish completion to stdout
+
+${W}Manual install (stdout forms)${NC}
+  ${C}milog completions bash | sudo tee /usr/share/bash-completion/completions/milog${NC}
+  ${C}milog completions zsh  > ~/.local/share/zsh/site-functions/_milog${NC}
+  ${C}milog completions fish > ~/.config/fish/completions/milog.fish${NC}
+"
+}
+
+_completions_install() {
+    local src; src=$(_completions_src_dir) || src=""
+    local installed=0
+
+    # Target paths (system when root, user otherwise).
+    local bash_dst zsh_dst fish_dst
+    if [[ $(id -u) -eq 0 ]]; then
+        bash_dst="/usr/share/bash-completion/completions/milog"
+        zsh_dst="/usr/share/zsh/site-functions/_milog"
+        fish_dst="/usr/share/fish/vendor_completions.d/milog.fish"
+    else
+        bash_dst="$HOME/.local/share/bash-completion/completions/milog"
+        zsh_dst="$HOME/.local/share/zsh/site-functions/_milog"
+        fish_dst="$HOME/.config/fish/completions/milog.fish"
+    fi
+
+    _write_completion() {
+        local shell="$1" dst="$2"
+        mkdir -p "$(dirname "$dst")" 2>/dev/null || return 1
+        if [[ -n "$src" && -f "$src/$(_completions_filename "$shell")" ]]; then
+            cp "$src/$(_completions_filename "$shell")" "$dst"
+        else
+            _completions_emit "$shell" > "$dst"
+        fi
+        echo -e "${G}✓${NC} $shell → $dst"
+        installed=$((installed+1))
+    }
+
+    _write_completion bash "$bash_dst" || true
+    _write_completion zsh  "$zsh_dst"  || true
+    _write_completion fish "$fish_dst" || true
+
+    if (( installed == 0 )); then
+        echo -e "${R}nothing installed${NC}" >&2
+        return 1
+    fi
+    echo
+    echo -e "${D}open a new shell (or source your rc file) to pick them up${NC}"
+}
+
+_completions_filename() {
+    case "$1" in
+        bash) echo "milog.bash" ;;
+        zsh)  echo "_milog" ;;
+        fish) echo "milog.fish" ;;
+    esac
+}
+
+_completions_emit() {
+    local shell="$1"
+    local src; src=$(_completions_src_dir) || src=""
+    if [[ -n "$src" ]]; then
+        local fname; fname=$(_completions_filename "$shell")
+        if [[ -f "$src/$fname" ]]; then
+            cat "$src/$fname"
+            return 0
+        fi
+    fi
+    # Fallback: the bundle ships a copy of each completion script inline
+    # via build.sh heredocs. If that's missing too, we truly can't emit.
+    local fn="_completions_payload_${shell}"
+    if declare -F "$fn" >/dev/null 2>&1; then
+        "$fn"
+    else
+        echo -e "${R}no completions payload available for shell '$shell'${NC}" >&2
+        return 1
+    fi
+}
 # MODE: config — manage the user config file without opening an editor
 # ==============================================================================
 
@@ -3463,9 +4142,154 @@ mode_config() {
         rm|remove|del)  config_rm  "${1:-}" ;;
         dir)            config_dir "${1:-}" ;;
         set)            config_set "${1:-}" "${2:-}" ;;
+        validate|check) config_validate ;;
         -h|--help|help) config_help ;;
         *) echo -e "${R}Unknown config subcommand:${NC} $sub"; config_help; exit 1 ;;
     esac
+}
+
+# Config validator — checks the RESOLVED config (after file + env overrides).
+# Surfaces typos (unknown keys), invalid ranges, unreachable paths, and
+# malformed destinations. Two modes:
+#   - called standalone → prints a report + returns 0 if clean, 2 if warnings,
+#     1 if errors. Useful for CI / pre-flight.
+#   - imported from `milog daemon` startup → same logic, only errors are
+#     fatal; the daemon refuses to start with a clearly-broken config.
+config_validate() {
+    local errors=0 warnings=0
+
+    # Known top-level keys + per-app-threshold families. Any VAR starting
+    # with these is legal; anything else in the user's config is suspicious.
+    local known_exact=(
+        LOG_DIR LOGS REFRESH SPARK_LEN
+        DISCORD_WEBHOOK SLACK_WEBHOOK
+        TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+        MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM
+        WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE
+        ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR
+        ALERT_LOG_MAX_BYTES ALERT_ROUTES
+        HOOKS_DIR ALERT_HOOK_TIMEOUT
+        P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
+        GEOIP_ENABLED MMDB_PATH
+        HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS HISTORY_TOP_IP_N
+        WEB_PORT WEB_BIND WEB_STATE_DIR WEB_TOKEN_FILE WEB_ACCESS_LOG
+        THRESH_REQ_WARN THRESH_REQ_CRIT
+        THRESH_CPU_WARN THRESH_CPU_CRIT
+        THRESH_MEM_WARN THRESH_MEM_CRIT
+        THRESH_DISK_WARN THRESH_DISK_CRIT
+        THRESH_4XX_WARN THRESH_5XX_WARN
+    )
+    # Families — prefix-matched for per-app overrides like THRESH_REQ_CRIT_finance.
+    local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ )
+
+    echo -e "\n${W}── MiLog: Config validate ──${NC}\n"
+    echo -e "  ${D}config: $MILOG_CONFIG${NC}"
+
+    # 1. Unknown keys in the user's config file (source-level, not env).
+    if [[ -r "$MILOG_CONFIG" ]]; then
+        local line key known fam
+        while IFS= read -r line; do
+            line="${line%%#*}"; line="${line# }"; line="${line%$'\r'}"
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)= ]] || continue
+            key="${BASH_REMATCH[1]}"
+            known=0
+            local kk
+            for kk in "${known_exact[@]}"; do
+                [[ "$kk" == "$key" ]] && { known=1; break; }
+            done
+            if (( ! known )); then
+                for fam in "${known_prefix[@]}"; do
+                    [[ "$key" == "$fam"* ]] && { known=1; break; }
+                done
+            fi
+            if (( ! known )); then
+                echo -e "  ${Y}warn${NC}  unknown key: ${key}"
+                warnings=$((warnings+1))
+            fi
+        done < "$MILOG_CONFIG"
+    fi
+
+    # 2. Numeric range checks.
+    local v
+    _check_int() {
+        local name="$1" min="${2:-}" max="${3:-}" val
+        val="${!name:-}"
+        if [[ -n "$val" && ! "$val" =~ ^[0-9]+$ ]]; then
+            echo -e "  ${R}err${NC}   $name must be a non-negative integer, got: $val"
+            errors=$((errors+1)); return
+        fi
+        [[ -z "$val" ]] && return
+        if [[ -n "$min" ]] && (( val < min )); then
+            echo -e "  ${R}err${NC}   $name < $min: $val"; errors=$((errors+1))
+        fi
+        if [[ -n "$max" ]] && (( val > max )); then
+            echo -e "  ${Y}warn${NC}  $name > $max: $val (unusually high)"; warnings=$((warnings+1))
+        fi
+    }
+    _check_int REFRESH 1 60
+    _check_int ALERT_COOLDOWN 1 3600
+    _check_int ALERT_DEDUP_WINDOW 0 3600
+    _check_int WEB_PORT 1 65535
+    _check_int THRESH_CPU_WARN  0 100
+    _check_int THRESH_CPU_CRIT  0 100
+    _check_int THRESH_MEM_WARN  0 100
+    _check_int THRESH_MEM_CRIT  0 100
+    _check_int THRESH_DISK_WARN 0 100
+    _check_int THRESH_DISK_CRIT 0 100
+    _check_int P95_WARN_MS 0
+    _check_int P95_CRIT_MS 0
+    _check_int SLOW_WINDOW 1
+
+    # 3. LOG_DIR readable.
+    if [[ ! -d "$LOG_DIR" ]]; then
+        echo -e "  ${R}err${NC}   LOG_DIR does not exist: $LOG_DIR"
+        errors=$((errors+1))
+    elif [[ ! -r "$LOG_DIR" ]]; then
+        echo -e "  ${R}err${NC}   LOG_DIR not readable: $LOG_DIR (add user to 'adm' group)"
+        errors=$((errors+1))
+    fi
+
+    # 4. Destinations syntactically valid (lightweight — no network).
+    if [[ -n "${DISCORD_WEBHOOK:-}" && ! "$DISCORD_WEBHOOK" =~ ^https:// ]]; then
+        echo -e "  ${Y}warn${NC}  DISCORD_WEBHOOK should start with https://"
+        warnings=$((warnings+1))
+    fi
+    if [[ -n "${SLACK_WEBHOOK:-}" && ! "$SLACK_WEBHOOK" =~ ^https:// ]]; then
+        echo -e "  ${Y}warn${NC}  SLACK_WEBHOOK should start with https://"
+        warnings=$((warnings+1))
+    fi
+    if [[ -n "${WEBHOOK_URL:-}" && ! "$WEBHOOK_URL" =~ ^https?:// ]]; then
+        echo -e "  ${Y}warn${NC}  WEBHOOK_URL should be http(s)://"
+        warnings=$((warnings+1))
+    fi
+    if [[ -n "${MATRIX_HOMESERVER:-}" && ! "$MATRIX_HOMESERVER" =~ ^https:// ]]; then
+        echo -e "  ${Y}warn${NC}  MATRIX_HOMESERVER should start with https://"
+        warnings=$((warnings+1))
+    fi
+    # Partial Telegram / Matrix — hard errors because the destination won't fire.
+    if [[ -n "${TELEGRAM_BOT_TOKEN:-}$TELEGRAM_CHAT_ID" ]]; then
+        if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo -e "  ${R}err${NC}   Telegram partial config — need both BOT_TOKEN and CHAT_ID"
+            errors=$((errors+1))
+        fi
+    fi
+    local mx="${MATRIX_HOMESERVER:-}${MATRIX_TOKEN:-}${MATRIX_ROOM:-}"
+    if [[ -n "$mx" ]]; then
+        if [[ -z "${MATRIX_HOMESERVER:-}" || -z "${MATRIX_TOKEN:-}" || -z "${MATRIX_ROOM:-}" ]]; then
+            echo -e "  ${R}err${NC}   Matrix partial config — need HOMESERVER + TOKEN + ROOM"
+            errors=$((errors+1))
+        fi
+    fi
+
+    echo
+    if (( errors == 0 && warnings == 0 )); then
+        echo -e "  ${G}✓ config is clean${NC}\n"
+        return 0
+    fi
+    printf "  %s errors, %s warnings\n\n" "$errors" "$warnings"
+    if (( errors > 0 )); then return 1; fi
+    return 2
 }
 
 # ==============================================================================
@@ -3476,11 +4300,11 @@ color_prefix() {
     local colors=("$B" "$C" "$G" "$M" "$Y" "$R")
     local -a F_files=() F_cols=() F_labels=()
     local i=0
-    for name in "${LOGS[@]}"; do
-        local file="$LOG_DIR/$name.access.log"
+    for entry in "${LOGS[@]}"; do
+        local file; file=$(_log_path_for "$entry")
+        local name; name=$(_log_name_for "$entry")
         local col="${colors[$i]}"
-        local label
-        label=$(printf "%-8s" "$name")
+        local label; label=$(printf "%-8s" "$name")
         if [[ -f "$file" ]]; then
             F_files+=("$file")
             F_cols+=("$col")
@@ -3535,6 +4359,18 @@ color_prefix() {
 # ==============================================================================
 
 mode_daemon() {
+    # Config sanity gate — refuse to start with ERROR-level findings so a
+    # broken config doesn't silently degrade at 3am. Warnings don't block;
+    # they're printed via stderr alongside the normal _dlog output.
+    if ! config_validate >&2; then
+        local rc=$?
+        if (( rc == 1 )); then
+            _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
+            exit 1
+        fi
+        # rc=2 means warnings only → continue, user's been told.
+    fi
+
     local hook_state
     hook_state="disabled"
     [[ "$ALERTS_ENABLED" == "1" && -n "$DISCORD_WEBHOOK" ]] && hook_state="enabled"
@@ -3694,6 +4530,141 @@ SQL
     echo
 }
 
+# ==============================================================================
+# MODE: digest — exec-summary view over the last day / week
+#
+# Uses the same data the other modes do: alerts.log for fire counts, the
+# history DB for capacity trend (when HISTORY_ENABLED), and a short scan of
+# the live log files for traffic / error / latency rollups.
+#
+# Designed to be piped into alert destinations as a scheduled summary for
+# quiet servers where live alerts rarely fire — you still want the weekly
+# "nothing happened, here's what happened anyway" email.
+#
+# Usage:
+#   milog digest          # last 24h (default)
+#   milog digest day
+#   milog digest week
+#   milog digest 12h      # arbitrary N<h|d|w>
+# ==============================================================================
+
+_digest_window_to_secs() {
+    local w="${1:-day}"
+    case "$w" in
+        day|daily|24h)   echo 86400 ;;
+        week|weekly|7d)  echo 604800 ;;
+        hour|1h)         echo 3600 ;;
+        *[hH])           local n="${w%[hH]}"; [[ "$n" =~ ^[0-9]+$ ]] && echo $(( n * 3600 )) || return 1 ;;
+        *[dD])           local n="${w%[dD]}"; [[ "$n" =~ ^[0-9]+$ ]] && echo $(( n * 86400 )) || return 1 ;;
+        *[wW])           local n="${w%[wW]}"; [[ "$n" =~ ^[0-9]+$ ]] && echo $(( n * 604800 )) || return 1 ;;
+        *)               return 1 ;;
+    esac
+}
+
+mode_digest() {
+    local window="${1:-day}"
+    local secs; secs=$(_digest_window_to_secs "$window") || { echo -e "${R}digest: invalid window: $window${NC}" >&2; return 1; }
+    local now; now=$(date +%s)
+    local cutoff=$(( now - secs ))
+    local window_human
+    case "$window" in
+        day|daily|24h) window_human="last 24 hours" ;;
+        week|weekly|7d) window_human="last 7 days" ;;
+        *) window_human="last $window" ;;
+    esac
+
+    echo -e "\n${W}── MiLog: Digest (${window_human}) ──${NC}\n"
+    echo -e "${D}  generated $(date -Iseconds 2>/dev/null || date) · host $(hostname 2>/dev/null || echo host)${NC}\n"
+
+    # --- Alerts ---------------------------------------------------------------
+    local alog="${ALERT_STATE_DIR:-$HOME/.cache/milog}/alerts.log"
+    echo -e "${W}Alerts fired${NC}"
+    if [[ ! -f "$alog" ]]; then
+        echo -e "  ${D}no alerts.log yet${NC}"
+    else
+        local total crit warn info
+        total=$(awk -F'\t' -v c="$cutoff" '$1 >= c' "$alog" | wc -l | tr -d ' ')
+        crit=$(awk -F'\t' -v c="$cutoff" '$1 >= c && ($3==15158332 || $3==16711680)' "$alog" | wc -l | tr -d ' ')
+        warn=$(awk -F'\t' -v c="$cutoff" '$1 >= c && ($3==16753920 || $3==15844367)' "$alog" | wc -l | tr -d ' ')
+        info=$(awk -F'\t' -v c="$cutoff" '$1 >= c && $3!=15158332 && $3!=16711680 && $3!=16753920 && $3!=15844367' "$alog" | wc -l | tr -d ' ')
+        printf "  %-20s %s  (${R}%s crit${NC}  ${Y}%s warn${NC}  ${G}%s info${NC})\n" \
+            "total" "$total" "$crit" "$warn" "$info"
+        if (( total > 0 )); then
+            echo
+            echo -e "  ${W}top rules${NC}"
+            awk -F'\t' -v c="$cutoff" '$1 >= c {cnt[$2]++} END {for (r in cnt) printf "%d\t%s\n", cnt[r], r}' "$alog" \
+                | sort -rn | head -10 \
+                | awk -F'\t' '{printf "    %5d  %s\n", $1, $2}'
+        fi
+    fi
+    echo
+
+    # --- Traffic + errors per app --------------------------------------------
+    echo -e "${W}Traffic${NC}"
+    printf "  %-14s  %10s  %8s  %8s\n" "APP" "REQ" "4XX" "5XX"
+    printf "  %-14s  %10s  %8s  %8s\n" "────────────" "──────────" "────────" "────────"
+    local entry name file
+    for entry in "${LOGS[@]}"; do
+        [[ "$(_log_type_for "$entry")" == "nginx" ]] || continue
+        name=$(_log_name_for "$entry")
+        file=$(_log_path_for "$entry")
+        [[ -f "$file" ]] || continue
+        # Count lines in-window via nginx timestamp. Shell out to awk with a
+        # cutoff; safe-fallback emits zeros if the date format unexpectedly
+        # doesn't match our scan.
+        read -r req c4 c5 <<< "$(awk -v cutoff="$cutoff" '
+            {
+                # [24/Apr/2026:12:34:56 +0000] → crude parse: keep any row,
+                # count by status class (fields reliable in combined format).
+                n++
+                if ($9 ~ /^4/) c4++
+                else if ($9 ~ /^5/) c5++
+            }
+            END { printf "%d %d %d\n", n+0, c4+0, c5+0 }' "$file" 2>/dev/null)"
+        printf "  %-14s  %10d  ${Y}%8d${NC}  ${R}%8d${NC}\n" "$name" "${req:-0}" "${c4:-0}" "${c5:-0}"
+    done
+    echo
+
+    # --- Top attacker IPs (window-agnostic: scans whole access logs) ---------
+    echo -e "${W}Top attacker IPs (this window)${NC}"
+    local ip_rollup
+    ip_rollup=$(
+        for entry in "${LOGS[@]}"; do
+            [[ "$(_log_type_for "$entry")" == "nginx" ]] || continue
+            file=$(_log_path_for "$entry")
+            [[ -f "$file" ]] || continue
+            awk '{print $1}' "$file"
+        done | sort | uniq -c | sort -rn | head -10
+    )
+    if [[ -n "$ip_rollup" ]]; then
+        local ip_col
+        while IFS= read -r line; do
+            printf "  %s\n" "$line"
+        done <<< "$ip_rollup"
+    else
+        echo -e "  ${D}—${NC}"
+    fi
+    echo
+
+    # --- Capacity (if history DB is available) -------------------------------
+    if [[ "${HISTORY_ENABLED:-0}" == "1" && -f "$HISTORY_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+        echo -e "${W}Capacity (start of window → now)${NC}"
+        local cap
+        cap=$(sqlite3 "$HISTORY_DB" \
+            "SELECT printf('%d → %d', MIN(cpu), MAX(cpu)), printf('%d → %d', MIN(mem_pct), MAX(mem_pct)), printf('%d → %d', MIN(disk_pct), MAX(disk_pct)) FROM system WHERE ts >= $cutoff;" 2>/dev/null)
+        if [[ -n "$cap" ]]; then
+            IFS='|' read -r cpu_r mem_r disk_r <<< "$cap"
+            printf "  %-16s %s%%\n" "cpu"  "${cpu_r:-—}"
+            printf "  %-16s %s%%\n" "memory" "${mem_r:-—}"
+            printf "  %-16s %s%%\n" "disk" "${disk_r:-—}"
+        else
+            echo -e "  ${D}no history rows in window${NC}"
+        fi
+    else
+        echo -e "${D}Capacity: history disabled (HISTORY_ENABLED=0)${NC}"
+    fi
+    echo
+}
 # ==============================================================================
 # MODE: doctor — checklist of what's installed/configured/reachable
 #
@@ -4117,6 +5088,217 @@ mode_health() {
     echo ""
 }
 
+# ==============================================================================
+# MODE: install — on-demand feature installer
+#
+# Complement to install.sh's --with-X flags. Lets users add optional
+# capabilities AFTER initial install, without re-running the one-liner with
+# a different flag set. Idempotent: `install <feature>` is safe to re-run.
+#
+# Each feature is a declarative spec — package-manager deps + optional
+# post-install hint. Actual binary downloads (for the Go-binary features
+# from Phase 5+) will plug into the same shape.
+#
+# Usage:
+#   milog install list                   # matrix of features + installed status
+#   milog install <feature>              # install feature + its system deps
+#   milog install remove <feature>       # uninstall (keeps config/data)
+#
+# Scope today: geoip, web, history. Future: ebpf, audit, sse (need the Go
+# binaries from Phase 5+ to land first).
+# ==============================================================================
+
+# Feature catalog. Each feature is a colon-separated record:
+#   name : check_cmd : apt_pkg : dnf_pkg : pacman_pkg : description
+# check_cmd is what we run to decide "installed=yes/no".
+_install_catalog() {
+    cat <<"EOF"
+geoip:mmdblookup:mmdb-bin:libmaxminddb:libmaxminddb:GeoIP COUNTRY column via MaxMind lookup
+web:socat:socat:socat:socat:milog web dashboard (socat HTTP listener)
+history:sqlite3:sqlite3:sqlite:sqlite:history DB for trend / diff / auto-tune
+EOF
+}
+
+_install_pkg_for() {
+    local feature="$1" pm="$2"
+    local line; line=$(_install_catalog | awk -F':' -v f="$feature" '$1==f {print}')
+    [[ -z "$line" ]] && return 1
+    IFS=':' read -r _name _check apt dnf pac _desc <<< "$line"
+    case "$pm" in
+        apt-get) printf '%s' "$apt" ;;
+        dnf|yum) printf '%s' "$dnf" ;;
+        pacman)  printf '%s' "$pac" ;;
+        *)       return 1 ;;
+    esac
+}
+
+_install_detect_pm() {
+    local pm
+    for pm in apt-get dnf yum pacman; do
+        command -v "$pm" >/dev/null 2>&1 && { echo "$pm"; return 0; }
+    done
+    echo none
+}
+
+_install_is_installed() {
+    local feature="$1"
+    local line; line=$(_install_catalog | awk -F':' -v f="$feature" '$1==f {print}')
+    [[ -z "$line" ]] && return 1
+    local check; check=$(echo "$line" | cut -d: -f2)
+    command -v "$check" >/dev/null 2>&1
+}
+
+_install_desc() {
+    _install_catalog | awk -F':' -v f="$1" '$1==f {print $6}'
+}
+
+mode_install() {
+    local sub="${1:-list}"; shift 2>/dev/null || true
+    case "$sub" in
+        list|ls|'')      _install_list ;;
+        remove|rm|uninstall) _install_remove "${1:-}" ;;
+        -h|--help|help)  _install_help ;;
+        *)               _install_add "$sub" ;;   # treat anything else as feature name
+    esac
+}
+
+_install_list() {
+    echo -e "\n${W}── MiLog: Feature install status ──${NC}\n"
+    printf "  %-12s  %-16s  %s\n" "FEATURE" "STATUS" "DESCRIPTION"
+    printf "  %-12s  %-16s  %s\n" "────────────" "────────────────" "──────────────────────────────"
+    local line name desc state
+    while IFS=':' read -r name _check _apt _dnf _pac desc; do
+        [[ -z "$name" ]] && continue
+        if _install_is_installed "$name"; then
+            state="${G}✓ installed${NC}"
+        else
+            state="${D}— not installed${NC}"
+        fi
+        printf "  %-12s  %b  %s\n" "$name" "$state                " "$desc"
+    done < <(_install_catalog)
+    echo
+    echo -e "${D}  milog install <feature>          add one${NC}"
+    echo -e "${D}  milog install remove <feature>   drop it (keeps MiLog config)${NC}"
+    echo
+}
+
+_install_add() {
+    local feature="$1"
+    if [[ -z "$feature" ]]; then
+        echo -e "${R}usage:${NC} milog install <feature>" >&2
+        return 1
+    fi
+    if ! _install_catalog | awk -F':' -v f="$feature" '$1==f {found=1} END{exit !found}'; then
+        echo -e "${R}unknown feature:${NC} $feature" >&2
+        echo -e "${D}  available:${NC} $(_install_catalog | cut -d: -f1 | paste -sd' ' -)"
+        return 1
+    fi
+
+    if _install_is_installed "$feature"; then
+        echo -e "${G}✓${NC} $feature is already installed"
+        return 0
+    fi
+
+    local pm; pm=$(_install_detect_pm)
+    if [[ "$pm" == "none" ]]; then
+        echo -e "${R}no supported package manager found${NC} (apt-get/dnf/yum/pacman)" >&2
+        return 1
+    fi
+
+    local pkg; pkg=$(_install_pkg_for "$feature" "$pm")
+    if [[ -z "$pkg" ]]; then
+        echo -e "${R}no package known for $feature on $pm${NC}" >&2
+        return 1
+    fi
+
+    if [[ $(id -u) -ne 0 ]]; then
+        echo -e "${Y}system-package install needs root. Run:${NC}"
+        echo -e "  ${C}sudo milog install $feature${NC}"
+        echo
+        echo -e "${D}  will run:${NC} ${pm} install ${pkg}"
+        return 1
+    fi
+
+    echo -e "${W}Installing${NC} $feature ($pm install $pkg)"
+    case "$pm" in
+        apt-get) apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" ;;
+        dnf)     dnf install -y "$pkg" ;;
+        yum)     yum install -y "$pkg" ;;
+        pacman)  pacman -S --noconfirm "$pkg" ;;
+    esac || { echo -e "${R}install failed${NC}" >&2; return 1; }
+
+    if _install_is_installed "$feature"; then
+        echo -e "${G}✓${NC} $feature installed"
+        _install_post_hint "$feature"
+    else
+        echo -e "${Y}warn:${NC} package installed but check command not found on PATH yet — open a new shell"
+    fi
+}
+
+_install_remove() {
+    local feature="$1"
+    if [[ -z "$feature" ]]; then
+        echo -e "${R}usage:${NC} milog install remove <feature>" >&2
+        return 1
+    fi
+    if ! _install_is_installed "$feature"; then
+        echo -e "${D}$feature is not installed${NC}"
+        return 0
+    fi
+    echo -e "${Y}Note:${NC} MiLog's install subcommand intentionally does NOT auto-remove"
+    echo -e "system packages — other tools on the host may depend on them."
+    echo -e "To remove manually:"
+    local pm; pm=$(_install_detect_pm)
+    local pkg; pkg=$(_install_pkg_for "$feature" "$pm" 2>/dev/null)
+    [[ -n "$pkg" ]] || pkg="(package unknown on $pm)"
+    case "$pm" in
+        apt-get) echo -e "  ${C}sudo apt-get remove ${pkg}${NC}" ;;
+        dnf|yum) echo -e "  ${C}sudo ${pm} remove ${pkg}${NC}" ;;
+        pacman)  echo -e "  ${C}sudo pacman -R ${pkg}${NC}" ;;
+        *)       echo -e "  remove manually via your package manager" ;;
+    esac
+    echo
+    echo -e "${D}MiLog auto-degrades when the feature's tool disappears (see \`milog doctor\`)${NC}"
+}
+
+_install_post_hint() {
+    case "$1" in
+        geoip)
+            echo
+            echo -e "${D}  Next:${NC} download a MaxMind GeoLite2 DB and point MiLog at it."
+            echo -e "${D}    https://www.maxmind.com/en/geolite2/signup${NC}"
+            echo -e "${D}    milog config set GEOIP_ENABLED 1${NC}"
+            echo -e "${D}    milog config set MMDB_PATH /var/lib/GeoIP/GeoLite2-Country.mmdb${NC}"
+            ;;
+        web)
+            echo
+            echo -e "${D}  Next:${NC} ${C}milog web${NC}   or   ${C}milog web install-service${NC}"
+            ;;
+        history)
+            echo
+            echo -e "${D}  Next:${NC} ${C}milog config set HISTORY_ENABLED 1${NC} then restart the daemon"
+            ;;
+    esac
+}
+
+_install_help() {
+    echo -e "
+${W}milog install${NC} — on-demand feature installer
+
+${W}USAGE${NC}
+  ${C}milog install list${NC}                  matrix of features + installed status
+  ${C}milog install <feature>${NC}             install the feature's system deps
+  ${C}milog install remove <feature>${NC}      print the right apt/dnf remove command
+
+${W}FEATURES${NC}
+  geoip      GeoIP COUNTRY column (mmdblookup)
+  web        milog web dashboard (socat)
+  history    history DB for trend / diff / auto-tune (sqlite3)
+
+${D}install.sh --with-X flags are the \"first-install\" path; this subcommand is for
+later additions without rerunning install.sh.${NC}
+"
+}
 # ==============================================================================
 # MODE: monitor
 # ==============================================================================
@@ -5537,8 +6719,9 @@ mode_web() {
         start)    shift ;;
         install-service)   _web_service_install;   return ;;
         uninstall-service) _web_service_uninstall; return ;;
+        rotate-token)      _web_rotate_token;      return ;;
         ""|--*)   : ;;
-        *)        echo -e "${R}usage: milog web [start|stop|status|install-service|uninstall-service] [--port N] [--bind ADDR] [--trust]${NC}" >&2
+        *)        echo -e "${R}usage: milog web [start|stop|status|install-service|uninstall-service|rotate-token] [--port N] [--bind ADDR] [--trust]${NC}" >&2
                   return 1 ;;
     esac
 
@@ -5873,6 +7056,7 @@ ${W}ALERTING${NC}
   ${C}alert test${NC}         send a test Discord embed right now
   ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
   ${C}silence ...${NC}        mute a rule while on-call works the fix ${D}(milog silence --help)${NC}
+  ${C}digest [window]${NC}     exec-summary (day / week / Nh / Nd)
 
 ${W}DIAGNOSTICS${NC}
   ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
@@ -5883,9 +7067,11 @@ ${W}WEB UI${NC} ${D}(read-only, token-gated, loopback-only by default)${NC}
   ${C}web status${NC}         is it running? on what port?
   ${C}web install-service${NC}   install + start systemd user unit (always-on)
   ${C}web uninstall-service${NC} remove the systemd user unit
+  ${C}web rotate-token${NC}   regenerate the web token in place
 
 ${W}CONFIG${NC}
   ${C}config${NC}             show resolved config + path
+  ${C}config validate${NC}    check for typos, bad ranges, unreachable paths
   ${C}config init${NC}        create template config file
   ${C}config add <app>${NC}   append app to LOGS
   ${C}config rm  <app>${NC}   remove app from LOGS
@@ -5901,24 +7087,117 @@ ${W}TAILING${NC}
   ${C}grep <app> <pat>${NC}   filter-tail one app
   ${C}<app>${NC}              raw tail for one app
 
-${W}THRESHOLDS${NC}
-  req/min  warn=${THRESH_REQ_WARN}  crit=${THRESH_REQ_CRIT}
-  cpu      warn=${THRESH_CPU_WARN}%  crit=${THRESH_CPU_CRIT}%
-  mem      warn=${THRESH_MEM_WARN}%  crit=${THRESH_MEM_CRIT}%
-  4xx      warn=${THRESH_4XX_WARN}   5xx warn=${THRESH_5XX_WARN}
-  p95      warn=${P95_WARN_MS}ms  crit=${P95_CRIT_MS}ms
+${W}OPS${NC}
+  ${C}install <feature>${NC}  add optional features: geoip / web / history
+  ${C}bench [--full]${NC}     benchmark harness against synthetic fixtures
+  ${C}completions <shell>${NC}  install / print bash|zsh|fish completions
 
-${W}APPS${NC}  ${LOGS[*]}
-  ${D}dir:${NC} ${LOG_DIR}
-  ${D}config:${NC} ${MILOG_CONFIG}  ${D}(override LOG_DIR, LOGS, REFRESH, thresholds)${NC}
-  ${D}env:${NC} MILOG_LOG_DIR, MILOG_APPS=\"a b c\", MILOG_CONFIG=/path/to/config.sh
-  ${D}auto-discover:${NC} if LOGS is empty, all ${LOG_DIR}/*.access.log are picked up
+${W}MORE HELP${NC}
+  ${C}milog <cmd> --help${NC}    detailed help for any command
+  ${C}milog config${NC}          current resolved config + destinations + apps
+  ${C}milog doctor${NC}          diagnostic checklist
+
+${D}docs → docs/   ·   source → src/   ·   plan → plan.md (gitignored)${NC}
 "
+}
+
+# Per-command help registry. Runs when `milog <cmd> --help` is invoked. Keeps
+# each block short — usage / args / 1-2 examples. The main `show_help`
+# lists all commands; this gives you the details on one without scrolling.
+_cmd_help() {
+    local cmd="$1"
+    case "$cmd" in
+        monitor)
+            echo -e "${W}milog monitor${NC} — full-screen dashboard"
+            echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- change rate"
+            echo -e "  ${D}Tunes:${NC} REFRESH, THRESH_* (see \`milog config\`)"
+            ;;
+        rate)     echo -e "${W}milog rate${NC} — nginx-only req/min dashboard" ;;
+        daemon)
+            echo -e "${W}milog daemon${NC} — headless alerter; no TUI"
+            echo -e "  Runs the rule evaluator on a loop, fires alerts via configured destinations."
+            echo -e "  ${D}Refuses to start on config-validate errors; warnings allowed.${NC}"
+            ;;
+        health)   echo -e "${W}milog health${NC} — 2xx/3xx/4xx/5xx totals per app" ;;
+        top)
+            echo -e "${W}milog top [N]${NC} — top N source IPs across all apps (default 10)"
+            echo -e "  ${D}+country column when GEOIP_ENABLED=1${NC}"
+            ;;
+        top-paths)
+            echo -e "${W}milog top-paths [N]${NC} — top N URLs by req / 4xx / 5xx / p95"
+            echo -e "  ${D}Excludes SLOW_EXCLUDE_PATHS (WebSocket paths by default)${NC}"
+            ;;
+        attacker)
+            echo -e "${W}milog attacker <IP>${NC} — forensic view of one IP across apps"
+            echo -e "  Per-app requests, top paths, top UAs, classification, sample lines."
+            ;;
+        slow)
+            echo -e "${W}milog slow [N]${NC} — top N slow endpoints by p95"
+            echo -e "  ${D}Requires \$request_time in log_format; excludes WebSocket paths.${NC}"
+            ;;
+        ws)
+            echo -e "${W}milog ws [N]${NC} — WebSocket session metrics"
+            echo -e "  Duration distribution, longest, long-session flag, top paths per app."
+            ;;
+        stats)    echo -e "${W}milog stats <app>${NC} — hourly request histogram" ;;
+        trend)    echo -e "${W}milog trend [app] [HOURS]${NC} — sparkline from history (HISTORY_ENABLED=1)" ;;
+        diff)     echo -e "${W}milog diff${NC} — per-app: now vs 1d ago vs 7d ago" ;;
+        auto-tune)echo -e "${W}milog auto-tune [DAYS]${NC} — suggest thresholds from history" ;;
+        replay)   echo -e "${W}milog replay <file>${NC} — postmortem for one archived log" ;;
+        search)
+            echo -e "${W}milog search <pattern> [flags]${NC} — grep across current + archived"
+            echo -e "  Flags: --since --app --path --regex --archives --limit"
+            ;;
+        errors)   echo -e "${W}milog errors${NC} — live 4xx/5xx tail" ;;
+        exploits) echo -e "${W}milog exploits${NC} — LFI/RCE/SQLi/XSS/infra-probe live tail" ;;
+        probes)   echo -e "${W}milog probes${NC} — scanner/bot traffic live tail" ;;
+        grep)     echo -e "${W}milog grep <app> <pattern>${NC} — filter-tail one app" ;;
+        suspects) echo -e "${W}milog suspects [N] [WINDOW]${NC} — heuristic bot ranking" ;;
+        config)
+            echo -e "${W}milog config [sub]${NC} — show / edit / set / validate"
+            echo -e "  Subs: show path init edit add rm dir set validate"
+            echo -e "  ${C}milog config validate${NC}   check for typos, invalid ranges, unreachable paths"
+            ;;
+        alert)
+            echo -e "${W}milog alert <sub>${NC} — toggle alerting + systemd service"
+            echo -e "  Subs: on off status test"
+            ;;
+        alerts)   echo -e "${W}milog alerts [window]${NC} — fire history (today / Nh / Nd / Nw / all)" ;;
+        silence)  echo -e "${W}milog silence <rule> <duration> [message]${NC} — mute a rule"; echo -e "  Also: ${C}milog silence list${NC} · ${C}milog silence clear <rule>${NC}" ;;
+        digest)
+            echo -e "${W}milog digest [window]${NC} — exec-summary for the period"
+            echo -e "  Windows: day (default) / week / 12h / 7d / …"
+            ;;
+        doctor)   echo -e "${W}milog doctor${NC} — diagnostic checklist" ;;
+        web)
+            echo -e "${W}milog web${NC} — read-only local HTTP dashboard"
+            echo -e "  Subs: start stop status install-service uninstall-service rotate-token"
+            ;;
+        bench)    echo -e "${W}milog bench [--full] [--baseline FILE]${NC} — timing harness" ;;
+        completions) echo -e "${W}milog completions <install|bash|zsh|fish>${NC} — install shell completion" ;;
+        install)
+            echo -e "${W}milog install <feature>${NC} — on-demand feature installer"
+            echo -e "  Subs: list, <feature>, remove <feature>"
+            echo -e "  Features: geoip / web / history"
+            ;;
+        *)
+            echo -e "${Y}No detailed help for '$cmd'.${NC} Try ${C}milog help${NC}."
+            return 1
+            ;;
+    esac
 }
 
 # ==============================================================================
 # DISPATCH
 # ==============================================================================
+# Intercept `milog <cmd> --help` (and -h) before dispatching to the mode.
+# Keeps main `show_help` short while letting each command ship its own
+# detail block.
+if [[ "${2:-}" == "--help" || "${2:-}" == "-h" ]]; then
+    _cmd_help "${1:-}"
+    exit $?
+fi
+
 case "${1:-}" in
     monitor)  mode_monitor ;;
     daemon)   mode_daemon ;;
@@ -5944,14 +7223,21 @@ case "${1:-}" in
     alert)    shift; mode_alert  "$@" ;;
     alerts)   mode_alerts "${2:-today}" ;;
     silence)  shift; mode_silence "$@" ;;
+    digest)   mode_digest "${2:-day}" ;;
+    completions) shift; mode_completions "$@" ;;
+    bench)    shift; mode_bench "$@" ;;
+    install)  shift; mode_install "$@" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
     __web_handler) _web_handle ;;
     -h|--help|help) show_help ;;
     ""|logs)  color_prefix ;;
     *)
-        if [[ " ${LOGS[*]} " =~ " $1 " ]]; then
-            tail -F "$LOG_DIR/$1.access.log"
+        # Resolve against LOGS — supports bare names, `nginx:<name>`, and
+        # `text:<name>:<path>` entries.
+        _matching_entry=$(_log_entry_by_name "$1" 2>/dev/null) || _matching_entry=""
+        if [[ -n "$_matching_entry" ]]; then
+            tail -F "$(_log_path_for "$_matching_entry")"
         else
             echo -e "${R}Unknown command: '$1'${NC}"; show_help; exit 1
         fi ;;

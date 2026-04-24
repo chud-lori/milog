@@ -199,6 +199,66 @@ if [[ ${#LOGS[@]} -eq 0 ]]; then
     exit 1
 fi
 
+# --- Typed log sources -------------------------------------------------------
+# LOGS entries are bare names by default (`LOGS=(api web)`) and resolve to
+# nginx-format files at `$LOG_DIR/<name>.access.log`. A typed prefix makes
+# MiLog usable on non-nginx logs too:
+#
+#   LOGS=(api web text:myapp:/var/log/myapp/error.log)
+#   LOGS=(api text:rails:/var/log/rails/production.log nginx:gateway)
+#
+# Resolution:
+#   bare `api`                    → nginx type, path = $LOG_DIR/api.access.log
+#   `nginx:api`                   → same (explicit)
+#   `text:<name>:<absolute path>` → any text file, path = <absolute path>
+#
+# Parser-free modes (logs, grep, search, <name> tail) work for every source
+# type. Parsing modes (monitor, top, slow, top-paths, etc.) skip non-nginx
+# sources gracefully — they need combined log format to work.
+
+# Return the file path for a LOGS entry — bare name or typed prefix.
+_log_path_for() {
+    local entry="${1-}"
+    case "$entry" in
+        text:*:*) printf '%s' "${entry#text:*:}" ;;
+        nginx:*)  printf '%s/%s.access.log' "$LOG_DIR" "${entry#nginx:}" ;;
+        *)        printf '%s/%s.access.log' "$LOG_DIR" "$entry" ;;
+    esac
+}
+
+# Return the type for a LOGS entry.
+_log_type_for() {
+    case "${1-}" in
+        text:*) printf 'text' ;;
+        nginx:*) printf 'nginx' ;;
+        *) printf 'nginx' ;;
+    esac
+}
+
+# Return the display name (strip type prefix and path).
+_log_name_for() {
+    local entry="${1-}"
+    case "$entry" in
+        text:*:*) local rest="${entry#text:}"; printf '%s' "${rest%%:*}" ;;
+        nginx:*)  printf '%s' "${entry#nginx:}" ;;
+        *)        printf '%s' "$entry" ;;
+    esac
+}
+
+# Find the LOGS entry that matches a display name, or empty if no match.
+# Callers use this to map `milog <app>` / `milog grep <app> <pat>` / etc.
+# back to the typed source entry they came from.
+_log_entry_by_name() {
+    local target="${1-}" entry
+    for entry in "${LOGS[@]}"; do
+        if [[ "$(_log_name_for "$entry")" == "$target" ]]; then
+            printf '%s' "$entry"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Alert thresholds
 THRESH_REQ_WARN=15
 THRESH_REQ_CRIT=40

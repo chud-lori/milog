@@ -5,6 +5,18 @@
 # ==============================================================================
 
 mode_daemon() {
+    # Config sanity gate — refuse to start with ERROR-level findings so a
+    # broken config doesn't silently degrade at 3am. Warnings don't block;
+    # they're printed via stderr alongside the normal _dlog output.
+    if ! config_validate >&2; then
+        local rc=$?
+        if (( rc == 1 )); then
+            _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
+            exit 1
+        fi
+        # rc=2 means warnings only → continue, user's been told.
+    fi
+
     local hook_state
     hook_state="disabled"
     [[ "$ALERTS_ENABLED" == "1" && -n "$DISCORD_WEBHOOK" ]] && hook_state="enabled"

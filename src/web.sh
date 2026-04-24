@@ -159,6 +159,177 @@ _web_route_meta() {
     _web_respond 200 "application/json" "$body"
 }
 
+# ---- route: /api/logs.json ---------------------------------------------------
+# Returns recent lines from ONE nginx source, filtered by grep pattern + path
+# + status-class. Capped at 500 rows per fetch. For bigger windows, the
+# caller narrows filters. Designed for the tier-1 in-browser log viewer —
+# every pass scans the tail of one log file, no sqlite layer yet.
+#
+# Query params:
+#   app=<name>    required — must be an nginx source in LOGS
+#   limit=<N>     default 200, max 500
+#   grep=<sub>    optional substring filter (case-sensitive)
+#   path=<pre>    optional path-prefix filter (starts with /)
+#   class=<c>     optional status class: 2xx 3xx 4xx 5xx any
+_web_route_logs() {
+    local app="${1:-}" limit="${2:-200}" grep_s="${3:-}" path_s="${4:-}" cls="${5:-}"
+    local max=500
+    [[ "$limit" =~ ^[0-9]+$ ]] || limit=200
+    (( limit > max )) && limit=$max
+
+    local body
+    local file="$LOG_DIR/${app}.access.log"
+    if [[ -z "$app" || ! -f "$file" ]]; then
+        body=$(printf '{"app":%s,"lines":[],"error":"no such app"}' \
+            "$(json_escape "${app:-}")")
+        _web_respond 404 "application/json" "$body"
+        return
+    fi
+
+    # Read last N*3 lines, then filter + cap in awk (lets us filter-then-slice
+    # so grep+path+class yield exactly `limit` rows when possible).
+    local read_n=$(( limit * 3 ))
+    (( read_n < 200 )) && read_n=200
+    local raw
+    raw=$(tail -n "$read_n" "$file" 2>/dev/null \
+        | awk -F'"' -v grep_s="$grep_s" -v path_s="$path_s" -v cls="$cls" -v limit="$limit" '
+            function jesc(s) {
+                gsub(/\\/, "\\\\", s)
+                gsub(/"/,  "\\\"", s)
+                gsub(/\t/, "\\t", s)
+                gsub(/\n/, "\\n", s)
+                gsub(/\r/, "\\r", s)
+                return s
+            }
+            # Combined-format line:
+            #   ip - user [t] "METHOD path HTTP" status bytes "ref" "ua" rt?
+            # We split on double-quotes: $1 has ip+dash+time, $2 is request,
+            # $3 has status+bytes, $4 is referer, $5 has ua+maybe-rt.
+            {
+                line = $0
+                # Substring filter first — cheapest on no-match.
+                if (grep_s != "" && index(line, grep_s) == 0) next
+
+                # Parse fields. Field-split on whitespace for the unquoted bits.
+                n_ws = split($1, ws, " ")
+                ip = ws[1]
+                timestamp = ""
+                for (i = 1; i <= n_ws; i++) {
+                    if (ws[i] ~ /^\[/) { timestamp = ws[i]; break }
+                }
+
+                # Request string (field $2): "METHOD /path HTTP/1.1"
+                req = $2
+                n_rq = split(req, rq, " ")
+                method = (n_rq >= 1) ? rq[1] : ""
+                raw_path = (n_rq >= 2) ? rq[2] : ""
+                q = index(raw_path, "?")
+                clean_path = (q > 0) ? substr(raw_path, 1, q-1) : raw_path
+
+                # Defensive: path must start with /
+                if (substr(clean_path, 1, 1) != "/") next
+                if (path_s != "" && index(clean_path, path_s) != 1) next
+
+                # Status is the first field of $3 (after the closing quote).
+                # Strip leading whitespace first — split on " " with a
+                # leading-space input yields ["401","0"] not ["","401","0",""]
+                # in most awks.
+                f3 = $3
+                sub(/^[[:space:]]+/, "", f3)
+                n_sb = split(f3, sb, " ")
+                status = (n_sb >= 1) ? sb[1] : ""
+                if (status !~ /^[0-9]+$/) next
+                sclass = substr(status, 1, 1) "xx"
+                if (cls != "" && cls != "any" && cls != sclass) next
+
+                # UA is field $6 (quoted ua string surrounded by quotes means
+                # $6 exactly). After the UA, an optional request_time float.
+                ua = ($6 != "" ? $6 : "")
+
+                n++
+                # Emit JSON object per surviving row.
+                out[n] = sprintf("{\"ts\":\"%s\",\"ip\":\"%s\",\"method\":\"%s\",\"path\":\"%s\",\"status\":%s,\"ua\":\"%s\",\"class\":\"%s\"}",
+                    jesc(timestamp), jesc(ip), jesc(method), jesc(clean_path), status, jesc(ua), sclass)
+
+                if (n > limit) {
+                    # Drop the oldest if over-cap (keep latest N).
+                    for (j = 1; j < n; j++) out[j] = out[j+1]
+                    n = limit
+                }
+            }
+            END {
+                for (j = 1; j <= n; j++) {
+                    print out[j]
+                }
+            }')
+
+    local arr="[]"
+    if [[ -n "$raw" ]]; then
+        arr="[$(printf '%s' "$raw" | paste -sd, -)]"
+    fi
+
+    body=$(printf '{"app":%s,"lines":%s}' "$(json_escape "$app")" "$arr")
+    _web_respond 200 "application/json" "$body"
+}
+
+# ---- route: /api/logs/histogram.json -----------------------------------------
+# Per-minute request counts for the selected app over a window (N minutes).
+# Used for the timeline strip above the log table.
+_web_route_logs_histogram() {
+    local app="${1:-}" minutes="${2:-60}"
+    [[ "$minutes" =~ ^[0-9]+$ ]] || minutes=60
+    (( minutes > 1440 )) && minutes=1440
+    local file="$LOG_DIR/${app}.access.log"
+    local body
+    if [[ -z "$app" || ! -f "$file" ]]; then
+        body=$(printf '{"app":%s,"buckets":[]}' "$(json_escape "${app:-}")")
+        _web_respond 404 "application/json" "$body"
+        return
+    fi
+
+    # Build N per-minute bucket keys: [dd/Mon/yyyy:HH:MM, ...] for the
+    # last `minutes` minutes. Scan tail of file counting matches.
+    local now_ts; now_ts=$(date +%s)
+    local cur_minute_str
+    local i ts_i
+    # Pre-generate all minute strings into an awk-readable list.
+    local keys=""
+    for (( i = minutes - 1; i >= 0; i-- )); do
+        ts_i=$(( now_ts - i * 60 ))
+        cur_minute_str=$(date -d "@$ts_i" '+%d/%b/%Y:%H:%M' 2>/dev/null \
+            || date -r  "$ts_i" '+%d/%b/%Y:%H:%M' 2>/dev/null)
+        keys="${keys}${cur_minute_str}\n"
+    done
+
+    # For very large logs, only scan a bounded tail slice.
+    local scan_lines=$(( minutes * 500 ))
+    (( scan_lines < 1000 )) && scan_lines=1000
+
+    local raw
+    raw=$(printf '%b' "$keys" | awk -v file="$file" -v scan="$scan_lines" '
+        { keys[NR] = $0 }
+        END {
+            cmd = sprintf("tail -n %d %s 2>/dev/null", scan, file)
+            while ((cmd | getline line) > 0) {
+                for (k in keys) {
+                    if (index(line, keys[k]) > 0) {
+                        counts[keys[k]]++
+                        break
+                    }
+                }
+            }
+            close(cmd)
+            for (i = 1; i <= NR; i++) {
+                printf "{\"t\":\"%s\",\"c\":%d}\n", keys[i], counts[keys[i]]+0
+            }
+        }')
+
+    local arr="[]"
+    [[ -n "$raw" ]] && arr="[$(printf '%s' "$raw" | paste -sd, -)]"
+    body=$(printf '{"app":%s,"buckets":%s}' "$(json_escape "$app")" "$arr")
+    _web_respond 200 "application/json" "$body"
+}
+
 # ---- route: /api/alerts.json -------------------------------------------------
 # Returns the last N alerts from ALERT_STATE_DIR/alerts.log, filtered by a
 # window query param (?window=24h, 1d, 7d, today, all — same grammar as
@@ -292,6 +463,23 @@ _web_route_index() {
   .table-scroll::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; }
   .table-scroll::-webkit-scrollbar-thumb:hover { background: #484f58; }
   .table-scroll { scrollbar-color: #30363d #0b0d10; scrollbar-width: thin; }
+  /* Log viewer histogram strip — N tiny bars that together form a
+     per-minute activity timeline above the log table. */
+  .histogram { display:flex; align-items:flex-end; gap:1px; height:32px; margin:.4rem 0 .6rem;
+               background:#0b0d10; border:1px solid #1b1f24; border-radius:.3rem; padding:2px; }
+  .histogram .bar { flex:1 1 auto; background:#3fb950; min-width:1px; border-radius:1px; transition:height .2s; }
+  .histogram .bar.empty { background:#1b1f24; }
+  .histogram .bar:hover { background:#58a6ff; }
+  /* Logs table — denser than alerts since lines are higher volume. */
+  #logs td { font-size:.82rem; padding:.25rem .5rem; }
+  #logs td.ip  { color:#8b949e; font-variant-numeric: tabular-nums; white-space:nowrap; }
+  #logs td.mth { color:#6b7177; white-space:nowrap; }
+  #logs td.pth { color:#d6d9dc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                 overflow:hidden; text-overflow:ellipsis; max-width:52ch; }
+  #logs td.st2 { color:#3fb950; text-align:right; font-variant-numeric: tabular-nums; }
+  #logs td.st3 { color:#8b949e; text-align:right; font-variant-numeric: tabular-nums; }
+  #logs td.st4 { color:#d29922; text-align:right; font-variant-numeric: tabular-nums; }
+  #logs td.st5 { color:#f85149; text-align:right; font-variant-numeric: tabular-nums; }
   footer { padding:1rem 1.2rem; color:#6b7177; font-size:.75rem; text-align:center; }
   .err { color:#f85149; padding:.6rem; border:1px solid #da3633; border-radius:.3rem; background:#2a1215; }
 </style>
@@ -333,6 +521,28 @@ _web_route_index() {
       <table id="alerts">
         <thead><tr><th>WHEN</th><th>SEV</th><th>RULE</th><th>TITLE</th></tr></thead>
         <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+  <section>
+    <div class="alerts-head">
+      <h2>Logs (live tail)</h2>
+      <span class="meta" id="logs-count">—</span>
+      <select id="logs-app" aria-label="app"></select>
+      <select id="logs-class" aria-label="status class">
+        <option value="any" selected>any</option>
+        <option value="2xx">2xx</option>
+        <option value="3xx">3xx</option>
+        <option value="4xx">4xx</option>
+        <option value="5xx">5xx</option>
+      </select>
+      <input id="logs-grep" placeholder="grep…" style="background:#10141a;color:#d6d9dc;border:1px solid #30363d;border-radius:.3rem;padding:.15rem .4rem;font:inherit;font-size:.8rem;width:14ch;">
+    </div>
+    <div id="logs-histogram" class="histogram"></div>
+    <div class="table-scroll">
+      <table id="logs">
+        <thead><tr><th>WHEN</th><th>IP</th><th>METHOD</th><th>PATH</th><th>STATUS</th></tr></thead>
+        <tbody><tr><td colspan="5" class="empty">pick an app…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -461,6 +671,92 @@ _web_route_index() {
   }
   document.getElementById('alerts-window').addEventListener('change', tickAlerts);
 
+  // ---- logs panel --------------------------------------------------------
+  // Short-poll log viewer (tier 1). Every 5s it fetches /api/logs.json with
+  // the current filters and /api/logs/histogram.json for the timeline.
+  // Tier 2 (SSE live tail) is a Go feature on the roadmap.
+  function fmtLogWhen(s) {
+    // "[24/Apr/2026:12:34:56 +0000]" → "12:34:56"
+    var m = /:(\d\d:\d\d:\d\d)/.exec(s || '');
+    return m ? m[1] : (s || '');
+  }
+  function setLogsApp(apps) {
+    var sel = document.getElementById('logs-app');
+    if (sel.options.length) return;
+    (apps || []).forEach(function(a){
+      var opt = document.createElement('option');
+      opt.value = a; opt.textContent = a;
+      sel.appendChild(opt);
+    });
+    if (sel.options.length) sel.value = sel.options[0].value;
+  }
+  function renderLogs(d) {
+    var tbody = document.querySelector('#logs tbody');
+    var meta = document.getElementById('logs-count');
+    tbody.innerHTML = '';
+    var list = (d && d.lines) || [];
+    meta.textContent = list.length + ' line' + (list.length === 1 ? '' : 's');
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">no matching lines</td></tr>';
+      return;
+    }
+    list.slice().reverse().forEach(function(r){
+      var tr = document.createElement('tr');
+      function td(v, cls){ var c = document.createElement('td'); if (cls) c.className = cls; c.textContent = v; return c; }
+      var stClass = 'st' + String(r.status || '').charAt(0);
+      tr.appendChild(td(fmtLogWhen(r.ts), 'when'));
+      tr.appendChild(td(r.ip || '', 'ip'));
+      tr.appendChild(td(r.method || '', 'mth'));
+      tr.appendChild(td(r.path || '', 'pth'));
+      tr.appendChild(td(r.status, stClass));
+      tbody.appendChild(tr);
+    });
+  }
+  function renderHistogram(d) {
+    var el = document.getElementById('logs-histogram');
+    el.innerHTML = '';
+    var buckets = (d && d.buckets) || [];
+    if (!buckets.length) { el.innerHTML = '<div style="flex:1;color:#6b7177;text-align:center;font-size:.7rem;line-height:28px;">no activity</div>'; return; }
+    var max = buckets.reduce(function(m,b){ return Math.max(m, b.c || 0); }, 1);
+    buckets.forEach(function(b){
+      var bar = document.createElement('div');
+      var pct = Math.round(((b.c || 0) / max) * 100);
+      bar.className = 'bar' + ((b.c || 0) === 0 ? ' empty' : '');
+      bar.style.height = ((b.c || 0) === 0 ? 2 : Math.max(4, pct)) + '%';
+      bar.title = b.t + '  ' + (b.c || 0) + ' req';
+      el.appendChild(bar);
+    });
+  }
+  function tickLogs() {
+    var app = document.getElementById('logs-app').value;
+    if (!app) return;
+    var grep = document.getElementById('logs-grep').value;
+    var cls = document.getElementById('logs-class').value;
+    var q = 'app=' + encodeURIComponent(app) + '&limit=200';
+    if (grep) q += '&grep=' + encodeURIComponent(grep);
+    if (cls && cls !== 'any') q += '&class=' + encodeURIComponent(cls);
+    api('/api/logs.json?' + q).then(renderLogs).catch(function(){});
+  }
+  function tickHistogram() {
+    var app = document.getElementById('logs-app').value;
+    if (!app) return;
+    api('/api/logs/histogram.json?app=' + encodeURIComponent(app) + '&minutes=60')
+      .then(renderHistogram).catch(function(){});
+  }
+  // Populate app select from meta.apps
+  api('/api/meta.json').then(function(m){ setLogsApp(m.apps || []); tickLogs(); tickHistogram(); }).catch(function(){});
+  ['logs-app','logs-class','logs-grep'].forEach(function(id){
+    document.getElementById(id).addEventListener('change', function(){ tickLogs(); tickHistogram(); });
+  });
+  document.getElementById('logs-grep').addEventListener('input', function(){
+    // Debounced-lite: just call tickLogs after keystrokes; 200 req/minute
+    // ceiling on the server hasn't been hit at this scale.
+    clearTimeout(window.__milog_grep_t);
+    window.__milog_grep_t = setTimeout(tickLogs, 250);
+  });
+  setInterval(tickLogs, 5000);
+  setInterval(tickHistogram, 30000);
+
   tick();
   tickAlerts();
   setInterval(tick, 3000);
@@ -542,6 +838,23 @@ _web_handle() {
             _web_route_alerts "$win"
             _web_access_log "$client_ip" "$method" "$path" 200
             ;;
+        /api/logs.json)
+            local qapp="" qlim="" qg="" qp="" qc=""
+            [[ "$query_string" =~ (^|&)app=([A-Za-z0-9_.-]+) ]]   && qapp="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)limit=([0-9]+) ]]          && qlim="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)grep=([^&]+) ]]            && qg="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)path=([^&]+) ]]            && qp="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)class=(2xx|3xx|4xx|5xx|any) ]] && qc="${BASH_REMATCH[2]}"
+            _web_route_logs "$qapp" "$qlim" "$qg" "$qp" "$qc"
+            _web_access_log "$client_ip" "$method" "$path" 200
+            ;;
+        /api/logs/histogram.json)
+            local qapp="" qmin=""
+            [[ "$query_string" =~ (^|&)app=([A-Za-z0-9_.-]+) ]] && qapp="${BASH_REMATCH[2]}"
+            [[ "$query_string" =~ (^|&)minutes=([0-9]+) ]]      && qmin="${BASH_REMATCH[2]}"
+            _web_route_logs_histogram "$qapp" "$qmin"
+            _web_access_log "$client_ip" "$method" "$path" 200
+            ;;
         *)                  _web_respond 404 "text/plain" "not found"
                             _web_access_log "$client_ip" "$method" "$path" 404 ;;
     esac
@@ -557,6 +870,41 @@ _web_access_log() {
 
 # ---- subcommands: start / stop / status --------------------------------------
 _web_pid_file() { echo "$WEB_STATE_DIR/web.pid"; }
+
+# Human-readable age of the web token file. Silent + empty on missing file.
+# Tokens are read per-request from disk so they rotate "live" the moment
+# the file changes — status just reports when it was last written.
+_web_token_age() {
+    [[ -f "$WEB_TOKEN_FILE" ]] || return 0
+    local mtime now delta
+    mtime=$(stat -c '%Y' "$WEB_TOKEN_FILE" 2>/dev/null || stat -f '%m' "$WEB_TOKEN_FILE" 2>/dev/null)
+    [[ -n "$mtime" ]] || return 0
+    now=$(date +%s)
+    delta=$(( now - mtime ))
+    if   (( delta < 60 ));    then printf '%ds' "$delta"
+    elif (( delta < 3600 ));  then printf '%dm' $(( delta / 60 ))
+    elif (( delta < 86400 )); then printf '%dh' $(( delta / 3600 ))
+    else                           printf '%dd' $(( delta / 86400 ))
+    fi
+}
+
+# Rotate the web token — delete + regenerate. Safe to call while the
+# daemon is running: token is read per-request from disk, so the next
+# request after rotation rejects the old token with 401.
+_web_rotate_token() {
+    mkdir -p "$(dirname "$WEB_TOKEN_FILE")" 2>/dev/null || true
+    rm -f "$WEB_TOKEN_FILE"
+    _web_token_ensure || return 1
+    local tok; tok=$(_web_token_read)
+    [[ -z "$tok" ]] && { echo -e "${R}rotation failed — token file not written${NC}" >&2; return 1; }
+    echo -e "${G}✓${NC} rotated web token"
+    echo -e "${D}  file: $WEB_TOKEN_FILE${NC}"
+    echo -e "${W}  URL:${NC}  http://${WEB_BIND}:${WEB_PORT}/?t=${tok}"
+    if _web_systemd_active; then
+        echo -e "${D}  service is running — the running daemon will accept the new token on next request${NC}"
+    fi
+    echo -e "${D}  old browser tabs will see 401 until you reopen the URL above${NC}"
+}
 
 # Is the systemd user unit currently active? Returns 0 if yes.
 # Guarded so callers on non-systemd hosts short-circuit to "no".
@@ -574,7 +922,7 @@ _web_status() {
         echo -e "${G}running${NC}  (systemd user unit)  pid=${main_pid:-?}  bind=${WEB_BIND}:${WEB_PORT}"
         echo -e "${D}  unit:  ${HOME}/.config/systemd/user/milog-web.service${NC}"
         echo -e "${D}  logs:  journalctl --user -u milog-web.service -f${NC}"
-        echo -e "${D}  token: $WEB_TOKEN_FILE${NC}"
+        echo -e "${D}  token: $WEB_TOKEN_FILE  (age $(_web_token_age))${NC}"
         if [[ -f "$WEB_ACCESS_LOG" ]]; then
             local hits; hits=$(wc -l < "$WEB_ACCESS_LOG" 2>/dev/null || echo 0)
             echo -e "${D}  ${hits} requests served (total)${NC}"

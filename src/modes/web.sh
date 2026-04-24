@@ -131,8 +131,9 @@ mode_web() {
         start)    shift ;;
         install-service)   _web_service_install;   return ;;
         uninstall-service) _web_service_uninstall; return ;;
+        rotate-token)      _web_rotate_token;      return ;;
         ""|--*)   : ;;
-        *)        echo -e "${R}usage: milog web [start|stop|status|install-service|uninstall-service] [--port N] [--bind ADDR] [--trust]${NC}" >&2
+        *)        echo -e "${R}usage: milog web [start|stop|status|install-service|uninstall-service|rotate-token] [--port N] [--bind ADDR] [--trust]${NC}" >&2
                   return 1 ;;
     esac
 
