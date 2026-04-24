@@ -140,6 +140,70 @@ Every alert passes through two gates before delivery:
 Both gates share no state; a burst across different rule keys and
 different `(ip, path)` fingerprints fires each alert as expected.
 
+## Routing — different rules to different destinations
+
+By default, every configured destination receives every fire. At any
+team scale that's wrong: `exploits:*` belongs in a security channel,
+`cpu`/`mem`/`disk` in ops, `5xx` in dev-on-call. `ALERT_ROUTES` maps
+rule keys (or their prefixes) to subset destination lists.
+
+Config format (multiline string; `#` starts a comment):
+
+```bash
+# ~/.config/milog/config.sh
+ALERT_ROUTES="
+    # Security-relevant rules → Slack security channel + Telegram
+    exploits:   slack telegram
+    audit:      slack telegram
+    # System-level stuff → Discord ops
+    cpu:        discord
+    mem:        discord
+    disk:/:     discord
+    workers:    discord
+    # HTTP errors → split
+    5xx:        slack discord
+    4xx:        discord
+    # Known-noise rules → intentionally drop (no fire, but rule still
+    # runs and can be observed in alerts.log via webhook-less path)
+    probes:     skip
+    # Catch-all for anything unmatched
+    default:    discord
+"
+```
+
+Resolution is leftmost-match first:
+
+1. **Exact rule key** — `5xx:api` finds `5xx:api: slack`
+2. **Prefix** (first segment before `:`) — `5xx:api` falls through to `5xx:`
+3. **`default:`** — fallback
+4. **No match at all** — fans out to every configured destination
+   (today's behavior; lets users add `ALERT_ROUTES` incrementally)
+
+Destination types: `discord`, `slack`, `telegram`, `matrix`. Also
+`skip` / `none` for "don't fire at all" — useful for rules like
+`probes:scanner` that you want catalogued in `alerts.log` but not
+paged. Unknown tokens are silently ignored (forward-compatible for
+adapters not yet implemented).
+
+View the active routing:
+
+```bash
+milog alert status
+```
+
+The routing block prints whatever's in the config; `—` when unset.
+
+Limitations today:
+
+- One webhook URL per destination type (no "slack:#security-alerts" vs
+  "slack:#ops" named channels yet — tracked in plan.md as a future
+  iteration).
+- Routing applies at the `alert_fire` fan-out boundary. Cooldown,
+  dedup, and silence/ack still run first — a route can't bypass a
+  silenced rule.
+- Changes take effect for new fires; running daemon picks it up on
+  the next tick.
+
 ## Fire history log
 
 Every fire appends one row to `~/.cache/milog/alerts.log` as TSV:

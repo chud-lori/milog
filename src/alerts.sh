@@ -332,9 +332,79 @@ alert_silence_list_active() {
         | sort -t $'\t' -k3,3 -rn
 }
 
+# --- Alert routing ------------------------------------------------------------
+#
+# Resolve a rule_key to its destination list by consulting ALERT_ROUTES.
+# See `ALERT_ROUTES` in core.sh for the config-file format.
+#
+# Resolution:
+#   1. Exact match on rule_key  (e.g. `5xx:api` → line `5xx:api: slack`)
+#   2. Prefix match (first segment before `:`)  (e.g. `exploits:sqli` → `exploits:`)
+#   3. `default:` line
+#   4. No match → empty string → caller fans out to all configured dests
+#      (back-compat: today's behavior when ALERT_ROUTES is unset)
+#
+# Echoes the resolved destination list on stdout. Empty output means "no
+# routing configured for this key; fan out".
+_alert_route_for() {
+    local rule_key="${1:-}"
+    local routes="${ALERT_ROUTES:-}"
+    [[ -z "$routes" ]] && return 0     # unset → empty → fan-out path
+
+    local prefix="${rule_key%%:*}"
+    local default_val="" exact_val="" prefix_val=""
+    local line key val
+
+    # Parse the multiline config block. Tolerates leading/trailing whitespace
+    # and `#` comments. Only the first occurrence of each key wins (so
+    # `exploits: slack` before `exploits: discord` in the config means slack).
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        # trim whitespace both sides
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        # Only split on the FIRST `:` so values can contain colons (e.g.
+        # `disk:/: discord` — key is `disk:/`, value is `discord`). Find the
+        # last `:` followed by space; that's the separator.
+        # Simpler: anchor-split — the key/value separator is ": " (colon+space)
+        # and unambiguous since neither keys nor destination tokens contain
+        # that literal sequence.
+        if [[ "$line" == *": "* ]]; then
+            key="${line%%: *}"
+            val="${line#*: }"
+        else
+            # Tolerate `key:value` without space too.
+            key="${line%%:*}"
+            val="${line#*:}"
+            # strip one leading space if present
+            val="${val# }"
+        fi
+        # trim both sides (value can still have trailing whitespace)
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+
+        if   [[ "$key" == "default" ]]; then
+            [[ -z "$default_val" ]] && default_val="$val"
+        elif [[ "$key" == "$rule_key" ]]; then
+            [[ -z "$exact_val"   ]] && exact_val="$val"
+        elif [[ "$key" == "$prefix" ]]; then
+            [[ -z "$prefix_val"  ]] && prefix_val="$val"
+        fi
+    done <<< "$routes"
+
+    if   [[ -n "$exact_val"   ]]; then printf '%s' "$exact_val"
+    elif [[ -n "$prefix_val"  ]]; then printf '%s' "$prefix_val"
+    elif [[ -n "$default_val" ]]; then printf '%s' "$default_val"
+    fi
+}
+
 # --- Fanout dispatcher --------------------------------------------------------
 #
-# Fire one alert to every configured destination. Silently no-ops when
+# Fire one alert to every configured destination — or, if ALERT_ROUTES
+# matched this rule, just the destinations it lists. Silently no-ops when
 # alerts are disabled; each destination no-ops on missing config.
 #
 # Signature: alert_fire <title> <body> [color] [rule_key]
@@ -359,13 +429,40 @@ alert_fire() {
     # webhooks fail (network blip, rate limit, rotated token).
     _alert_record "$rule_key" "$title" "$body" "$color"
     command -v curl >/dev/null 2>&1 || return 0
-    # Each destination backgrounded so a slow one doesn't delay the others.
-    # Callers also typically background `alert_fire &` — the resulting
-    # grandchild sends are orphaned to init on exit, which is fine.
-    _alert_send_discord  "$title" "$body" "$color" &
-    _alert_send_slack    "$title" "$body" "$color" &
-    _alert_send_telegram "$title" "$body" "$color" &
-    _alert_send_matrix   "$title" "$body" "$color" &
+
+    # Resolve routing — empty = today's behavior (fan out to every configured
+    # destination). Non-empty = only the destination types listed here fire.
+    local route
+    route=$(_alert_route_for "$rule_key")
+
+    if [[ -z "$route" ]]; then
+        # Each destination backgrounded so a slow one doesn't delay the
+        # others. Callers also typically background `alert_fire &` — the
+        # resulting grandchild sends are orphaned to init on exit, which is
+        # fine.
+        _alert_send_discord  "$title" "$body" "$color" &
+        _alert_send_slack    "$title" "$body" "$color" &
+        _alert_send_telegram "$title" "$body" "$color" &
+        _alert_send_matrix   "$title" "$body" "$color" &
+        return 0
+    fi
+
+    # Routed fire: dispatch only to the listed destination types. Unknown
+    # tokens are silently ignored so a forward-looking config (e.g. naming
+    # `webhook` before that adapter lands) doesn't break existing rules.
+    # `skip` is an explicit "do not fire this class" — useful for noise
+    # rules you want to keep recording in alerts.log but not page on.
+    local dest
+    for dest in $route; do
+        case "$dest" in
+            discord)   _alert_send_discord  "$title" "$body" "$color" & ;;
+            slack)     _alert_send_slack    "$title" "$body" "$color" & ;;
+            telegram)  _alert_send_telegram "$title" "$body" "$color" & ;;
+            matrix)    _alert_send_matrix   "$title" "$body" "$color" & ;;
+            skip|none) : ;;
+            *)         : ;;   # unknown type — silently drop (forward-compat)
+        esac
+    done
 }
 
 # Back-compat alias for `alert_discord`. Drop-in replacement for code that

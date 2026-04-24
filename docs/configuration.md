@@ -112,6 +112,7 @@ no per-app form — they're not app-scoped.
 | `ALERT_DEDUP_WINDOW`  | `300` (5 min)       | Cross-rule `(ip, path)` dedup TTL         |
 | `ALERT_STATE_DIR`     | `~/.cache/milog`    | Where cooldown/dedup state + alerts.log live |
 | `ALERT_LOG_MAX_BYTES` | `10485760` (10 MB)  | In-place rotate alerts.log past this size; `0` disables |
+| `ALERT_ROUTES`        | (empty — fan out)   | Per-rule destination mapping; see [alerts.md](alerts.md#routing--different-rules-to-different-destinations) |
 | `DISCORD_WEBHOOK`     | (empty)             | Set to enable Discord                     |
 | `SLACK_WEBHOOK`       | (empty)             | Set to enable Slack                       |
 | `TELEGRAM_BOT_TOKEN`  | (empty)             | Bot token (with matching CHAT_ID)         |
@@ -159,6 +160,7 @@ systemd units, one-shot runs, or CI:
 | `MILOG_ALERT_COOLDOWN`        | `ALERT_COOLDOWN`        |
 | `MILOG_ALERT_DEDUP_WINDOW`    | `ALERT_DEDUP_WINDOW`    |
 | `MILOG_ALERT_LOG_MAX_BYTES`   | `ALERT_LOG_MAX_BYTES`   |
+| `MILOG_ALERT_ROUTES`          | `ALERT_ROUTES`          |
 | `MILOG_GEOIP_ENABLED`         | `GEOIP_ENABLED`         |
 | `MILOG_MMDB_PATH`             | `MMDB_PATH`             |
 | `MILOG_HISTORY_ENABLED`       | `HISTORY_ENABLED`       |

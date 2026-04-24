@@ -71,6 +71,20 @@ _alert_read_webhook() {
     return 0
 }
 
+# Read the (possibly multiline) ALERT_ROUTES value from a config file.
+# Sources the file in a subshell to get the real bash-parsed value, then
+# echoes it. `_alert_read_key` grep-hack can't handle heredoc-style
+# multiline assignments, so routing gets its own helper.
+#
+# Silent + empty on any error — caller treats empty as "no routing".
+_alert_read_routes() {
+    local file="$1"
+    [[ -r "$file" ]] || return 0
+    # Subshell insulation: ALERT_ROUTES from the target config overrides
+    # any env-loaded value only for the duration of this subshell.
+    ( set +u; ALERT_ROUTES=""; . "$file" 2>/dev/null; printf '%s' "$ALERT_ROUTES" ) || true
+}
+
 # Read a simple KEY's value from the config file — same no-fail contract.
 _alert_read_key() {
     local file="$1" key="$2"
@@ -232,6 +246,36 @@ alert_status() {
     printf "  %-18s %s\n"  "state dir"       "${ALERT_STATE_DIR:-$HOME/.cache/milog}"
     printf "  %-18s %s\n"  "config"          "$target_config"
     printf "  %-18s %b\n"  "systemd service" "$svc_state"
+
+    # Routing block — only shown when ALERT_ROUTES is configured. Reads the
+    # full block from the target config (not env) for the same sudo-vs-user
+    # reason as destinations above.
+    local routes_raw
+    routes_raw=$(_alert_read_routes "$target_config")
+    if [[ -n "$routes_raw" ]]; then
+        echo
+        echo -e "  ${W}routing${NC}"
+        printf "    %-18s  %s\n" "RULE / PREFIX" "DESTINATIONS"
+        printf "    %-18s  %s\n" "──────────────────" "────────────────────────"
+        local line key val
+        while IFS= read -r line; do
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" ]] && continue
+            if [[ "$line" == *": "* ]]; then
+                key="${line%%: *}"; val="${line#*: }"
+            else
+                key="${line%%:*}"; val="${line#*:}"; val="${val# }"
+            fi
+            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+            val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+            printf "    ${Y}%-18s${NC}  %s\n" "$key" "$val"
+        done <<< "$routes_raw"
+    else
+        echo
+        echo -e "  ${W}routing${NC}   ${D}— (not configured; fires fan out to every configured destination)${NC}"
+    fi
 
     local state_file="${ALERT_STATE_DIR:-$HOME/.cache/milog}/alerts.state"
     if [[ -s "$state_file" ]]; then
