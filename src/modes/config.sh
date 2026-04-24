@@ -235,9 +235,154 @@ mode_config() {
         rm|remove|del)  config_rm  "${1:-}" ;;
         dir)            config_dir "${1:-}" ;;
         set)            config_set "${1:-}" "${2:-}" ;;
+        validate|check) config_validate ;;
         -h|--help|help) config_help ;;
         *) echo -e "${R}Unknown config subcommand:${NC} $sub"; config_help; exit 1 ;;
     esac
+}
+
+# Config validator — checks the RESOLVED config (after file + env overrides).
+# Surfaces typos (unknown keys), invalid ranges, unreachable paths, and
+# malformed destinations. Two modes:
+#   - called standalone → prints a report + returns 0 if clean, 2 if warnings,
+#     1 if errors. Useful for CI / pre-flight.
+#   - imported from `milog daemon` startup → same logic, only errors are
+#     fatal; the daemon refuses to start with a clearly-broken config.
+config_validate() {
+    local errors=0 warnings=0
+
+    # Known top-level keys + per-app-threshold families. Any VAR starting
+    # with these is legal; anything else in the user's config is suspicious.
+    local known_exact=(
+        LOG_DIR LOGS REFRESH SPARK_LEN
+        DISCORD_WEBHOOK SLACK_WEBHOOK
+        TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+        MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM
+        WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE
+        ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR
+        ALERT_LOG_MAX_BYTES ALERT_ROUTES
+        HOOKS_DIR ALERT_HOOK_TIMEOUT
+        P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
+        GEOIP_ENABLED MMDB_PATH
+        HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS HISTORY_TOP_IP_N
+        WEB_PORT WEB_BIND WEB_STATE_DIR WEB_TOKEN_FILE WEB_ACCESS_LOG
+        THRESH_REQ_WARN THRESH_REQ_CRIT
+        THRESH_CPU_WARN THRESH_CPU_CRIT
+        THRESH_MEM_WARN THRESH_MEM_CRIT
+        THRESH_DISK_WARN THRESH_DISK_CRIT
+        THRESH_4XX_WARN THRESH_5XX_WARN
+    )
+    # Families — prefix-matched for per-app overrides like THRESH_REQ_CRIT_finance.
+    local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ )
+
+    echo -e "\n${W}── MiLog: Config validate ──${NC}\n"
+    echo -e "  ${D}config: $MILOG_CONFIG${NC}"
+
+    # 1. Unknown keys in the user's config file (source-level, not env).
+    if [[ -r "$MILOG_CONFIG" ]]; then
+        local line key known fam
+        while IFS= read -r line; do
+            line="${line%%#*}"; line="${line# }"; line="${line%$'\r'}"
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)= ]] || continue
+            key="${BASH_REMATCH[1]}"
+            known=0
+            local kk
+            for kk in "${known_exact[@]}"; do
+                [[ "$kk" == "$key" ]] && { known=1; break; }
+            done
+            if (( ! known )); then
+                for fam in "${known_prefix[@]}"; do
+                    [[ "$key" == "$fam"* ]] && { known=1; break; }
+                done
+            fi
+            if (( ! known )); then
+                echo -e "  ${Y}warn${NC}  unknown key: ${key}"
+                warnings=$((warnings+1))
+            fi
+        done < "$MILOG_CONFIG"
+    fi
+
+    # 2. Numeric range checks.
+    local v
+    _check_int() {
+        local name="$1" min="${2:-}" max="${3:-}" val
+        val="${!name:-}"
+        if [[ -n "$val" && ! "$val" =~ ^[0-9]+$ ]]; then
+            echo -e "  ${R}err${NC}   $name must be a non-negative integer, got: $val"
+            errors=$((errors+1)); return
+        fi
+        [[ -z "$val" ]] && return
+        if [[ -n "$min" ]] && (( val < min )); then
+            echo -e "  ${R}err${NC}   $name < $min: $val"; errors=$((errors+1))
+        fi
+        if [[ -n "$max" ]] && (( val > max )); then
+            echo -e "  ${Y}warn${NC}  $name > $max: $val (unusually high)"; warnings=$((warnings+1))
+        fi
+    }
+    _check_int REFRESH 1 60
+    _check_int ALERT_COOLDOWN 1 3600
+    _check_int ALERT_DEDUP_WINDOW 0 3600
+    _check_int WEB_PORT 1 65535
+    _check_int THRESH_CPU_WARN  0 100
+    _check_int THRESH_CPU_CRIT  0 100
+    _check_int THRESH_MEM_WARN  0 100
+    _check_int THRESH_MEM_CRIT  0 100
+    _check_int THRESH_DISK_WARN 0 100
+    _check_int THRESH_DISK_CRIT 0 100
+    _check_int P95_WARN_MS 0
+    _check_int P95_CRIT_MS 0
+    _check_int SLOW_WINDOW 1
+
+    # 3. LOG_DIR readable.
+    if [[ ! -d "$LOG_DIR" ]]; then
+        echo -e "  ${R}err${NC}   LOG_DIR does not exist: $LOG_DIR"
+        errors=$((errors+1))
+    elif [[ ! -r "$LOG_DIR" ]]; then
+        echo -e "  ${R}err${NC}   LOG_DIR not readable: $LOG_DIR (add user to 'adm' group)"
+        errors=$((errors+1))
+    fi
+
+    # 4. Destinations syntactically valid (lightweight — no network).
+    if [[ -n "${DISCORD_WEBHOOK:-}" && ! "$DISCORD_WEBHOOK" =~ ^https:// ]]; then
+        echo -e "  ${Y}warn${NC}  DISCORD_WEBHOOK should start with https://"
+        warnings=$((warnings+1))
+    fi
+    if [[ -n "${SLACK_WEBHOOK:-}" && ! "$SLACK_WEBHOOK" =~ ^https:// ]]; then
+        echo -e "  ${Y}warn${NC}  SLACK_WEBHOOK should start with https://"
+        warnings=$((warnings+1))
+    fi
+    if [[ -n "${WEBHOOK_URL:-}" && ! "$WEBHOOK_URL" =~ ^https?:// ]]; then
+        echo -e "  ${Y}warn${NC}  WEBHOOK_URL should be http(s)://"
+        warnings=$((warnings+1))
+    fi
+    if [[ -n "${MATRIX_HOMESERVER:-}" && ! "$MATRIX_HOMESERVER" =~ ^https:// ]]; then
+        echo -e "  ${Y}warn${NC}  MATRIX_HOMESERVER should start with https://"
+        warnings=$((warnings+1))
+    fi
+    # Partial Telegram / Matrix — hard errors because the destination won't fire.
+    if [[ -n "${TELEGRAM_BOT_TOKEN:-}$TELEGRAM_CHAT_ID" ]]; then
+        if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo -e "  ${R}err${NC}   Telegram partial config — need both BOT_TOKEN and CHAT_ID"
+            errors=$((errors+1))
+        fi
+    fi
+    local mx="${MATRIX_HOMESERVER:-}${MATRIX_TOKEN:-}${MATRIX_ROOM:-}"
+    if [[ -n "$mx" ]]; then
+        if [[ -z "${MATRIX_HOMESERVER:-}" || -z "${MATRIX_TOKEN:-}" || -z "${MATRIX_ROOM:-}" ]]; then
+            echo -e "  ${R}err${NC}   Matrix partial config — need HOMESERVER + TOKEN + ROOM"
+            errors=$((errors+1))
+        fi
+    fi
+
+    echo
+    if (( errors == 0 && warnings == 0 )); then
+        echo -e "  ${G}✓ config is clean${NC}\n"
+        return 0
+    fi
+    printf "  %s errors, %s warnings\n\n" "$errors" "$warnings"
+    if (( errors > 0 )); then return 1; fi
+    return 2
 }
 
 # ==============================================================================
@@ -248,11 +393,11 @@ color_prefix() {
     local colors=("$B" "$C" "$G" "$M" "$Y" "$R")
     local -a F_files=() F_cols=() F_labels=()
     local i=0
-    for name in "${LOGS[@]}"; do
-        local file="$LOG_DIR/$name.access.log"
+    for entry in "${LOGS[@]}"; do
+        local file; file=$(_log_path_for "$entry")
+        local name; name=$(_log_name_for "$entry")
         local col="${colors[$i]}"
-        local label
-        label=$(printf "%-8s" "$name")
+        local label; label=$(printf "%-8s" "$name")
         if [[ -f "$file" ]]; then
             F_files+=("$file")
             F_cols+=("$col")

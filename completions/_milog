@@ -1,0 +1,85 @@
+#compdef milog
+# zsh completion for milog.
+# Install to /usr/share/zsh/site-functions/_milog (system) or any dir in $fpath.
+
+_milog() {
+    local -a commands config_subs config_keys alert_subs silence_subs web_subs window_vals
+
+    commands=(
+        'monitor:full TUI (nginx + system)'
+        'daemon:headless alerter — no TUI'
+        'rate:nginx-only req/min dashboard'
+        'health:2xx/3xx/4xx/5xx per app'
+        'top:top N source IPs'
+        'top-paths:top N URLs by req/4xx/5xx/p95'
+        'attacker:forensic view of one IP'
+        'slow:top N slow endpoints by p95'
+        'ws:WebSocket session metrics'
+        'stats:hourly request histogram per app'
+        'trend:sparkline of req/min from history'
+        'replay:postmortem for one archived log'
+        'search:grep across current + archived logs'
+        'diff:per-app req now vs 1d/7d ago'
+        'auto-tune:suggest thresholds from history'
+        'grep:filter-tail one app'
+        'errors:live 4xx/5xx tail'
+        'exploits:LFI/RCE/SQLi/XSS/infra-probe tail'
+        'probes:scanner/bot traffic tail'
+        'suspects:heuristic bot ranking'
+        'config:show / edit / set / init / validate'
+        'alert:toggle alerting + systemd service'
+        'alerts:local fire history'
+        'silence:mute a rule while on-call fixes it'
+        'digest:exec-summary view over last day / week'
+        'doctor:diagnostic checklist'
+        'web:start/stop/status web UI'
+        'help:show help'
+    )
+
+    config_subs=(show path init edit add rm dir set validate)
+    config_keys=(
+        LOG_DIR LOGS REFRESH SPARK_LEN
+        DISCORD_WEBHOOK SLACK_WEBHOOK
+        TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+        MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM
+        WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE
+        ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW
+        ALERT_LOG_MAX_BYTES ALERT_ROUTES
+        HOOKS_DIR ALERT_HOOK_TIMEOUT
+        P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
+        GEOIP_ENABLED MMDB_PATH
+        HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS
+        WEB_PORT WEB_BIND
+        THRESH_REQ_WARN THRESH_REQ_CRIT
+        THRESH_CPU_WARN THRESH_CPU_CRIT
+        THRESH_MEM_WARN THRESH_MEM_CRIT
+        THRESH_DISK_WARN THRESH_DISK_CRIT
+        THRESH_4XX_WARN THRESH_5XX_WARN
+    )
+    alert_subs=(on off status test)
+    silence_subs=(list clear)
+    web_subs=(start stop status install-service uninstall-service rotate-token)
+    window_vals=(today yesterday 1h 6h 12h 24h 7d 30d all)
+
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'milog subcommand' commands
+        return
+    fi
+
+    case "${words[2]}" in
+        config)
+            if   (( CURRENT == 3 )); then _describe 'config subcommand' config_subs
+            elif (( CURRENT == 4 )); then
+                case "${words[3]}" in
+                    set) _describe 'config key' config_keys ;;
+                esac
+            fi
+            ;;
+        alert)    (( CURRENT == 3 )) && _describe 'alert subcommand' alert_subs ;;
+        silence)  (( CURRENT == 3 )) && _describe 'silence subcommand' silence_subs ;;
+        web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
+        alerts|digest) (( CURRENT == 3 )) && _describe 'window' window_vals ;;
+    esac
+}
+
+_milog "$@"
