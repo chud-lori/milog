@@ -75,6 +75,46 @@ Format: `<b>title</b>\n<pre>body</pre>` via `parse_mode: HTML`. Body is
 HTML-escaped — log lines with `<script>` or `<a href>` render as
 literal text, never executed.
 
+### Generic webhook — ntfy.sh, Mattermost, Rocket.Chat, anything POST-able
+
+For any service that accepts an HTTP POST (ntfy.sh, Mattermost,
+Rocket.Chat, internal triggers, custom ingests) — or a service
+MiLog doesn't ship a dedicated adapter for — use the generic webhook:
+
+```bash
+milog config set WEBHOOK_URL 'https://ntfy.sh/milog-alerts'
+# Optional: override the default JSON template / content type
+milog config set WEBHOOK_TEMPLATE '{"topic":"milog-alerts","title":%TITLE%,"message":%BODY%,"priority":3}'
+milog config set WEBHOOK_CONTENT_TYPE 'application/json'
+```
+
+**Template placeholders** (all `json_escape`'d, so each expands to a
+valid JSON string literal — the default template below is valid JSON
+after substitution):
+
+| Placeholder  | Expands to                                       |
+| ------------ | ------------------------------------------------ |
+| `%TITLE%`    | alert title (e.g. `"5xx spike: api"`)            |
+| `%BODY%`     | alert body (short description)                   |
+| `%SEV%`      | severity word — `"crit"` / `"warn"` / `"info"`   |
+| `%RULE%`     | rule key (e.g. `"5xx:api"`, `"exploits:sqli"`)   |
+
+**Default template** (good for most JSON-ingest APIs):
+```json
+{"title":%TITLE%,"body":%BODY%,"severity":%SEV%,"rule":%RULE%}
+```
+
+**Using this destination in `ALERT_ROUTES`:** routes accept a
+`webhook` token alongside `discord` / `slack` / `telegram` /
+`matrix` — e.g. `default: webhook` to send everything through a
+single pipe, or `exploits: webhook slack` to fan out to both.
+
+Limits today:
+- One webhook URL. For multiple endpoints, route through an
+  intermediary (n8n, Zapier, a small dispatcher).
+- JSON-first template — `text/plain` works if you're OK with quoted
+  values in the output.
+
 ### Matrix
 
 ```bash

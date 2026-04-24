@@ -69,7 +69,8 @@ config_show() {
         "${DISCORD_WEBHOOK:-}" \
         "${SLACK_WEBHOOK:-}" \
         "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" \
-        "${MATRIX_HOMESERVER:-}" "${MATRIX_TOKEN:-}" "${MATRIX_ROOM:-}"
+        "${MATRIX_HOMESERVER:-}" "${MATRIX_TOKEN:-}" "${MATRIX_ROOM:-}" \
+        "${WEBHOOK_URL:-}"
 }
 
 config_init() {

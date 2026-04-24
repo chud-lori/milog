@@ -211,7 +211,7 @@ alert_status() {
     # Read all destinations from the target config. Done via _alert_read_key
     # (not env) so `sudo milog alert status` shows alice's real config,
     # not root's. Empty strings when unset.
-    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room
+    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url
     d_url=$(_alert_read_webhook "$target_config")
     s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
     tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
@@ -219,6 +219,7 @@ alert_status() {
     mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
     mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
     mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+    wh_url=$(  _alert_read_key "$target_config" "WEBHOOK_URL")
 
     local enabled svc_state
     enabled=$(_alert_read_key "$target_config" "ALERTS_ENABLED")
@@ -237,7 +238,7 @@ alert_status() {
     echo -e "\n${W}── MiLog: Alert status ──${NC}\n"
 
     echo -e "  ${W}destinations${NC}"
-    _alert_destinations_status "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room"
+    _alert_destinations_status "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room" "$wh_url"
     echo
 
     printf "  %-18s %s\n"  "ALERTS_ENABLED"  "$enabled"
@@ -299,16 +300,19 @@ alert_test() {
 
     # Pull every destination from the target-user's config file, not the
     # env this process started with. Makes `sudo milog alert test` test
-    # alice's full fanout (Discord + Slack + Telegram + Matrix), not just
-    # whatever happens to live in root's env.
-    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room
-    d_url=$(   _alert_read_webhook "$target_config")
-    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
-    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
-    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
-    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
-    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
-    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+    # alice's full fanout (Discord + Slack + Telegram + Matrix + Webhook),
+    # not just whatever happens to live in root's env.
+    local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url wh_template wh_ctype
+    d_url=$(      _alert_read_webhook "$target_config")
+    s_url=$(      _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    tg_token=$(   _alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$(    _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(      _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(   _alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$(    _alert_read_key "$target_config" "MATRIX_ROOM")
+    wh_url=$(     _alert_read_key "$target_config" "WEBHOOK_URL")
+    wh_template=$(_alert_read_key "$target_config" "WEBHOOK_TEMPLATE")
+    wh_ctype=$(   _alert_read_key "$target_config" "WEBHOOK_CONTENT_TYPE")
 
     # Track which destinations will actually fire so we can print a
     # per-destination line. Mirrors the readiness logic in each
@@ -320,6 +324,7 @@ alert_test() {
     elif [[ -n "$tg_token" || -n "$tg_chat" ]]; then dests_partial+=("telegram"); fi
     if   [[ -n "$mx_hs" && -n "$mx_token" && -n "$mx_room" ]]; then dests_ok+=("matrix")
     elif [[ -n "$mx_hs" || -n "$mx_token" || -n "$mx_room" ]]; then dests_partial+=("matrix"); fi
+    [[ -n "$wh_url"   ]] && dests_ok+=("webhook")
 
     if (( ${#dests_ok[@]} == 0 )); then
         echo -e "${R}no alert destinations configured in $target_config${NC}" >&2
@@ -338,11 +343,16 @@ alert_test() {
     local _s_enabled="$ALERTS_ENABLED" _s_dw="$DISCORD_WEBHOOK" _s_sw="$SLACK_WEBHOOK"
     local _s_tt="$TELEGRAM_BOT_TOKEN" _s_tc="$TELEGRAM_CHAT_ID"
     local _s_mh="$MATRIX_HOMESERVER"  _s_mt="$MATRIX_TOKEN"    _s_mr="$MATRIX_ROOM"
+    local _s_wu="${WEBHOOK_URL:-}"    _s_wt="${WEBHOOK_TEMPLATE:-}"  _s_wc="${WEBHOOK_CONTENT_TYPE:-}"
     ALERTS_ENABLED=1
     DISCORD_WEBHOOK="$d_url"
     SLACK_WEBHOOK="$s_url"
     TELEGRAM_BOT_TOKEN="$tg_token"; TELEGRAM_CHAT_ID="$tg_chat"
     MATRIX_HOMESERVER="$mx_hs";     MATRIX_TOKEN="$mx_token";  MATRIX_ROOM="$mx_room"
+    WEBHOOK_URL="$wh_url"
+    # Empty template / ctype from target config → keep the process defaults.
+    [[ -n "$wh_template" ]] && WEBHOOK_TEMPLATE="$wh_template"
+    [[ -n "$wh_ctype"    ]] && WEBHOOK_CONTENT_TYPE="$wh_ctype"
 
     echo -e "Firing test alert to: ${G}${dests_ok[*]}${NC}"
     if (( ${#dests_partial[@]} > 0 )); then
@@ -357,6 +367,7 @@ alert_test() {
     DISCORD_WEBHOOK="$_s_dw";       SLACK_WEBHOOK="$_s_sw"
     TELEGRAM_BOT_TOKEN="$_s_tt";    TELEGRAM_CHAT_ID="$_s_tc"
     MATRIX_HOMESERVER="$_s_mh";     MATRIX_TOKEN="$_s_mt";     MATRIX_ROOM="$_s_mr"
+    WEBHOOK_URL="$_s_wu";           WEBHOOK_TEMPLATE="$_s_wt"; WEBHOOK_CONTENT_TYPE="$_s_wc"
     echo -e "${G}✓${NC} fanout dispatched — check each channel; any silent dest is a wire issue, not a config issue"
 }
 

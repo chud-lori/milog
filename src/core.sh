@@ -18,6 +18,7 @@ REFRESH=5
 #   Slack:    SLACK_WEBHOOK
 #   Telegram: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
 #   Matrix:   MATRIX_HOMESERVER + MATRIX_TOKEN + MATRIX_ROOM
+#   Webhook:  WEBHOOK_URL (+ optional WEBHOOK_TEMPLATE / WEBHOOK_CONTENT_TYPE)
 DISCORD_WEBHOOK=""
 SLACK_WEBHOOK=""
 TELEGRAM_BOT_TOKEN=""
@@ -25,6 +26,22 @@ TELEGRAM_CHAT_ID=""
 MATRIX_HOMESERVER=""
 MATRIX_TOKEN=""
 MATRIX_ROOM=""
+
+# Generic webhook destination — any POST-accepting endpoint (ntfy.sh,
+# Mattermost, Rocket.Chat, custom ingest). Distinct from the discord/slack
+# adapters which know each API's specific payload shape; this is free-form.
+#
+# Template placeholders (all json_escape'd → quoted JSON string literals,
+# so the default template below is valid JSON after substitution):
+#   %TITLE%  alert title      %SEV%   severity word (crit / warn / info)
+#   %BODY%   alert body       %RULE%  rule key     (e.g. `5xx:api`)
+#
+# For `text/plain` ingest, override the template to a bare string and set
+# WEBHOOK_CONTENT_TYPE accordingly — the placeholder values will still be
+# quoted, but that's acceptable for most plain-text receivers.
+WEBHOOK_URL=""
+WEBHOOK_TEMPLATE='{"title":%TITLE%,"body":%BODY%,"severity":%SEV%,"rule":%RULE%}'
+WEBHOOK_CONTENT_TYPE="application/json"
 ALERTS_ENABLED=0
 ALERT_COOLDOWN=300
 # Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
@@ -137,6 +154,9 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
 [[ -n "${MILOG_ALERT_ROUTES+x}"         ]] && ALERT_ROUTES="$MILOG_ALERT_ROUTES"
+[[ -n "${MILOG_WEBHOOK_URL:-}"          ]] && WEBHOOK_URL="$MILOG_WEBHOOK_URL"
+[[ -n "${MILOG_WEBHOOK_TEMPLATE+x}"     ]] && WEBHOOK_TEMPLATE="$MILOG_WEBHOOK_TEMPLATE"
+[[ -n "${MILOG_WEBHOOK_CONTENT_TYPE:-}" ]] && WEBHOOK_CONTENT_TYPE="$MILOG_WEBHOOK_CONTENT_TYPE"
 [[ -n "${MILOG_SLACK_WEBHOOK:-}"      ]] && SLACK_WEBHOOK="$MILOG_SLACK_WEBHOOK"
 [[ -n "${MILOG_TELEGRAM_BOT_TOKEN:-}" ]] && TELEGRAM_BOT_TOKEN="$MILOG_TELEGRAM_BOT_TOKEN"
 [[ -n "${MILOG_TELEGRAM_CHAT_ID:-}"   ]] && TELEGRAM_CHAT_ID="$MILOG_TELEGRAM_CHAT_ID"

@@ -120,6 +120,9 @@ no per-app form — they're not app-scoped.
 | `MATRIX_HOMESERVER`   | (empty)             | `https://matrix.example.com`              |
 | `MATRIX_TOKEN`        | (empty)             | Long-lived access token                   |
 | `MATRIX_ROOM`         | (empty)             | `!abc123:matrix.example.com`              |
+| `WEBHOOK_URL`         | (empty)             | Generic POST target (ntfy.sh, Mattermost, custom ingests) |
+| `WEBHOOK_TEMPLATE`    | `{"title":%TITLE%,"body":%BODY%,"severity":%SEV%,"rule":%RULE%}` | Body template; placeholders are JSON-quoted |
+| `WEBHOOK_CONTENT_TYPE`| `application/json`  | `Content-Type` header on the POST         |
 
 See [alerts.md](alerts.md) for full destination setup.
 
@@ -161,6 +164,9 @@ systemd units, one-shot runs, or CI:
 | `MILOG_ALERT_DEDUP_WINDOW`    | `ALERT_DEDUP_WINDOW`    |
 | `MILOG_ALERT_LOG_MAX_BYTES`   | `ALERT_LOG_MAX_BYTES`   |
 | `MILOG_ALERT_ROUTES`          | `ALERT_ROUTES`          |
+| `MILOG_WEBHOOK_URL`           | `WEBHOOK_URL`           |
+| `MILOG_WEBHOOK_TEMPLATE`      | `WEBHOOK_TEMPLATE`      |
+| `MILOG_WEBHOOK_CONTENT_TYPE`  | `WEBHOOK_CONTENT_TYPE`  |
 | `MILOG_GEOIP_ENABLED`         | `GEOIP_ENABLED`         |
 | `MILOG_MMDB_PATH`             | `MMDB_PATH`             |
 | `MILOG_HISTORY_ENABLED`       | `HISTORY_ENABLED`       |
