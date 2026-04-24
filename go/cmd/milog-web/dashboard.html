@@ -120,6 +120,9 @@
     <div class="alerts-head">
       <h2>Logs (live tail)</h2>
       <span class="meta" id="logs-count">—</span>
+      <span class="meta" id="logs-rate">—</span>
+      <span class="meta" id="logs-mode">poll</span>
+      <button id="logs-pause" type="button" style="background:#10141a;color:#d6d9dc;border:1px solid #30363d;border-radius:.3rem;padding:.15rem .6rem;font:inherit;font-size:.8rem;cursor:pointer;">pause</button>
       <select id="logs-app" aria-label="app"></select>
       <select id="logs-class" aria-label="status class">
         <option value="any" selected>any</option>
@@ -282,28 +285,6 @@
     });
     if (sel.options.length) sel.value = sel.options[0].value;
   }
-  function renderLogs(d) {
-    var tbody = document.querySelector('#logs tbody');
-    var meta = document.getElementById('logs-count');
-    tbody.innerHTML = '';
-    var list = (d && d.lines) || [];
-    meta.textContent = list.length + ' line' + (list.length === 1 ? '' : 's');
-    if (!list.length) {
-      tbody.innerHTML = '<tr><td colspan="5" class="empty">no matching lines</td></tr>';
-      return;
-    }
-    list.slice().reverse().forEach(function(r){
-      var tr = document.createElement('tr');
-      function td(v, cls){ var c = document.createElement('td'); if (cls) c.className = cls; c.textContent = v; return c; }
-      var stClass = 'st' + String(r.status || '').charAt(0);
-      tr.appendChild(td(fmtLogWhen(r.ts), 'when'));
-      tr.appendChild(td(r.ip || '', 'ip'));
-      tr.appendChild(td(r.method || '', 'mth'));
-      tr.appendChild(td(r.path || '', 'pth'));
-      tr.appendChild(td(r.status, stClass));
-      tbody.appendChild(tr);
-    });
-  }
   function renderHistogram(d) {
     var el = document.getElementById('logs-histogram');
     el.innerHTML = '';
@@ -319,15 +300,147 @@
       el.appendChild(bar);
     });
   }
-  function tickLogs() {
+  // Shared state across poll + SSE modes.
+  var logsState = {
+    rows: [],              // newest first, capped at MAX_ROWS
+    paused: false,
+    source: null,          // EventSource when live, null otherwise
+    pollTimer: null,       // setInterval handle when in poll mode
+    rateSamples: [],       // event timestamps (ms) for rolling req/s
+  };
+  var MAX_ROWS = 500;
+
+  function rowFromLine(l) {
+    var stClass = 'st' + String(l.status || '').charAt(0);
+    return {
+      ts: l.ts, ip: l.ip, method: l.method, path: l.path,
+      status: l.status, ua: l.ua, stClass: stClass,
+    };
+  }
+  function redrawLogs() {
+    var tbody = document.querySelector('#logs tbody');
+    var meta = document.getElementById('logs-count');
+    tbody.innerHTML = '';
+    if (!logsState.rows.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">no matching lines</td></tr>';
+      meta.textContent = '0 lines';
+      return;
+    }
+    meta.textContent = logsState.rows.length + ' line' + (logsState.rows.length === 1 ? '' : 's');
+    logsState.rows.forEach(function(r){
+      var tr = document.createElement('tr');
+      function td(v, cls){ var c = document.createElement('td'); if (cls) c.className = cls; c.textContent = v; return c; }
+      tr.appendChild(td(fmtLogWhen(r.ts), 'when'));
+      tr.appendChild(td(r.ip || '', 'ip'));
+      tr.appendChild(td(r.method || '', 'mth'));
+      tr.appendChild(td(r.path || '', 'pth'));
+      tr.appendChild(td(r.status, r.stClass));
+      tbody.appendChild(tr);
+    });
+  }
+  function recordRate() {
+    var now = Date.now();
+    logsState.rateSamples.push(now);
+    // Rolling 10-second window.
+    while (logsState.rateSamples.length && now - logsState.rateSamples[0] > 10000) {
+      logsState.rateSamples.shift();
+    }
+    var rate = logsState.rateSamples.length / 10;
+    document.getElementById('logs-rate').textContent = rate.toFixed(1) + '/s';
+  }
+  function appendLiveLine(l) {
+    if (logsState.paused) return; // keep the render frozen; rate meter still ticks for situational awareness
+    logsState.rows.unshift(rowFromLine(l));
+    if (logsState.rows.length > MAX_ROWS) logsState.rows.length = MAX_ROWS;
+    redrawLogs();
+  }
+  function setLogsMode(label) {
+    document.getElementById('logs-mode').textContent = label;
+  }
+
+  // Load the historical slice once on filter change (SSE replay handles
+  // this too, but the initial render before SSE connects comes from here).
+  function loadLogsInitial() {
     var app = document.getElementById('logs-app').value;
-    if (!app) return;
+    if (!app) return Promise.resolve();
     var grep = document.getElementById('logs-grep').value;
     var cls = document.getElementById('logs-class').value;
     var q = 'app=' + encodeURIComponent(app) + '&limit=200';
     if (grep) q += '&grep=' + encodeURIComponent(grep);
     if (cls && cls !== 'any') q += '&class=' + encodeURIComponent(cls);
-    api('/api/logs.json?' + q).then(renderLogs).catch(function(){});
+    return api('/api/logs.json?' + q).then(function(d){
+      var list = (d && d.lines) || [];
+      logsState.rows = list.slice().reverse().map(rowFromLine); // newest first
+      redrawLogs();
+    }).catch(function(){});
+  }
+
+  function stopLogsSources() {
+    if (logsState.source) { try { logsState.source.close(); } catch(_){} logsState.source = null; }
+    if (logsState.pollTimer) { clearInterval(logsState.pollTimer); logsState.pollTimer = null; }
+  }
+
+  function startLogsStream() {
+    stopLogsSources();
+    var app = document.getElementById('logs-app').value;
+    if (!app) { redrawLogs(); return; }
+    logsState.rows = [];
+    logsState.rateSamples = [];
+
+    if (typeof EventSource === 'undefined') {
+      // No SSE support in the browser — stay on the 5-second poll loop
+      // that the tier-1 implementation used.
+      setLogsMode('poll');
+      loadLogsInitial();
+      logsState.pollTimer = setInterval(loadLogsInitial, 5000);
+      return;
+    }
+
+    var grep = document.getElementById('logs-grep').value;
+    var cls = document.getElementById('logs-class').value;
+    var q = 'app=' + encodeURIComponent(app) + '&limit=200&t=' + encodeURIComponent(token);
+    if (grep) q += '&grep=' + encodeURIComponent(grep);
+    if (cls && cls !== 'any') q += '&class=' + encodeURIComponent(cls);
+
+    setLogsMode('connecting…');
+    var src;
+    try { src = new EventSource('/api/logs/stream?' + q); }
+    catch (_) {
+      setLogsMode('poll');
+      loadLogsInitial();
+      logsState.pollTimer = setInterval(loadLogsInitial, 5000);
+      return;
+    }
+    logsState.source = src;
+
+    var fellBack = false;
+    var fallbackTimer = setTimeout(function(){
+      if (logsState.source !== src) return;
+      fellBack = true;
+      stopLogsSources();
+      setLogsMode('poll');
+      loadLogsInitial();
+      logsState.pollTimer = setInterval(loadLogsInitial, 5000);
+    }, 4000);
+
+    src.addEventListener('log', function(ev){
+      clearTimeout(fallbackTimer);
+      try { appendLiveLine(JSON.parse(ev.data)); recordRate(); }
+      catch(_){}
+    });
+    src.addEventListener('ready', function(){
+      clearTimeout(fallbackTimer);
+      setLogsMode('live');
+    });
+    src.onerror = function(){
+      if (fellBack) return;
+      if (src.readyState === EventSource.CLOSED) {
+        stopLogsSources();
+        setLogsMode('poll');
+        loadLogsInitial();
+        logsState.pollTimer = setInterval(loadLogsInitial, 5000);
+      }
+    };
   }
   function tickHistogram() {
     var app = document.getElementById('logs-app').value;
@@ -336,17 +449,20 @@
       .then(renderHistogram).catch(function(){});
   }
   // Populate app select from meta.apps
-  api('/api/meta.json').then(function(m){ setLogsApp(m.apps || []); tickLogs(); tickHistogram(); }).catch(function(){});
+  api('/api/meta.json').then(function(m){ setLogsApp(m.apps || []); startLogsStream(); tickHistogram(); }).catch(function(){});
   ['logs-app','logs-class','logs-grep'].forEach(function(id){
-    document.getElementById(id).addEventListener('change', function(){ tickLogs(); tickHistogram(); });
+    document.getElementById(id).addEventListener('change', function(){ startLogsStream(); tickHistogram(); });
   });
   document.getElementById('logs-grep').addEventListener('input', function(){
-    // Debounced-lite: just call tickLogs after keystrokes; 200 req/minute
-    // ceiling on the server hasn't been hit at this scale.
+    // Debounce so every keystroke doesn't open+close a fresh SSE stream.
     clearTimeout(window.__milog_grep_t);
-    window.__milog_grep_t = setTimeout(tickLogs, 250);
+    window.__milog_grep_t = setTimeout(function(){ startLogsStream(); }, 300);
   });
-  setInterval(tickLogs, 5000);
+  document.getElementById('logs-pause').addEventListener('click', function(){
+    logsState.paused = !logsState.paused;
+    this.textContent = logsState.paused ? 'resume' : 'pause';
+    this.style.background = logsState.paused ? '#3a2b05' : '#10141a';
+  });
   setInterval(tickHistogram, 30000);
 
   // ---- live summary: SSE with poll fallback ---------------------------
