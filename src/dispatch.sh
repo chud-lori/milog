@@ -61,6 +61,7 @@ ${W}TAILING${NC}
   ${C}errors${NC}             4xx/5xx lines only
   ${C}exploits${NC}           LFI / RCE / SQLi / XSS / infra-probe payloads
   ${C}probes${NC}             scanner/bot traffic
+  ${C}patterns${NC}           app-error signatures (panics, OOM, stacktraces…)
   ${C}grep <app> <pat>${NC}   filter-tail one app
   ${C}<app>${NC}              raw tail for one app
 
@@ -135,6 +136,12 @@ _cmd_help() {
         errors)   echo -e "${W}milog errors${NC} — live 4xx/5xx tail" ;;
         exploits) echo -e "${W}milog exploits${NC} — LFI/RCE/SQLi/XSS/infra-probe live tail" ;;
         probes)   echo -e "${W}milog probes${NC} — scanner/bot traffic live tail" ;;
+        patterns)
+            echo -e "${W}milog patterns [list]${NC} — app-error pattern detector across all sources"
+            echo -e "  Built-ins: Go panic, Python traceback, Java stacktrace, Node UPR, OOM, segfault, ERROR/FATAL/CRITICAL"
+            echo -e "  Custom:    APP_PATTERN_<name>='regex' (empty value disables a built-in of the same name)"
+            echo -e "  ${C}milog patterns list${NC}  show merged catalog (built-ins + overrides + custom)"
+            ;;
         grep)     echo -e "${W}milog grep <app> <pattern>${NC} — filter-tail one app" ;;
         suspects) echo -e "${W}milog suspects [N] [WINDOW]${NC} — heuristic bot ranking" ;;
         config)
@@ -203,6 +210,11 @@ case "${1:-}" in
     errors)   mode_errors ;;
     exploits) mode_exploits ;;
     probes)   mode_probes ;;
+    patterns)
+        case "${2:-}" in
+            list) mode_patterns_list ;;
+            *)    mode_patterns ;;
+        esac ;;
     suspects) mode_suspects "${2:-20}" "${3:-2000}" ;;
     config)   shift; mode_config "$@" ;;
     alert)    shift; mode_alert  "$@" ;;

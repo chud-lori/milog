@@ -26,11 +26,13 @@ mode_daemon() {
 
     history_init   # no-op when HISTORY_ENABLED=0; disables itself on error
 
-    # Live-tail watchers for exploit + probe rules. Their stdout is suppressed;
-    # the alert call sites inside each mode fire webhooks directly.
+    # Live-tail watchers for exploit + probe + app-pattern rules. Their stdout
+    # is suppressed; the alert call sites inside each mode fire webhooks
+    # directly. `mode_patterns` self-suppresses when PATTERNS_ENABLED=0.
     local watcher_pids=()
     ( mode_exploits > /dev/null ) & watcher_pids+=($!)
     ( mode_probes   > /dev/null ) & watcher_pids+=($!)
+    ( mode_patterns > /dev/null ) & watcher_pids+=($!)
 
     local _cleanup='
         _dlog "milog daemon shutting down"

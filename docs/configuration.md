@@ -179,6 +179,7 @@ systemd units, one-shot runs, or CI:
 | `MILOG_WEB_BIND`              | `WEB_BIND`              |
 | `MILOG_SLOW_EXCLUDE_PATHS`    | `SLOW_EXCLUDE_PATHS`    |
 | `MILOG_DOCKER_ROOT`           | Docker state dir for `docker:` sources when `docker inspect` is unavailable (default `/var/lib/docker`) |
+| `MILOG_PATTERNS_ENABLED`      | `PATTERNS_ENABLED`     |
 
 ## `LOGS` — source types
 
@@ -248,6 +249,41 @@ MiLog auto-detects the extra field per line; mixed formats degrade
 gracefully (lines without `$request_time` are skipped for timing
 purposes, and the UI shows `—` when no timed samples exist for the
 current minute).
+
+## App-error patterns (`milog patterns`)
+
+`milog patterns` runs in the daemon by default and fires alerts keyed
+`app:<source>:<pattern>` whenever a known error signature appears in
+any configured log source — works on nginx, journal, docker, and text
+sources. Standalone `milog patterns` shows the same matches in the
+terminal; `milog patterns list` prints the merged catalog.
+
+Built-in pattern names: `panic_go`, `traceback_python`,
+`stacktrace_java`, `unhandled_promise_node`, `oom_kill`,
+`generic_critical`, `segfault`, `out_of_memory`.
+
+Custom patterns and overrides slot in via env vars (config file or
+`MILOG_*`-style overrides):
+
+```bash
+# Add a project-specific pattern
+APP_PATTERN_db_timeout='database connection timed out after'
+
+# Override a built-in's regex
+APP_PATTERN_panic_go='^(panic|fatal error):'
+
+# Disable a built-in (empty value drops it from the catalog)
+APP_PATTERN_segfault=''
+```
+
+| Variable             | Default | Purpose                                                        |
+| -------------------- | ------- | -------------------------------------------------------------- |
+| `PATTERNS_ENABLED`   | `1`     | Set to `0` to skip the pattern watcher inside `milog daemon`. |
+| `APP_PATTERN_<name>` | unset   | Add (custom) or replace (override) a pattern. Empty disables. |
+
+Each fire goes through the same alert path as everything else —
+silence rules (`milog silence app:<source>:<pattern> 1h`),
+cooldown, dedup, routing, and webhook fan-out all apply.
 
 ## Permissions on `/var/log/nginx`
 
