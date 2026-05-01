@@ -1,0 +1,66 @@
+# CI workflow — runs on every PR and push to main.
+#
+# Catches the regressions release.yml can't (it only runs on tag push):
+#   - milog.sh drift   — someone edited src/ but forgot `bash build.sh`
+#   - Go test / vet    — a refactor breaks an internal package
+#   - goreleaser check — `.goreleaser.yaml` syntax / deprecation
+#
+# Kept tight on purpose: ~2 min wall time on ubuntu-latest. The release
+# workflow runs the same Go build + goreleaser pipeline at tag time, so
+# we don't double-build artifacts here.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache: true
+          cache-dependency-path: go/go.sum
+
+      - name: Bash bundle freshness
+        # build.sh regenerates milog.sh from src/*.sh. If the diff is
+        # non-empty, someone edited src/ but didn't rebuild — block
+        # before that lands on main, where install.sh users would pull
+        # a stale bundle from raw.githubusercontent. The version-stamp
+        # lines (MILOG_VERSION / MILOG_BUILT) update on each build, so
+        # we ignore those and check only the body content.
+        run: |
+          bash build.sh
+          # Strip the two version-stamp lines before diffing — they're
+          # build-timestamp dependent and would always show as drift.
+          diff <(grep -v '^# MILOG_\(VERSION\|BUILT\)=' milog.sh) \
+               <(git show HEAD:milog.sh | grep -v '^# MILOG_\(VERSION\|BUILT\)=')
+
+      - name: Bash bundle syntax check
+        run: bash -n milog.sh
+
+      - name: Go vet
+        working-directory: go
+        run: go vet ./...
+
+      - name: Go test
+        working-directory: go
+        run: go test -race -count=1 ./...
+
+      - name: goreleaser config check
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: check
