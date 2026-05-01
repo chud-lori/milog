@@ -92,3 +92,109 @@ func TestView_ShowsPausedBadge(t *testing.T) {
 		t.Errorf("paused view missing PAUSED badge; got:\n%s", view)
 	}
 }
+
+func TestRuleMentionsApp(t *testing.T) {
+	cases := []struct {
+		rule, app string
+		want      bool
+	}{
+		{"app:api:panic_go", "api", true},
+		{"web:5xx_burst:api", "api", true},
+		{"exploit:api:sqli", "api", true},
+		{"probe:api", "api", true},
+		{"app:worker:panic_go", "api", false},
+		{"sys:cpu_high", "api", false},
+		{"", "api", false},
+		{"app:api:foo", "", false},
+		// Substring guard: 'api-v2' app shouldn't match a rule about 'api'.
+		{"app:api:foo", "api-v2", false},
+	}
+	for _, c := range cases {
+		if got := ruleMentionsApp(c.rule, c.app); got != c.want {
+			t.Errorf("ruleMentionsApp(%q, %q) = %v, want %v", c.rule, c.app, got, c.want)
+		}
+	}
+}
+
+func TestTopN_SortsByCountDescThenKeyAsc(t *testing.T) {
+	in := map[string]int{"/a": 1, "/b": 5, "/c": 5, "/d": 3}
+	got := topN(in, 3)
+	if len(got) != 3 {
+		t.Fatalf("want 3 rows, got %d", len(got))
+	}
+	if got[0].count != 5 || got[0].key != "/b" {
+		t.Errorf("rank 1: want (/b, 5), got (%s, %d)", got[0].key, got[0].count)
+	}
+	if got[1].count != 5 || got[1].key != "/c" {
+		t.Errorf("rank 2 (tie-break by key asc): want (/c, 5), got (%s, %d)", got[1].key, got[1].count)
+	}
+	if got[2].count != 3 || got[2].key != "/d" {
+		t.Errorf("rank 3: want (/d, 3), got (%s, %d)", got[2].key, got[2].count)
+	}
+}
+
+func TestApps_CursorRendered(t *testing.T) {
+	m := model{
+		cfg:         &config.Config{Apps: []string{"api", "web"}},
+		width:       120,
+		refreshSec:  5,
+		selectedIdx: 1,
+		apps: []appSample{
+			{name: "api", count: 1},
+			{name: "web", count: 2},
+		},
+		history: map[string][]int{"api": {1}, "web": {2}},
+	}
+	view := m.View()
+	// Cursor glyph from renderApps: `›` precedes the highlighted row.
+	if !strings.Contains(view, "›") {
+		t.Errorf("expected cursor glyph in view when selectedIdx=1; got:\n%s", view)
+	}
+}
+
+func TestRenderDrilldown_RendersAllPanes(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewDrilldown,
+		apps:       []appSample{{name: "api"}},
+		drill: drilldownData{
+			app:        "api",
+			totalLines: 2000,
+			topPaths:   []kv{{key: "/v1/users", count: 42}, {key: "/v1/orders", count: 7}},
+			topIPs:     []kv{{key: "1.2.3.4", count: 12}},
+		},
+	}
+	view := m.View()
+	for _, want := range []string{"APP", "api", "TOP PATHS", "/v1/users", "TOP IPs", "1.2.3.4", "RECENT ALERTS"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("drill-down view missing %q; got:\n%s", want, view)
+		}
+	}
+	if !strings.Contains(view, "esc:back") {
+		t.Errorf("drill-down footer missing back hint; got:\n%s", view)
+	}
+}
+
+func TestRenderDrilldown_EmptyShowsHelpfulMessages(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewDrilldown,
+		apps:       []appSample{{name: "api"}},
+		drill: drilldownData{
+			app:        "api",
+			totalLines: 0,
+			// no paths / IPs / alerts
+		},
+	}
+	view := m.View()
+	if !strings.Contains(view, "no data") {
+		t.Errorf("empty top-paths/ips should show 'no data'; got:\n%s", view)
+	}
+	if !strings.Contains(view, "RECENT ALERTS") || !strings.Contains(view, "none") {
+		t.Errorf("empty alerts should show 'none'; got:\n%s", view)
+	}
+}
