@@ -67,6 +67,7 @@ ${W}TAILING${NC}
 
 ${W}OPS${NC}
   ${C}install <feature>${NC}  add optional features: geoip / web / history
+  ${C}audit fim${NC}           file integrity monitor (baseline + drift)
   ${C}bench [--full]${NC}     benchmark harness against synthetic fixtures
   ${C}completions <shell>${NC}  install / print bash|zsh|fish completions
 
@@ -175,6 +176,11 @@ _cmd_help() {
             echo -e "  Subs: list, <feature>, remove <feature>"
             echo -e "  Features: geoip / web / history"
             ;;
+        audit)
+            echo -e "${W}milog audit <sub>${NC} — point-in-time host integrity scans"
+            echo -e "  Subs: ${C}fim baseline${NC} / ${C}fim check${NC} / ${C}fim status${NC}"
+            echo -e "  Watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC}"
+            ;;
         *)
             echo -e "${Y}No detailed help for '$cmd'.${NC} Try ${C}milog help${NC}."
             return 1
@@ -228,6 +234,7 @@ case "${1:-}" in
     completions) shift; mode_completions "$@" ;;
     bench)    shift; mode_bench "$@" ;;
     install)  shift; mode_install "$@" ;;
+    audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
     __web_handler) _web_handle ;;
