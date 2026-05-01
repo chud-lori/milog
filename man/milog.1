@@ -1,0 +1,348 @@
+.\" milog(1) — single-host nginx + system + app-error monitor
+.\"
+.\" This man page is hand-written roff. To preview locally:
+.\"   man -l man/milog.1
+.\" Or:
+.\"   nroff -man man/milog.1 | less
+.\"
+.\" Source-of-truth note: when adding a new mode to src/dispatch.sh's per-cmd
+.\" help registry, mirror it under COMMANDS below. CI does not yet enforce
+.\" sync; reviewers should eyeball it.
+.\"
+.TH MILOG 1 "2026-05-01" "milog" "User Commands"
+.SH NAME
+milog \- single-host nginx + system + app-error monitor with alerts
+.SH SYNOPSIS
+.B milog
+[\fICOMMAND\fR] [\fIARGS\fR ...]
+.br
+.B milog
+[\fB-h\fR | \fB--help\fR | \fBhelp\fR]
+.br
+.B milog
+\fICOMMAND\fR
+.B --help
+.SH DESCRIPTION
+\fBmilog\fR ships as a single bash bundle plus optional Go binaries
+(\fBmilog-web\fR, \fBmilog-tui\fR). It tails nginx access logs, the
+systemd journal, docker container logs, and arbitrary text logs from one
+host, computes per-app metrics, and fires alerts to Discord, Slack,
+Telegram, Matrix, generic webhooks, and user-defined hook scripts.
+Bash modes work on any POSIX box with bash 4+; Go binaries unlock the
+SSE web dashboard, the bubbletea TUI, and the Prometheus
+\fB/metrics\fR endpoint.
+.PP
+The default invocation
+.RB ( "milog" )
+tails every configured source with a coloured prefix per source. All
+other behaviour is opt-in through a subcommand.
+.SH COMMANDS
+.SS Live views
+.TP
+.B monitor
+Bash dashboard \(em refresh-and-redraw TUI showing CPU / MEM / DISK +
+per-app nginx tables. Keys: \fBq\fR quit, \fBp\fR pause, \fBr\fR refresh,
+\fB+\fR/\fB-\fR change rate.
+.TP
+.B tui
+Richer bubbletea TUI in Go. Same data as
+.BR monitor .
+Requires the
+.B milog-tui
+companion binary on
+.BR PATH .
+.TP
+.B rate
+Nginx-only req/min dashboard.
+.TP
+.B web
+Read-only local HTTP dashboard. Subcommands: \fBstart\fR, \fBstop\fR,
+\fBstatus\fR, \fBinstall-service\fR, \fBuninstall-service\fR,
+\fBrotate-token\fR. Prefers the
+.B milog-web
+Go binary (SSE + Prometheus
+.BR /metrics )
+when present, falls back to a bash
+.BR socat (1)
+poller otherwise.
+.TP
+.B daemon
+Headless rule evaluator + alerter. No TUI. Refuses to start when
+.B milog config validate
+reports errors; warnings are allowed.
+.SS Per-app inspection
+.TP
+.B health
+Per-app totals \(em 2xx / 3xx / 4xx / 5xx counts.
+.TP
+.BR top " [\fIN\fR]"
+Top \fIN\fR source IPs across all apps (default 10). Adds a country
+column when
+.B GEOIP_ENABLED=1
+and
+.BR mmdblookup (1)
+is on
+.BR PATH .
+.TP
+.BR top-paths " [\fIN\fR]"
+Top \fIN\fR URLs by req / 4xx / 5xx / p95. Excludes
+.B SLOW_EXCLUDE_PATHS
+(WebSocket paths by default).
+.TP
+.B attacker " \fIIP\fR"
+Forensic view of one IP across apps \(em per-app requests, top paths,
+top user-agents, classification, sample lines.
+.TP
+.BR slow " [\fIN\fR]"
+Top \fIN\fR slow endpoints by p95. Requires
+.B $request_time
+in nginx
+.BR log_format ;
+excludes WebSocket paths.
+.TP
+.BR ws " [\fIN\fR]"
+WebSocket session metrics \(em duration distribution, longest, long-session
+flag, top paths per app.
+.TP
+.B stats " \fIAPP\fR"
+Hourly request histogram for one app.
+.TP
+.BR trend " [\fIAPP\fR] [\fIHOURS\fR]"
+Sparkline from history (requires
+.BR HISTORY_ENABLED=1 ).
+.TP
+.B diff
+Per-app: now vs 1d ago vs 7d ago.
+.TP
+.BR auto-tune " [\fIDAYS\fR]"
+Suggest threshold values from history data.
+.TP
+.B replay " \fIFILE\fR"
+Postmortem for one archived log file.
+.SS Search and filter
+.TP
+.B search " \fIPATTERN\fR [\fIFLAGS\fR]"
+Grep across current + archived log files.
+Flags:
+.BR --since ,
+.BR --app ,
+.BR --path ,
+.BR --regex ,
+.BR --archives ,
+.BR --limit .
+.TP
+.BR errors " [\fIFLAGS\fR]"
+Live tail (default) or summary report (\fB--since\fR /\fB--source\fR
+/\fB--pattern\fR). Live mode: nginx sources show 4xx/5xx, others show
+app-pattern matches. Summary mode: scans
+.B alerts.log
+for
+.B app:<src>:<pat>
+fires within the window.
+.TP
+.B exploits
+Live tail of LFI / RCE / SQLi / XSS / infra-probe payload hits.
+.TP
+.B probes
+Live tail of scanner / bot user-agent traffic.
+.TP
+.BR patterns " [\fBlist\fR]"
+App-error pattern detector across all sources. Built-ins: Go panic,
+Python traceback, Java stacktrace, Node UPR, OOM, segfault,
+ERROR/FATAL/CRITICAL.
+.B milog patterns list
+shows the merged catalog (built-ins + overrides + custom).
+.TP
+.B grep " \fIAPP\fR \fIPATTERN\fR"
+Filter-tail one app.
+.TP
+.BR suspects " [\fIN\fR] [\fIWINDOW\fR]"
+Heuristic bot ranking.
+.SS Configuration
+.TP
+.B config
+Show resolved config + destinations + apps (no args).
+.br
+Subs: \fBshow\fR, \fBpath\fR, \fBinit\fR, \fBedit\fR, \fBadd\fR \fINAME\fR,
+\fBrm\fR \fINAME\fR, \fBdir\fR \fIPATH\fR, \fBset\fR \fIKEY\fR \fIVALUE\fR,
+\fBvalidate\fR.
+.TP
+.B alert " \fISUB\fR"
+Toggle alerting + systemd service. Subs: \fBon\fR, \fBoff\fR, \fBstatus\fR,
+\fBtest\fR.
+.TP
+.BR alerts " [\fIWINDOW\fR]"
+Fire history reader. Window grammar: \fBtoday\fR, \fByesterday\fR,
+\fBall\fR, \fIN\fBm\fR, \fIN\fBh\fR, \fIN\fBd\fR, \fIN\fBw\fR (default
+\fBtoday\fR).
+.TP
+.B silence " \fIRULE\fR \fIDURATION\fR [\fIMESSAGE\fR]"
+Mute a rule. Also: \fBsilence list\fR, \fBsilence clear\fR \fIRULE\fR.
+.TP
+.BR digest " [\fIWINDOW\fR]"
+Exec-summary for the period.
+.TP
+.B doctor
+Diagnostic checklist \(em flags every degraded optional capability with a
+one-line fix.
+.SS Distribution
+.TP
+.B install " \fIFEATURE\fR"
+On-demand feature installer. Features:
+.BR geoip ,
+.BR web ,
+.BR history .
+.B install list
+shows installed state.
+.TP
+.B completions " <\fBinstall\fR | \fBbash\fR | \fBzsh\fR | \fBfish\fR>"
+Install / print shell completion script.
+.TP
+.BR bench " [\fB--full\fR] [\fB--baseline\fR \fIFILE\fR]"
+Synthetic-fixture timing harness for CI baseline comparison.
+.SH GLOBAL HELP
+.TP
+.B milog --help
+List all commands (slim main help).
+.TP
+.B milog \fICOMMAND\fR --help
+Detailed per-command help block (usage / args / 1\(en2 examples).
+.SH FILES
+.TP
+.I ~/.config/milog/config.sh
+User config file (sourced as bash). Override path with
+.BR MILOG_CONFIG .
+Template via
+.BR "milog config init" .
+.TP
+.I ~/.cache/milog/
+Default
+.B ALERT_STATE_DIR
+\(em holds
+.BR alerts.log ,
+.BR alerts.state
+(cooldown timestamps),
+.B alerts.fingerprints
+(cross-rule dedup), and
+.BR alerts.silences .
+.TP
+.I ~/.config/systemd/user/milog-web.service
+Web dashboard user unit (written by
+.BR "milog web install-service" ).
+.TP
+.I /var/log/nginx/<app>.access.log
+Default per-app log location. Override
+.B LOG_DIR
+to change.
+.SH ENVIRONMENT
+Every config variable has a matching
+.BR MILOG_ *
+override. Common ones:
+.TP
+.B MILOG_CONFIG
+Alternate config file path (default
+.IR ~/.config/milog/config.sh ).
+.TP
+.B MILOG_LOG_DIR
+Override
+.BR LOG_DIR .
+.TP
+.B MILOG_APPS
+Space-separated list, overrides
+.BR LOGS .
+.TP
+.B MILOG_ALERTS_ENABLED
+Master alert switch. Set to
+.B 1
+to fire alerts.
+.TP
+.B MILOG_PATTERNS_ENABLED
+App-error pattern detector switch (default
+.BR 1 ).
+.TP
+.B MILOG_DISCORD_WEBHOOK ", " MILOG_SLACK_WEBHOOK ", " MILOG_TELEGRAM_BOT_TOKEN
+Per-destination credentials.
+.TP
+.B MILOG_DOCKER_ROOT
+Docker state dir for
+.B docker:
+sources when
+.BR docker (1)
+inspect is unavailable (default
+.IR /var/lib/docker ).
+.PP
+See
+.B milog config
+for the complete env-var table.
+.SH LOG SOURCES
+The
+.B LOGS
+array names log sources. Four prefixes are recognised; bare names default
+to nginx.
+.TP
+.BR api ", " nginx:api
+Nginx app at
+.IR $LOG_DIR/api.access.log .
+.TP
+.B text:\fINAME\fR:\fIPATH\fR
+Arbitrary text log at the absolute
+.IR PATH .
+.TP
+.B journal:\fIUNIT\fR
+Systemd journal for
+.IR UNIT
+\(em streamed via
+.BR journalctl (1)
+.BR -f .
+.TP
+.B docker:\fICONTAINER\fR
+Docker container's JSON log file, unwrapped on read via
+.BR jq (1)
+or
+.BR sed (1).
+.PP
+Streaming, filtering (\fBlogs\fR, \fBgrep\fR, \fBsearch\fR, raw
+\fBmilog \fIname\fR tail) work uniformly across all four source types.
+Parsing modes (\fBmonitor\fR, \fBtop\fR, \fBslow\fR, \fBtop-paths\fR,
+alerts, web dashboard) require nginx combined-log format.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error \(em invalid arguments, unknown command, broken config, missing
+required tool. Diagnostic on stderr.
+.SH EXAMPLES
+.TP
+Bash dashboard with default refresh:
+.B milog monitor
+.TP
+Live tail of all sources, coloured per source:
+.B milog
+.TP
+Top 20 source IPs in the last hour:
+.B "milog top 20"
+.TP
+Filter-tail one app for a pattern:
+.B "milog grep api timeout"
+.TP
+Recent app-pattern fires across every source:
+.B "milog errors --since 1d"
+.TP
+Mute a noisy rule for 1 hour:
+.B "milog silence app:api:panic_go 1h \(dqdeploying fix\(dq"
+.TP
+Web dashboard as a systemd user service:
+.B "milog web install-service && systemctl --user start milog-web"
+.SH SEE ALSO
+.BR journalctl (1),
+.BR jq (1),
+.BR systemctl (1),
+.BR nginx (8).
+.PP
+Project documentation:
+.IR /usr/share/doc/milog/ .
+.br
+Project home:
+.I https://github.com/chud-lori/milog
