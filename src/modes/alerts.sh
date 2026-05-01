@@ -11,6 +11,7 @@
 #   today        since local midnight today
 #   yesterday    24h window ending at today's midnight
 #   all          no cutoff
+#   <N>m         last N minutes
 #   <N>h         last N hours
 #   <N>d         last N days
 #   <N>w         last N weeks
@@ -43,6 +44,11 @@ _alerts_window_to_epoch() {
         all)
             echo 0
             ;;
+        *[mM])
+            local n="${w%[mM]}"
+            [[ "$n" =~ ^[0-9]+$ ]] || { echo "invalid window: $w" >&2; return 1; }
+            echo $(( now - n * 60 ))
+            ;;
         *[hH])
             local n="${w%[hH]}"
             [[ "$n" =~ ^[0-9]+$ ]] || { echo "invalid window: $w" >&2; return 1; }
@@ -59,7 +65,7 @@ _alerts_window_to_epoch() {
             echo $(( now - n * 7 * 86400 ))
             ;;
         *)
-            echo "invalid window: $w (valid: today / yesterday / all / Nh / Nd / Nw)" >&2
+            echo "invalid window: $w (valid: today / yesterday / all / Nm / Nh / Nd / Nw)" >&2
             return 1
             ;;
     esac

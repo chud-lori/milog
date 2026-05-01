@@ -285,6 +285,19 @@ Each fire goes through the same alert path as everything else —
 silence rules (`milog silence app:<source>:<pattern> 1h`),
 cooldown, dedup, routing, and webhook fan-out all apply.
 
+### Inspecting recent fires
+
+`milog errors` is the operator-facing view that pairs with this:
+
+```bash
+milog errors                                # live tail (mixed: nginx 4xx/5xx + app patterns)
+milog errors --since 1h                     # summary report for the last hour
+milog errors --since 1d --source api        # one source
+milog errors --since 1w --pattern panic_go  # one pattern across all sources
+```
+
+Window grammar: `today` / `yesterday` / `all` / `Nm` / `Nh` / `Nd` / `Nw`.
+
 ## Permissions on `/var/log/nginx`
 
 Usually owned by `root:adm` with `640` perms. Either:
