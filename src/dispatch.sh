@@ -58,7 +58,7 @@ ${W}CONFIG${NC}
 
 ${W}TAILING${NC}
   ${C}(none) / logs${NC}      tail all logs, color prefixed  ${D}<- default${NC}
-  ${C}errors${NC}             4xx/5xx lines only
+  ${C}errors${NC}             4xx/5xx + app-pattern live tail (or --since for summary)
   ${C}exploits${NC}           LFI / RCE / SQLi / XSS / infra-probe payloads
   ${C}probes${NC}             scanner/bot traffic
   ${C}patterns${NC}           app-error signatures (panics, OOM, stacktraces…)
@@ -133,7 +133,11 @@ _cmd_help() {
             echo -e "${W}milog search <pattern> [flags]${NC} — grep across current + archived"
             echo -e "  Flags: --since --app --path --regex --archives --limit"
             ;;
-        errors)   echo -e "${W}milog errors${NC} — live 4xx/5xx tail" ;;
+        errors)
+            echo -e "${W}milog errors${NC} — live tail or summary report"
+            echo -e "  Live:    nginx sources show 4xx/5xx, others show app-pattern matches"
+            echo -e "  Summary: ${C}--since 1d${NC} ${C}--source <name>${NC} ${C}--pattern <name>${NC}"
+            ;;
         exploits) echo -e "${W}milog exploits${NC} — LFI/RCE/SQLi/XSS/infra-probe live tail" ;;
         probes)   echo -e "${W}milog probes${NC} — scanner/bot traffic live tail" ;;
         patterns)
@@ -207,7 +211,7 @@ case "${1:-}" in
     diff)     mode_diff ;;
     auto-tune|autotune|tune) mode_auto_tune "${2:-7}" ;;
     grep)     mode_grep "${2:-}" "${3:-.}" ;;
-    errors)   mode_errors ;;
+    errors)   shift; mode_errors "$@" ;;
     exploits) mode_exploits ;;
     probes)   mode_probes ;;
     patterns)
