@@ -64,6 +64,36 @@ AUDIT_FIM_PATHS=(
     /root/.ssh/authorized_keys
     /home/*/.ssh/authorized_keys
 )
+# Persistence diff — track file-existence drift across the classic
+# attacker re-entry directories. NEW files in any of these → alert;
+# removed files are logged but don't page (a sysadmin pruning unused
+# units is normal noise).
+#
+# Glob patterns are *quoted* so the array stores the patterns themselves,
+# not their expansion at config-source time. The expander re-globs every
+# tick so a `cron.d/sneaky.cron` dropped after daemon start is detected.
+# (Unquoted globs would expand once at startup and miss new files
+# entirely — exactly what the watcher exists to catch.)
+AUDIT_PERSISTENCE_INTERVAL=3600
+AUDIT_PERSISTENCE_PATHS=(
+    '/etc/cron.d/*'
+    '/etc/cron.hourly/*'
+    '/etc/cron.daily/*'
+    '/etc/cron.weekly/*'
+    '/etc/cron.monthly/*'
+    '/var/spool/cron/crontabs/*'
+    '/var/spool/cron/*'
+    '/etc/systemd/system/*.service'
+    '/etc/systemd/system/*.timer'
+    '/etc/systemd/user/*.service'
+    '/etc/systemd/user/*.timer'
+    '/root/.config/systemd/user/*.service'
+    '/root/.config/systemd/user/*.timer'
+    '/home/*/.config/systemd/user/*.service'
+    '/home/*/.config/systemd/user/*.timer'
+    '/etc/rc.local'
+    '/etc/ld.so.preload'
+)
 ALERT_COOLDOWN=300
 # Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
 # the same logline, only the first to fire records the (ip, path) fingerprint;
@@ -184,6 +214,7 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_PATTERNS_ENABLED:-}" ]] && PATTERNS_ENABLED="$MILOG_PATTERNS_ENABLED"
 [[ -n "${MILOG_AUDIT_ENABLED:-}"    ]] && AUDIT_ENABLED="$MILOG_AUDIT_ENABLED"
 [[ -n "${MILOG_AUDIT_FIM_INTERVAL:-}" ]] && AUDIT_FIM_INTERVAL="$MILOG_AUDIT_FIM_INTERVAL"
+[[ -n "${MILOG_AUDIT_PERSISTENCE_INTERVAL:-}" ]] && AUDIT_PERSISTENCE_INTERVAL="$MILOG_AUDIT_PERSISTENCE_INTERVAL"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"

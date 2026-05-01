@@ -75,9 +75,11 @@ mode_daemon() {
             nginx_check_http_alerts "$name" "$c4" "$c5"
         done
 
-        # File integrity monitor. Self-throttled by AUDIT_FIM_INTERVAL —
-        # cheap to call every tick (returns immediately when not due).
+        # File integrity + persistence-surface scanners. Self-throttled
+        # by their respective AUDIT_*_INTERVAL — cheap to call every tick
+        # (returns immediately when not due). No-op when AUDIT_ENABLED=0.
         _audit_fim_tick
+        _audit_persistence_tick
 
         # History rollover. Write the *previous* complete minute so nothing
         # lands partial. Hour rollup runs similarly on the hour edge.
