@@ -76,6 +76,81 @@ archives:
       # LICENSE is omitted while the project doesn't ship one; re-add
       # `LICENSE*` here once a LICENSE file exists in the repo root.
 
+# Native packages — `.deb` (Debian/Ubuntu), `.rpm` (Fedora/Rocky/RHEL),
+# `.apk` (Alpine). Built once, attached to the same Release as the
+# tarballs. Users get `apt install` / `dnf install` flow; the curl-pipe
+# install.sh path stays for distros without a packaging story.
+#
+# What ends up on disk:
+#   /usr/bin/milog                                     — bash entry point
+#   /usr/bin/milog-web                                 — Go SSE daemon
+#   /usr/bin/milog-tui                                 — Go bubbletea TUI
+#   /usr/share/bash-completion/completions/milog       — bash completions
+#   /usr/share/zsh/site-functions/_milog               — zsh completions
+#   /usr/share/fish/vendor_completions.d/milog.fish    — fish completions
+#   /usr/share/doc/milog/{README.md,SERVER_HARDENING.md,docs/}
+#
+# Runtime deps mirror what milog.sh actually uses across modes. Each
+# format names them with that distro's package conventions. `gawk` is
+# preferred for fflush() in awk one-liners; `mawk` is acceptable on
+# Debian/Ubuntu — listed as alternatives where the format supports it.
+nfpms:
+  - id: milog
+    package_name: milog
+    ids:
+      - milog-web
+      - milog-tui
+    formats: [deb, rpm, apk]
+    vendor: chud-lori
+    homepage: https://github.com/chud-lori/milog
+    maintainer: chud-lori <noreply@github.com>
+    description: |-
+      Single-host nginx + system + app-error monitor with alerts.
+      One bash bundle plus optional Go binaries for the SSE web
+      dashboard and the bubbletea TUI. Source-aware tail/grep/search
+      across nginx access logs, systemd journal, docker container
+      logs, and arbitrary text logs.
+    section: utils
+    priority: optional
+    bindir: /usr/bin
+    contents:
+      - src: milog.sh
+        dst: /usr/bin/milog
+        file_info:
+          mode: 0755
+      - src: completions/milog.bash
+        dst: /usr/share/bash-completion/completions/milog
+      - src: completions/_milog
+        dst: /usr/share/zsh/site-functions/_milog
+      - src: completions/milog.fish
+        dst: /usr/share/fish/vendor_completions.d/milog.fish
+      - src: README.md
+        dst: /usr/share/doc/milog/README.md
+      - src: SERVER_HARDENING.md
+        dst: /usr/share/doc/milog/SERVER_HARDENING.md
+      - src: docs
+        dst: /usr/share/doc/milog/docs
+        type: tree
+    overrides:
+      deb:
+        dependencies:
+          - bash
+          - coreutils
+          - curl
+          - gawk | mawk
+      rpm:
+        dependencies:
+          - bash
+          - coreutils
+          - curl
+          - gawk
+      apk:
+        dependencies:
+          - bash
+          - coreutils
+          - curl
+          - gawk
+
 checksum:
   name_template: checksums.txt
 

@@ -33,8 +33,35 @@ optionally mmdblookup / socat) is handled by `install.sh`.
 
 ## Install
 
-One-liner — installs `gawk` + `curl` + `sqlite3` through your distro's
-package manager, drops `milog` into `/usr/local/bin`:
+### Native package (preferred when available)
+
+GitHub Releases ship `.deb`, `.rpm`, and `.apk` packages alongside the
+tarballs. Pulls in `bash` + `coreutils` + `curl` + `gawk` automatically
+through your distro's package manager:
+
+```bash
+# Debian / Ubuntu
+curl -fsSL -o milog.deb https://github.com/chud-lori/milog/releases/latest/download/milog_<VER>_linux_amd64.deb
+sudo apt install ./milog.deb
+
+# Fedora / Rocky / RHEL
+curl -fsSL -o milog.rpm https://github.com/chud-lori/milog/releases/latest/download/milog_<VER>_linux_amd64.rpm
+sudo dnf install ./milog.rpm
+
+# Alpine
+curl -fsSL -o milog.apk https://github.com/chud-lori/milog/releases/latest/download/milog_<VER>_linux_amd64.apk
+sudo apk add --allow-untrusted ./milog.apk
+```
+
+Replace `<VER>` with the [latest release tag](https://github.com/chud-lori/milog/releases/latest)
+(or omit the version and use the unversioned `latest` redirect manually).
+The packages drop `milog`, `milog-web`, and `milog-tui` into `/usr/bin`,
+plus shell completions and docs under `/usr/share`.
+
+### Curl one-liner (any Linux/macOS)
+
+Drops `milog` + Go binaries into `/usr/local/bin`; uses your distro's
+package manager to ensure `gawk` / `curl` / `sqlite3` are present:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh | sudo bash
@@ -52,7 +79,9 @@ curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
   | sudo bash -s -- --with-web
 ```
 
-Or from a clone (installer auto-detects and uses the local `milog.sh`):
+### From a clone (contributors)
+
+Installer auto-detects and uses the local `milog.sh`:
 
 ```bash
 git clone https://github.com/chud-lori/milog.git /opt/milog
