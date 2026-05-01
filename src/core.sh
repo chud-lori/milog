@@ -44,6 +44,26 @@ WEBHOOK_TEMPLATE='{"title":%TITLE%,"body":%BODY%,"severity":%SEV%,"rule":%RULE%}
 WEBHOOK_CONTENT_TYPE="application/json"
 ALERTS_ENABLED=0
 PATTERNS_ENABLED=1
+# File integrity monitor (audit). Off by default — opting in means
+# `milog daemon` rehashes the watchlist every AUDIT_FIM_INTERVAL seconds
+# and fires `audit:fim:<path>` on drift. Read perms on /etc/shadow etc.
+# are the user's deployment problem; we never `sudo` ourselves.
+AUDIT_ENABLED=0
+AUDIT_FIM_INTERVAL=3600
+# Default watchlist — the classic post-compromise re-entry surface.
+# Glob patterns expanded with `nullglob`; missing files / dirs are
+# tolerated silently (auto-baseline records "absent" and alerts on
+# next-time-it-appears, which IS the signal we want).
+AUDIT_FIM_PATHS=(
+    /etc/passwd
+    /etc/shadow
+    /etc/sudoers
+    /etc/crontab
+    /etc/ssh/sshd_config
+    /etc/ld.so.preload
+    /root/.ssh/authorized_keys
+    /home/*/.ssh/authorized_keys
+)
 ALERT_COOLDOWN=300
 # Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
 # the same logline, only the first to fire records the (ip, path) fingerprint;
@@ -162,6 +182,8 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_DISCORD_WEBHOOK:-}" ]] && DISCORD_WEBHOOK="$MILOG_DISCORD_WEBHOOK"
 [[ -n "${MILOG_ALERTS_ENABLED:-}"  ]] && ALERTS_ENABLED="$MILOG_ALERTS_ENABLED"
 [[ -n "${MILOG_PATTERNS_ENABLED:-}" ]] && PATTERNS_ENABLED="$MILOG_PATTERNS_ENABLED"
+[[ -n "${MILOG_AUDIT_ENABLED:-}"    ]] && AUDIT_ENABLED="$MILOG_AUDIT_ENABLED"
+[[ -n "${MILOG_AUDIT_FIM_INTERVAL:-}" ]] && AUDIT_FIM_INTERVAL="$MILOG_AUDIT_FIM_INTERVAL"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
