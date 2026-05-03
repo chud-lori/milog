@@ -101,6 +101,19 @@ AUDIT_PERSISTENCE_PATHS=(
 # a service moving from 127.0.0.1 to 0.0.0.0 also fires — bind-address
 # expansion onto a new interface is itself the signal.
 AUDIT_PORTS_INTERVAL=3600
+# YARA scan over webroot — opt-in via AUDIT_YARA_PATHS. Daily by default;
+# YARA is heavier than the other audit scans (full filesystem walk +
+# regex per file), so the rate is intentionally lower than FIM.
+#
+# AUDIT_YARA_PATHS is empty by default — we do NOT pick a webroot for
+# you. Configure it explicitly in milog.conf, e.g.
+#   AUDIT_YARA_PATHS=(/var/www /usr/share/nginx/html)
+# A daemon with no AUDIT_YARA_PATHS silently skips the scan. The yara
+# binary itself is also optional — the module logs once on missing
+# `yara` and degrades to no-op.
+AUDIT_YARA_INTERVAL=86400
+AUDIT_YARA_RULES_DIR="$HOME/.config/milog/yara"
+AUDIT_YARA_PATHS=()
 ALERT_COOLDOWN=300
 # Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
 # the same logline, only the first to fire records the (ip, path) fingerprint;
@@ -223,6 +236,9 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_AUDIT_FIM_INTERVAL:-}" ]] && AUDIT_FIM_INTERVAL="$MILOG_AUDIT_FIM_INTERVAL"
 [[ -n "${MILOG_AUDIT_PERSISTENCE_INTERVAL:-}" ]] && AUDIT_PERSISTENCE_INTERVAL="$MILOG_AUDIT_PERSISTENCE_INTERVAL"
 [[ -n "${MILOG_AUDIT_PORTS_INTERVAL:-}" ]] && AUDIT_PORTS_INTERVAL="$MILOG_AUDIT_PORTS_INTERVAL"
+[[ -n "${MILOG_AUDIT_YARA_INTERVAL:-}"  ]] && AUDIT_YARA_INTERVAL="$MILOG_AUDIT_YARA_INTERVAL"
+[[ -n "${MILOG_AUDIT_YARA_RULES_DIR:-}" ]] && AUDIT_YARA_RULES_DIR="$MILOG_AUDIT_YARA_RULES_DIR"
+[[ -n "${MILOG_AUDIT_YARA_PATHS:-}"     ]] && read -r -a AUDIT_YARA_PATHS <<< "$MILOG_AUDIT_YARA_PATHS"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"

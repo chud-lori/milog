@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=e5538fd-dirty
-# MILOG_BUILT=2026-05-03T07:57:44Z
+# MILOG_VERSION=8599380-dirty
+# MILOG_BUILT=2026-05-03T08:09:06Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -103,6 +103,19 @@ AUDIT_PERSISTENCE_PATHS=(
 # a service moving from 127.0.0.1 to 0.0.0.0 also fires — bind-address
 # expansion onto a new interface is itself the signal.
 AUDIT_PORTS_INTERVAL=3600
+# YARA scan over webroot — opt-in via AUDIT_YARA_PATHS. Daily by default;
+# YARA is heavier than the other audit scans (full filesystem walk +
+# regex per file), so the rate is intentionally lower than FIM.
+#
+# AUDIT_YARA_PATHS is empty by default — we do NOT pick a webroot for
+# you. Configure it explicitly in milog.conf, e.g.
+#   AUDIT_YARA_PATHS=(/var/www /usr/share/nginx/html)
+# A daemon with no AUDIT_YARA_PATHS silently skips the scan. The yara
+# binary itself is also optional — the module logs once on missing
+# `yara` and degrades to no-op.
+AUDIT_YARA_INTERVAL=86400
+AUDIT_YARA_RULES_DIR="$HOME/.config/milog/yara"
+AUDIT_YARA_PATHS=()
 ALERT_COOLDOWN=300
 # Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
 # the same logline, only the first to fire records the (ip, path) fingerprint;
@@ -225,6 +238,9 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_AUDIT_FIM_INTERVAL:-}" ]] && AUDIT_FIM_INTERVAL="$MILOG_AUDIT_FIM_INTERVAL"
 [[ -n "${MILOG_AUDIT_PERSISTENCE_INTERVAL:-}" ]] && AUDIT_PERSISTENCE_INTERVAL="$MILOG_AUDIT_PERSISTENCE_INTERVAL"
 [[ -n "${MILOG_AUDIT_PORTS_INTERVAL:-}" ]] && AUDIT_PORTS_INTERVAL="$MILOG_AUDIT_PORTS_INTERVAL"
+[[ -n "${MILOG_AUDIT_YARA_INTERVAL:-}"  ]] && AUDIT_YARA_INTERVAL="$MILOG_AUDIT_YARA_INTERVAL"
+[[ -n "${MILOG_AUDIT_YARA_RULES_DIR:-}" ]] && AUDIT_YARA_RULES_DIR="$MILOG_AUDIT_YARA_RULES_DIR"
+[[ -n "${MILOG_AUDIT_YARA_PATHS:-}"     ]] && read -r -a AUDIT_YARA_PATHS <<< "$MILOG_AUDIT_YARA_PATHS"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
@@ -3869,6 +3885,7 @@ mode_audit() {
         fim) shift; _audit_fim_subcmd "$@" ;;
         persistence) shift; _audit_persistence_subcmd "$@" ;;
         ports) shift; _audit_ports_subcmd "$@" ;;
+        yara) shift; _audit_yara_subcmd "$@" ;;
         *)
             echo -e "${R}unknown audit subcommand: $1${NC}" >&2
             _audit_help; return 1 ;;
@@ -3882,16 +3899,19 @@ ${W}milog audit${NC} — point-in-time host integrity scans
   ${C}milog audit fim ${NC}<sub>          file integrity (SHA256 drift on watched files)
   ${C}milog audit persistence ${NC}<sub>  re-entry surface diff (new cron / systemd units / rc.local)
   ${C}milog audit ports ${NC}<sub>        listening-port baseline (new TCP/UDP listeners)
+  ${C}milog audit yara ${NC}<sub>         YARA scan over webroot (webshell + obfuscation rules)
 
-  Subs (all): ${C}baseline${NC} | ${C}check${NC} | ${C}status${NC}
+  Subs (fim/persistence/ports): ${C}baseline${NC} | ${C}check${NC} | ${C}status${NC}
+  Subs (yara):                  ${C}init${NC} | ${C}scan${NC} | ${C}status${NC}
 
 The watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC} —
 auto-baselines on first run, then fires ${C}audit:fim:<change>:<path>${NC},
-${C}audit:persistence:APPEARED:<path>${NC}, or ${C}audit:ports:NEW:<proto>:<port>${NC}
-on every subsequent drift.
+${C}audit:persistence:APPEARED:<path>${NC}, ${C}audit:ports:NEW:<proto>:<port>${NC},
+or ${C}audit:yara:<rule>:<path>${NC} on every subsequent drift.
 
 Watchlists: ${C}AUDIT_FIM_PATHS${NC} / ${C}AUDIT_PERSISTENCE_PATHS${NC}. Glob patterns OK.
 Listening-port scan reads from ${C}ss${NC} (or ${C}netstat${NC} fallback).
+YARA scan needs the system ${C}yara${NC} binary + ${C}AUDIT_YARA_PATHS${NC} configured.
 EOF
 }
 
@@ -4352,6 +4372,326 @@ _audit_ports_subcmd() {
             ;;
         *)
             echo -e "${R}unknown ports subcommand: $1${NC}" >&2
+            _audit_help; return 1 ;;
+    esac
+}
+
+# ==============================================================================
+# YARA scan over webroot — pattern-match against a curated rule catalogue
+# every AUDIT_YARA_INTERVAL seconds. Daily default; webroots are large and
+# the regex pass is the heaviest of the audit scans.
+#
+# This module **shells out** to the system `yara` binary rather than
+# binding libyara directly. Two reasons:
+#   1. Curl-pipe install path stays single-file bash. Users on Debian
+#      run `apt install yara` once; daemon picks it up next tick.
+#   2. We don't yet need the live-fsnotify trigger that would justify
+#      the cgo cost — daily scans catch attacker-dropped webshells
+#      well before they're useful, and a missed window of < 24h is
+#      acceptable signal-vs-effort.
+#
+# Off until both of these are true:
+#   - `yara` binary is on PATH (logged-once warning otherwise)
+#   - AUDIT_YARA_PATHS contains at least one directory
+#
+# Match dedup: TSV at $ALERT_STATE_DIR/audit/yara.matches stores
+# `<rule>\t<file>\t<sha256>\t<first_seen>`. A second tick that finds
+# the same (rule, file, sha) tuple is silent — only NEW matches alert.
+# A modified file with the same rule firing alerts again (sha changed).
+# ==============================================================================
+
+# Embedded starter ruleset. Three conservative rules — high signal,
+# minimal false-positive risk on legit PHP webroots. User extends by
+# dropping more `.yar` files into AUDIT_YARA_RULES_DIR; we never
+# overwrite user files.
+_audit_yara_default_rules() {
+    cat <<'YARA_RULES'
+/*
+ * milog default YARA ruleset — high-signal webshell + obfuscation
+ * detectors. Conservative on purpose: any of these matching a file in
+ * the webroot is worth investigating. Drop additional .yar files in
+ * this directory to extend; this file is only written on `milog audit
+ * yara init` and is not overwritten on subsequent runs.
+ */
+
+rule milog_php_eval_obfuscation
+{
+    meta:
+        author      = "milog"
+        description = "PHP eval() over an obfuscation primitive — classic dropper signature"
+    strings:
+        $a1 = /eval\s*\(\s*base64_decode\s*\(/   nocase
+        $a2 = /eval\s*\(\s*gzinflate\s*\(/       nocase
+        $a3 = /eval\s*\(\s*gzuncompress\s*\(/    nocase
+        $a4 = /eval\s*\(\s*str_rot13\s*\(/       nocase
+        $a5 = /assert\s*\(\s*base64_decode\s*\(/ nocase
+    condition:
+        any of them
+}
+
+rule milog_php_request_eval
+{
+    meta:
+        author      = "milog"
+        description = "Direct eval/assert of $_REQUEST/$_GET/$_POST/$_COOKIE — RCE primitive"
+    strings:
+        $a1 = /eval\s*\(\s*\$_(REQUEST|GET|POST|COOKIE)/   nocase
+        $a2 = /assert\s*\(\s*\$_(REQUEST|GET|POST|COOKIE)/ nocase
+        $a3 = /system\s*\(\s*\$_(REQUEST|GET|POST|COOKIE)/ nocase
+        $a4 = /passthru\s*\(\s*\$_(REQUEST|GET|POST|COOKIE)/ nocase
+        $a5 = /exec\s*\(\s*\$_(REQUEST|GET|POST|COOKIE)/   nocase
+    condition:
+        any of them
+}
+
+rule milog_webshell_families
+{
+    meta:
+        author      = "milog"
+        description = "WSO / c99 / r57 webshell family fingerprints"
+    strings:
+        $wso1 = "WSO " ascii
+        $wso2 = "wso_" ascii
+        $wso3 = "wsoEx" ascii
+        $c99a = "c99shell" nocase
+        $c99b = "Captain Crunch Security" nocase
+        $r57a = "r57shell" nocase
+        $r57b = "r57.gen.tr" nocase
+    condition:
+        2 of ($wso*) or 2 of ($c99*) or any of ($r57*)
+}
+YARA_RULES
+}
+
+# Init the rules dir if missing. Returns 0 on success (dir exists with at
+# least one .yar file), 1 on failure to create.
+_audit_yara_init_rules() {
+    local dir="${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}"
+    mkdir -p "$dir" 2>/dev/null || return 1
+    local default="$dir/milog-default.yar"
+    if [[ ! -f "$default" ]]; then
+        _audit_yara_default_rules > "$default" || return 1
+    fi
+    return 0
+}
+
+# `yara` binary present?  Caches the answer in a marker file so we don't
+# log the "missing" warning more than once per daemon lifetime.
+_audit_yara_have_binary() {
+    if command -v yara >/dev/null 2>&1; then
+        return 0
+    fi
+    local dir; dir=$(_audit_state_dir)
+    local marker="$dir/yara.no_binary_warned"
+    if [[ ! -f "$marker" ]]; then
+        echo "milog: yara binary not found on PATH — \`milog audit yara\` will no-op until \`apt install yara\` (or equivalent)" >&2
+        : > "$marker" 2>/dev/null || true
+    fi
+    return 1
+}
+
+# Scan one path with all .yar files in the rules dir. Stdout: one match
+# per line, format `<rule>\t<file>` (yara's `-s` for full match details
+# is too noisy for the alert body — we record the rule name + path and
+# leave deeper triage to the operator).
+_audit_yara_scan_path() {
+    local target="$1"
+    local rules_dir="${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}"
+    [[ -d "$target" || -f "$target" ]] || return 0
+    [[ -d "$rules_dir" ]] || return 0
+
+    # `yara -r` recursive; per-file invocation per rule file lets us
+    # recover gracefully from one bad rule file without aborting the
+    # whole scan.
+    local yar
+    for yar in "$rules_dir"/*.yar; do
+        [[ -f "$yar" ]] || continue
+        # `yara` exit codes: 0 = no match, 1 = match, >1 = error.
+        # Output format `<rule_name> <file_path>` (space-separated).
+        # Convert to TSV for downstream parsing.
+        # NB: no `--` separator — `yara` 4.x treats `--` as a literal
+        # filename, not an end-of-options sentinel. Path arguments come
+        # from AUDIT_YARA_PATHS / AUDIT_YARA_RULES_DIR (operator config),
+        # so a leading-dash filename isn't a realistic attack surface.
+        yara -r -w "$yar" "$target" 2>/dev/null | awk '{
+            rule = $1
+            # File path can contain spaces; everything from $2 to EOL.
+            $1 = ""
+            sub(/^ /, "")
+            printf "%s\t%s\n", rule, $0
+        }'
+    done
+}
+
+# Run the full scan over every configured path, dedup against the
+# matches log. Stdout: one NEW match per line, `<rule>\t<file>\t<sha256>`.
+# Already-recorded (rule, file, sha) tuples are filtered out.
+#
+# Dedup uses fgrep against the matches log rather than an in-memory set.
+# Reasons: (a) typical webroot finds ≤ a handful of hits per scan, so
+# fork-per-match is cheap; (b) sidesteps bash-3.2's empty-array
+# `unbound variable` trap under `set -u`; (c) one less in-memory data
+# structure to keep coherent with the on-disk log.
+_audit_yara_scan_all() {
+    local dir; dir=$(_audit_state_dir)
+    local matches_log="$dir/yara.matches"
+    [[ -f "$matches_log" ]] || : > "$matches_log"
+
+    local p rule file sha line
+    for p in "${AUDIT_YARA_PATHS[@]}"; do
+        [[ -e "$p" ]] || continue
+        while IFS=$'\t' read -r rule file; do
+            [[ -z "$rule" || -z "$file" ]] && continue
+            sha=$(_audit_sha256 "$file")
+            [[ -z "$sha" ]] && sha="UNREADABLE"
+            line=$(printf '%s\t%s\t%s\t' "$rule" "$file" "$sha")
+            # Fixed-string match — rule/file/sha can't contain regex
+            # metacharacters that matter, but fgrep is faster anyway.
+            if ! grep -Fq "$line" "$matches_log"; then
+                printf '%s\t%s\t%s\n' "$rule" "$file" "$sha"
+                # Record immediately so a same-tick duplicate path (e.g.
+                # the same file matched by two rules) doesn't double-fire.
+                _audit_yara_record_match "$rule" "$file" "$sha"
+            fi
+        done < <(_audit_yara_scan_path "$p")
+    done
+}
+
+_audit_yara_record_match() {
+    local rule="$1" file="$2" sha="$3"
+    local dir; dir=$(_audit_state_dir)
+    local matches_log="$dir/yara.matches"
+    local now; now=$(date +%s)
+    printf '%s\t%s\t%s\t%s\n' "$rule" "$file" "$sha" "$now" >> "$matches_log"
+}
+
+_audit_yara_tick() {
+    [[ "${AUDIT_ENABLED:-0}" == "1" ]] || return 0
+    (( ${#AUDIT_YARA_PATHS[@]} > 0 )) || return 0
+    _audit_yara_have_binary || return 0
+
+    local dir; dir=$(_audit_state_dir)
+    local marker="$dir/yara.lastcheck"
+    local now; now=$(date +%s)
+    local last=0
+    [[ -f "$marker" ]] && last=$(cat "$marker" 2>/dev/null || echo 0)
+    [[ -z "$last" ]] && last=0
+    if (( now - last < AUDIT_YARA_INTERVAL )); then
+        return 0
+    fi
+
+    # Bootstrap rules dir on first tick (also handles the case where
+    # the user wiped it). Failure is logged, not fatal.
+    if ! _audit_yara_init_rules; then
+        echo "milog: failed to init yara rules dir at ${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}" >&2
+        printf '%s' "$now" > "$marker"
+        return 0
+    fi
+
+    # _audit_yara_scan_all records matches inline — we just fire alerts
+    # for what comes through (which is already deduped against the log).
+    local rule file sha key body
+    while IFS=$'\t' read -r rule file sha; do
+        [[ -z "$rule" ]] && continue
+        key="audit:yara:$rule:$file"
+        if alert_should_fire "$key"; then
+            body="\`\`\`yara hit: rule=$rule path=$file sha=${sha:0:16}\`\`\`"
+            alert_fire "YARA: $rule on $file" "$body" 15158332 "$key" &
+        fi
+    done < <(_audit_yara_scan_all)
+
+    printf '%s' "$now" > "$marker"
+}
+
+_audit_yara_subcmd() {
+    case "${1:-status}" in
+        init)
+            local dir="${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}"
+            if _audit_yara_init_rules; then
+                echo -e "${G}rules dir ready${NC} at ${C}$dir${NC}"
+                local n
+                n=$(find "$dir" -maxdepth 1 -name '*.yar' 2>/dev/null | wc -l | tr -d ' ')
+                echo -e "  ${D}rule files: ${n:-0}${NC}"
+                echo -e "  ${D}default rules written to milog-default.yar (your edits NOT overwritten)${NC}"
+            else
+                echo -e "${R}failed to create $dir${NC}" >&2
+                return 1
+            fi
+            ;;
+        scan)
+            if ! _audit_yara_have_binary; then
+                echo -e "${R}yara binary not found on PATH${NC}" >&2
+                echo -e "  Install via: ${C}apt install yara${NC} (Debian/Ubuntu) / ${C}dnf install yara${NC} (Fedora)"
+                return 1
+            fi
+            (( ${#AUDIT_YARA_PATHS[@]} > 0 )) || {
+                echo -e "${Y}AUDIT_YARA_PATHS is empty — configure webroot(s) in milog.conf${NC}" >&2
+                echo -e "  Example: ${C}AUDIT_YARA_PATHS=(/var/www /usr/share/nginx/html)${NC}"
+                return 1
+            }
+            _audit_yara_init_rules || {
+                echo -e "${R}failed to init rules dir${NC}" >&2
+                return 1
+            }
+            local out; out=$(_audit_yara_scan_all)
+            if [[ -z "$out" ]]; then
+                echo -e "${G}no new matches${NC} across ${#AUDIT_YARA_PATHS[@]} path(s)"
+                return 0
+            fi
+            echo -e "${R}new YARA matches:${NC}"
+            local rule file sha
+            while IFS=$'\t' read -r rule file sha; do
+                printf "  \033[31m%-30s\033[0m  %s  \033[90m%s\033[0m\n" \
+                    "$rule" "$file" "${sha:0:16}"
+            done <<< "$out"
+            return 1
+            ;;
+        status)
+            local dir; dir=$(_audit_state_dir)
+            local marker="$dir/yara.lastcheck"
+            local matches_log="$dir/yara.matches"
+            local rules_dir="${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}"
+            echo -e "${W}milog audit yara — status${NC}"
+            echo -e "  ${D}AUDIT_ENABLED=${NC}${AUDIT_ENABLED:-0}   ${D}AUDIT_YARA_INTERVAL=${NC}${AUDIT_YARA_INTERVAL:-86400}s"
+            local bin_state="missing"
+            command -v yara >/dev/null 2>&1 && bin_state="present ($(yara --version 2>/dev/null))"
+            echo -e "  ${D}yara binary:${NC} ${bin_state}"
+            echo -e "  ${D}rules dir:${NC} $rules_dir"
+            if [[ -d "$rules_dir" ]]; then
+                local n
+                n=$(find "$rules_dir" -maxdepth 1 -name '*.yar' 2>/dev/null | wc -l | tr -d ' ')
+                echo -e "  ${D}  rule files:${NC} ${n:-0}"
+            else
+                echo -e "  ${D}  rule files:${NC} ${Y}not initialised — run \`milog audit yara init\`${NC}"
+            fi
+            if (( ${#AUDIT_YARA_PATHS[@]} > 0 )); then
+                echo -e "  ${D}scan paths (${#AUDIT_YARA_PATHS[@]}):${NC}"
+                local p
+                for p in "${AUDIT_YARA_PATHS[@]}"; do
+                    if [[ -e "$p" ]]; then
+                        printf "    %s\n" "$p"
+                    else
+                        printf "    %s   ${Y}(missing)${NC}\n" "$p"
+                    fi
+                done
+            else
+                echo -e "  ${D}scan paths:${NC} ${Y}none configured (set AUDIT_YARA_PATHS)${NC}"
+            fi
+            if [[ -f "$marker" ]]; then
+                local last; last=$(cat "$marker" 2>/dev/null || echo 0)
+                local now; now=$(date +%s); local hrs=$(( (now - last) / 3600 ))
+                echo -e "  ${D}last scan:${NC} ${hrs}h ago"
+            else
+                echo -e "  ${D}last scan:${NC} ${Y}never${NC}"
+            fi
+            if [[ -f "$matches_log" ]]; then
+                local match_count
+                match_count=$(wc -l < "$matches_log" 2>/dev/null | tr -d ' ')
+                echo -e "  ${D}recorded matches (lifetime):${NC} ${match_count:-0}"
+            fi
+            ;;
+        *)
+            echo -e "${R}unknown yara subcommand: $1${NC}" >&2
             _audit_help; return 1 ;;
     esac
 }
@@ -5331,13 +5671,15 @@ mode_daemon() {
             nginx_check_http_alerts "$name" "$c4" "$c5"
         done
 
-        # File integrity + persistence-surface + listening-port scanners.
-        # Self-throttled by their respective AUDIT_*_INTERVAL — cheap to
-        # call every tick (returns immediately when not due). No-op when
-        # AUDIT_ENABLED=0.
+        # Audit scanners — file integrity, persistence surface, listening
+        # ports, YARA over webroot. Self-throttled by their respective
+        # AUDIT_*_INTERVAL — cheap to call every tick (returns immediately
+        # when not due). No-op when AUDIT_ENABLED=0. YARA additionally
+        # no-ops when `yara` isn't installed or AUDIT_YARA_PATHS is empty.
         _audit_fim_tick
         _audit_persistence_tick
         _audit_ports_tick
+        _audit_yara_tick
 
         # History rollover. Write the *previous* complete minute so nothing
         # lands partial. Hour rollup runs similarly on the hour edge.
@@ -8519,6 +8861,7 @@ ${W}OPS${NC}
   ${C}audit fim${NC}           file integrity monitor (baseline + drift)
   ${C}audit persistence${NC}   re-entry surface diff (new cron / systemd / rc.local)
   ${C}audit ports${NC}         listening-port baseline (new TCP/UDP listeners)
+  ${C}audit yara${NC}          YARA scan over webroot (webshell + obfuscation rules)
   ${C}bench [--full]${NC}     benchmark harness against synthetic fixtures
   ${C}completions <shell>${NC}  install / print bash|zsh|fish completions
 
@@ -8632,7 +8975,9 @@ _cmd_help() {
             echo -e "  ${C}fim baseline | check | status${NC}          SHA256 drift on watched files"
             echo -e "  ${C}persistence baseline | check | status${NC}  new files in re-entry surface"
             echo -e "  ${C}ports baseline | check | status${NC}        new TCP/UDP listeners"
+            echo -e "  ${C}yara init | scan | status${NC}              YARA scan over webroot"
             echo -e "  Watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC}"
+            echo -e "  YARA additionally needs the system ${C}yara${NC} binary + ${C}AUDIT_YARA_PATHS${NC}"
             ;;
         *)
             echo -e "${Y}No detailed help for '$cmd'.${NC} Try ${C}milog help${NC}."

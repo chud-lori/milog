@@ -75,13 +75,15 @@ mode_daemon() {
             nginx_check_http_alerts "$name" "$c4" "$c5"
         done
 
-        # File integrity + persistence-surface + listening-port scanners.
-        # Self-throttled by their respective AUDIT_*_INTERVAL — cheap to
-        # call every tick (returns immediately when not due). No-op when
-        # AUDIT_ENABLED=0.
+        # Audit scanners — file integrity, persistence surface, listening
+        # ports, YARA over webroot. Self-throttled by their respective
+        # AUDIT_*_INTERVAL — cheap to call every tick (returns immediately
+        # when not due). No-op when AUDIT_ENABLED=0. YARA additionally
+        # no-ops when `yara` isn't installed or AUDIT_YARA_PATHS is empty.
         _audit_fim_tick
         _audit_persistence_tick
         _audit_ports_tick
+        _audit_yara_tick
 
         # History rollover. Write the *previous* complete minute so nothing
         # lands partial. Hour rollup runs similarly on the hour edge.
