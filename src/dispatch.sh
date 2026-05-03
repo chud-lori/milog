@@ -70,6 +70,7 @@ ${W}OPS${NC}
   ${C}audit fim${NC}           file integrity monitor (baseline + drift)
   ${C}audit persistence${NC}   re-entry surface diff (new cron / systemd / rc.local)
   ${C}audit ports${NC}         listening-port baseline (new TCP/UDP listeners)
+  ${C}audit yara${NC}          YARA scan over webroot (webshell + obfuscation rules)
   ${C}bench [--full]${NC}     benchmark harness against synthetic fixtures
   ${C}completions <shell>${NC}  install / print bash|zsh|fish completions
 
@@ -183,7 +184,9 @@ _cmd_help() {
             echo -e "  ${C}fim baseline | check | status${NC}          SHA256 drift on watched files"
             echo -e "  ${C}persistence baseline | check | status${NC}  new files in re-entry surface"
             echo -e "  ${C}ports baseline | check | status${NC}        new TCP/UDP listeners"
+            echo -e "  ${C}yara init | scan | status${NC}              YARA scan over webroot"
             echo -e "  Watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC}"
+            echo -e "  YARA additionally needs the system ${C}yara${NC} binary + ${C}AUDIT_YARA_PATHS${NC}"
             ;;
         *)
             echo -e "${Y}No detailed help for '$cmd'.${NC} Try ${C}milog help${NC}."
