@@ -114,6 +114,31 @@ AUDIT_PORTS_INTERVAL=3600
 AUDIT_YARA_INTERVAL=86400
 AUDIT_YARA_RULES_DIR="$HOME/.config/milog/yara"
 AUDIT_YARA_PATHS=()
+# Account / SSH-key audit — line-level diff (not file-hash like FIM) over
+# the files where new privileges materialise. New lines (added user, new
+# sudo grant, new SSH pubkey) fire alerts; removed lines are informational
+# only (admins clean up old keys).
+#
+# Same quoted-glob pattern as AUDIT_PERSISTENCE_PATHS — patterns expand
+# at tick-time so a newly-created /home/<user>/.ssh/authorized_keys is
+# picked up without a daemon restart.
+AUDIT_ACCOUNTS_INTERVAL=3600
+AUDIT_ACCOUNTS_PATHS=(
+    '/etc/passwd'
+    '/etc/sudoers'
+    '/etc/sudoers.d/*'
+    '/root/.ssh/authorized_keys'
+    '/root/.ssh/authorized_keys2'
+    '/home/*/.ssh/authorized_keys'
+    '/home/*/.ssh/authorized_keys2'
+)
+# Rootkit hint scanner — point-in-time heuristics, no baseline. Fires
+# on the heuristic itself: hidden processes (ps vs /proc count mismatch),
+# /etc/ld.so.preload existence, binaries executing from /tmp / /dev/shm
+# / /var/tmp, processes whose /proc/PID/exe points to a deleted path
+# (memory-resident malware). Linux-only; macOS / BSD lack /proc and the
+# module no-ops.
+AUDIT_ROOTKIT_INTERVAL=3600
 ALERT_COOLDOWN=300
 # Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
 # the same logline, only the first to fire records the (ip, path) fingerprint;
@@ -239,6 +264,9 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_AUDIT_YARA_INTERVAL:-}"  ]] && AUDIT_YARA_INTERVAL="$MILOG_AUDIT_YARA_INTERVAL"
 [[ -n "${MILOG_AUDIT_YARA_RULES_DIR:-}" ]] && AUDIT_YARA_RULES_DIR="$MILOG_AUDIT_YARA_RULES_DIR"
 [[ -n "${MILOG_AUDIT_YARA_PATHS:-}"     ]] && read -r -a AUDIT_YARA_PATHS <<< "$MILOG_AUDIT_YARA_PATHS"
+[[ -n "${MILOG_AUDIT_ACCOUNTS_INTERVAL:-}" ]] && AUDIT_ACCOUNTS_INTERVAL="$MILOG_AUDIT_ACCOUNTS_INTERVAL"
+[[ -n "${MILOG_AUDIT_ACCOUNTS_PATHS:-}"    ]] && read -r -a AUDIT_ACCOUNTS_PATHS <<< "$MILOG_AUDIT_ACCOUNTS_PATHS"
+[[ -n "${MILOG_AUDIT_ROOTKIT_INTERVAL:-}"  ]] && AUDIT_ROOTKIT_INTERVAL="$MILOG_AUDIT_ROOTKIT_INTERVAL"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"

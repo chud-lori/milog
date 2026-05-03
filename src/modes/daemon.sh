@@ -76,14 +76,17 @@ mode_daemon() {
         done
 
         # Audit scanners — file integrity, persistence surface, listening
-        # ports, YARA over webroot. Self-throttled by their respective
-        # AUDIT_*_INTERVAL — cheap to call every tick (returns immediately
-        # when not due). No-op when AUDIT_ENABLED=0. YARA additionally
-        # no-ops when `yara` isn't installed or AUDIT_YARA_PATHS is empty.
+        # ports, YARA, account/SSH-key drift, rootkit hints. Self-throttled
+        # by their respective AUDIT_*_INTERVAL — cheap to call every tick
+        # (returns immediately when not due). No-op when AUDIT_ENABLED=0.
+        # YARA additionally no-ops when `yara` isn't installed or
+        # AUDIT_YARA_PATHS is empty; rootkit no-ops on macOS / BSD.
         _audit_fim_tick
         _audit_persistence_tick
         _audit_ports_tick
         _audit_yara_tick
+        _audit_accounts_tick
+        _audit_rootkit_tick
 
         # History rollover. Write the *previous* complete minute so nothing
         # lands partial. Hour rollup runs similarly on the hour edge.
