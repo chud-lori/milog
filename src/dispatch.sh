@@ -69,6 +69,7 @@ ${W}OPS${NC}
   ${C}install <feature>${NC}  add optional features: geoip / web / history
   ${C}audit fim${NC}           file integrity monitor (baseline + drift)
   ${C}audit persistence${NC}   re-entry surface diff (new cron / systemd / rc.local)
+  ${C}audit ports${NC}         listening-port baseline (new TCP/UDP listeners)
   ${C}bench [--full]${NC}     benchmark harness against synthetic fixtures
   ${C}completions <shell>${NC}  install / print bash|zsh|fish completions
 
@@ -181,6 +182,7 @@ _cmd_help() {
             echo -e "${W}milog audit <sub>${NC} — point-in-time host integrity scans"
             echo -e "  ${C}fim baseline | check | status${NC}          SHA256 drift on watched files"
             echo -e "  ${C}persistence baseline | check | status${NC}  new files in re-entry surface"
+            echo -e "  ${C}ports baseline | check | status${NC}        new TCP/UDP listeners"
             echo -e "  Watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC}"
             ;;
         *)
