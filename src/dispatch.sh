@@ -71,6 +71,8 @@ ${W}OPS${NC}
   ${C}audit persistence${NC}   re-entry surface diff (new cron / systemd / rc.local)
   ${C}audit ports${NC}         listening-port baseline (new TCP/UDP listeners)
   ${C}audit yara${NC}          YARA scan over webroot (webshell + obfuscation rules)
+  ${C}audit accounts${NC}      passwd / sudoers / SSH-key line-level diff
+  ${C}audit rootkit${NC}       hidden-process / ld.so.preload / tmp-exec heuristics
   ${C}bench [--full]${NC}     benchmark harness against synthetic fixtures
   ${C}completions <shell>${NC}  install / print bash|zsh|fish completions
 
@@ -185,8 +187,11 @@ _cmd_help() {
             echo -e "  ${C}persistence baseline | check | status${NC}  new files in re-entry surface"
             echo -e "  ${C}ports baseline | check | status${NC}        new TCP/UDP listeners"
             echo -e "  ${C}yara init | scan | status${NC}              YARA scan over webroot"
+            echo -e "  ${C}accounts baseline | check | status${NC}     line-level diff over passwd / sudoers / authorized_keys"
+            echo -e "  ${C}rootkit check | status${NC}                 hidden-process / ld.so.preload / tmp-exec"
             echo -e "  Watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC}"
             echo -e "  YARA additionally needs the system ${C}yara${NC} binary + ${C}AUDIT_YARA_PATHS${NC}"
+            echo -e "  Rootkit scan is Linux-only (relies on /proc); silent no-op on macOS / BSD"
             ;;
         *)
             echo -e "${Y}No detailed help for '$cmd'.${NC} Try ${C}milog help${NC}."

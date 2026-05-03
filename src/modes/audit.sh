@@ -201,6 +201,8 @@ mode_audit() {
         persistence) shift; _audit_persistence_subcmd "$@" ;;
         ports) shift; _audit_ports_subcmd "$@" ;;
         yara) shift; _audit_yara_subcmd "$@" ;;
+        accounts) shift; _audit_accounts_subcmd "$@" ;;
+        rootkit) shift; _audit_rootkit_subcmd "$@" ;;
         *)
             echo -e "${R}unknown audit subcommand: $1${NC}" >&2
             _audit_help; return 1 ;;
@@ -215,18 +217,23 @@ ${W}milog audit${NC} — point-in-time host integrity scans
   ${C}milog audit persistence ${NC}<sub>  re-entry surface diff (new cron / systemd units / rc.local)
   ${C}milog audit ports ${NC}<sub>        listening-port baseline (new TCP/UDP listeners)
   ${C}milog audit yara ${NC}<sub>         YARA scan over webroot (webshell + obfuscation rules)
+  ${C}milog audit accounts ${NC}<sub>     line-level diff over passwd / sudoers / authorized_keys
+  ${C}milog audit rootkit ${NC}<sub>      hidden-process / ld.so.preload / tmp-exec heuristics
 
-  Subs (fim/persistence/ports): ${C}baseline${NC} | ${C}check${NC} | ${C}status${NC}
-  Subs (yara):                  ${C}init${NC} | ${C}scan${NC} | ${C}status${NC}
+  Subs (fim/persistence/ports/accounts): ${C}baseline${NC} | ${C}check${NC} | ${C}status${NC}
+  Subs (yara):                           ${C}init${NC} | ${C}scan${NC} | ${C}status${NC}
+  Subs (rootkit):                        ${C}check${NC} | ${C}status${NC}
 
 The watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC} —
 auto-baselines on first run, then fires ${C}audit:fim:<change>:<path>${NC},
 ${C}audit:persistence:APPEARED:<path>${NC}, ${C}audit:ports:NEW:<proto>:<port>${NC},
-or ${C}audit:yara:<rule>:<path>${NC} on every subsequent drift.
+${C}audit:yara:<rule>:<path>${NC}, ${C}audit:accounts:NEW:<path>${NC}, or
+${C}audit:rootkit:<heuristic>${NC} on every subsequent drift.
 
-Watchlists: ${C}AUDIT_FIM_PATHS${NC} / ${C}AUDIT_PERSISTENCE_PATHS${NC}. Glob patterns OK.
+Watchlists: ${C}AUDIT_FIM_PATHS${NC} / ${C}AUDIT_PERSISTENCE_PATHS${NC} / ${C}AUDIT_ACCOUNTS_PATHS${NC}. Glob OK.
 Listening-port scan reads from ${C}ss${NC} (or ${C}netstat${NC} fallback).
 YARA scan needs the system ${C}yara${NC} binary + ${C}AUDIT_YARA_PATHS${NC} configured.
+Rootkit scan is Linux-only (relies on /proc); silent no-op on macOS / BSD.
 EOF
 }
 
@@ -1007,6 +1014,382 @@ _audit_yara_subcmd() {
             ;;
         *)
             echo -e "${R}unknown yara subcommand: $1${NC}" >&2
+            _audit_help; return 1 ;;
+    esac
+}
+
+# ==============================================================================
+# Account / SSH-key audit — line-level diff over the files where new
+# privileges materialise. Stronger than FIM here: FIM tells you "passwd
+# changed", this tells you "user `eve` was added with UID 0 and shell
+# /bin/bash". Same machinery as persistence-diff but per-file.
+#
+# Storage: $ALERT_STATE_DIR/audit/accounts/<sanitised-path> — full file
+# content captured at baseline time. comm against current state to find
+# ADDED / REMOVED lines. Sanitisation: `/` → `_`, leading underscore
+# stripped (so `/etc/passwd` becomes `etc_passwd`).
+#
+# Drift policy:
+#   ADDED   fires alert. Each baseline-vs-current run reports up to 5
+#           new lines in the body (capped to fit Discord's 4000-char
+#           limit even with many keys at once).
+#   REMOVED informational on `check` output but does NOT alert. Admins
+#           routinely revoke old SSH keys and clean up sudoers entries.
+# ==============================================================================
+
+_audit_accounts_state_dir() {
+    local d; d=$(_audit_state_dir)/accounts
+    mkdir -p "$d" 2>/dev/null
+    printf '%s' "$d"
+}
+
+_audit_accounts_sanitise() {
+    # `/etc/sudoers.d/foo` → `etc_sudoers.d_foo`. Leading slash stripped
+    # so we don't end up with a hidden `_etc_...` file the operator can't
+    # see in `ls`. Backslash + colon also escaped for paranoia even
+    # though they're vanishingly unlikely in account-file paths.
+    local p="$1"
+    p="${p#/}"
+    printf '%s' "${p//\//_}"
+}
+
+_audit_accounts_expand() {
+    local pat path
+    local -a out=()
+    shopt -s nullglob
+    for pat in "${AUDIT_ACCOUNTS_PATHS[@]}"; do
+        local -a matches=( $pat )
+        if (( ${#matches[@]} > 0 )); then
+            for path in "${matches[@]}"; do
+                [[ -f "$path" ]] || continue   # files only
+                out+=("$path")
+            done
+        fi
+    done
+    shopt -u nullglob
+    printf '%s\n' "${out[@]}" | sort -u
+}
+
+# Capture each tracked file's contents into the baseline dir. Returns
+# `<count> <baseline_dir>` so the caller can `read` it without subshell-
+# scope variable leakage.
+_audit_accounts_baseline() {
+    local dir; dir=$(_audit_accounts_state_dir)
+    local count=0 path safe
+    # Wipe the baseline dir on full re-baseline so files removed from
+    # AUDIT_ACCOUNTS_PATHS don't linger as ghost rows on subsequent diffs.
+    rm -f "$dir"/*.baseline 2>/dev/null
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        safe=$(_audit_accounts_sanitise "$path")
+        # `cp -f` would dereference symlinks; we want the actual content
+        # at this instant, which `cat >` accomplishes with no metadata.
+        if cat "$path" 2>/dev/null > "$dir/$safe.baseline"; then
+            (( count++ )) || true
+        fi
+    done < <(_audit_accounts_expand)
+    printf '%d %s\n' "$count" "$dir"
+}
+
+# Diff every currently-tracked file against its baseline. Stdout per
+# line: `<change>\t<file>\t<line>` where change ∈ {ADDED, REMOVED}.
+# A missing baseline file is treated as if every line in the current
+# file is ADDED — which is exactly the signal we want when an attacker
+# creates a new authorized_keys for an existing or freshly-added user.
+_audit_accounts_diff() {
+    local dir; dir=$(_audit_accounts_state_dir)
+    local path safe baseline
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        safe=$(_audit_accounts_sanitise "$path")
+        baseline="$dir/$safe.baseline"
+        if [[ ! -f "$baseline" ]]; then
+            # File appeared since last baseline — every line is ADDED.
+            awk -v p="$path" 'NF { printf "ADDED\t%s\t%s\n", p, $0 }' "$path" 2>/dev/null
+            continue
+        fi
+        # comm wants sorted inputs; account files are small enough that
+        # sorting per tick is cheap (passwd ≈ 50 lines, authorized_keys
+        # rarely beyond ~20 keys).
+        comm -23 <(sort -u "$path" 2>/dev/null) <(sort -u "$baseline") \
+            | awk -v p="$path" 'NF { printf "ADDED\t%s\t%s\n", p, $0 }'
+        comm -13 <(sort -u "$path" 2>/dev/null) <(sort -u "$baseline") \
+            | awk -v p="$path" 'NF { printf "REMOVED\t%s\t%s\n", p, $0 }'
+    done < <(_audit_accounts_expand)
+}
+
+_audit_accounts_tick() {
+    [[ "${AUDIT_ENABLED:-0}" == "1" ]] || return 0
+    local dir; dir=$(_audit_accounts_state_dir)
+    local marker="$dir/.lastcheck"
+    local now; now=$(date +%s)
+    local last=0
+    [[ -f "$marker" ]] && last=$(cat "$marker" 2>/dev/null || echo 0)
+    [[ -z "$last" ]] && last=0
+    if (( now - last < AUDIT_ACCOUNTS_INTERVAL )); then
+        return 0
+    fi
+
+    # First-run silent baseline. Marker file used to detect bootstrap
+    # state because the per-file baselines may legitimately be missing
+    # (file glob matches zero entries on a freshly-installed host).
+    if [[ ! -f "$marker" ]]; then
+        _audit_accounts_baseline >/dev/null 2>&1
+        printf '%s' "$now" > "$marker"
+        return 0
+    fi
+
+    # Group ADDED lines by file so we fire one alert per file rather
+    # than one per added key — critical when an attacker drops 5 new
+    # keys at once into authorized_keys. Body is capped at 5 lines plus
+    # an "… and N more" tail to stay under Discord's 4000-char limit.
+    local prev_file="" body="" capped=""
+    local change file line lines_count=0 key b
+    while IFS=$'\t' read -r change file line; do
+        [[ "$change" == "ADDED" ]] || continue
+        [[ -z "$file" ]] && continue
+        if [[ "$file" != "$prev_file" ]]; then
+            if [[ -n "$prev_file" ]]; then
+                [[ -n "$capped" ]] && body="${body}
+${capped}"
+                key="audit:accounts:NEW:$prev_file"
+                if alert_should_fire "$key"; then
+                    b="\`\`\`new lines in $prev_file:
+$body\`\`\`"
+                    alert_fire "Account drift: $prev_file" "$b" 15158332 "$key" &
+                fi
+            fi
+            prev_file="$file"; body="$line"; lines_count=1; capped=""
+        else
+            (( lines_count++ ))
+            if (( lines_count <= 5 )); then
+                body="${body}
+${line}"
+            else
+                capped="… (and $((lines_count - 5)) more)"
+            fi
+        fi
+    done < <(_audit_accounts_diff | sort)   # sort groups ADDED rows by file
+    if [[ -n "$prev_file" ]]; then
+        [[ -n "$capped" ]] && body="${body}
+${capped}"
+        key="audit:accounts:NEW:$prev_file"
+        if alert_should_fire "$key"; then
+            b="\`\`\`new lines in $prev_file:
+$body\`\`\`"
+            alert_fire "Account drift: $prev_file" "$b" 15158332 "$key" &
+        fi
+    fi
+
+    printf '%s' "$now" > "$marker"
+}
+
+_audit_accounts_subcmd() {
+    case "${1:-status}" in
+        baseline)
+            local count path
+            read -r count path < <(_audit_accounts_baseline)
+            local marker="$path/.lastcheck"
+            date +%s > "$marker"
+            echo -e "${G}baseline${NC} written under ${C}$path${NC}"
+            echo -e "  ${D}tracked: ${count:-0} files${NC}"
+            ;;
+        check)
+            local dir; dir=$(_audit_accounts_state_dir)
+            local marker="$dir/.lastcheck"
+            if [[ ! -f "$marker" ]]; then
+                echo -e "${Y}no baseline yet — run \`milog audit accounts baseline\` first${NC}"
+                return 1
+            fi
+            local out; out=$(_audit_accounts_diff)
+            if [[ -z "$out" ]]; then
+                echo -e "${G}no drift${NC} — every tracked file matches baseline"
+                return 0
+            fi
+            local added removed
+            added=$(printf   '%s\n' "$out" | grep -c '^ADDED'   || true)
+            removed=$(printf '%s\n' "$out" | grep -c '^REMOVED' || true)
+            if (( added > 0 )); then
+                echo -e "${R}NEW lines (alert-worthy):${NC}"
+                printf '%s\n' "$out" | awk -F'\t' '$1=="ADDED"   {printf "  \033[31m%-9s\033[0m  %s  ::  %s\n", $1, $2, $3}'
+            fi
+            if (( removed > 0 )); then
+                echo -e "${D}removed (housekeeping, no alert):${NC}"
+                printf '%s\n' "$out" | awk -F'\t' '$1=="REMOVED" {printf "  \033[90m%-9s\033[0m  %s  ::  %s\n", $1, $2, $3}'
+            fi
+            (( added > 0 )) && return 1 || return 0
+            ;;
+        status)
+            local dir; dir=$(_audit_accounts_state_dir)
+            local marker="$dir/.lastcheck"
+            echo -e "${W}milog audit accounts — status${NC}"
+            echo -e "  ${D}AUDIT_ENABLED=${NC}${AUDIT_ENABLED:-0}   ${D}AUDIT_ACCOUNTS_INTERVAL=${NC}${AUDIT_ACCOUNTS_INTERVAL:-3600}s"
+            local tracked
+            tracked=$(_audit_accounts_expand | wc -l | tr -d ' ')
+            echo -e "  ${D}files currently matching globs:${NC} ${tracked:-0}"
+            if [[ -f "$marker" ]]; then
+                local last; last=$(cat "$marker" 2>/dev/null || echo 0)
+                local now; now=$(date +%s); local mins=$(( (now - last) / 60 ))
+                echo -e "  ${D}last check:${NC} ${mins}m ago"
+            else
+                echo -e "  ${D}last check:${NC} ${Y}never (no baseline yet)${NC}"
+            fi
+            echo -e "  ${D}watchlist (${#AUDIT_ACCOUNTS_PATHS[@]} patterns):${NC}"
+            local p
+            for p in "${AUDIT_ACCOUNTS_PATHS[@]}"; do
+                printf "    %s\n" "$p"
+            done
+            ;;
+        *)
+            echo -e "${R}unknown accounts subcommand: $1${NC}" >&2
+            _audit_help; return 1 ;;
+    esac
+}
+
+# ==============================================================================
+# Rootkit hint scanner — point-in-time heuristics, no baseline. Each
+# heuristic is a yes/no signal that's worth firing on its own:
+#
+#   hidden_process       /proc dir count > `ps -e` count (slack for racing)
+#   ld_preload_present   /etc/ld.so.preload exists at all
+#   exec_from_tmp        a running process's exe lives under /tmp,
+#                        /dev/shm, or /var/tmp
+#   deleted_exe          /proc/<pid>/exe symlink ends with `(deleted)`
+#                        — backing file unlinked, classic memory-resident
+#                        malware tell
+#
+# Linux-only (relies on /proc). On macOS / BSD the support check fails
+# fast and the module no-ops. Same design as ports — the existing
+# point-in-time scanners stay coherent across OS detection.
+# ==============================================================================
+
+_audit_rootkit_supported() {
+    [[ -d /proc ]] && [[ -d /proc/1 ]]
+}
+
+# Hidden-process check. Returns one line `hidden_process\t<detail>` if the
+# /proc directory count exceeds `ps -e` count by more than the slack.
+# The slack accommodates the race window between the two enumerations
+# (a process can spawn or die in the microseconds between them).
+_audit_rootkit_check_hidden() {
+    local ps_count proc_count slack=5
+    ps_count=$(ps -eo pid 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+    proc_count=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l | tr -d ' ')
+    [[ -z "$ps_count" || -z "$proc_count" ]] && return 0
+    if (( proc_count > ps_count + slack )); then
+        printf 'hidden_process\tps_count=%d /proc_count=%d (delta=%d > slack=%d)\n' \
+            "$ps_count" "$proc_count" "$((proc_count - ps_count))" "$slack"
+    fi
+}
+
+_audit_rootkit_check_preload() {
+    if [[ -e /etc/ld.so.preload ]]; then
+        local content
+        content=$(head -c 200 /etc/ld.so.preload 2>/dev/null | tr '\n' ' ')
+        printf 'ld_preload_present\t/etc/ld.so.preload exists: %s\n' "${content:-(empty)}"
+    fi
+}
+
+# Walk /proc/<pid>/exe symlinks. Two heuristics share the walk so we
+# don't pay for it twice per tick:
+#   - exec_from_tmp:    exe path resolves under /tmp / /dev/shm / /var/tmp
+#   - deleted_exe:      exe symlink target ends with " (deleted)"
+# kernel-thread exe links are unreadable (-EPERM) — silently skipped.
+_audit_rootkit_walk_proc() {
+    local pid exe comm
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        # readlink on /proc/<pid>/exe returns either the absolute path or
+        # `<path> (deleted)` for unlinked-but-still-running binaries.
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+        [[ -z "$exe" ]] && continue
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null | tr -d '\n')
+        [[ -z "$comm" ]] && comm="?"
+        case "$exe" in
+            *" (deleted)")
+                printf 'deleted_exe:%s\tpid=%s comm=%s exe=%s\n' \
+                    "$comm" "$pid" "$comm" "$exe"
+                ;;
+            /tmp/*|/var/tmp/*|/dev/shm/*)
+                printf 'exec_from_tmp:%s\tpid=%s comm=%s exe=%s\n' \
+                    "$comm" "$pid" "$comm" "$exe"
+                ;;
+        esac
+    done
+}
+
+# Run every heuristic; emit one line per finding, format
+# `<heuristic_key>\t<detail>`. heuristic_key may be suffixed with the
+# process comm for per-process keys (so cooldown groups correctly).
+_audit_rootkit_run_all() {
+    _audit_rootkit_supported || return 0
+    _audit_rootkit_check_hidden
+    _audit_rootkit_check_preload
+    _audit_rootkit_walk_proc
+}
+
+_audit_rootkit_tick() {
+    [[ "${AUDIT_ENABLED:-0}" == "1" ]] || return 0
+    _audit_rootkit_supported || return 0
+    local dir; dir=$(_audit_state_dir)
+    local marker="$dir/rootkit.lastcheck"
+    local now; now=$(date +%s)
+    local last=0
+    [[ -f "$marker" ]] && last=$(cat "$marker" 2>/dev/null || echo 0)
+    [[ -z "$last" ]] && last=0
+    if (( now - last < AUDIT_ROOTKIT_INTERVAL )); then
+        return 0
+    fi
+
+    local heur detail key body
+    while IFS=$'\t' read -r heur detail; do
+        [[ -z "$heur" ]] && continue
+        key="audit:rootkit:$heur"
+        if alert_should_fire "$key"; then
+            body="\`\`\`$detail\`\`\`"
+            alert_fire "Rootkit hint: $heur" "$body" 15158332 "$key" &
+        fi
+    done < <(_audit_rootkit_run_all)
+
+    printf '%s' "$now" > "$marker"
+}
+
+_audit_rootkit_subcmd() {
+    case "${1:-status}" in
+        check)
+            if ! _audit_rootkit_supported; then
+                echo -e "${Y}rootkit scan needs /proc — Linux only (this is $(uname -s))${NC}"
+                return 1
+            fi
+            local out; out=$(_audit_rootkit_run_all)
+            if [[ -z "$out" ]]; then
+                echo -e "${G}no hits${NC} — every heuristic clean"
+                return 0
+            fi
+            echo -e "${R}rootkit hints:${NC}"
+            printf '%s\n' "$out" | awk -F'\t' '{
+                printf "  \033[31m%-40s\033[0m  %s\n", $1, $2
+            }'
+            return 1
+            ;;
+        status)
+            local dir; dir=$(_audit_state_dir)
+            local marker="$dir/rootkit.lastcheck"
+            echo -e "${W}milog audit rootkit — status${NC}"
+            echo -e "  ${D}AUDIT_ENABLED=${NC}${AUDIT_ENABLED:-0}   ${D}AUDIT_ROOTKIT_INTERVAL=${NC}${AUDIT_ROOTKIT_INTERVAL:-3600}s"
+            local sup="no (needs /proc — Linux only)"
+            _audit_rootkit_supported && sup="yes"
+            echo -e "  ${D}supported on this host:${NC} $sup"
+            echo -e "  ${D}heuristics:${NC} hidden_process, ld_preload_present, exec_from_tmp, deleted_exe"
+            if [[ -f "$marker" ]]; then
+                local last; last=$(cat "$marker" 2>/dev/null || echo 0)
+                local now; now=$(date +%s); local mins=$(( (now - last) / 60 ))
+                echo -e "  ${D}last check:${NC} ${mins}m ago"
+            else
+                echo -e "  ${D}last check:${NC} ${Y}never${NC}"
+            fi
+            ;;
+        *)
+            echo -e "${R}unknown rootkit subcommand: $1${NC}" >&2
             _audit_help; return 1 ;;
     esac
 }
