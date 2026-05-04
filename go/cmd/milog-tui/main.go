@@ -5,10 +5,11 @@
 // Bash `milog monitor` stays — this is an additional option, not a
 // replacement.
 //
-// Two views:
+// Three views:
 //
 //	overview    header + system bars + per-app table (default)
 //	drilldown   one app: top paths, top IPs, recent alerts
+//	alerts      global last-24h alert log, latest first
 //
 // Key bindings:
 //
@@ -19,7 +20,8 @@
 //	?           toggle help
 //	↑/k ↓/j     move row selection (overview)
 //	enter / l   drill into the highlighted app
-//	esc / h     leave drill-down → overview
+//	a           open the global alerts view
+//	esc / h     leave drill-down / alerts → overview
 package main
 
 import (
@@ -67,6 +69,16 @@ type viewMode int
 const (
 	viewOverview viewMode = iota
 	viewDrilldown
+	viewAlerts
+)
+
+// alertsViewCap caps the global alerts view at a sensible row budget.
+// At ~24 chars per row that's about 80 rows of viewport on a 100x40
+// terminal; bigger histories get truncated with a count footer rather
+// than scrolling, since the TUI today is screen-fitting (no scroll).
+const (
+	alertsViewWindow = "24h"
+	alertsViewCap    = 50
 )
 
 // ---- Styles -----------------------------------------------------------
@@ -145,6 +157,18 @@ type drilldownMsg struct {
 	data drilldownData
 }
 
+// alertsData is the global-alerts payload computed off the UI thread.
+type alertsData struct {
+	rows  []alertlog.Row // newest first, capped at alertsViewCap
+	total int            // total rows within window before capping
+	err   error
+}
+
+// alertsMsg carries the result of an alerts sample pass.
+type alertsMsg struct {
+	data alertsData
+}
+
 type model struct {
 	cfg        *config.Config
 	width      int
@@ -163,6 +187,7 @@ type model struct {
 	view        viewMode
 	selectedIdx int           // highlighted row in overview
 	drill       drilldownData // current drill-down payload (empty when in overview)
+	alerts      alertsData    // current alerts-view payload (empty when not in viewAlerts)
 }
 
 // ---- Commands ---------------------------------------------------------
@@ -265,6 +290,39 @@ func drilldownSampleCmd(cfg *config.Config, app string) tea.Cmd {
 	}
 }
 
+// alertsSampleCmd loads the last alertsViewWindow of alerts from disk
+// and trims to alertsViewCap with newest first. Runs off the UI thread
+// so a slow disk read can't stutter the TUI redraw.
+//
+// Unlike the drill-down's filtered-by-app pane, this view is global —
+// every rule key, every app. Operators land here when they want to see
+// "what's been firing across the host" at a glance, without first
+// picking an app.
+func alertsSampleCmd(cfg *config.Config) tea.Cmd {
+	return func() tea.Msg {
+		var d alertsData
+		cutoff, _ := alertlog.WindowToCutoff(alertsViewWindow, time.Now())
+		rows, err := alertlog.Load(filepath.Join(cfg.AlertStateDir, "alerts.log"), cutoff, 0)
+		if err != nil {
+			d.err = err
+			return alertsMsg{data: d}
+		}
+		d.total = len(rows)
+		// alertlog.Load returns oldest-first by file order; we want
+		// newest-first for the at-a-glance read. Cap THEN reverse so
+		// the cap takes the most recent N rows.
+		if len(rows) > alertsViewCap {
+			rows = rows[len(rows)-alertsViewCap:]
+		}
+		// Reverse in place — newest first.
+		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+			rows[i], rows[j] = rows[j], rows[i]
+		}
+		d.rows = rows
+		return alertsMsg{data: d}
+	}
+}
+
 // topN sorts the (key, count) map and keeps the highest n by count.
 func topN(m map[string]int, n int) []kv {
 	out := make([]kv, 0, len(m))
@@ -361,6 +419,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.view = viewDrilldown
 				return m, drilldownSampleCmd(m.cfg, m.apps[m.selectedIdx].name)
+			case "a":
+				m.view = viewAlerts
+				return m, alertsSampleCmd(m.cfg)
 			}
 		case viewDrilldown:
 			switch msg.String() {
@@ -374,6 +435,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+		case viewAlerts:
+			switch msg.String() {
+			case "esc", "h", "left", "backspace":
+				m.view = viewOverview
+				m.alerts = alertsData{}
+				return m, nil
+			case "r":
+				return m, alertsSampleCmd(m.cfg)
+			}
 		}
 
 	case tickMsg:
@@ -385,8 +455,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Refresh the current view's data on every tick.
 		batch := []tea.Cmd{sampleCmd(m.cfg), next}
-		if m.view == viewDrilldown && m.selectedIdx < len(m.apps) {
-			batch = append(batch, drilldownSampleCmd(m.cfg, m.apps[m.selectedIdx].name))
+		switch m.view {
+		case viewDrilldown:
+			if m.selectedIdx < len(m.apps) {
+				batch = append(batch, drilldownSampleCmd(m.cfg, m.apps[m.selectedIdx].name))
+			}
+		case viewAlerts:
+			batch = append(batch, alertsSampleCmd(m.cfg))
 		}
 		return m, tea.Batch(batch...)
 
@@ -426,6 +501,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.data.err != nil {
 			m.status = "drill: " + msg.data.err.Error()
 		}
+
+	case alertsMsg:
+		m.alerts = msg.data
+		if msg.data.err != nil {
+			m.status = "alerts: " + msg.data.err.Error()
+		}
 	}
 	return m, nil
 }
@@ -440,6 +521,8 @@ func (m model) View() string {
 	switch m.view {
 	case viewDrilldown:
 		b.WriteString(m.renderDrilldown())
+	case viewAlerts:
+		b.WriteString(m.renderAlertsView())
 	default:
 		b.WriteString(m.renderSystem())
 		b.WriteString("\n\n")
@@ -614,31 +697,87 @@ func (m model) renderDrilldown() string {
 		return b.String()
 	}
 	for _, r := range d.alerts {
-		when := time.Unix(r.TS, 0).Format("15:04")
-		sevStyle := labelStyle
-		switch r.Sev {
-		case "crit":
-			sevStyle = critStyle
-		case "warn":
-			sevStyle = warnStyle
-		}
-		title := r.Title
-		// Pull the trailing app context off the rule so the row reads
-		// `15:04 [crit] panic_go  body…` rather than repeating the app.
-		ruleShort := r.Rule
-		if len(ruleShort) > 32 {
-			ruleShort = ruleShort[:29] + "…"
-		}
-		body := strings.TrimSpace(strings.Trim(r.Body, "`"))
-		if len(body) > 60 {
-			body = body[:57] + "…"
-		}
-		b.WriteString(fmt.Sprintf("  %s %s %s %s\n",
-			dimStyle.Render(when),
-			sevStyle.Render(fmt.Sprintf("[%s]", r.Sev)),
-			ruleShort,
-			dimStyle.Render(body)))
-		_ = title
+		b.WriteString(renderAlertRow(r))
+	}
+	return b.String()
+}
+
+// renderAlertRow formats one alertlog row for the recent-alerts panes
+// (used by drill-down and the global alerts view). One line per row,
+// 2-space indent: `<HH:MM> [<sev>] <rule>  <body excerpt>`. Body is
+// trimmed of its enclosing backticks (alert_fire wraps in ``` for
+// Discord) and capped at 60 chars so the line fits a typical 100-col
+// terminal alongside time + sev + rule.
+func renderAlertRow(r alertlog.Row) string {
+	when := time.Unix(r.TS, 0).Format("15:04")
+	sevStyle := labelStyle
+	switch r.Sev {
+	case "crit":
+		sevStyle = critStyle
+	case "warn":
+		sevStyle = warnStyle
+	}
+	ruleShort := r.Rule
+	if len(ruleShort) > 32 {
+		ruleShort = ruleShort[:29] + "…"
+	}
+	body := strings.TrimSpace(strings.Trim(r.Body, "`"))
+	if len(body) > 60 {
+		body = body[:57] + "…"
+	}
+	return fmt.Sprintf("  %s %s %s %s\n",
+		dimStyle.Render(when),
+		sevStyle.Render(fmt.Sprintf("[%s]", r.Sev)),
+		ruleShort,
+		dimStyle.Render(body))
+}
+
+// renderAlertsView is the global alerts screen — every rule, every app,
+// last alertsViewWindow. Header shows total count + window + cap; one
+// row per alertlog entry below, newest first. Empty state distinguishes
+// "no alerts in window" from "couldn't load file" so the operator
+// knows whether the silence is good news or a config problem.
+func (m model) renderAlertsView() string {
+	d := m.alerts
+	var b strings.Builder
+
+	b.WriteString("  ")
+	b.WriteString(labelStyle.Render(fmt.Sprintf("ALERTS (last %s)", alertsViewWindow)))
+	b.WriteString("\n")
+
+	if d.err != nil {
+		b.WriteString("  ")
+		b.WriteString(critStyle.Render("error reading alerts.log: " + d.err.Error()))
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	if d.total == 0 {
+		b.WriteString("  ")
+		b.WriteString(dimStyle.Render("no alerts in the last " + alertsViewWindow))
+		b.WriteString("\n")
+		b.WriteString("  ")
+		b.WriteString(dimStyle.Render("(quiet host, or alerts.log not yet populated)"))
+		return b.String()
+	}
+
+	// Counter line so an operator knows whether the cap kicked in.
+	if d.total > len(d.rows) {
+		b.WriteString("  ")
+		b.WriteString(dimStyle.Render(fmt.Sprintf(
+			"showing latest %d of %d in window",
+			len(d.rows), d.total,
+		)))
+		b.WriteString("\n")
+	} else {
+		b.WriteString("  ")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("%d total in window", d.total)))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+
+	for _, r := range d.rows {
+		b.WriteString(renderAlertRow(r))
 	}
 	return b.String()
 }
@@ -722,8 +861,10 @@ func (m model) renderFooter() string {
 	keys := "  q:quit  p:pause  r:refresh  +/-:rate (%ds)  ?:help"
 	switch m.view {
 	case viewOverview:
-		keys += "  ↑↓:select  enter:drill"
+		keys += "  ↑↓:select  enter:drill  a:alerts"
 	case viewDrilldown:
+		keys += "  esc:back"
+	case viewAlerts:
 		keys += "  esc:back"
 	}
 	return dimStyle.Render(fmt.Sprintf(keys, m.refreshSec) + status)
@@ -741,10 +882,15 @@ func (m model) renderHelp() string {
   Overview view:
     ↑/k ↓/j         move row selection
     enter / l       drill into the highlighted app
+    a               open the global alerts view
 
   Drill-down view:
     esc / h         back to overview
     r               refresh the focused-app data now
+
+  Alerts view:
+    esc / h         back to overview
+    r               reload alerts.log
 
   MILOG_APPS / MILOG_LOG_DIR pick the apps shown. Config loaded from
   env vars matching the bash side — no separate TUI config.`)
@@ -782,7 +928,8 @@ KEYS (inside the TUI)
   q / Ctrl+C   quit            p   pause    r   refresh now
   + / -        adjust rate     ?   toggle help
   ↑/k ↓/j      select row      enter / l   drill into app
-  esc / h      back from drill-down`)
+  a            open alerts view
+  esc / h      back from drill-down / alerts`)
 			return
 		}
 	}
