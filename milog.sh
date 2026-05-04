@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.2.0-dirty
-# MILOG_BUILT=2026-05-04T09:37:20Z
+# MILOG_VERSION=v0.2.0-10-gd5a21f5-dirty
+# MILOG_BUILT=2026-05-04T13:00:31Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -2398,6 +2398,35 @@ _web_route_index() {
   td.when { color:#8b949e; white-space:nowrap; font-variant-numeric: tabular-nums; }
   td.title { color:#d6d9dc; overflow:hidden; text-overflow:ellipsis; max-width:48ch; }
   .empty { color:#6b7177; padding:.6rem 0; }
+  /* Click hover for alert rows — operator visual that drill-down is wired. */
+  #alerts tbody tr { cursor: pointer; }
+  #alerts tbody tr:hover td { background:#10141a; }
+  /* Alert drill-down modal. Backdrop fills viewport; panel centers via flex.
+     Body shown in a pre block so multi-line alert content (audit drift,
+     stack traces from app patterns) keeps its formatting. */
+  .modal-backdrop { display:none; position:fixed; inset:0; z-index:10;
+                    background:rgba(0,0,0,.65); align-items:center; justify-content:center; }
+  .modal-backdrop.open { display:flex; }
+  .modal { background:#10141a; border:1px solid #30363d; border-radius:.5rem;
+           max-width:min(720px, 90vw); max-height:80vh; width:100%;
+           display:flex; flex-direction:column; box-shadow: 0 8px 32px rgba(0,0,0,.5); }
+  .modal header { display:flex; align-items:baseline; gap:.6rem; padding:.8rem 1rem;
+                  border-bottom:1px solid #1b1f24; }
+  .modal header .when { color:#6b7177; font-size:.8rem; font-variant-numeric: tabular-nums; }
+  .modal header h3 { margin:0; font-size:.95rem; flex:1; overflow:hidden; text-overflow:ellipsis; }
+  .modal header .close { background:none; border:1px solid #30363d; color:#8b949e;
+                         border-radius:.3rem; padding:.1rem .5rem; font:inherit; font-size:.85rem;
+                         cursor:pointer; }
+  .modal header .close:hover { color:#f85149; border-color:#da3633; }
+  .modal .meta { padding:.6rem 1rem; border-bottom:1px solid #1b1f24;
+                 font-size:.85rem; color:#8b949e; display:grid;
+                 grid-template-columns:auto 1fr; column-gap:.8rem; row-gap:.3rem; }
+  .modal .meta .k { color:#6b7177; text-transform:uppercase; letter-spacing:.08em; font-size:.7rem; }
+  .modal .meta .v { color:#d6d9dc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                    word-break: break-all; }
+  .modal pre { margin:0; padding:1rem; overflow:auto; flex:1; font-size:.85rem;
+               white-space:pre-wrap; word-break:break-word; color:#d6d9dc;
+               background:#0b0d10; border-radius:0 0 .5rem .5rem; }
   /* Scroll the alerts table inside its own box instead of growing the page.
      Max ~14 rows visible; header stays pinned while scrolling. */
   .table-scroll { max-height: 26rem; overflow-y: auto; border:1px solid #1b1f24; border-radius:.4rem; }
@@ -2470,6 +2499,22 @@ _web_route_index() {
         <thead><tr><th>WHEN</th><th>SEV</th><th>RULE</th><th>TITLE</th></tr></thead>
         <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
       </table>
+    </div>
+    <!-- Alert drill-down modal. Hidden until a row is clicked; populated
+         from the alerts.json payload already in memory (no extra fetch). -->
+    <div id="alert-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="alert-modal-title">
+      <div class="modal">
+        <header>
+          <span class="when" id="alert-modal-when">—</span>
+          <h3 id="alert-modal-title">—</h3>
+          <button type="button" class="close" id="alert-modal-close" aria-label="close (esc)">esc</button>
+        </header>
+        <div class="meta">
+          <span class="k">sev</span><span class="v" id="alert-modal-sev">—</span>
+          <span class="k">rule</span><span class="v" id="alert-modal-rule">—</span>
+        </div>
+        <pre id="alert-modal-body">—</pre>
+      </div>
     </div>
   </section>
   <section>
@@ -2608,6 +2653,11 @@ _web_route_index() {
       tr.appendChild(sev);
       tr.appendChild(td(a.rule || '', 'rule'));
       tr.appendChild(td(a.title || '', 'title'));
+      // Drill-down: click → modal with the full body. The body field is
+      // already in the alerts.json payload, so no additional fetch is
+      // needed. Rebinding `a` per-iteration is automatic via the
+      // forEach closure.
+      tr.addEventListener('click', function(){ openAlertModal(a); });
       tbody.appendChild(tr);
     });
   }
@@ -2618,6 +2668,42 @@ _web_route_index() {
       .catch(function(){ /* non-fatal; summary tick already surfaces errors */ });
   }
   document.getElementById('alerts-window').addEventListener('change', tickAlerts);
+
+  // ---- alert drill-down modal ---------------------------------------------
+  // Click a row in the alerts table to inspect its full body. Body is
+  // displayed verbatim with the markdown backticks stripped — alert_fire
+  // wraps Discord bodies in ``` so they render as code blocks; here we
+  // strip them since the <pre> tag does the same job.
+  function stripBackticks(s) {
+    if (typeof s !== 'string') return '';
+    return s.replace(/^```\n?/, '').replace(/\n?```$/, '');
+  }
+  function openAlertModal(a) {
+    document.getElementById('alert-modal-when').textContent = fmtWhen(a.ts);
+    document.getElementById('alert-modal-title').textContent = a.title || '(no title)';
+    var sev = document.getElementById('alert-modal-sev');
+    sev.textContent = (a.sev || 'info').toUpperCase();
+    sev.className = 'v sev-' + (a.sev || 'info');
+    document.getElementById('alert-modal-rule').textContent = a.rule || '(no rule key)';
+    document.getElementById('alert-modal-body').textContent =
+        stripBackticks(a.body || '') || '(empty body)';
+    document.getElementById('alert-modal').classList.add('open');
+  }
+  function closeAlertModal() {
+    document.getElementById('alert-modal').classList.remove('open');
+  }
+  document.getElementById('alert-modal-close').addEventListener('click', closeAlertModal);
+  // Backdrop click closes; clicks INSIDE the modal panel propagate up to
+  // the backdrop, so we filter by event.target.
+  document.getElementById('alert-modal').addEventListener('click', function(e){
+    if (e.target === this) closeAlertModal();
+  });
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Escape' &&
+        document.getElementById('alert-modal').classList.contains('open')) {
+      closeAlertModal();
+    }
+  });
 
   // ---- logs panel --------------------------------------------------------
   // Short-poll log viewer (tier 1). Every 5s it fetches /api/logs.json with
