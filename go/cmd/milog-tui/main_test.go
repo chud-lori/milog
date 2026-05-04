@@ -1,11 +1,39 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/chud-lori/milog/internal/alertlog"
 	"github.com/chud-lori/milog/internal/config"
 )
+
+// keyMsg builds a tea.KeyMsg for tests. Special names ("esc", "enter",
+// "up" ...) map to their KeyType counterparts; anything else is treated
+// as a single-rune Runes key. Only the names this TUI actually uses
+// are mapped — the table grows when a new keybind needs testing.
+func keyMsg(s string) tea.KeyMsg {
+	switch s {
+	case "esc":
+		return tea.KeyMsg{Type: tea.KeyEsc}
+	case "enter":
+		return tea.KeyMsg{Type: tea.KeyEnter}
+	case "up":
+		return tea.KeyMsg{Type: tea.KeyUp}
+	case "down":
+		return tea.KeyMsg{Type: tea.KeyDown}
+	case "left":
+		return tea.KeyMsg{Type: tea.KeyLeft}
+	case "right":
+		return tea.KeyMsg{Type: tea.KeyRight}
+	case "backspace":
+		return tea.KeyMsg{Type: tea.KeyBackspace}
+	}
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+}
 
 func TestRenderSparkline_Empty(t *testing.T) {
 	got := renderSparkline(nil, 10)
@@ -174,6 +202,157 @@ func TestRenderDrilldown_RendersAllPanes(t *testing.T) {
 	}
 	if !strings.Contains(view, "esc:back") {
 		t.Errorf("drill-down footer missing back hint; got:\n%s", view)
+	}
+}
+
+func TestRenderAlertsView_RendersRowsLatestFirst(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewAlerts,
+		alerts: alertsData{
+			total: 2,
+			// alertsSampleCmd reverses to newest-first before storing,
+			// so we feed pre-reversed rows here.
+			rows: []alertlog.Row{
+				{TS: 1714000200, Sev: "crit", Rule: "process:exec_from_tmp:dropper",
+					Title: "Exec from tmp", Body: "```/tmp/x```"},
+				{TS: 1714000100, Sev: "warn", Rule: "audit:fim:MODIFIED:/etc/passwd",
+					Title: "FIM drift", Body: "```diff…```"},
+			},
+		},
+	}
+	view := m.View()
+	for _, want := range []string{
+		"ALERTS (last 24h)",
+		"2 total in window",
+		"process:exec_from_tmp:dropper",
+		"audit:fim:MODIFIED:/etc/passwd",
+		"esc:back",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("alerts view missing %q; got:\n%s", want, view)
+		}
+	}
+	// Newest-first ordering: process:exec... must appear before audit:fim...
+	idxExec := strings.Index(view, "process:exec_from_tmp")
+	idxFim := strings.Index(view, "audit:fim:MODIFIED")
+	if idxExec < 0 || idxFim < 0 || idxExec >= idxFim {
+		t.Errorf("expected process:exec... before audit:fim... (newest first); got idxExec=%d idxFim=%d", idxExec, idxFim)
+	}
+}
+
+func TestRenderAlertsView_CapNotice(t *testing.T) {
+	// total > rows means we hit the cap. View should say so explicitly.
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewAlerts,
+		alerts: alertsData{
+			total: 200,
+			rows: []alertlog.Row{
+				{TS: 1714000000, Sev: "crit", Rule: "x", Title: "y", Body: "z"},
+			},
+		},
+	}
+	view := m.View()
+	if !strings.Contains(view, "showing latest 1 of 200") {
+		t.Errorf("expected cap notice; got:\n%s", view)
+	}
+}
+
+func TestRenderAlertsView_EmptyState(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewAlerts,
+		alerts:     alertsData{total: 0},
+	}
+	view := m.View()
+	if !strings.Contains(view, "no alerts in the last 24h") {
+		t.Errorf("expected empty-state message; got:\n%s", view)
+	}
+}
+
+func TestRenderAlertsView_LoadError(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewAlerts,
+		alerts:     alertsData{err: errors.New("permission denied")},
+	}
+	view := m.View()
+	if !strings.Contains(view, "error reading alerts.log") || !strings.Contains(view, "permission denied") {
+		t.Errorf("expected error message in view; got:\n%s", view)
+	}
+}
+
+func TestUpdate_AKeyOpensAlertsViewFromOverview(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewOverview,
+		apps:       []appSample{{name: "api"}},
+		history:    map[string][]int{"api": {1}},
+	}
+	updated, _ := m.Update(keyMsg("a"))
+	got := updated.(model)
+	if got.view != viewAlerts {
+		t.Errorf("after 'a' from overview, view=%v want viewAlerts", got.view)
+	}
+}
+
+func TestUpdate_EscFromAlertsReturnsToOverview(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewAlerts,
+		alerts:     alertsData{total: 5, rows: []alertlog.Row{{Rule: "x"}}},
+	}
+	updated, _ := m.Update(keyMsg("esc"))
+	got := updated.(model)
+	if got.view != viewOverview {
+		t.Errorf("after 'esc' from alerts, view=%v want viewOverview", got.view)
+	}
+	if got.alerts.total != 0 {
+		t.Errorf("alerts payload should be cleared on back; got total=%d", got.alerts.total)
+	}
+}
+
+func TestUpdate_AKeyDoesNothingFromDrilldown(t *testing.T) {
+	// `a` is overview-only; pressing it from drill-down must NOT switch.
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewDrilldown,
+		apps:       []appSample{{name: "api"}},
+	}
+	updated, _ := m.Update(keyMsg("a"))
+	if updated.(model).view != viewDrilldown {
+		t.Errorf("drilldown should ignore 'a'; got view=%v", updated.(model).view)
+	}
+}
+
+func TestRenderAlertRow_FormatsSeverity(t *testing.T) {
+	row := alertlog.Row{TS: 1714000000, Sev: "crit", Rule: "audit:yara:milog_php_eval_obfuscation",
+		Title: "YARA hit", Body: "```yara hit: rule=… path=/var/www/x.php```"}
+	got := renderAlertRow(row)
+	if !strings.Contains(got, "audit:yara:milog_php_eval_obf…") {
+		t.Errorf("rule should truncate to 29 chars + ellipsis; got %q", got)
+	}
+	if !strings.Contains(got, "[crit]") {
+		t.Errorf("expected sev tag in row; got %q", got)
+	}
+	// Body backticks should be stripped for readability.
+	if strings.Contains(got, "```") {
+		t.Errorf("body backticks should be trimmed; got %q", got)
 	}
 }
 
