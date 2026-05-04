@@ -34,6 +34,15 @@ jobs:
           cache: true
           cache-dependency-path: go/go.sum
 
+      - name: Install BPF toolchain
+        # clang + libbpf headers so build.sh can compile the milog-probe
+        # eBPF object. Without it, exec_linux.go's //go:embed bpf/exec.bpf.o
+        # has no file to embed and `go vet` fails on Linux. ubuntu-latest
+        # ships clang but not libbpf-dev.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+
       - name: Bash bundle freshness
         # build.sh regenerates milog.sh from src/*.sh. If the diff is
         # non-empty, someone edited src/ but didn't rebuild — block
