@@ -33,7 +33,9 @@ mode_errors() {
 }
 
 _errors_help() {
-    cat <<EOF
+    # printf '%b' interprets the \033 escapes embedded in the color vars.
+    # `cat <<EOF` would dump them as literal text on real terminals.
+    printf '%b' "
 ${W}milog errors${NC} — what's broken right now, across every log source
 
   ${C}milog errors${NC}                          live tail (mixed view)
@@ -48,7 +50,7 @@ Live view (no flags):
 
 Summary view (any flag): scans alerts.log for ${C}app:<src>:<pat>${NC} fires
 within the window. Window grammar: today / yesterday / all / Nm / Nh / Nd / Nw.
-EOF
+"
 }
 
 # --- Live tail ----------------------------------------------------------------

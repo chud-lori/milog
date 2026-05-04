@@ -210,7 +210,10 @@ mode_audit() {
 }
 
 _audit_help() {
-    cat <<EOF
+    # printf '%b' interprets the \033 escape sequences in $W / $C / $NC.
+    # `cat <<EOF` would pass them through as the literal 4-char string
+    # \033[…m, which is what users on real terminals would actually see.
+    printf '%b' "
 ${W}milog audit${NC} — point-in-time host integrity scans
 
   ${C}milog audit fim ${NC}<sub>          file integrity (SHA256 drift on watched files)
@@ -234,7 +237,7 @@ Watchlists: ${C}AUDIT_FIM_PATHS${NC} / ${C}AUDIT_PERSISTENCE_PATHS${NC} / ${C}AU
 Listening-port scan reads from ${C}ss${NC} (or ${C}netstat${NC} fallback).
 YARA scan needs the system ${C}yara${NC} binary + ${C}AUDIT_YARA_PATHS${NC} configured.
 Rootkit scan is Linux-only (relies on /proc); silent no-op on macOS / BSD.
-EOF
+"
 }
 
 _audit_fim_subcmd() {

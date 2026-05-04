@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.2.0-13-g8006fd1
-# MILOG_BUILT=2026-05-04T13:30:30Z
+# MILOG_VERSION=v0.3.0-1-gd898d88-dirty
+# MILOG_BUILT=2026-05-04T13:46:50Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -3101,7 +3101,10 @@ mode_audit() {
 }
 
 _audit_help() {
-    cat <<EOF
+    # printf '%b' interprets the \033 escape sequences in $W / $C / $NC.
+    # `cat <<EOF` would pass them through as the literal 4-char string
+    # \033[…m, which is what users on real terminals would actually see.
+    printf '%b' "
 ${W}milog audit${NC} — point-in-time host integrity scans
 
   ${C}milog audit fim ${NC}<sub>          file integrity (SHA256 drift on watched files)
@@ -3125,7 +3128,7 @@ Watchlists: ${C}AUDIT_FIM_PATHS${NC} / ${C}AUDIT_PERSISTENCE_PATHS${NC} / ${C}AU
 Listening-port scan reads from ${C}ss${NC} (or ${C}netstat${NC} fallback).
 YARA scan needs the system ${C}yara${NC} binary + ${C}AUDIT_YARA_PATHS${NC} configured.
 Rootkit scan is Linux-only (relies on /proc); silent no-op on macOS / BSD.
-EOF
+"
 }
 
 _audit_fim_subcmd() {
@@ -5849,7 +5852,9 @@ mode_errors() {
 }
 
 _errors_help() {
-    cat <<EOF
+    # printf '%b' interprets the \033 escapes embedded in the color vars.
+    # `cat <<EOF` would dump them as literal text on real terminals.
+    printf '%b' "
 ${W}milog errors${NC} — what's broken right now, across every log source
 
   ${C}milog errors${NC}                          live tail (mixed view)
@@ -5864,7 +5869,7 @@ Live view (no flags):
 
 Summary view (any flag): scans alerts.log for ${C}app:<src>:<pat>${NC} fires
 within the window. Window grammar: today / yesterday / all / Nm / Nh / Nd / Nw.
-EOF
+"
 }
 
 # --- Live tail ----------------------------------------------------------------
