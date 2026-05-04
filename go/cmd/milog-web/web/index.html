@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>MiLog</title>
+<link rel="stylesheet" href="/static/app.css">
+</head><body>
+<header>
+  <h1>MiLog</h1>
+  <span class="ts" id="ts">—</span>
+  <span class="pill" id="status">connecting…</span>
+</header>
+<main>
+  <section>
+    <h2>System</h2>
+    <div class="sys">
+      <div class="card"><div class="lbl">CPU</div><div class="val" id="cpu">—</div><div class="sub" id="cpu-sub">&nbsp;</div><div class="bar"><span id="cpu-bar" style="width:0"></span></div></div>
+      <div class="card"><div class="lbl">Memory</div><div class="val" id="mem">—</div><div class="sub" id="mem-sub">&nbsp;</div><div class="bar"><span id="mem-bar" style="width:0"></span></div></div>
+      <div class="card"><div class="lbl">Disk</div><div class="val" id="disk">—</div><div class="sub" id="disk-sub">&nbsp;</div><div class="bar"><span id="disk-bar" style="width:0"></span></div></div>
+    </div>
+  </section>
+  <section>
+    <h2>Nginx (last minute)</h2>
+    <table id="apps">
+      <thead><tr><th>APP</th><th class="n">REQ</th><th class="n">2xx</th><th class="n">3xx</th><th class="n">4xx</th><th class="n">5xx</th></tr></thead>
+      <tbody><tr><td colspan="6">loading…</td></tr></tbody>
+    </table>
+  </section>
+  <section>
+    <div class="alerts-head">
+      <h2>Recent alerts</h2>
+      <span class="meta" id="alerts-count">—</span>
+      <select id="alerts-window" aria-label="alerts window">
+        <option value="1h">last 1h</option>
+        <option value="24h" selected>last 24h</option>
+        <option value="7d">last 7d</option>
+        <option value="today">today</option>
+        <option value="all">all</option>
+      </select>
+    </div>
+    <div class="table-scroll">
+      <table id="alerts">
+        <thead><tr><th>WHEN</th><th>SEV</th><th>RULE</th><th>TITLE</th></tr></thead>
+        <tbody><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div id="alert-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="alert-modal-title">
+      <div class="modal">
+        <header>
+          <span class="when" id="alert-modal-when">—</span>
+          <h3 id="alert-modal-title">—</h3>
+          <button type="button" class="close" id="alert-modal-close" aria-label="close (esc)">esc</button>
+        </header>
+        <div class="meta">
+          <span class="k">sev</span><span class="v" id="alert-modal-sev">—</span>
+          <span class="k">rule</span><span class="v" id="alert-modal-rule">—</span>
+        </div>
+        <pre id="alert-modal-body">—</pre>
+      </div>
+    </div>
+  </section>
+  <section>
+    <div class="alerts-head">
+      <h2>Logs (live tail)</h2>
+      <span class="meta" id="logs-count">—</span>
+      <span class="meta" id="logs-rate">—</span>
+      <span class="meta" id="logs-mode">poll</span>
+      <button id="logs-pause" type="button" class="logs-pause">pause</button>
+      <select id="logs-app" aria-label="app"></select>
+      <select id="logs-class" aria-label="status class">
+        <option value="any" selected>any</option>
+        <option value="2xx">2xx</option>
+        <option value="3xx">3xx</option>
+        <option value="4xx">4xx</option>
+        <option value="5xx">5xx</option>
+      </select>
+      <input id="logs-grep" class="logs-grep" placeholder="grep…">
+    </div>
+    <div id="logs-histogram" class="histogram"></div>
+    <div class="table-scroll">
+      <table id="logs">
+        <thead><tr><th>WHEN</th><th>IP</th><th>METHOD</th><th>PATH</th><th>STATUS</th></tr></thead>
+        <tbody><tr><td colspan="5" class="empty">pick an app…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+  <section id="err-section" hidden><div class="err" id="err">&nbsp;</div></section>
+</main>
+<footer>read-only · loopback by default · <span id="meta-uptime">—</span></footer>
+<script src="/static/app.js" defer></script>
+</body></html>

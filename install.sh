@@ -307,22 +307,22 @@ EOF
 # ---- install ----------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: install.sh [--with-geoip] [--with-web] [--bin PATH] [--script-url URL] [--uninstall]
+Usage: install.sh [--with-geoip] [--bin PATH] [--script-url URL] [--uninstall]
 
   --with-geoip      install mmdblookup (for GeoIP enrichment in top/suspects)
-  --with-web        install socat (for the 'milog web' dashboard)
   --bin PATH        install destination (default: /usr/local/bin/milog)
   --script-url URL  override milog.sh download URL (pipe-install mode)
   --uninstall       remove installed binary (keeps config and state dirs)
 
 Core deps (gawk, curl, sqlite3) are always installed.
-The --with-history flag is accepted silently for backward compatibility.
+The --with-history and --with-web flags are accepted silently for
+backward compatibility (history is default; the web dashboard now ships
+as a Go binary, no socat needed).
 
-Go companion binaries (milog-web, milog-tui) are OPTIONAL. They get
-picked up automatically when they're sitting next to install.sh — which
-happens if you cloned the repo and ran \`bash build.sh\` yourself (the
-contributor path). There's no prebuilt-binary distribution yet; that's
-the 'goreleaser' chunk still on the roadmap.
+The Go companion binaries milog-web (the dashboard server) and
+milog-tui are pulled automatically from the latest GitHub release. They
+also get picked up when sitting next to install.sh — that happens if you
+cloned the repo and ran \`bash build.sh\` yourself (contributor path).
 EOF
 }
 
@@ -386,13 +386,13 @@ resolve_script_src() {
 }
 
 main() {
-    local with_geoip=0 with_web=0 do_uninstall=0
+    local with_geoip=0 do_uninstall=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --with-geoip)   with_geoip=1;   shift ;;
-            --with-web)     with_web=1;     shift ;;
             --with-history) shift ;;   # deprecated no-op; sqlite3 is default
+            --with-web)     shift ;;   # deprecated no-op; web is a Go binary now
             --bin)          BIN_DST="${2:?--bin needs a path}"; shift 2 ;;
             --script-url)   SCRIPT_URL="${2:?--script-url needs a URL}"; shift 2 ;;
             --uninstall)    do_uninstall=1; shift ;;
@@ -416,7 +416,6 @@ main() {
     # always install. mmdblookup stays opt-in (needs a MaxMind account).
     local deps=(gawk curl sqlite3)
     (( with_geoip )) && deps+=(mmdblookup)
-    (( with_web ))   && deps+=(socat)
 
     # Only install what's missing — idempotent reruns stay fast.
     local need_install=() tool resolved

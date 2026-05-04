@@ -10,9 +10,10 @@ package main
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -35,14 +36,13 @@ import (
 	"github.com/chud-lori/milog/internal/token"
 )
 
-// dashboardHTML is the self-contained dashboard page — HTML + inline CSS
-// + inline JS. Copied from bash `_web_route_index`'s heredoc and embedded
-// at build time. The bash version stays as a fallback for installs
-// without the Go binary, but this is the authoritative copy going
-// forward.
+// webFS embeds the dashboard assets — index.html, app.css, app.js — split
+// into separate files so each language lints + diffs cleanly. The bundle
+// is the only artifact that ships; assets are rooted at `web/` here and
+// surfaced under `/static/*` on the server.
 //
-//go:embed dashboard.html
-var dashboardHTML []byte
+//go:embed web
+var webFS embed.FS
 
 // buildVersion is overridden at link time: `go build -ldflags "-X main.buildVersion=abc1234"`.
 var buildVersion = "unknown"
@@ -56,6 +56,11 @@ func main() {
 	tokenPath := token.Resolve()
 	auth := token.Middleware(tokenPath)
 
+	staticFS, err := fs.Sub(webFS, "web")
+	if err != nil {
+		log.Fatalf("milog-web: embed: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)                        // public
 	mux.Handle("/api/meta.json", auth(metaHandler(cfg)))       // token-gated
@@ -68,9 +73,15 @@ func main() {
 	mux.Handle("/metrics", auth(metricsHandler(cfg)))
 	mux.Handle("/api/latency.json", auth(latencyHandler(cfg)))
 	mux.Handle("/debug", auth(debugHandler(cfg)))
-	mux.Handle("/", auth(rootHandler(cfg)))
+	// Static dashboard assets (CSS / JS) live under /static/* and are
+	// served from the embed FS. http.FileServer sets Last-Modified so the
+	// browser revalidates with If-Modified-Since on each load — that's
+	// correct for our case (assets only change between binary upgrades).
+	mux.Handle("/static/", auth(http.StripPrefix("/static/", http.FileServer(http.FS(staticFS)))))
+	mux.Handle("/", auth(rootHandler(staticFS)))
 
-	// Security headers on every response — match bash `_web_respond`.
+	// Security headers on every response — see securityHeaders below for
+	// the policy (CSP, no-sniff, frame-deny, no-referrer).
 	handler := securityHeaders(mux)
 
 	addr := net.JoinHostPort(cfg.Bind, cfg.Port)
@@ -107,7 +118,8 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintln(w, "ok")
 }
 
-// metaHandler returns the same shape as bash `_web_route_meta`:
+// metaHandler emits dashboard config — apps, log dir, alerts status,
+// redacted webhook, host uptime, refresh cadence:
 //
 //	{"apps":[…], "log_dir":"…", "alerts":"enabled|disabled",
 //	 "webhook":"…redacted…", "uptime":"…", "refresh":N}
@@ -144,7 +156,7 @@ func summaryHandler(cfg *config.Config) http.HandlerFunc {
 
 // alertsHandler returns recent alerts.log rows filtered by the `window`
 // query param (default "24h", same grammar as `milog alerts`). Capped at
-// 100 rows. Shape matches bash `_web_route_alerts`:
+// 100 rows.
 //
 //	{"window":"24h","alerts":[{"ts":…,"rule":…,"sev":…,"title":…,"body":…}, …]}
 func alertsHandler(cfg *config.Config) http.HandlerFunc {
@@ -624,7 +636,7 @@ func collectSummary(cfg *config.Config) any {
 }
 
 // logsHandler returns recent log lines for one nginx app, filtered by
-// grep / path / status-class. Shape matches bash `_web_route_logs`:
+// grep / path / status-class:
 //
 //	{"app":"api","lines":[{"ts":"…","ip":"…","method":"…","path":"…",
 //	                        "status":200,"ua":"…","class":"2xx"}, …]}
@@ -716,13 +728,17 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-// rootHandler serves the embedded dashboard HTML on "/" and 404s
-// anything else that slipped through the auth-guarded catch-all.
-func rootHandler(cfg *config.Config) http.HandlerFunc {
-	// cfg currently unused — kept in signature for symmetry with the other
-	// handlers and for future template substitution (e.g. injecting the
-	// version banner server-side).
-	_ = cfg
+// rootHandler serves the embedded index.html on "/" and 404s anything
+// else that slipped through the auth-guarded catch-all. Static assets
+// (CSS / JS) are mounted separately at /static/*.
+func rootHandler(staticFS fs.FS) http.HandlerFunc {
+	indexHTML, err := fs.ReadFile(staticFS, "index.html")
+	if err != nil {
+		// Fatal at startup-time only — the embed contract guarantees
+		// presence at build, so a miss here means the binary itself is
+		// corrupt and serving anything else would just be confusing.
+		log.Fatalf("milog-web: read index.html from embed: %v", err)
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -730,7 +746,7 @@ func rootHandler(cfg *config.Config) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write(dashboardHTML)
+		_, _ = w.Write(indexHTML)
 	}
 }
 
@@ -748,13 +764,14 @@ func debugHandler(cfg *config.Config) http.HandlerFunc {
 		fmt.Fprintf(&sb, "log_dir:  %s\n", cfg.LogDir)
 		fmt.Fprintf(&sb, "apps:     %s\n", strings.Join(cfg.Apps, " "))
 		sb.WriteString("\nRoutes:\n")
-		sb.WriteString("  /                        dashboard (HTML + inline JS)\n")
+		sb.WriteString("  /                        dashboard (index.html)\n")
+		sb.WriteString("  /static/{app.css,app.js} dashboard assets (embedded)\n")
 		sb.WriteString("  /healthz                 public liveness probe\n")
 		sb.WriteString("  /api/meta.json           apps + alerts status + uptime\n")
 		sb.WriteString("  /api/summary.json        system + nginx counts\n")
 		sb.WriteString("  /api/alerts.json         fire history\n")
-		sb.WriteString("  /api/logs.json           log viewer tier 1\n")
-		sb.WriteString("  /api/logs/histogram.json timeline strip\n")
+		sb.WriteString("  /api/logs.json           recent nginx lines (filtered)\n")
+		sb.WriteString("  /api/logs/histogram.json per-minute timeline strip\n")
 		sb.WriteString("  /api/latency.json        request-time percentiles (requires combined_timed)\n")
 		sb.WriteString("  /api/stream              SSE live summary push\n")
 		sb.WriteString("  /api/logs/stream         SSE live log tail (per app, with filters)\n")

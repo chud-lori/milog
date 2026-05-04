@@ -30,9 +30,11 @@ src/
 ├── nginx.sh        # Log-parsing helpers called by many modes:
 │                   # nginx_minute_counts, nginx_check_http_alerts, nginx_row,
 │                   # sys_check_alerts, geoip_country, color_prefix, wait_or_key.
-├── web.sh          # Everything for `milog web` *except* the mode_web entry
-│                   # point: _web_handle, _web_respond, _web_route_*,
-│                   # _web_token_*, _web_access_log, _web_status, _web_stop.
+├── web.sh          # Token + lifecycle helpers for `milog web`. The
+│                   # dashboard server itself is the milog-web Go binary
+│                   # (see go/cmd/milog-web/). bash side: _web_token_*,
+│                   # _web_status, _web_stop, _web_rotate_token,
+│                   # _web_systemd_active.
 ├── modes/
 │   └── *.sh        # One file per `milog <subcommand>`. Each defines a
 │                   # single `mode_<name>` function (plus private `_<name>_*`

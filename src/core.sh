@@ -226,17 +226,16 @@ HISTORY_DB="$HOME/.local/share/milog/metrics.db"
 HISTORY_RETAIN_DAYS=30
 HISTORY_TOP_IP_N=50
 
-# Web dashboard. Off by default; `milog web` starts a tiny local HTTP
-# listener (socat or ncat) that serves a read-only JSON + HTML view.
-# Binds to loopback; expose via SSH tunnel, Tailscale, or Cloudflare
-# Tunnel (see README → "milog web"). Non-loopback bind requires --trust.
-# 8765 is unassigned by IANA and rarely used (unlike 8080, which collides
-# with Jenkins / Tomcat / "my random dev server"). Override via --port.
+# Web dashboard. Off by default; `milog web` execs the milog-web Go
+# binary, which serves a read-only JSON + HTML view on loopback. Expose
+# via SSH tunnel, Tailscale, or Cloudflare Tunnel (see README → "milog
+# web"). Non-loopback bind requires --trust. 8765 is unassigned by IANA
+# and rarely used (unlike 8080, which collides with Jenkins / Tomcat /
+# "my random dev server"). Override via --port.
 WEB_PORT=8765
 WEB_BIND="127.0.0.1"
 WEB_STATE_DIR="$HOME/.cache/milog"
 WEB_TOKEN_FILE="$HOME/.config/milog/web.token"
-WEB_ACCESS_LOG="$HOME/.cache/milog/web.access.log"
 
 # Optional user config — sourced if present. Can override any variable above.
 # Example:

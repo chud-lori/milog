@@ -10,8 +10,10 @@ headlessly. A read-only web dashboard (`milog web`) exposes the same data
 over HTTP with a minimal single-page HTML UI.
 
 **Runtime deps:** bash 4+, coreutils, `awk` (gawk preferred), `ps`, `df`,
-`curl` (alerts), `sqlite3` (history/trend/diff/auto-tune), and optionally
-`socat`/`ncat` (web dashboard) and `mmdblookup` (GeoIP).
+`curl` (alerts), `sqlite3` (history/trend/diff/auto-tune). The web
+dashboard ships as the `milog-web` Go binary (pulled by `install.sh`
+from GitHub releases, no system listener needed). `mmdblookup` is
+optional for GeoIP enrichment.
 
 **Target:** Linux VMs, `/var/log/nginx` (or an arbitrary dir via `LOG_DIR`).
 
@@ -357,7 +359,9 @@ stays clean.
   under, but a burst of rule hits inside one cooldown window still all
   produce webhooks if they're separate rule keys. Consider a coalescing
   queue in `mode_daemon` if this ever matters in practice.
-- **HTTP responses built in bash:** use byte-count (`wc -c`) for
-  `Content-Length`, not `${#var}` — under UTF-8 locales the latter counts
-  codepoints and truncates multi-byte responses. See `_web_respond` in
-  `src/web.sh` for the pattern.
+- **The dashboard server is `milog-web` (Go), not bash.** All HTTP
+  routing, JSON shaping, and dashboard markup live under
+  `go/cmd/milog-web/`; `src/web.sh` only hosts token + lifecycle
+  helpers for the bash launcher. There used to be a parallel bash/socat
+  router; it was deleted because keeping two implementations in sync
+  cost a chunk per UI change.
