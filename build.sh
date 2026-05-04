@@ -104,6 +104,48 @@ if [[ -d go && -f go/go.mod ]]; then
                     echo "build.sh: go build ${bin} failed — milog.sh still usable" >&2
                 fi
             done
+
+            # milog-probe is Linux-only (eBPF). On Linux build hosts we
+            # also need clang to compile the .bpf.c source into the .o
+            # blob that exec_linux.go embeds. Skip path on macOS / BSD,
+            # or on a Linux host without clang installed.
+            uname_s=$(uname -s 2>/dev/null || echo unknown)
+            probe_dir="internal/probe"
+            bpf_src="${probe_dir}/bpf/exec.bpf.c"
+            bpf_obj="${probe_dir}/bpf/exec.bpf.o"
+            if [[ "$uname_s" == "Linux" ]]; then
+                if command -v clang >/dev/null 2>&1; then
+                    if clang -target bpf -O2 -g -Wall \
+                        -D__TARGET_ARCH_$(uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/') \
+                        -I/usr/include/$(uname -m)-linux-gnu \
+                        -c "$bpf_src" -o "$bpf_obj" 2>/dev/null; then
+                        :
+                    else
+                        # Retry without the -I path (some distros put
+                        # libbpf headers in /usr/include directly).
+                        clang -target bpf -O2 -g -Wall \
+                            -c "$bpf_src" -o "$bpf_obj" 2>&1 || {
+                            echo "build.sh: clang failed to compile BPF object — skipping milog-probe" >&2
+                            bpf_obj=""
+                        }
+                    fi
+                    if [[ -s "$bpf_obj" ]]; then
+                        if go build \
+                            -ldflags "-X main.buildVersion=${MILOG_VERSION}" \
+                            -o "bin/milog-probe" \
+                            "./cmd/milog-probe"; then
+                            echo "built go/bin/milog-probe  (version ${MILOG_VERSION})"
+                        else
+                            echo "build.sh: go build milog-probe failed — milog.sh + other binaries still usable" >&2
+                        fi
+                    fi
+                else
+                    echo "build.sh: clang missing — skipping milog-probe (apt install clang llvm)" >&2
+                fi
+            fi
+            # Non-Linux build hosts skip the probe silently. Probe is
+            # never useful off Linux anyway; no point in printing a
+            # banner about it on every macOS build.
         )
     else
         echo "build.sh: go toolchain not found — skipping milog-web + milog-tui (install.sh fallback stays)" >&2
