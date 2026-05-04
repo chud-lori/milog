@@ -126,12 +126,12 @@ type Line struct {
 //
 //	<ip> - - [<time>] "METHOD <path> HTTP/1.1" <status> <bytes> "<ref>" "<ua>" [<rt>]
 //
-// Implementation scans on `"` boundaries — same approach as the bash
-// `_web_route_logs` awk. Resilient to missing $request_time and unusual
-// UA strings; returns Status=0 on any malformed row.
+// Implementation scans on `"` boundaries — that's the only stable
+// anchor in the combined format. Resilient to missing $request_time
+// and unusual UA strings; returns Status=0 on any malformed row.
 func ParseLine(raw string) Line {
 	var ln Line
-	// Split on `"` — same trick bash uses. Fields are:
+	// Split on `"`. Fields are:
 	//   [0] "<ip> - - [<time>] "   (ends in a space before the opening quote)
 	//   [1] "METHOD <path> HTTP/1.1"
 	//   [2] " <status> <bytes> "

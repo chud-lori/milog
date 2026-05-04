@@ -238,13 +238,15 @@ mode_doctor() {
 
     # ---- web dashboard ------------------------------------------------------
     _doc_head "web dashboard"
-    if command -v socat >/dev/null 2>&1 || command -v ncat >/dev/null 2>&1; then
-        local listener
-        listener=$(command -v socat 2>/dev/null || command -v ncat 2>/dev/null)
-        _doc_ok "listener available  ($listener)"
+    # milog-web is the Go binary served by `milog web`. _web_go_binary
+    # checks the same path order the launcher uses, so the warning here
+    # mirrors what users will hit at start time.
+    local web_bin
+    if web_bin=$(_web_go_binary 2>/dev/null) && [[ -n "$web_bin" ]]; then
+        _doc_ok "milog-web binary present  ($web_bin)"
     else
-        _doc_warn "neither socat nor ncat installed" \
-                  "install with: sudo apt install -y socat — enables 'milog web'"
+        _doc_warn "milog-web binary not found" \
+                  "rerun install.sh — it pulls milog-web from the latest GitHub release"
         warn=$(( warn + 1 ))
     fi
     if [[ -f "$WEB_STATE_DIR/web.pid" ]]; then

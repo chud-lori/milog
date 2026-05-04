@@ -1,0 +1,111 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin:0; background:#0b0d10; color:#d6d9dc; font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+header { display:flex; align-items:baseline; gap:1rem; padding:1rem 1.2rem; border-bottom:1px solid #1b1f24; }
+header h1 { margin:0; font-size:1.05rem; font-weight:600; letter-spacing:.05em; }
+header .ts { color:#6b7177; font-size:.85rem; }
+header .pill { margin-left:auto; padding:.1rem .5rem; border:1px solid #30363d; border-radius:.3rem; font-size:.8rem; }
+.pill.ok  { color:#3fb950; border-color:#1a7f37; }
+.pill.bad { color:#f85149; border-color:#da3633; }
+main { padding:1rem 1.2rem; display:grid; gap:1.5rem; max-width:1000px; margin:0 auto; }
+section h2 { margin:0 0 .6rem; font-size:.8rem; color:#8b949e; text-transform:uppercase; letter-spacing:.1em; font-weight:600; }
+.sys { display:grid; grid-template-columns: repeat(3, 1fr); gap:.8rem; }
+.sys .card { padding:.8rem 1rem; background:#10141a; border:1px solid #1b1f24; border-radius:.4rem; }
+.sys .lbl { color:#8b949e; font-size:.75rem; text-transform:uppercase; letter-spacing:.08em; }
+.sys .val { font-size:1.5rem; font-weight:600; margin-top:.1rem; }
+.sys .sub { color:#6b7177; font-size:.8rem; }
+.bar { margin-top:.5rem; height:6px; background:#1b1f24; border-radius:2px; overflow:hidden; }
+.bar > span { display:block; height:100%; background:#3fb950; transition:width .4s; }
+.bar > span.warn { background:#d29922; }
+.bar > span.crit { background:#f85149; }
+
+table { width:100%; border-collapse:collapse; font-size:.9rem; }
+th, td { text-align:left; padding:.45rem .6rem; border-bottom:1px solid #1b1f24; }
+th { color:#8b949e; font-weight:500; font-size:.75rem; text-transform:uppercase; letter-spacing:.1em; }
+th.n, td.n { text-align:right; font-variant-numeric: tabular-nums; }
+td.err4 { color:#d29922; }
+td.err5 { color:#f85149; }
+
+.sev-crit { color:#f85149; font-weight:600; }
+.sev-warn { color:#d29922; font-weight:600; }
+.sev-info { color:#3fb950; font-weight:600; }
+
+.alerts-head { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:.6rem; gap:.8rem; }
+.alerts-head h2 { margin:0; }
+.alerts-head .meta { color:#6b7177; font-size:.75rem; margin-left:auto; }
+.alerts-head select,
+.alerts-head input,
+.alerts-head button { background:#10141a; color:#d6d9dc; border:1px solid #30363d; border-radius:.3rem; padding:.15rem .4rem; font:inherit; font-size:.8rem; }
+.alerts-head .logs-pause { padding:.15rem .6rem; cursor:pointer; }
+.alerts-head .logs-grep { width:14ch; }
+
+td.rule { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space:nowrap; }
+td.when { color:#8b949e; white-space:nowrap; font-variant-numeric: tabular-nums; }
+td.title { color:#d6d9dc; overflow:hidden; text-overflow:ellipsis; max-width:48ch; }
+.empty { color:#6b7177; padding:.6rem 0; }
+
+/* Click + hover affordance for alert rows — operator visual that
+   drill-down is wired. */
+#alerts tbody tr { cursor: pointer; }
+#alerts tbody tr:hover td { background:#10141a; }
+
+/* Alert drill-down modal. Backdrop fills viewport; panel centers via
+   flex. Body shown in a <pre> block so multi-line alert content
+   (audit drift, app stack traces) keeps its formatting. */
+.modal-backdrop { display:none; position:fixed; inset:0; z-index:10;
+                  background:rgba(0,0,0,.65); align-items:center; justify-content:center; }
+.modal-backdrop.open { display:flex; }
+.modal { background:#10141a; border:1px solid #30363d; border-radius:.5rem;
+         max-width:min(720px, 90vw); max-height:80vh; width:100%;
+         display:flex; flex-direction:column; box-shadow: 0 8px 32px rgba(0,0,0,.5); }
+.modal header { display:flex; align-items:baseline; gap:.6rem; padding:.8rem 1rem;
+                border-bottom:1px solid #1b1f24; }
+.modal header .when { color:#6b7177; font-size:.8rem; font-variant-numeric: tabular-nums; }
+.modal header h3 { margin:0; font-size:.95rem; flex:1; overflow:hidden; text-overflow:ellipsis; }
+.modal header .close { background:none; border:1px solid #30363d; color:#8b949e;
+                       border-radius:.3rem; padding:.1rem .5rem; font:inherit; font-size:.85rem;
+                       cursor:pointer; }
+.modal header .close:hover { color:#f85149; border-color:#da3633; }
+.modal .meta { padding:.6rem 1rem; border-bottom:1px solid #1b1f24;
+               font-size:.85rem; color:#8b949e; display:grid;
+               grid-template-columns:auto 1fr; column-gap:.8rem; row-gap:.3rem; }
+.modal .meta .k { color:#6b7177; text-transform:uppercase; letter-spacing:.08em; font-size:.7rem; }
+.modal .meta .v { color:#d6d9dc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                  word-break: break-all; }
+.modal pre { margin:0; padding:1rem; overflow:auto; flex:1; font-size:.85rem;
+             white-space:pre-wrap; word-break:break-word; color:#d6d9dc;
+             background:#0b0d10; border-radius:0 0 .5rem .5rem; }
+
+/* Alerts table scrolls inside its own box so it doesn't grow the page.
+   Max ~14 rows visible; header stays pinned while scrolling. */
+.table-scroll { max-height: 26rem; overflow-y: auto; border:1px solid #1b1f24; border-radius:.4rem; }
+.table-scroll table { border-collapse: separate; border-spacing: 0; }
+.table-scroll thead th { position: sticky; top: 0; background:#10141a; z-index: 1; border-bottom:1px solid #1b1f24; }
+.table-scroll tbody tr:last-child td { border-bottom: none; }
+.table-scroll::-webkit-scrollbar { width: 10px; }
+.table-scroll::-webkit-scrollbar-track { background: #0b0d10; }
+.table-scroll::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; }
+.table-scroll::-webkit-scrollbar-thumb:hover { background: #484f58; }
+.table-scroll { scrollbar-color: #30363d #0b0d10; scrollbar-width: thin; }
+
+/* Log viewer histogram — N tiny bars forming a per-minute timeline
+   above the log table. */
+.histogram { display:flex; align-items:flex-end; gap:1px; height:32px; margin:.4rem 0 .6rem;
+             background:#0b0d10; border:1px solid #1b1f24; border-radius:.3rem; padding:2px; }
+.histogram .bar { flex:1 1 auto; background:#3fb950; min-width:1px; border-radius:1px; transition:height .2s; }
+.histogram .bar.empty { background:#1b1f24; }
+.histogram .bar:hover { background:#58a6ff; }
+
+/* Logs table — denser than alerts since lines are higher volume. */
+#logs td { font-size:.82rem; padding:.25rem .5rem; }
+#logs td.ip  { color:#8b949e; font-variant-numeric: tabular-nums; white-space:nowrap; }
+#logs td.mth { color:#6b7177; white-space:nowrap; }
+#logs td.pth { color:#d6d9dc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+               overflow:hidden; text-overflow:ellipsis; max-width:52ch; }
+#logs td.st2 { color:#3fb950; text-align:right; font-variant-numeric: tabular-nums; }
+#logs td.st3 { color:#8b949e; text-align:right; font-variant-numeric: tabular-nums; }
+#logs td.st4 { color:#d29922; text-align:right; font-variant-numeric: tabular-nums; }
+#logs td.st5 { color:#f85149; text-align:right; font-variant-numeric: tabular-nums; }
+
+footer { padding:1rem 1.2rem; color:#6b7177; font-size:.75rem; text-align:center; }
+.err { color:#f85149; padding:.6rem; border:1px solid #da3633; border-radius:.3rem; background:#2a1215; }

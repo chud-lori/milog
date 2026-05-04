@@ -136,7 +136,7 @@ add the daemon's user to `adm` group, or edit the unit's `User=` to
 
 ## Web dashboard stuck at "connecting…"
 
-The browser reached the HTML but the inline JS never got to call
+The browser reached the HTML but `app.js` never got to call
 `/api/summary.json`. Usually:
 
 - **`milog web` was Ctrl+C'd** after you opened the page. Restart it

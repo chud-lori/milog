@@ -28,8 +28,9 @@ server hardening.
 ## Requirements
 
 Linux, bash 4+, coreutils, `ps`, `df`, `uptime`, read access to
-`/var/log/nginx/*.access.log`. Everything else (gawk, curl, sqlite3, and
-optionally mmdblookup / socat) is handled by `install.sh`.
+`/var/log/nginx/*.access.log`. Everything else (gawk, curl, sqlite3,
+optionally mmdblookup, plus the `milog-web` / `milog-tui` Go binaries)
+is handled by `install.sh`.
 
 ## Install
 
@@ -73,11 +74,11 @@ Opt-in extras:
 # GeoIP enrichment (adds mmdblookup; also needs a MaxMind MMDB later)
 curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
   | sudo bash -s -- --with-geoip
-
-# Web dashboard (adds socat)
-curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
-  | sudo bash -s -- --with-web
 ```
+
+The web dashboard ships as the `milog-web` Go binary — `install.sh`
+fetches it from the latest GitHub release alongside `milog` itself, so
+no separate flag and no system listener (socat / ncat) is needed.
 
 ### From a clone (contributors)
 

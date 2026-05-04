@@ -1,9 +1,10 @@
-// Package token handles web-UI auth — same token file bash uses.
+// Package token handles web-UI auth.
 //
-// milog-web reuses ~/.config/milog/web.token (mode 0600, 32-byte hex) so
-// users don't get two separate auth systems when running the Go binary
-// vs the bash socat handler. Rotating via `milog web rotate-token` works
-// for both — the file is read per-request, never cached.
+// The file ~/.config/milog/web.token (mode 0600, 32-byte hex) is the
+// single source of truth: the bash launcher generates it (see
+// `_web_token_ensure`), `milog web rotate-token` regenerates, and this
+// package reads it on every request — never cached, so rotation takes
+// effect at the next HTTP call without restarting milog-web.
 package token
 
 import (

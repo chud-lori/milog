@@ -24,7 +24,6 @@
 _install_catalog() {
     cat <<"EOF"
 geoip:mmdblookup:mmdb-bin:libmaxminddb:libmaxminddb:GeoIP COUNTRY column via MaxMind lookup
-web:socat:socat:socat:socat:milog web dashboard (socat HTTP listener)
 history:sqlite3:sqlite3:sqlite:sqlite:history DB for trend / diff / auto-tune
 EOF
 }
@@ -202,8 +201,10 @@ ${W}USAGE${NC}
 
 ${W}FEATURES${NC}
   geoip      GeoIP COUNTRY column (mmdblookup)
-  web        milog web dashboard (socat)
   history    history DB for trend / diff / auto-tune (sqlite3)
+
+${D}The web dashboard ships as the milog-web Go binary (no system deps);
+install.sh fetches it from the latest GitHub release alongside milog itself.${NC}
 
 ${D}install.sh --with-X flags are the \"first-install\" path; this subcommand is for
 later additions without rerunning install.sh.${NC}

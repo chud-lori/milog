@@ -1,32 +1,27 @@
 # Web dashboard
 
-`milog web` starts a tiny local HTTP server (powered by `socat`) that
-serves a read-only JSON + HTML view of the current system + per-app
-state. Useful when you want to glance at your server from a phone or
-laptop without SSHing in.
+`milog web` execs the `milog-web` Go binary, which serves a read-only
+JSON + HTML view of the current system + per-app state on loopback.
+Useful when you want to glance at your server from a phone or laptop
+without SSHing in.
 
 ## One-time install
 
-The curl installer auto-downloads the `milog-web` Go binary from the
-matching GitHub Release for your arch — no Go toolchain needed on
-the server. If no prebuilt asset matches your arch (or no release is
-published yet), the installer falls back to the bash socat handler;
-that needs `socat` (or `ncat`):
+The curl installer auto-downloads `milog-web` from the matching GitHub
+Release for your arch alongside `milog` itself — no Go toolchain
+needed on the server, no separate flag:
 
 ```bash
-# Installer — pulls prebuilt milog-web when available, socat fallback otherwise
 curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
-  | sudo bash -s -- --with-web
-
-# If you ended up on the socat fallback path, install it directly:
-sudo apt install -y socat        # Debian / Ubuntu
-sudo dnf install -y socat        # Fedora / Rocky / RHEL
+  | sudo bash
 ```
 
-The Go binary gives SSE live push, HDR latency percentiles, and the
-`/metrics` Prometheus endpoint. The socat fallback serves the same
-dashboard via the polling-based bash routes — same data, no live
-stream.
+`milog-web` lands at `/usr/local/bin/milog-web` (or
+`/usr/local/libexec/milog/milog-web` for package installs). It hosts
+SSE live push, HDR latency percentiles, and the `/metrics` Prometheus
+endpoint. If the binary is missing, `milog web` exits with a clear
+error pointing at install.sh — there is no longer a bash fallback to
+maintain.
 
 ## Run it
 

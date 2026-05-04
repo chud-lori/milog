@@ -252,7 +252,6 @@ case "${1:-}" in
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
-    __web_handler) _web_handle ;;
     # Hidden subcommand: invoked by milog-probe (eBPF sidecar) once per
     # rule hit. Args are positional: <rule_key> <title> <body> <color>.
     # Goes through the full alert path so cooldown / silence / dedup /
