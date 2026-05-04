@@ -15,6 +15,7 @@ Everything in-depth lives under [`docs/`](docs/) — skim the
 
 - [**Configuration**](docs/configuration.md) — variables, env overrides, nginx `log_format`
 - [**Alerts**](docs/alerts.md) — Discord / Slack / Telegram / Matrix setup, rule catalog, history
+- [**Host integrity audits**](docs/audit.md) — `milog audit` (fim / rootkit / persistence / ports / accounts / yara), provocations to verify detection
 - [**Web dashboard**](docs/web-dashboard.md) — `milog web`, systemd user service, SSH / Tailscale / Cloudflare Tunnel exposure patterns
 - [**Historical metrics**](docs/historical-metrics.md) — SQLite time series, `trend` / `diff` / `auto-tune`
 - [**`milog daemon`**](docs/daemon.md) — headless mode, systemd service, permissions

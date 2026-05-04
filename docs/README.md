@@ -9,6 +9,9 @@ quick start; this directory has everything else.
   nginx `log_format` recipe, permissions on `/var/log/nginx`
 - [**Alerts**](alerts.md) — Discord / Slack / Telegram / Matrix setup,
   cooldown + dedup, rule catalog, how `milog alerts` history works
+- [**Host integrity audits**](audit.md) — `milog audit` modes (fim,
+  rootkit, persistence, ports, accounts, yara), provocations to verify
+  detection, known false positives
 - [**Web dashboard**](web-dashboard.md) — `milog web`, systemd user
   service, three exposure patterns (SSH tunnel, Tailscale, Cloudflare)
 - [**TUI (`milog tui`)**](tui.md) — bubbletea Go binary, when to pick
