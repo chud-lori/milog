@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=7f59282-dirty
-# MILOG_BUILT=2026-05-03T08:18:34Z
+# MILOG_VERSION=v0.2.0-dirty
+# MILOG_BUILT=2026-05-04T09:37:20Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -9278,6 +9278,9 @@ ${W}OPS${NC}
   ${C}audit yara${NC}          YARA scan over webroot (webshell + obfuscation rules)
   ${C}audit accounts${NC}      passwd / sudoers / SSH-key line-level diff
   ${C}audit rootkit${NC}       hidden-process / ld.so.preload / tmp-exec heuristics
+
+${W}KERNEL OBSERVABILITY${NC} (Linux only — needs ${C}milog-probe${NC} sidecar)
+  ${C}milog-probe${NC}          eBPF exec watcher: shell-from-web-worker, exec-from-tmp, suid-escalation
   ${C}bench [--full]${NC}     benchmark harness against synthetic fixtures
   ${C}completions <shell>${NC}  install / print bash|zsh|fish completions
 
@@ -9455,6 +9458,32 @@ case "${1:-}" in
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
     __web_handler) _web_handle ;;
+    # Hidden subcommand: invoked by milog-probe (eBPF sidecar) once per
+    # rule hit. Args are positional: <rule_key> <title> <body> <color>.
+    # Goes through the full alert path so cooldown / silence / dedup /
+    # routing / hooks all apply — same as audit-layer rules. NOT
+    # documented in user help on purpose; if a user invokes it directly,
+    # `milog alert test` is what they actually wanted.
+    _internal_alert)
+        shift
+        if (( $# < 3 )); then
+            echo -e "${R}_internal_alert: needs <rule_key> <title> <body> [color]${NC}" >&2
+            exit 1
+        fi
+        # Gate on cooldown — milog-probe shells us out per matched
+        # event without filtering, so bursty exec floods (e.g. an
+        # attacker piping output through `xargs sh`) would otherwise
+        # spam the webhook. alert_should_fire bumps the cooldown
+        # state; alert_fire then handles silence + dedup + delivery.
+        if alert_should_fire "$1"; then
+            alert_fire "$2" "$3" "${4:-15158332}" "$1"
+            # alert_fire backgrounds each destination's curl. We wait
+            # so this one-shot CLI exits AFTER delivery — otherwise
+            # orphaned curls might be killed during systemd cgroup
+            # teardown of the milog-probe → milog cmd chain.
+            wait
+        fi
+        ;;
     -h|--help|help) show_help ;;
     ""|logs)  color_prefix ;;
     *)

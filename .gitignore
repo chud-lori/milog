@@ -16,5 +16,11 @@ plan.md
 # are distributed via GitHub Releases.
 /go/bin/
 
+# Compiled BPF object — built per-build by clang on the Linux host
+# from go/internal/probe/bpf/exec.bpf.c. Bytecode is portable across
+# little-endian Linux archs (x86_64 + aarch64), but rebuilding is
+# cheap and keeps the repo free of binary blobs that diff badly.
+/go/internal/probe/bpf/*.o
+
 # goreleaser output — only exists during a release run or local snapshot.
 /dist/
