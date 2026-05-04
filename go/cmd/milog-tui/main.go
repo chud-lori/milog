@@ -5,13 +5,14 @@
 // Bash `milog monitor` stays — this is an additional option, not a
 // replacement.
 //
-// Five views:
+// Six views:
 //
 //	overview    header + system bars + per-app table (default)
 //	drilldown   one app: top paths, top IPs, recent alerts
 //	alerts      global last-24h alert log, latest first
 //	paths       top paths summed across every configured app
 //	errors      pattern-fire aggregation (app:* rule keys) with per-source breakdown
+//	trend       per-app request-rate sparklines over the last hour from the SQLite history DB
 //
 // Key bindings:
 //
@@ -25,10 +26,12 @@
 //	a           open the global alerts view
 //	P           open the paths-cross-app view (capital P; lowercase p is pause)
 //	e           open the errors aggregation view
-//	esc / h     leave drill-down / alerts / paths / errors → overview
+//	t           open the trend view
+//	esc / h     leave drill-down / alerts / paths / errors / trend → overview
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -42,6 +45,7 @@ import (
 
 	"github.com/chud-lori/milog/internal/alertlog"
 	"github.com/chud-lori/milog/internal/config"
+	"github.com/chud-lori/milog/internal/history"
 	"github.com/chud-lori/milog/internal/nginxlog"
 	"github.com/chud-lori/milog/internal/sysinfo"
 	"github.com/chud-lori/milog/internal/sysstat"
@@ -76,6 +80,7 @@ const (
 	viewAlerts
 	viewPaths
 	viewErrors
+	viewTrend
 )
 
 // alertsViewCap caps the global alerts view at a sensible row budget.
@@ -97,6 +102,12 @@ const (
 	// build a consistent mental model; row cap matches paths view.
 	errorsViewWindow = "24h"
 	errorsViewCap    = 12
+
+	// Trend view: 60-minute window, 1 char per minute → 60-char-wide
+	// sparkline. Fits a 100-col terminal alongside ~30 chars of stats
+	// column. The bash daemon writes one row per minute, so 60 rows
+	// is the natural upper bound and there's nothing to bucket.
+	trendWindowMinutes = 60
 )
 
 // ---- Styles -----------------------------------------------------------
@@ -230,6 +241,30 @@ type errorsMsg struct {
 	data errorsData
 }
 
+// trendRow is one app's hour of per-minute request counts plus the
+// stats we render. cur is the most-recent minute; peak is the max
+// over the window; sum is total requests in the window.
+type trendRow struct {
+	app  string
+	mins []int // length up to trendWindowMinutes, oldest → newest
+	cur  int
+	peak int
+	sum  int
+}
+
+type trendData struct {
+	rows []trendRow
+	// State of the underlying data source: ErrNotConfigured (HISTORY
+	// off / file missing), ErrNoBinary (no sqlite3), or any other
+	// error from the LoadMinutes call. Nil means "data loaded fine,
+	// even if rows is empty (quiet host)".
+	loadErr error
+}
+
+type trendMsg struct {
+	data trendData
+}
+
 type model struct {
 	cfg        *config.Config
 	width      int
@@ -251,6 +286,7 @@ type model struct {
 	alerts      alertsData    // current alerts-view payload (empty when not in viewAlerts)
 	paths       pathsData     // current paths-view payload (empty when not in viewPaths)
 	errors      errorsData    // current errors-view payload (empty when not in viewErrors)
+	trend       trendData     // current trend-view payload (empty when not in viewTrend)
 }
 
 // ---- Commands ---------------------------------------------------------
@@ -383,6 +419,85 @@ func alertsSampleCmd(cfg *config.Config) tea.Cmd {
 		}
 		d.rows = rows
 		return alertsMsg{data: d}
+	}
+}
+
+// trendSampleCmd loads the last trendWindowMinutes of per-minute
+// request counts from the SQLite history DB, bucketed by app. The
+// bash daemon already writes per-minute rows so we don't need to
+// re-bucket — just align timestamps to fixed minute slots so apps
+// with different first-write timestamps still line up visually.
+//
+// Errors are passed through to the renderer rather than stuffed in
+// model.status because the trend view has its own diagnostic real
+// estate. ErrNotConfigured / ErrNoBinary get a friendly hint pointing
+// at `milog install history`; other errors render verbatim.
+func trendSampleCmd(cfg *config.Config) tea.Cmd {
+	return func() tea.Msg {
+		var d trendData
+		// 60-minute lookback. We add 60s of slack at the front edge
+		// because the daemon writes the *previous* completed minute,
+		// so "now - 1h" might miss the row that just landed seconds
+		// ago. Cheap insurance against a confusing "rate=0 cur" in
+		// the right column.
+		since := time.Now().Add(-time.Duration(trendWindowMinutes+1)*time.Minute).Unix()
+		raw, err := history.LoadMinutes(cfg.HistoryDB, since)
+		if err != nil {
+			d.loadErr = err
+			return trendMsg{data: d}
+		}
+
+		// Stable order: configured-app order first, then any extra
+		// apps from the DB that aren't in cfg.Apps (host changed
+		// configs since last write). Both branches preserve insertion
+		// order so the rendered rows don't flicker on tick.
+		seen := map[string]bool{}
+		ordered := make([]string, 0, len(raw))
+		for _, a := range cfg.Apps {
+			if _, ok := raw[a]; ok {
+				ordered = append(ordered, a)
+				seen[a] = true
+			}
+		}
+		for a := range raw {
+			if !seen[a] {
+				ordered = append(ordered, a)
+			}
+		}
+
+		nowMin := time.Now().Unix() / 60
+		for _, app := range ordered {
+			rows := raw[app]
+			if len(rows) == 0 {
+				continue
+			}
+			// Bucket into a fixed-size slot array indexed by
+			// `(rowMin - oldestSlot)` where slot 0 is the oldest
+			// minute in the window. Missing minutes (server idle)
+			// stay at zero — the sparkline glyph for zero is the
+			// flattest one, which reads as "nothing happened" at
+			// a glance. Right-edge of the slot array is `now`.
+			slots := make([]int, trendWindowMinutes)
+			oldestSlot := nowMin - int64(trendWindowMinutes-1)
+			for _, r := range rows {
+				rowMin := r.TS / 60
+				idx := int(rowMin - oldestSlot)
+				if idx < 0 || idx >= trendWindowMinutes {
+					continue
+				}
+				slots[idx] += r.Req
+			}
+			tr := trendRow{app: app, mins: slots}
+			for _, v := range slots {
+				tr.sum += v
+				if v > tr.peak {
+					tr.peak = v
+				}
+			}
+			tr.cur = slots[len(slots)-1]
+			d.rows = append(d.rows, tr)
+		}
+		return trendMsg{data: d}
 	}
 }
 
@@ -661,6 +776,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "e":
 				m.view = viewErrors
 				return m, errorsSampleCmd(m.cfg)
+			case "t":
+				m.view = viewTrend
+				return m, trendSampleCmd(m.cfg)
 			}
 		case viewDrilldown:
 			switch msg.String() {
@@ -701,6 +819,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "r":
 				return m, errorsSampleCmd(m.cfg)
 			}
+		case viewTrend:
+			switch msg.String() {
+			case "esc", "h", "left", "backspace":
+				m.view = viewOverview
+				m.trend = trendData{}
+				return m, nil
+			case "r":
+				return m, trendSampleCmd(m.cfg)
+			}
 		}
 
 	case tickMsg:
@@ -723,6 +850,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			batch = append(batch, pathsSampleCmd(m.cfg))
 		case viewErrors:
 			batch = append(batch, errorsSampleCmd(m.cfg))
+		case viewTrend:
+			batch = append(batch, trendSampleCmd(m.cfg))
 		}
 		return m, tea.Batch(batch...)
 
@@ -777,6 +906,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.data.err != nil {
 			m.status = "errors: " + msg.data.err.Error()
 		}
+
+	case trendMsg:
+		m.trend = msg.data
+		// Don't set m.status — the trend view renders its own
+		// loadErr inline so the operator sees the diagnostic in
+		// context rather than as a generic footer status.
 	}
 	return m, nil
 }
@@ -797,6 +932,8 @@ func (m model) View() string {
 		b.WriteString(m.renderPathsView())
 	case viewErrors:
 		b.WriteString(m.renderErrorsView())
+	case viewTrend:
+		b.WriteString(m.renderTrendView())
 	default:
 		b.WriteString(m.renderSystem())
 		b.WriteString("\n\n")
@@ -1201,6 +1338,78 @@ func (m model) renderErrorsView() string {
 	return b.String()
 }
 
+// renderTrendView shows per-app request-rate sparklines from the
+// SQLite history DB over the last hour. One row per app:
+//
+//	app   ▁▂▅▇▆▃▂▁ ··· ▆█▇▅  cur=12 1h=4567 peak=89
+//
+// The bash daemon writes one row per minute, so the sparkline is
+// 60 chars wide (one glyph per minute). Apps with no data in the
+// window don't appear; missing minutes (server idle) render as the
+// flattest glyph.
+func (m model) renderTrendView() string {
+	d := m.trend
+	var b strings.Builder
+
+	b.WriteString("  ")
+	b.WriteString(labelStyle.Render(fmt.Sprintf(
+		"REQUEST TREND — last %d min, per minute",
+		trendWindowMinutes,
+	)))
+	b.WriteString("\n")
+
+	if d.loadErr != nil {
+		// ErrNotConfigured / ErrNoBinary get a fix-it hint; other
+		// errors render verbatim so the operator can debug without
+		// shelling around. Both paths share the warn color rather
+		// than crit — missing-history is a feature off, not a bug.
+		hint := ""
+		switch {
+		case errors.Is(d.loadErr, history.ErrNotConfigured):
+			hint = "  enable with: HISTORY_ENABLED=1 + `milog install history` (provisions sqlite3 + DB schema)"
+		case errors.Is(d.loadErr, history.ErrNoBinary):
+			hint = "  install with: `milog install history` (resolves apt/dnf/brew per host)"
+		}
+		b.WriteString("  ")
+		b.WriteString(warnStyle.Render(d.loadErr.Error()))
+		b.WriteString("\n")
+		if hint != "" {
+			b.WriteString(dimStyle.Render(hint))
+			b.WriteString("\n")
+		}
+		return b.String()
+	}
+
+	if len(d.rows) == 0 {
+		b.WriteString("  ")
+		b.WriteString(dimStyle.Render(
+			"no data in window (quiet host, or daemon hasn't completed a minute yet)",
+		))
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	// Layout per row:
+	//   2 leading spaces + nameW + 1 + sparkW + 2 + statsW
+	// nameW: longest app name in d.rows + 1 padding char
+	// sparkW: trendWindowMinutes (= 60 by default)
+	// statsW: ~24 chars for "cur=NNN 1h=NNNNNN peak=NNN"
+	nameW := 4
+	for _, r := range d.rows {
+		if len(r.app) > nameW {
+			nameW = len(r.app)
+		}
+	}
+	for _, r := range d.rows {
+		spark := renderSparkline(r.mins, trendWindowMinutes)
+		stats := fmt.Sprintf("cur=%-4d 1h=%-7d peak=%-4d",
+			r.cur, r.sum, r.peak)
+		b.WriteString(fmt.Sprintf("  %-*s  %s  %s\n",
+			nameW, r.app, spark, dimStyle.Render(stats)))
+	}
+	return b.String()
+}
+
 // formatPathsBreakdown renders the per-app counts as a compact
 // `app1:N1 app2:N2 …` string capped at width chars. When the path
 // shows up under just one app, the breakdown is left blank — the
@@ -1307,7 +1516,7 @@ func (m model) renderFooter() string {
 	keys := "  q:quit  p:pause  r:refresh  +/-:rate (%ds)  ?:help"
 	switch m.view {
 	case viewOverview:
-		keys += "  ↑↓:select  enter:drill  a:alerts  P:paths  e:errors"
+		keys += "  ↑↓:select  enter:drill  a:alerts  P:paths  e:errors  t:trend"
 	case viewDrilldown:
 		keys += "  esc:back"
 	case viewAlerts:
@@ -1315,6 +1524,8 @@ func (m model) renderFooter() string {
 	case viewPaths:
 		keys += "  esc:back"
 	case viewErrors:
+		keys += "  esc:back"
+	case viewTrend:
 		keys += "  esc:back"
 	}
 	return dimStyle.Render(fmt.Sprintf(keys, m.refreshSec) + status)
@@ -1335,6 +1546,7 @@ func (m model) renderHelp() string {
     a               open the global alerts view
     P               open the paths-cross-app view (capital P; lowercase p is pause)
     e               open the errors aggregation view
+    t               open the trend view (per-app sparklines, last hour)
 
   Drill-down view:
     esc / h         back to overview
@@ -1351,6 +1563,10 @@ func (m model) renderHelp() string {
   Errors view:
     esc / h         back to overview
     r               re-aggregate alerts.log
+
+  Trend view:
+    esc / h         back to overview
+    r               re-query the SQLite history DB
 
   MILOG_APPS / MILOG_LOG_DIR pick the apps shown. Config loaded from
   env vars matching the bash side — no separate TUI config.`)
@@ -1391,7 +1607,8 @@ KEYS (inside the TUI)
   a            open alerts view
   P            open paths-cross-app view (capital P; lowercase p is pause)
   e            open errors aggregation view
-  esc / h      back from drill-down / alerts / paths / errors`)
+  t            open trend view (per-app sparklines, last hour)
+  esc / h      back from drill-down / alerts / paths / errors / trend`)
 			return
 		}
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/chud-lori/milog/internal/alertlog"
 	"github.com/chud-lori/milog/internal/config"
+	"github.com/chud-lori/milog/internal/history"
 )
 
 // keyMsg builds a tea.KeyMsg for tests. Special names ("esc", "enter",
@@ -747,6 +749,150 @@ func TestUpdate_EKeyDoesNothingFromDrilldown(t *testing.T) {
 	updated, _ := m.Update(keyMsg("e"))
 	if updated.(model).view != viewDrilldown {
 		t.Errorf("drilldown should ignore 'e'; got view=%v", updated.(model).view)
+	}
+}
+
+func TestRenderTrendView_RendersRowWithSparklineAndStats(t *testing.T) {
+	mins := make([]int, trendWindowMinutes)
+	for i := range mins {
+		mins[i] = i // climbing trend
+	}
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewTrend,
+		trend: trendData{
+			rows: []trendRow{
+				{app: "api", mins: mins, cur: trendWindowMinutes - 1, peak: trendWindowMinutes - 1, sum: 1770},
+			},
+		},
+	}
+	view := m.View()
+	for _, want := range []string{
+		"REQUEST TREND",
+		fmt.Sprintf("last %d min", trendWindowMinutes),
+		"api",
+		"cur=" + fmt.Sprintf("%-4d", trendWindowMinutes-1),
+		"1h=1770",
+		"peak=" + fmt.Sprintf("%-4d", trendWindowMinutes-1),
+		"esc:back",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("trend view missing %q; got:\n%s", want, view)
+		}
+	}
+}
+
+func TestRenderTrendView_NoRowsMessage(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewTrend,
+		trend:      trendData{}, // no rows, no err
+	}
+	view := m.View()
+	if !strings.Contains(view, "no data in window") {
+		t.Errorf("expected empty-state message; got:\n%s", view)
+	}
+}
+
+func TestRenderTrendView_NotConfiguredHint(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewTrend,
+		trend:      trendData{loadErr: history.ErrNotConfigured},
+	}
+	view := m.View()
+	if !strings.Contains(view, "DB not present") {
+		t.Errorf("expected ErrNotConfigured message; got:\n%s", view)
+	}
+	if !strings.Contains(view, "milog install history") {
+		t.Errorf("expected fix-it hint pointing at milog install history; got:\n%s", view)
+	}
+}
+
+func TestRenderTrendView_NoBinaryHint(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewTrend,
+		trend:      trendData{loadErr: history.ErrNoBinary},
+	}
+	view := m.View()
+	if !strings.Contains(view, "sqlite3") {
+		t.Errorf("expected sqlite3 mention in error; got:\n%s", view)
+	}
+	if !strings.Contains(view, "milog install history") {
+		t.Errorf("expected install hint; got:\n%s", view)
+	}
+}
+
+func TestRenderTrendView_GenericLoadErrorRenders(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewTrend,
+		trend:      trendData{loadErr: errors.New("disk full")},
+	}
+	view := m.View()
+	if !strings.Contains(view, "disk full") {
+		t.Errorf("expected verbatim error in view; got:\n%s", view)
+	}
+}
+
+func TestUpdate_TKeyOpensTrendViewFromOverview(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewOverview,
+		apps:       []appSample{{name: "api"}},
+		history:    map[string][]int{"api": {1}},
+	}
+	updated, _ := m.Update(keyMsg("t"))
+	got := updated.(model)
+	if got.view != viewTrend {
+		t.Errorf("after 't' from overview, view=%v want viewTrend", got.view)
+	}
+}
+
+func TestUpdate_EscFromTrendReturnsToOverview(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewTrend,
+		trend: trendData{
+			rows: []trendRow{{app: "api", cur: 5, peak: 10, sum: 100}},
+		},
+	}
+	updated, _ := m.Update(keyMsg("esc"))
+	got := updated.(model)
+	if got.view != viewOverview {
+		t.Errorf("after 'esc' from trend, view=%v want viewOverview", got.view)
+	}
+	if len(got.trend.rows) != 0 {
+		t.Errorf("trend payload should be cleared on back; got %d rows", len(got.trend.rows))
+	}
+}
+
+func TestUpdate_TKeyDoesNothingFromDrilldown(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewDrilldown,
+		apps:       []appSample{{name: "api"}},
+	}
+	updated, _ := m.Update(keyMsg("t"))
+	if updated.(model).view != viewDrilldown {
+		t.Errorf("drilldown should ignore 't'; got view=%v", updated.(model).view)
 	}
 }
 
