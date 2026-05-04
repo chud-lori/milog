@@ -567,6 +567,189 @@ func TestUpdate_PCapitalDoesNothingFromDrilldown(t *testing.T) {
 	}
 }
 
+func TestParseAppRule(t *testing.T) {
+	cases := []struct {
+		rule              string
+		wantSrc, wantPat  string
+		wantOK            bool
+	}{
+		{"app:api:panic_go", "api", "panic_go", true},
+		{"app:web:py_traceback", "web", "py_traceback", true},
+		// Pattern with embedded colon — split exactly twice.
+		{"app:api:db:timeout", "api", "db:timeout", true},
+		// Wrong prefix — not a pattern fire.
+		{"audit:fim:MODIFIED:/etc/passwd", "", "", false},
+		{"web:5xx_burst:api", "", "", false},
+		{"process:exec_from_tmp:dropper", "", "", false},
+		// Malformed.
+		{"app:", "", "", false},
+		{"app:onlysource", "", "", false},
+		{"app:onlysource:", "", "", false},
+		{"", "", "", false},
+	}
+	for _, c := range cases {
+		gotSrc, gotPat, gotOK := parseAppRule(c.rule)
+		if gotOK != c.wantOK || gotSrc != c.wantSrc || gotPat != c.wantPat {
+			t.Errorf("parseAppRule(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.rule, gotSrc, gotPat, gotOK, c.wantSrc, c.wantPat, c.wantOK)
+		}
+	}
+}
+
+func TestRenderErrorsView_AggregatesAcrossSources(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api", "web"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewErrors,
+		errors: errorsData{
+			totalFires:  8,
+			sourcesSeen: []string{"api", "web"},
+			rows: []errorRow{
+				{pattern: "panic_go", total: 5, bySource: []kv{
+					{key: "api", count: 3}, {key: "web", count: 2},
+				}},
+				{pattern: "oom_kill", total: 3, bySource: []kv{
+					{key: "api", count: 3},
+				}},
+			},
+		},
+	}
+	view := m.View()
+	for _, want := range []string{
+		"PATTERN FIRES",
+		"last 24h",
+		"2 sources active",
+		"8 total fires across 2 distinct patterns",
+		"panic_go",
+		"api:3",
+		"web:2",
+		"oom_kill",
+		"esc:back",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("errors view missing %q; got:\n%s", want, view)
+		}
+	}
+	// panic_go (count 5) must appear before oom_kill (count 3).
+	idxPanic := strings.Index(view, "panic_go")
+	idxOom := strings.Index(view, "oom_kill")
+	if idxPanic < 0 || idxOom < 0 || idxPanic >= idxOom {
+		t.Errorf("expected panic_go before oom_kill (count desc); got idxPanic=%d idxOom=%d", idxPanic, idxOom)
+	}
+}
+
+func TestRenderErrorsView_SingleSourceRowHasEmptyBreakdown(t *testing.T) {
+	// A pattern that only fires on one source gets no breakdown column —
+	// same convention as the paths view, signalling "concentrated, not
+	// cross-source". The renderAlertRow truncation rules differ from
+	// renderErrorsView: errors-row truncates pattern at the patW
+	// budget, never at 32.
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewErrors,
+		errors: errorsData{
+			totalFires:  4,
+			sourcesSeen: []string{"api"},
+			rows: []errorRow{
+				{pattern: "panic_go", total: 4, bySource: []kv{{key: "api", count: 4}}},
+			},
+		},
+	}
+	view := m.View()
+	if !strings.Contains(view, "panic_go") {
+		t.Fatalf("expected pattern in view; got:\n%s", view)
+	}
+	if strings.Contains(view, "api:4") {
+		t.Errorf("expected NO breakdown for single-source row; got:\n%s", view)
+	}
+}
+
+func TestRenderErrorsView_NoFiresMessage(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewErrors,
+		errors:     errorsData{}, // no fires
+	}
+	view := m.View()
+	if !strings.Contains(view, "no app:* fires in the last 24h") {
+		t.Errorf("expected empty-state message; got:\n%s", view)
+	}
+	if !strings.Contains(view, "PATTERNS_ENABLED=0") {
+		t.Errorf("expected diagnostic hint about PATTERNS_ENABLED; got:\n%s", view)
+	}
+}
+
+func TestRenderErrorsView_LoadError(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewErrors,
+		errors:     errorsData{err: errors.New("permission denied")},
+	}
+	view := m.View()
+	if !strings.Contains(view, "error reading alerts.log") || !strings.Contains(view, "permission denied") {
+		t.Errorf("expected error message; got:\n%s", view)
+	}
+}
+
+func TestUpdate_EKeyOpensErrorsViewFromOverview(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewOverview,
+		apps:       []appSample{{name: "api"}},
+		history:    map[string][]int{"api": {1}},
+	}
+	updated, _ := m.Update(keyMsg("e"))
+	got := updated.(model)
+	if got.view != viewErrors {
+		t.Errorf("after 'e' from overview, view=%v want viewErrors", got.view)
+	}
+}
+
+func TestUpdate_EscFromErrorsReturnsToOverview(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewErrors,
+		errors: errorsData{
+			totalFires: 2,
+			rows:       []errorRow{{pattern: "panic_go", total: 2}},
+		},
+	}
+	updated, _ := m.Update(keyMsg("esc"))
+	got := updated.(model)
+	if got.view != viewOverview {
+		t.Errorf("after 'esc' from errors, view=%v want viewOverview", got.view)
+	}
+	if got.errors.totalFires != 0 {
+		t.Errorf("errors payload should be cleared on back; got totalFires=%d", got.errors.totalFires)
+	}
+}
+
+func TestUpdate_EKeyDoesNothingFromDrilldown(t *testing.T) {
+	// `e` is overview-only.
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewDrilldown,
+		apps:       []appSample{{name: "api"}},
+	}
+	updated, _ := m.Update(keyMsg("e"))
+	if updated.(model).view != viewDrilldown {
+		t.Errorf("drilldown should ignore 'e'; got view=%v", updated.(model).view)
+	}
+}
+
 func TestRenderDrilldown_EmptyShowsHelpfulMessages(t *testing.T) {
 	m := model{
 		cfg:        &config.Config{Apps: []string{"api"}},

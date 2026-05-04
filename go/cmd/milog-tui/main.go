@@ -5,12 +5,13 @@
 // Bash `milog monitor` stays — this is an additional option, not a
 // replacement.
 //
-// Four views:
+// Five views:
 //
 //	overview    header + system bars + per-app table (default)
 //	drilldown   one app: top paths, top IPs, recent alerts
 //	alerts      global last-24h alert log, latest first
 //	paths       top paths summed across every configured app
+//	errors      pattern-fire aggregation (app:* rule keys) with per-source breakdown
 //
 // Key bindings:
 //
@@ -22,8 +23,9 @@
 //	↑/k ↓/j     move row selection (overview)
 //	enter / l   drill into the highlighted app
 //	a           open the global alerts view
-//	P           open the paths-cross-app view (capital — `p` is pause)
-//	esc / h     leave drill-down / alerts / paths → overview
+//	P           open the paths-cross-app view (capital P; lowercase p is pause)
+//	e           open the errors aggregation view
+//	esc / h     leave drill-down / alerts / paths / errors → overview
 package main
 
 import (
@@ -73,6 +75,7 @@ const (
 	viewDrilldown
 	viewAlerts
 	viewPaths
+	viewErrors
 )
 
 // alertsViewCap caps the global alerts view at a sensible row budget.
@@ -89,6 +92,11 @@ const (
 	// 1k × ~10 apps ≈ 10k lines parsed per refresh, ~20ms on a busy host.
 	pathsViewTailLines = 1000
 	pathsViewCap       = 12 // top-N rows shown
+
+	// Errors view caps. Same window as alerts view (24h) so operators
+	// build a consistent mental model; row cap matches paths view.
+	errorsViewWindow = "24h"
+	errorsViewCap    = 12
 )
 
 // ---- Styles -----------------------------------------------------------
@@ -201,6 +209,27 @@ type pathsMsg struct {
 	data pathsData
 }
 
+// errorRow aggregates one pattern across every source it fired on.
+// `pattern` is the trailing segment of the rule key (the bit after
+// `app:<source>:`). bySource carries the (source, count) pairs sorted
+// count-desc; total is the sum.
+type errorRow struct {
+	pattern  string
+	total    int
+	bySource []kv
+}
+
+type errorsData struct {
+	rows         []errorRow
+	totalFires   int      // total app:* rule fires within window
+	sourcesSeen  []string // distinct sources that had at least one fire
+	err          error    // alertlog read failure (rare)
+}
+
+type errorsMsg struct {
+	data errorsData
+}
+
 type model struct {
 	cfg        *config.Config
 	width      int
@@ -221,6 +250,7 @@ type model struct {
 	drill       drilldownData // current drill-down payload (empty when in overview)
 	alerts      alertsData    // current alerts-view payload (empty when not in viewAlerts)
 	paths       pathsData     // current paths-view payload (empty when not in viewPaths)
+	errors      errorsData    // current errors-view payload (empty when not in viewErrors)
 }
 
 // ---- Commands ---------------------------------------------------------
@@ -353,6 +383,99 @@ func alertsSampleCmd(cfg *config.Config) tea.Cmd {
 		}
 		d.rows = rows
 		return alertsMsg{data: d}
+	}
+}
+
+// parseAppRule splits an `app:<source>:<pattern>` rule key into its
+// (source, pattern) components. Returns ("", "", false) for keys that
+// don't have the `app:` prefix or fewer than two trailing segments —
+// callers use that as the filter for "is this a pattern-fire alert?".
+//
+// The pattern segment can itself contain colons (e.g. user-defined
+// `APP_PATTERN_db:timeout='…'`), so we split exactly twice rather
+// than calling strings.Split — keeps the pattern intact when it has
+// colons in the name.
+func parseAppRule(rule string) (source, pattern string, ok bool) {
+	const prefix = "app:"
+	if !strings.HasPrefix(rule, prefix) {
+		return "", "", false
+	}
+	rest := rule[len(prefix):]
+	colon := strings.IndexByte(rest, ':')
+	if colon <= 0 || colon == len(rest)-1 {
+		return "", "", false
+	}
+	return rest[:colon], rest[colon+1:], true
+}
+
+// errorsSampleCmd loads the last errorsViewWindow of alerts, filters to
+// `app:*` rule keys (pattern-fire alerts from the patterns module),
+// and aggregates by pattern → source → count. Returns the top
+// errorsViewCap patterns by total count.
+//
+// Caller renders rows like `<count>  <pattern>  <src1:N1 src2:N2 …>` —
+// same shape as the paths view, swapping path-cross-app for
+// pattern-cross-source. When one pattern is firing across every
+// source, that's the "everything's broken at once" signature
+// (e.g. shared-library OOM panic showing in api + web + worker).
+func errorsSampleCmd(cfg *config.Config) tea.Cmd {
+	return func() tea.Msg {
+		var d errorsData
+		cutoff, _ := alertlog.WindowToCutoff(errorsViewWindow, time.Now())
+		rows, err := alertlog.Load(filepath.Join(cfg.AlertStateDir, "alerts.log"), cutoff, 0)
+		if err != nil {
+			d.err = err
+			return errorsMsg{data: d}
+		}
+		// pattern → source → count. Tracking sources at accumulation
+		// avoids a second pass and lets us emit a deduped sourcesSeen
+		// for the header at zero cost.
+		byPattern := map[string]map[string]int{}
+		sources := map[string]struct{}{}
+		for _, r := range rows {
+			source, pattern, ok := parseAppRule(r.Rule)
+			if !ok {
+				continue
+			}
+			d.totalFires++
+			sources[source] = struct{}{}
+			inner := byPattern[pattern]
+			if inner == nil {
+				inner = map[string]int{}
+				byPattern[pattern] = inner
+			}
+			inner[source]++
+		}
+		for s := range sources {
+			d.sourcesSeen = append(d.sourcesSeen, s)
+		}
+		sort.Strings(d.sourcesSeen)
+
+		out := make([]errorRow, 0, len(byPattern))
+		for p, inner := range byPattern {
+			total := 0
+			for _, c := range inner {
+				total += c
+			}
+			out = append(out, errorRow{
+				pattern:  p,
+				total:    total,
+				bySource: topN(inner, len(inner)),
+			})
+		}
+		// Same total-desc + tiebreak-asc order as paths view — keeps
+		// the row layout stable across ticks when counts are equal.
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].total != out[j].total {
+				return out[i].total > out[j].total
+			}
+			return out[i].pattern < out[j].pattern
+		})
+		if len(out) > errorsViewCap {
+			out = out[:errorsViewCap]
+		}
+		d.rows = out
+		return errorsMsg{data: d}
 	}
 }
 
@@ -535,6 +658,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// capital binding lives here in the per-view branch.
 				m.view = viewPaths
 				return m, pathsSampleCmd(m.cfg)
+			case "e":
+				m.view = viewErrors
+				return m, errorsSampleCmd(m.cfg)
 			}
 		case viewDrilldown:
 			switch msg.String() {
@@ -566,6 +692,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "r":
 				return m, pathsSampleCmd(m.cfg)
 			}
+		case viewErrors:
+			switch msg.String() {
+			case "esc", "h", "left", "backspace":
+				m.view = viewOverview
+				m.errors = errorsData{}
+				return m, nil
+			case "r":
+				return m, errorsSampleCmd(m.cfg)
+			}
 		}
 
 	case tickMsg:
@@ -586,6 +721,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			batch = append(batch, alertsSampleCmd(m.cfg))
 		case viewPaths:
 			batch = append(batch, pathsSampleCmd(m.cfg))
+		case viewErrors:
+			batch = append(batch, errorsSampleCmd(m.cfg))
 		}
 		return m, tea.Batch(batch...)
 
@@ -634,6 +771,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case pathsMsg:
 		m.paths = msg.data
+
+	case errorsMsg:
+		m.errors = msg.data
+		if msg.data.err != nil {
+			m.status = "errors: " + msg.data.err.Error()
+		}
 	}
 	return m, nil
 }
@@ -652,6 +795,8 @@ func (m model) View() string {
 		b.WriteString(m.renderAlertsView())
 	case viewPaths:
 		b.WriteString(m.renderPathsView())
+	case viewErrors:
+		b.WriteString(m.renderErrorsView())
 	default:
 		b.WriteString(m.renderSystem())
 		b.WriteString("\n\n")
@@ -979,6 +1124,83 @@ func (m model) renderPathsView() string {
 	return b.String()
 }
 
+// renderErrorsView aggregates pattern-fire alerts (`app:<source>:<pattern>`
+// rule keys) over the last errorsViewWindow into a top-N table. Same
+// shape as the paths view: <count>  <pattern>  <src1:N1 src2:N2 …>.
+//
+// When one pattern fires across every source, that's the
+// "everything's broken at once" signature — typically a shared library
+// regression hitting every app at the same time. When a pattern is
+// concentrated on one source, the breakdown column is blank, just like
+// in the paths view.
+func (m model) renderErrorsView() string {
+	d := m.errors
+	var b strings.Builder
+
+	b.WriteString("  ")
+	b.WriteString(labelStyle.Render(fmt.Sprintf(
+		"PATTERN FIRES — last %s, %d sources active",
+		errorsViewWindow, len(d.sourcesSeen),
+	)))
+	b.WriteString("\n")
+
+	if d.err != nil {
+		b.WriteString("  ")
+		b.WriteString(critStyle.Render("error reading alerts.log: " + d.err.Error()))
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	if len(d.rows) == 0 {
+		b.WriteString("  ")
+		if d.totalFires == 0 {
+			b.WriteString(dimStyle.Render(
+				"no app:* fires in the last " + errorsViewWindow,
+			))
+			b.WriteString("\n")
+			b.WriteString("  ")
+			b.WriteString(dimStyle.Render(
+				"(quiet apps, or PATTERNS_ENABLED=0 in milog.conf)",
+			))
+		} else {
+			// totalFires > 0 but rows == 0 shouldn't happen — guard
+			// against future refactors that could break the invariant.
+			b.WriteString(dimStyle.Render(
+				"no rows after aggregation (unexpected — file a bug)",
+			))
+		}
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	b.WriteString("  ")
+	b.WriteString(dimStyle.Render(fmt.Sprintf(
+		"%d total fires across %d distinct patterns",
+		d.totalFires, len(d.rows),
+	)))
+	b.WriteString("\n\n")
+
+	// Same width budget as the paths view: 5-char count + 2 + pattern +
+	// 2 + 30-char breakdown + 4 margin. Pattern column gets whatever's
+	// left over.
+	patW := m.width - 6 - 2 - 30 - 4
+	if patW < 20 {
+		patW = 20
+	}
+	for _, r := range d.rows {
+		key := r.pattern
+		if len(key) > patW {
+			key = key[:patW-1] + "…"
+		}
+		// Reuse the paths-view breakdown formatter — same shape, same
+		// "single source = empty breakdown" convention.
+		breakdown := formatPathsBreakdown(r.bySource, 30)
+		b.WriteString(fmt.Sprintf("  %5d  %-*s  %s\n",
+			r.total, patW, key, dimStyle.Render(breakdown)))
+	}
+	return b.String()
+}
+
 // formatPathsBreakdown renders the per-app counts as a compact
 // `app1:N1 app2:N2 …` string capped at width chars. When the path
 // shows up under just one app, the breakdown is left blank — the
@@ -1085,12 +1307,14 @@ func (m model) renderFooter() string {
 	keys := "  q:quit  p:pause  r:refresh  +/-:rate (%ds)  ?:help"
 	switch m.view {
 	case viewOverview:
-		keys += "  ↑↓:select  enter:drill  a:alerts  P:paths"
+		keys += "  ↑↓:select  enter:drill  a:alerts  P:paths  e:errors"
 	case viewDrilldown:
 		keys += "  esc:back"
 	case viewAlerts:
 		keys += "  esc:back"
 	case viewPaths:
+		keys += "  esc:back"
+	case viewErrors:
 		keys += "  esc:back"
 	}
 	return dimStyle.Render(fmt.Sprintf(keys, m.refreshSec) + status)
@@ -1110,6 +1334,7 @@ func (m model) renderHelp() string {
     enter / l       drill into the highlighted app
     a               open the global alerts view
     P               open the paths-cross-app view (capital P; lowercase p is pause)
+    e               open the errors aggregation view
 
   Drill-down view:
     esc / h         back to overview
@@ -1122,6 +1347,10 @@ func (m model) renderHelp() string {
   Paths view:
     esc / h         back to overview
     r               re-tail every app's log
+
+  Errors view:
+    esc / h         back to overview
+    r               re-aggregate alerts.log
 
   MILOG_APPS / MILOG_LOG_DIR pick the apps shown. Config loaded from
   env vars matching the bash side — no separate TUI config.`)
@@ -1161,7 +1390,8 @@ KEYS (inside the TUI)
   ↑/k ↓/j      select row      enter / l   drill into app
   a            open alerts view
   P            open paths-cross-app view (capital P; lowercase p is pause)
-  esc / h      back from drill-down / alerts / paths`)
+  e            open errors aggregation view
+  esc / h      back from drill-down / alerts / paths / errors`)
 			return
 		}
 	}
