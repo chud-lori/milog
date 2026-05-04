@@ -24,6 +24,7 @@ type Config struct {
 	AlertsEnabled  bool
 	DiscordWebhook string // raw; use RedactedDiscordWebhook() for display
 	AlertStateDir  string // where alerts.log + alerts.state live
+	HistoryDB      string // path to the SQLite metrics DB (empty when HISTORY_ENABLED=0)
 }
 
 // Load resolves the Config from env vars, falling back to documented
@@ -40,6 +41,9 @@ func Load() (*Config, error) {
 		LogDir:         getEnv("MILOG_LOG_DIR", "/var/log/nginx"),
 		DiscordWebhook: os.Getenv("MILOG_DISCORD_WEBHOOK"),
 		AlertStateDir:  getEnv("MILOG_ALERT_STATE_DIR", home+"/.cache/milog"),
+		// Bash side defaults the history DB to ~/.local/share/milog/metrics.db
+		// — match exactly so `MILOG_HISTORY_DB` env override semantics line up.
+		HistoryDB: getEnv("MILOG_HISTORY_DB", home+"/.local/share/milog/metrics.db"),
 	}
 	if _, err := strconv.Atoi(c.Port); err != nil {
 		return nil, fmt.Errorf("MILOG_WEB_PORT must be numeric, got %q", c.Port)
