@@ -5,23 +5,25 @@
 // Bash `milog monitor` stays — this is an additional option, not a
 // replacement.
 //
-// Three views:
+// Four views:
 //
 //	overview    header + system bars + per-app table (default)
 //	drilldown   one app: top paths, top IPs, recent alerts
 //	alerts      global last-24h alert log, latest first
+//	paths       top paths summed across every configured app
 //
 // Key bindings:
 //
 //	q / Ctrl+C  quit (anywhere)
-//	p           pause (freeze sparklines)
+//	p           pause sampling (freezes sparklines + numbers)
 //	r           refresh now
 //	+ / -       decrease / increase refresh interval
 //	?           toggle help
 //	↑/k ↓/j     move row selection (overview)
 //	enter / l   drill into the highlighted app
 //	a           open the global alerts view
-//	esc / h     leave drill-down / alerts → overview
+//	P           open the paths-cross-app view (capital — `p` is pause)
+//	esc / h     leave drill-down / alerts / paths → overview
 package main
 
 import (
@@ -70,6 +72,7 @@ const (
 	viewOverview viewMode = iota
 	viewDrilldown
 	viewAlerts
+	viewPaths
 )
 
 // alertsViewCap caps the global alerts view at a sensible row budget.
@@ -79,6 +82,13 @@ const (
 const (
 	alertsViewWindow = "24h"
 	alertsViewCap    = 50
+
+	// pathsViewTailLines: per-app tail depth for the paths view sample.
+	// Smaller than drilldownTailLines because we read every app, not
+	// one — the multiplication makes total work meaningful.
+	// 1k × ~10 apps ≈ 10k lines parsed per refresh, ~20ms on a busy host.
+	pathsViewTailLines = 1000
+	pathsViewCap       = 12 // top-N rows shown
 )
 
 // ---- Styles -----------------------------------------------------------
@@ -169,6 +179,28 @@ type alertsMsg struct {
 	data alertsData
 }
 
+// pathRow is one row in the cross-app paths view: the path, its total
+// hit count summed across apps, and a per-app breakdown for the right
+// column. byApp is sorted (by count desc) at sample time so the
+// renderer doesn't pay the cost.
+type pathRow struct {
+	path   string
+	total  int
+	byApp  []kv // {app: count}, sorted count-desc
+}
+
+// pathsData is the cross-app paths payload computed off the UI thread.
+type pathsData struct {
+	rows         []pathRow
+	totalLines   int      // total parsed lines across every app
+	appsSampled  []string // apps that produced at least one parsed line
+	appsErrored  []string // apps whose log couldn't be tailed (missing, perm)
+}
+
+type pathsMsg struct {
+	data pathsData
+}
+
 type model struct {
 	cfg        *config.Config
 	width      int
@@ -188,6 +220,7 @@ type model struct {
 	selectedIdx int           // highlighted row in overview
 	drill       drilldownData // current drill-down payload (empty when in overview)
 	alerts      alertsData    // current alerts-view payload (empty when not in viewAlerts)
+	paths       pathsData     // current paths-view payload (empty when not in viewPaths)
 }
 
 // ---- Commands ---------------------------------------------------------
@@ -323,6 +356,79 @@ func alertsSampleCmd(cfg *config.Config) tea.Cmd {
 	}
 }
 
+// pathsSampleCmd tails the last pathsViewTailLines of every configured
+// app's nginx log, sums path counts globally, and returns the top
+// pathsViewCap entries. Each row carries a per-app breakdown so the
+// operator can see whether a path's hits are concentrated on one app
+// or spread across the host (the latter being the scan-probe signature
+// this view exists to surface).
+//
+// Tail-failure semantics: an app whose log can't be read (missing
+// file, permission denied) is recorded in appsErrored but does NOT
+// fail the whole sample — the view still shows whatever the readable
+// apps produced. Empty appsSampled + non-empty appsErrored is the
+// signal "everything's broken, fix LOG_DIR".
+func pathsSampleCmd(cfg *config.Config) tea.Cmd {
+	return func() tea.Msg {
+		var d pathsData
+		// path → app → count. Tracking per-app at accumulation time
+		// avoids a second pass when building the breakdown column.
+		byPath := map[string]map[string]int{}
+
+		for _, a := range cfg.Apps {
+			path := filepath.Join(cfg.LogDir, a+".access.log")
+			lines, err := nginxlog.TailLines(path, pathsViewTailLines)
+			if err != nil || len(lines) == 0 {
+				if err != nil {
+					d.appsErrored = append(d.appsErrored, a)
+				}
+				continue
+			}
+			d.appsSampled = append(d.appsSampled, a)
+			d.totalLines += len(lines)
+			for _, raw := range lines {
+				ln := nginxlog.ParseLine(raw)
+				if ln.Path == "" {
+					continue
+				}
+				inner := byPath[ln.Path]
+				if inner == nil {
+					inner = map[string]int{}
+					byPath[ln.Path] = inner
+				}
+				inner[a]++
+			}
+		}
+
+		rows := make([]pathRow, 0, len(byPath))
+		for p, inner := range byPath {
+			total := 0
+			for _, c := range inner {
+				total += c
+			}
+			rows = append(rows, pathRow{
+				path:  p,
+				total: total,
+				byApp: topN(inner, len(inner)), // keep all, already small
+			})
+		}
+		// Sort by total desc, path asc as tie-break (stable + deterministic
+		// across ticks even when counts are identical, so the list doesn't
+		// flicker between renders).
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].total != rows[j].total {
+				return rows[i].total > rows[j].total
+			}
+			return rows[i].path < rows[j].path
+		})
+		if len(rows) > pathsViewCap {
+			rows = rows[:pathsViewCap]
+		}
+		d.rows = rows
+		return pathsMsg{data: d}
+	}
+}
+
 // topN sorts the (key, count) map and keeps the highest n by count.
 func topN(m map[string]int, n int) []kv {
 	out := make([]kv, 0, len(m))
@@ -422,6 +528,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "a":
 				m.view = viewAlerts
 				return m, alertsSampleCmd(m.cfg)
+			case "P":
+				// Capital P (shift+p) — `p` on its own is the global
+				// pause toggle, kept that way for muscle memory. The
+				// paths view is reachable from overview only, so the
+				// capital binding lives here in the per-view branch.
+				m.view = viewPaths
+				return m, pathsSampleCmd(m.cfg)
 			}
 		case viewDrilldown:
 			switch msg.String() {
@@ -444,6 +557,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "r":
 				return m, alertsSampleCmd(m.cfg)
 			}
+		case viewPaths:
+			switch msg.String() {
+			case "esc", "h", "left", "backspace":
+				m.view = viewOverview
+				m.paths = pathsData{}
+				return m, nil
+			case "r":
+				return m, pathsSampleCmd(m.cfg)
+			}
 		}
 
 	case tickMsg:
@@ -462,6 +584,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case viewAlerts:
 			batch = append(batch, alertsSampleCmd(m.cfg))
+		case viewPaths:
+			batch = append(batch, pathsSampleCmd(m.cfg))
 		}
 		return m, tea.Batch(batch...)
 
@@ -507,6 +631,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.data.err != nil {
 			m.status = "alerts: " + msg.data.err.Error()
 		}
+
+	case pathsMsg:
+		m.paths = msg.data
 	}
 	return m, nil
 }
@@ -523,6 +650,8 @@ func (m model) View() string {
 		b.WriteString(m.renderDrilldown())
 	case viewAlerts:
 		b.WriteString(m.renderAlertsView())
+	case viewPaths:
+		b.WriteString(m.renderPathsView())
 	default:
 		b.WriteString(m.renderSystem())
 		b.WriteString("\n\n")
@@ -782,6 +911,101 @@ func (m model) renderAlertsView() string {
 	return b.String()
 }
 
+// renderPathsView is the global top-paths-cross-app screen. Each row
+// shows the path total + per-app breakdown. The breakdown is the
+// value-add over `milog top-paths` (per-app) — when one path appears
+// at the top with hits across every app, that's the scan-probe
+// signature this view exists to surface (`/wp-login.php`, `.git/config`,
+// `xmlrpc.php`, etc.).
+func (m model) renderPathsView() string {
+	d := m.paths
+	var b strings.Builder
+
+	b.WriteString("  ")
+	b.WriteString(labelStyle.Render(fmt.Sprintf(
+		"TOP PATHS — across %d app(s), last %d lines/app",
+		len(d.appsSampled), pathsViewTailLines,
+	)))
+	b.WriteString("\n")
+
+	// Errored apps surfaced as an inline note so an unreadable log
+	// doesn't silently rot — the same pattern the audit-status output
+	// uses for missing paths.
+	if len(d.appsErrored) > 0 {
+		b.WriteString("  ")
+		b.WriteString(warnStyle.Render(
+			"unreadable: " + strings.Join(d.appsErrored, ", "),
+		))
+		b.WriteString("\n")
+	}
+
+	if len(d.rows) == 0 {
+		b.WriteString("  ")
+		if len(d.appsSampled) == 0 {
+			b.WriteString(dimStyle.Render(
+				"no apps sampled — check MILOG_LOG_DIR / MILOG_APPS",
+			))
+		} else {
+			b.WriteString(dimStyle.Render(
+				"no path data yet (quiet apps or fresh start)",
+			))
+		}
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	b.WriteString("  ")
+	b.WriteString(dimStyle.Render(fmt.Sprintf(
+		"%d total req parsed across %d distinct paths",
+		d.totalLines, len(d.rows),
+	)))
+	b.WriteString("\n\n")
+
+	// Layout: 6 chars count, gap, path (truncated to fit), gap, breakdown.
+	// Total width budget: m.width - 4 (2 leading + 2 trailing margin).
+	pathW := m.width - 6 - 2 - 30 - 4
+	if pathW < 20 {
+		pathW = 20
+	}
+	for _, r := range d.rows {
+		key := r.path
+		if len(key) > pathW {
+			key = key[:pathW-1] + "…"
+		}
+		breakdown := formatPathsBreakdown(r.byApp, 30)
+		b.WriteString(fmt.Sprintf("  %5d  %-*s  %s\n",
+			r.total, pathW, key, dimStyle.Render(breakdown)))
+	}
+	return b.String()
+}
+
+// formatPathsBreakdown renders the per-app counts as a compact
+// `app1:N1 app2:N2 …` string capped at width chars. When the path
+// shows up under just one app, the breakdown is left blank — the
+// total column already conveys the count and the empty per-app
+// column visually distinguishes "scan-across-apps" rows from
+// "concentrated on one app" rows.
+func formatPathsBreakdown(rows []kv, width int) string {
+	if len(rows) <= 1 {
+		// One-app paths get an empty breakdown — the visual gap
+		// signals "not cross-app" at a glance.
+		return ""
+	}
+	var b strings.Builder
+	for i, r := range rows {
+		seg := fmt.Sprintf("%s:%d", r.key, r.count)
+		if i > 0 {
+			seg = " " + seg
+		}
+		if b.Len()+len(seg) > width {
+			b.WriteString(" …")
+			break
+		}
+		b.WriteString(seg)
+	}
+	return b.String()
+}
+
 func renderTopPane(title string, rows []kv, width int) string {
 	var b strings.Builder
 	b.WriteString("  ")
@@ -861,10 +1085,12 @@ func (m model) renderFooter() string {
 	keys := "  q:quit  p:pause  r:refresh  +/-:rate (%ds)  ?:help"
 	switch m.view {
 	case viewOverview:
-		keys += "  ↑↓:select  enter:drill  a:alerts"
+		keys += "  ↑↓:select  enter:drill  a:alerts  P:paths"
 	case viewDrilldown:
 		keys += "  esc:back"
 	case viewAlerts:
+		keys += "  esc:back"
+	case viewPaths:
 		keys += "  esc:back"
 	}
 	return dimStyle.Render(fmt.Sprintf(keys, m.refreshSec) + status)
@@ -883,6 +1109,7 @@ func (m model) renderHelp() string {
     ↑/k ↓/j         move row selection
     enter / l       drill into the highlighted app
     a               open the global alerts view
+    P               open the paths-cross-app view (capital P; lowercase p is pause)
 
   Drill-down view:
     esc / h         back to overview
@@ -891,6 +1118,10 @@ func (m model) renderHelp() string {
   Alerts view:
     esc / h         back to overview
     r               reload alerts.log
+
+  Paths view:
+    esc / h         back to overview
+    r               re-tail every app's log
 
   MILOG_APPS / MILOG_LOG_DIR pick the apps shown. Config loaded from
   env vars matching the bash side — no separate TUI config.`)
@@ -929,7 +1160,8 @@ KEYS (inside the TUI)
   + / -        adjust rate     ?   toggle help
   ↑/k ↓/j      select row      enter / l   drill into app
   a            open alerts view
-  esc / h      back from drill-down / alerts`)
+  P            open paths-cross-app view (capital P; lowercase p is pause)
+  esc / h      back from drill-down / alerts / paths`)
 			return
 		}
 	}

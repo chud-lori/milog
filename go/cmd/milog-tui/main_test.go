@@ -356,6 +356,217 @@ func TestRenderAlertRow_FormatsSeverity(t *testing.T) {
 	}
 }
 
+func TestRenderPathsView_RendersRowsWithBreakdown(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api", "web"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewPaths,
+		paths: pathsData{
+			appsSampled: []string{"api", "web"},
+			totalLines:  2000,
+			rows: []pathRow{
+				{path: "/wp-login.php", total: 50, byApp: []kv{
+					{key: "api", count: 30}, {key: "web", count: 20},
+				}},
+				{path: "/v1/users", total: 12, byApp: []kv{
+					{key: "api", count: 12},
+				}},
+			},
+		},
+	}
+	view := m.View()
+	for _, want := range []string{
+		"TOP PATHS",
+		"across 2 app(s)",
+		"/wp-login.php",
+		"50",
+		"api:30",
+		"web:20",
+		"/v1/users",
+		"esc:back",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("paths view missing %q; got:\n%s", want, view)
+		}
+	}
+}
+
+func TestRenderPathsView_SingleAppRowHasEmptyBreakdown(t *testing.T) {
+	// A path that only appeared on one app gets no per-app breakdown
+	// rendered — visual signal that it isn't cross-app scan traffic.
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewPaths,
+		paths: pathsData{
+			appsSampled: []string{"api"},
+			totalLines:  100,
+			rows: []pathRow{
+				{path: "/v1/internal", total: 7, byApp: []kv{{key: "api", count: 7}}},
+			},
+		},
+	}
+	view := m.View()
+	if !strings.Contains(view, "/v1/internal") {
+		t.Fatalf("expected path in view; got:\n%s", view)
+	}
+	// A breakdown like `api:7` would be rendered for cross-app rows.
+	// For a one-app row there should be no `api:` segment because the
+	// total column already conveys it.
+	if strings.Contains(view, "api:7") {
+		t.Errorf("expected NO breakdown for single-app row; got:\n%s", view)
+	}
+}
+
+func TestRenderPathsView_NoAppsSampledMessage(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewPaths,
+		paths:      pathsData{}, // nothing sampled
+	}
+	view := m.View()
+	if !strings.Contains(view, "no apps sampled") {
+		t.Errorf("expected config-help message when nothing sampled; got:\n%s", view)
+	}
+}
+
+func TestRenderPathsView_QuietAppsMessage(t *testing.T) {
+	// Apps were sampled but produced zero parsed paths (e.g. clean
+	// startup before any traffic). Distinct from "config broken".
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api", "web"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewPaths,
+		paths: pathsData{
+			appsSampled: []string{"api", "web"},
+			totalLines:  0,
+		},
+	}
+	view := m.View()
+	if !strings.Contains(view, "no path data yet") {
+		t.Errorf("expected quiet-host message; got:\n%s", view)
+	}
+}
+
+func TestRenderPathsView_ErroredAppsSurfaced(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api", "web"}},
+		width:      120,
+		refreshSec: 5,
+		view:       viewPaths,
+		paths: pathsData{
+			appsSampled: []string{"api"},
+			appsErrored: []string{"web"},
+			totalLines:  10,
+			rows:        []pathRow{{path: "/x", total: 1, byApp: []kv{{key: "api", count: 1}}}},
+		},
+	}
+	view := m.View()
+	if !strings.Contains(view, "unreadable: web") {
+		t.Errorf("expected unreadable-apps note; got:\n%s", view)
+	}
+}
+
+func TestFormatPathsBreakdown_CapsAtWidth(t *testing.T) {
+	rows := []kv{
+		{key: "api", count: 100}, {key: "web", count: 50},
+		{key: "auth", count: 25}, {key: "billing", count: 10},
+	}
+	got := formatPathsBreakdown(rows, 20)
+	if len(got) > 22 { // width + " …" tail
+		t.Errorf("breakdown should be capped near width=20; got %q (len=%d)", got, len(got))
+	}
+	if !strings.Contains(got, "…") {
+		t.Errorf("expected ellipsis tail when capped; got %q", got)
+	}
+}
+
+func TestFormatPathsBreakdown_SingleRowReturnsEmpty(t *testing.T) {
+	got := formatPathsBreakdown([]kv{{key: "api", count: 12}}, 30)
+	if got != "" {
+		t.Errorf("single-app row should return empty breakdown; got %q", got)
+	}
+}
+
+func TestUpdate_PCapitalOpensPathsViewFromOverview(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewOverview,
+		apps:       []appSample{{name: "api"}},
+		history:    map[string][]int{"api": {1}},
+	}
+	updated, _ := m.Update(keyMsg("P"))
+	got := updated.(model)
+	if got.view != viewPaths {
+		t.Errorf("after 'P' from overview, view=%v want viewPaths", got.view)
+	}
+}
+
+func TestUpdate_LowercasePStillPausesNotPaths(t *testing.T) {
+	// Regression guard: lowercase 'p' must keep its existing pause
+	// semantics. Capital P is the paths-view binding.
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewOverview,
+		apps:       []appSample{{name: "api"}},
+		history:    map[string][]int{"api": {1}},
+	}
+	updated, _ := m.Update(keyMsg("p"))
+	got := updated.(model)
+	if got.view != viewOverview {
+		t.Errorf("lowercase 'p' must NOT switch view; got %v", got.view)
+	}
+	if !got.paused {
+		t.Errorf("lowercase 'p' must toggle pause; paused=%v", got.paused)
+	}
+}
+
+func TestUpdate_EscFromPathsReturnsToOverview(t *testing.T) {
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewPaths,
+		paths: pathsData{
+			appsSampled: []string{"api"},
+			totalLines:  10,
+			rows:        []pathRow{{path: "/x", total: 1}},
+		},
+	}
+	updated, _ := m.Update(keyMsg("esc"))
+	got := updated.(model)
+	if got.view != viewOverview {
+		t.Errorf("after 'esc' from paths, view=%v want viewOverview", got.view)
+	}
+	if got.paths.totalLines != 0 {
+		t.Errorf("paths payload should be cleared on back; got totalLines=%d", got.paths.totalLines)
+	}
+}
+
+func TestUpdate_PCapitalDoesNothingFromDrilldown(t *testing.T) {
+	// `P` is overview-only; pressing it from drill-down must NOT switch.
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		refreshSec: 5,
+		view:       viewDrilldown,
+		apps:       []appSample{{name: "api"}},
+	}
+	updated, _ := m.Update(keyMsg("P"))
+	if updated.(model).view != viewDrilldown {
+		t.Errorf("drilldown should ignore 'P'; got view=%v", updated.(model).view)
+	}
+}
+
 func TestRenderDrilldown_EmptyShowsHelpfulMessages(t *testing.T) {
 	m := model{
 		cfg:        &config.Config{Apps: []string{"api"}},
