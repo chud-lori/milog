@@ -70,6 +70,7 @@ MILOG_BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u 2>/dev/null || 
     cat src/ui.sh
     cat src/system.sh
     cat src/history.sh
+    cat src/anomaly.sh
     cat src/nginx.sh
     cat src/web.sh
     # shellcheck disable=SC2068

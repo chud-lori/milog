@@ -226,6 +226,19 @@ HISTORY_DB="$HOME/.local/share/milog/metrics.db"
 HISTORY_RETAIN_DAYS=30
 HISTORY_TOP_IP_N=50
 
+# Daily-pattern anomaly detection (off by default; piggybacks on history).
+# When enabled, every minute write triggers a same-minute-of-day baseline
+# check: if req / c5xx / p95 exceed mean + ANOMALY_SIGMA*stddev over the
+# last ANOMALY_MIN_DAYS days AND clear the per-metric floor, an alert
+# fires with rule key anomaly:<app>:<metric>. Hard-gated: needs
+# ANOMALY_MIN_DAYS distinct days of data before the first fire.
+ANOMALY_ENABLED=0
+ANOMALY_SIGMA=3
+ANOMALY_MIN_DAYS=14
+ANOMALY_FLOOR_REQ=10
+ANOMALY_FLOOR_C5XX=2
+ANOMALY_FLOOR_P95=100
+
 # Web dashboard. Off by default; `milog web` execs the milog-web Go
 # binary, which serves a read-only JSON + HTML view on loopback. Expose
 # via SSH tunnel, Tailscale, or Cloudflare Tunnel (see README → "milog
@@ -285,6 +298,12 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
 [[ -n "${MILOG_HISTORY_ENABLED:-}" ]] && HISTORY_ENABLED="$MILOG_HISTORY_ENABLED"
 [[ -n "${MILOG_HISTORY_DB:-}"      ]] && HISTORY_DB="$MILOG_HISTORY_DB"
+[[ -n "${MILOG_ANOMALY_ENABLED:-}"   ]] && ANOMALY_ENABLED="$MILOG_ANOMALY_ENABLED"
+[[ -n "${MILOG_ANOMALY_SIGMA:-}"     ]] && ANOMALY_SIGMA="$MILOG_ANOMALY_SIGMA"
+[[ -n "${MILOG_ANOMALY_MIN_DAYS:-}"  ]] && ANOMALY_MIN_DAYS="$MILOG_ANOMALY_MIN_DAYS"
+[[ -n "${MILOG_ANOMALY_FLOOR_REQ:-}"  ]] && ANOMALY_FLOOR_REQ="$MILOG_ANOMALY_FLOOR_REQ"
+[[ -n "${MILOG_ANOMALY_FLOOR_C5XX:-}" ]] && ANOMALY_FLOOR_C5XX="$MILOG_ANOMALY_FLOOR_C5XX"
+[[ -n "${MILOG_ANOMALY_FLOOR_P95:-}"  ]] && ANOMALY_FLOOR_P95="$MILOG_ANOMALY_FLOOR_P95"
 [[ -n "${MILOG_WEB_PORT:-}"        ]] && WEB_PORT="$MILOG_WEB_PORT"
 [[ -n "${MILOG_WEB_BIND:-}"        ]] && WEB_BIND="$MILOG_WEB_BIND"
 [[ -n "${MILOG_SLOW_EXCLUDE_PATHS+x}" ]] && SLOW_EXCLUDE_PATHS="$MILOG_SLOW_EXCLUDE_PATHS"
