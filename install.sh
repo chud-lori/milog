@@ -63,6 +63,56 @@ info() { _green  "== $*"; }
 warn() { _yellow "!! $*"; }
 die()  { _red    "!! $*"; exit 1; }
 
+# Print the last 3 commit subjects from MILOG_RELEASE_REPO so the user
+# sees what just landed without opening the repo. Single GitHub-API
+# call, 5s timeout — silent skip on any failure (offline, rate-limit,
+# unusual chars in commit subjects, MILOG_NO_RECENT=1).
+#
+# Why best-effort + silent-skip: install.sh has been zero-API-call
+# until now; this hint is nice-to-have, not load-bearing. We accept
+# a fragile-but-no-jq-dep grep-pipe instead of carrying a JSON parser.
+# The pipeline handles typical commit subjects (ASCII, no embedded
+# quotes); subjects with `"` or backslashes truncate gracefully —
+# better than refusing to install.
+_print_recent_commits_hint() {
+    [[ "${MILOG_NO_RECENT:-0}" == "1" ]] && return 0
+    command -v curl >/dev/null 2>&1 || return 0
+
+    local body
+    body=$(curl -fsSL --max-time 5 \
+        -H 'User-Agent: milog-install' \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${MILOG_RELEASE_REPO}/commits?per_page=3" \
+        2>/dev/null) || return 0
+    [[ -n "$body" ]] || return 0
+
+    # Split at top-level commit boundaries. The marker is the sequence
+    # `,{"sha":"<40hex>","node_id":` — `parents[]` array entries only
+    # carry `sha` + `url`, never `node_id`, so this splits exactly between
+    # top-level commits. Within each resulting line the FIRST `"sha"` is
+    # the commit sha and the FIRST `"message"` is commit.message; `tree.sha`
+    # and other nested shas appear later.
+    local commits
+    commits=$(printf '%s' "$body" \
+        | sed -E 's/,\{"sha":"([0-9a-f]+)","node_id":/\n{"sha":"\1","node_id":/g; s/^\[//' \
+        | head -3)
+    [[ -n "$commits" ]] || return 0
+
+    local sha msg
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        sha=$(printf '%s' "$line" \
+            | grep -oE '"sha":"[0-9a-f]{40}"' \
+            | head -1 \
+            | sed -E 's/.*"([0-9a-f]{7})[0-9a-f]+".*/\1/')
+        msg=$(printf '%s' "$line" \
+            | grep -oE '"message":"[^"]*' \
+            | head -1 \
+            | sed -E 's/^"message":"//; s/\\[nrtu].*//')
+        [[ -n "$sha" && -n "$msg" ]] && info "recent: $sha $msg"
+    done <<< "$commits"
+}
+
 # ---- package manager detection ----------------------------------------------
 detect_pkg_manager() {
     local pm
@@ -550,6 +600,8 @@ main() {
     if (( need_release )); then
         _release_install_companions "$dst_dir"
     fi
+
+    _print_recent_commits_hint
 
     info "MiLog installed. Try:"
     cat <<'NEXT'
