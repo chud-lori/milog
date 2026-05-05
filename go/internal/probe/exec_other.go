@@ -25,3 +25,9 @@ func Run(ctx context.Context, out chan<- Event) error {
 func RunNet(ctx context.Context, out chan<- NetEvent) error {
 	return ErrUnsupported
 }
+
+// RunFile stub — non-Linux builds compile but never stream file
+// events. Same ErrUnsupported sentinel as the other Run* stubs.
+func RunFile(ctx context.Context, out chan<- FileEvent) error {
+	return ErrUnsupported
+}

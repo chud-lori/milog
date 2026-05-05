@@ -2,11 +2,12 @@
 //
 // rules.go holds the rule-matching logic, deliberately OS-independent
 // so it can be unit-tested on any platform. The actual BPF loading +
-// ringbuf consumption lives in exec_linux.go / tcp_linux.go (and a
-// stub exec_other.go for non-Linux builds).
+// ringbuf consumption lives in exec_linux.go / tcp_linux.go /
+// file_linux.go (and a stub exec_other.go for non-Linux builds).
 //
 // Rule firing is fingerprint-based: the userspace consumer feeds an
-// `Event` (exec) or `NetEvent` (tcp connect) to `Match` / `MatchNet`,
+// `Event` (exec), `NetEvent` (tcp connect), or `FileEvent` (openat
+// against a sensitive path) to `Match` / `MatchNet` / `MatchFile`,
 // gets back a slice of `Hit` (rule key + body detail) per matching
 // rule, and shells those out to milog's existing alert path. Cooldown
 // / silence / dedup all apply via the rule key — no parallel state in
@@ -472,4 +473,226 @@ func parseCIDROrIP(s string) (*net.IPNet, error) {
 		return &net.IPNet{IP: ip.To4(), Mask: net.CIDRMask(32, 32)}, nil
 	}
 	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}, nil
+}
+
+// =============================================================================
+// File-audit probe — sensitive-path open monitoring.
+// =============================================================================
+
+// FileEvent is the userspace mirror of `struct file_event` from
+// file.bpf.c. Fired once per openat(2) on a file under one of the
+// BPF-side prefixes (`/etc/`, `/root`, `/home`, `/var/`); precise
+// per-path matching against the configurable sensitive list happens
+// here so operators can tune without re-compiling BPF.
+type FileEvent struct {
+	PID        uint32
+	PPID       uint32 // looked up via /proc/<pid>/status
+	UID        uint32
+	Flags      uint32 // openat(2) flags — O_RDONLY, O_WRONLY, O_RDWR plus O_CREAT etc.
+	Comm       string
+	ParentComm string
+	Filename   string
+}
+
+// MatchFile runs every file rule against the event and returns hits.
+// Mirrors Match / MatchNet. Currently one rule
+// (`file:sensitive_read`); space for `file:cred_write` once we plumb
+// write-flag detection (the openat tracepoint already gives us the
+// flags, the rule just hasn't been written yet).
+func MatchFile(e FileEvent) []Hit {
+	var hits []Hit
+	if h, ok := matchSensitiveRead(e); ok {
+		hits = append(hits, h)
+	}
+	return hits
+}
+
+// sensitiveCommAllowlist — processes that legitimately read sensitive
+// files as part of normal operation. Any of these reading
+// /etc/shadow / authorized_keys / sudoers is expected; alerting on
+// them would be pure noise. Operators can override via
+// MILOG_PROBE_FILE_ALLOWLIST (comma-separated comm names).
+//
+// Kept conservative: PAM / nss / system auth path get implicit access
+// via their toolnames, but anything beyond this list (curl, cat, less,
+// php-fpm, nginx, …) reading a sensitive file is the alert-worthy case.
+var defaultSensitiveCommAllowlist = []string{
+	"sshd",
+	"sshd-session",
+	"sudo",
+	"su",
+	"login",
+	"getty",
+	"agetty",
+	"cron",
+	"crond",
+	"anacron",
+	"systemd",
+	"systemd-logind",
+	"systemd-userdb",
+	"systemd-tmpfile",
+	"systemd-resolve",
+	"auditd",
+	"audisp-syslog",
+	"adduser",
+	"useradd",
+	"usermod",
+	"userdel",
+	"chpasswd",
+	"passwd",
+	"chage",
+	"visudo",
+	"pam_unix",
+	"nscd",
+	"nslcd",
+	"sssd",
+	"milog",
+	"milog-probe",
+}
+
+// defaultSensitivePaths — files whose reads are alert-worthy when
+// performed by a non-allowlisted process. Entries ending in `/` are
+// treated as prefix matches (covers /etc/sudoers.d/anything,
+// /etc/ssh/sshd_config + host keys, /root/.ssh/* including
+// authorized_keys2 + known_hosts).
+//
+// Mirrors the audit FIM module's defaults so file:sensitive_read
+// alerts and the audit-side hash-change alerts cover the same
+// ground from two different angles (live vs. periodic).
+var defaultSensitivePaths = []string{
+	"/etc/passwd",
+	"/etc/shadow",
+	"/etc/gshadow",
+	"/etc/sudoers",
+	"/etc/sudoers.d/",
+	"/etc/ssh/",
+	"/etc/ld.so.preload",
+	"/root/.ssh/",
+}
+
+// fileRules holds the parsed file-audit configuration. Computed once
+// via loadFileRules(); subsequent events reuse the cached value.
+// Same single-shot init pattern as netAllowlist — operator restarts
+// milog-probe to pick up env changes.
+type fileRules struct {
+	sensitivePaths []string            // raw entries; suffix `/` means prefix match
+	allowedComms   map[string]struct{} // exact-match comm allowlist
+}
+
+func (r *fileRules) isSensitive(path string) bool {
+	for _, p := range r.sensitivePaths {
+		if strings.HasSuffix(p, "/") {
+			if strings.HasPrefix(path, p) {
+				return true
+			}
+			continue
+		}
+		if path == p {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *fileRules) commAllowed(comm string) bool {
+	_, ok := r.allowedComms[comm]
+	return ok
+}
+
+var (
+	cachedFileRules fileRules
+	fileRulesReady  bool
+)
+
+func loadFileRules() *fileRules {
+	if fileRulesReady {
+		return &cachedFileRules
+	}
+	cachedFileRules = parseFileRules(
+		os.Getenv("MILOG_PROBE_FILE_SENSITIVE"),
+		os.Getenv("MILOG_PROBE_FILE_ALLOWLIST"),
+	)
+	fileRulesReady = true
+	return &cachedFileRules
+}
+
+// parseFileRules accepts comma-separated overrides for the sensitive
+// path list and the comm allowlist. Empty string → use the defaults;
+// any non-empty value REPLACES the default rather than appending, so
+// operators tightening the policy don't accidentally inherit the
+// shipped list. Same shape as MILOG_PROBE_NET_ALLOWLIST.
+func parseFileRules(pathsSrc, commsSrc string) fileRules {
+	out := fileRules{allowedComms: map[string]struct{}{}}
+
+	paths := defaultSensitivePaths
+	if strings.TrimSpace(pathsSrc) != "" {
+		paths = nil
+		for _, raw := range strings.Split(pathsSrc, ",") {
+			p := strings.TrimSpace(raw)
+			if p == "" {
+				continue
+			}
+			paths = append(paths, p)
+		}
+	}
+	out.sensitivePaths = paths
+
+	comms := defaultSensitiveCommAllowlist
+	if strings.TrimSpace(commsSrc) != "" {
+		comms = nil
+		for _, raw := range strings.Split(commsSrc, ",") {
+			c := strings.TrimSpace(raw)
+			if c == "" {
+				continue
+			}
+			comms = append(comms, c)
+		}
+	}
+	for _, c := range comms {
+		out.allowedComms[c] = struct{}{}
+	}
+	return out
+}
+
+// matchSensitiveRead fires when a non-allowlisted process opens a
+// sensitive file. The rule key embeds the comm AND the path so that
+// different (comm, path) pairs alert independently — e.g. nginx
+// reading /etc/shadow and curl reading /root/.ssh/id_rsa are two
+// distinct cooldown groups. Same process opening the same file
+// repeatedly within ALERT_COOLDOWN dedups to a single alert.
+func matchSensitiveRead(e FileEvent) (Hit, bool) {
+	rules := loadFileRules()
+	if rules.commAllowed(e.Comm) {
+		return Hit{}, false
+	}
+	if !rules.isSensitive(e.Filename) {
+		return Hit{}, false
+	}
+	return Hit{
+		RuleKey: "file:sensitive_read:" + e.Comm + ":" + e.Filename,
+		Title:   "Sensitive file read: " + e.Comm + " → " + e.Filename,
+		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" parent=" + e.ParentComm + " path=" + e.Filename +
+			" flags=0x" + uhex(e.Flags) + "```",
+	}, true
+}
+
+// uhex is the lowercase-hex sibling of uitoa, used for openat flag
+// rendering in alert bodies. Same stdlib-free constraint — strconv
+// would pull a fair bit of code into the probe binary just for
+// formatting on the hot path.
+func uhex(v uint32) string {
+	if v == 0 {
+		return "0"
+	}
+	const digits = "0123456789abcdef"
+	var buf [8]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = digits[v&0xf]
+		v >>= 4
+	}
+	return string(buf[i:])
 }

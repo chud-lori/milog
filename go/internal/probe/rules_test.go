@@ -303,3 +303,158 @@ func TestParseNetAllowlist_MalformedSkipped(t *testing.T) {
 		t.Errorf("expected exactly 1 valid CIDR (fc00::/7), got %d: %+v", len(a.nets), a.nets)
 	}
 }
+
+// resetFileRulesCache mirrors resetNetAllowlistCache for the file
+// probe — wipes the parsed-config cache so each test can stage its
+// own MILOG_PROBE_FILE_* env vars.
+func resetFileRulesCache() {
+	cachedFileRules = fileRules{}
+	fileRulesReady = false
+}
+
+func TestMatchFile_DefaultsFireOnSensitiveRead(t *testing.T) {
+	// A non-allowlisted process reading /etc/shadow is the canonical
+	// post-compromise signal the audit FIM module hashes for; here we
+	// catch the live read instead of the periodic re-hash.
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	cases := []struct {
+		name string
+		ev   FileEvent
+	}{
+		{"php-fpm reading /etc/shadow", FileEvent{
+			Comm: "php-fpm8.2", ParentComm: "nginx",
+			Filename: "/etc/shadow", PID: 1234, UID: 33,
+		}},
+		{"curl reading /etc/sudoers", FileEvent{
+			Comm: "curl", Filename: "/etc/sudoers",
+		}},
+		{"cat reading sudoers.d entry", FileEvent{
+			Comm: "cat", Filename: "/etc/sudoers.d/90-extra",
+		}},
+		{"nginx reading authorized_keys", FileEvent{
+			Comm: "nginx", Filename: "/root/.ssh/authorized_keys",
+		}},
+		{"cat reading sshd_config", FileEvent{
+			Comm: "cat", Filename: "/etc/ssh/sshd_config",
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			hits := MatchFile(c.ev)
+			if len(hits) != 1 {
+				t.Fatalf("expected 1 hit for %+v, got %d: %+v", c.ev, len(hits), hits)
+			}
+			h := hits[0]
+			wantKey := "file:sensitive_read:" + c.ev.Comm + ":" + c.ev.Filename
+			if h.RuleKey != wantKey {
+				t.Errorf("rule key = %q, want %q", h.RuleKey, wantKey)
+			}
+			if !strings.Contains(h.Body, "comm="+c.ev.Comm) {
+				t.Errorf("body missing comm=%s: %q", c.ev.Comm, h.Body)
+			}
+		})
+	}
+}
+
+func TestMatchFile_AllowlistedCommsSilent(t *testing.T) {
+	// sshd reading authorized_keys, cron reading /etc/sudoers, etc. —
+	// all expected, all allowlisted. The whole point of the comm
+	// allowlist is that operators don't get paged on every login.
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	cases := []FileEvent{
+		{Comm: "sshd", Filename: "/root/.ssh/authorized_keys"},
+		{Comm: "sudo", Filename: "/etc/sudoers"},
+		{Comm: "cron", Filename: "/etc/shadow"},
+		{Comm: "systemd", Filename: "/etc/passwd"},
+		{Comm: "auditd", Filename: "/etc/shadow"},
+		{Comm: "milog-probe", Filename: "/etc/shadow"},
+	}
+	for _, ev := range cases {
+		if hits := MatchFile(ev); len(hits) != 0 {
+			t.Errorf("allowlisted comm should not fire: %+v → %+v", ev, hits)
+		}
+	}
+}
+
+func TestMatchFile_NonSensitivePathSilent(t *testing.T) {
+	// The BPF prefix filter is coarse (/etc /root /home /var) so the
+	// userspace gets opens that aren't on the precise sensitive list.
+	// Those must NOT fire — the rule is per-path, not per-prefix.
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	cases := []FileEvent{
+		{Comm: "nginx", Filename: "/etc/nginx/nginx.conf"},
+		{Comm: "vim", Filename: "/home/alice/notes.md"},
+		{Comm: "tail", Filename: "/var/log/syslog"},
+		{Comm: "less", Filename: "/etc/hostname"},
+	}
+	for _, ev := range cases {
+		if hits := MatchFile(ev); len(hits) != 0 {
+			t.Errorf("non-sensitive path should not fire: %+v → %+v", ev, hits)
+		}
+	}
+}
+
+func TestMatchFile_CustomSensitivePaths(t *testing.T) {
+	// Operator extends defaults to also alert on webroot env files.
+	// Custom list REPLACES defaults rather than appending — same
+	// semantics as MILOG_PROBE_NET_ALLOWLIST.
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "/var/www/.env,/etc/myapp/secret.key")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	if hits := MatchFile(FileEvent{Comm: "curl", Filename: "/var/www/.env"}); len(hits) != 1 {
+		t.Errorf("custom sensitive path should fire, got %d hits", len(hits))
+	}
+	// The default /etc/shadow should NO LONGER fire — custom list replaces.
+	if hits := MatchFile(FileEvent{Comm: "curl", Filename: "/etc/shadow"}); len(hits) != 0 {
+		t.Errorf("custom list replaces defaults; /etc/shadow should not fire, got %+v", hits)
+	}
+}
+
+func TestMatchFile_CustomCommAllowlist(t *testing.T) {
+	// Operator runs a custom secrets-rotation tool that legitimately
+	// reads /etc/shadow. They allowlist its comm and expect silence.
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "rotator,backup-agent")
+	resetFileRulesCache()
+
+	// Allowlisted comms silent.
+	if hits := MatchFile(FileEvent{Comm: "rotator", Filename: "/etc/shadow"}); len(hits) != 0 {
+		t.Errorf("custom-allowlisted comm should be silent, got %+v", hits)
+	}
+	// And — because the custom list REPLACES — the previously-
+	// shipped sshd allowlist no longer applies.
+	if hits := MatchFile(FileEvent{Comm: "sshd", Filename: "/etc/shadow"}); len(hits) != 1 {
+		t.Errorf("custom allowlist replaces defaults; sshd should now fire, got %+v", hits)
+	}
+}
+
+func TestUhex(t *testing.T) {
+	// Spot-check the openat-flag formatter. Common openat values:
+	//   0x0  = O_RDONLY
+	//   0x1  = O_WRONLY
+	//   0x2  = O_RDWR
+	//   0x42 = O_RDWR | O_CREAT (most common open() default for write)
+	cases := map[uint32]string{
+		0:          "0",
+		1:          "1",
+		2:          "2",
+		0x42:       "42",
+		0x80000:    "80000",
+		0xffffffff: "ffffffff",
+	}
+	for v, want := range cases {
+		if got := uhex(v); got != want {
+			t.Errorf("uhex(0x%x) = %q, want %q", v, got, want)
+		}
+	}
+}

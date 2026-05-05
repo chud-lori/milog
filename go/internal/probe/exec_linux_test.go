@@ -189,3 +189,62 @@ func TestTcpBpfObject_KernelLoad(t *testing.T) {
 		t.Errorf("loaded collection missing program 'handle_inet_sock_set_state'")
 	}
 }
+
+// =============================================================================
+// file audit probe — same two-tier shape.
+// =============================================================================
+
+func TestFileBpfObject_Spec(t *testing.T) {
+	if len(fileBpfObj) == 0 {
+		t.Fatal("fileBpfObj is empty — build.sh didn't produce bpf/file.bpf.o " +
+			"(install clang + libbpf-dev and re-run `bash build.sh`)")
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(fileBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (file): %v", err)
+	}
+
+	prog, ok := spec.Programs["handle_openat"]
+	if !ok {
+		t.Fatalf("expected program 'handle_openat', got: %v", programNames(spec))
+	}
+	if prog.Type != ebpf.TracePoint {
+		t.Errorf("handle_openat.Type = %v, want TracePoint", prog.Type)
+	}
+
+	m, ok := spec.Maps["file_events"]
+	if !ok {
+		t.Fatalf("expected map 'file_events', got: %v", mapNames(spec))
+	}
+	if m.Type != ebpf.RingBuf {
+		t.Errorf("file_events.Type = %v, want RingBuf", m.Type)
+	}
+	if m.MaxEntries < 64*1024 {
+		t.Errorf("file_events.MaxEntries = %d, want >= 65536", m.MaxEntries)
+	}
+}
+
+func TestFileBpfObject_KernelLoad(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (CAP_BPF) — see ci.yml's sudo step")
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit.RemoveMemlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(fileBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (file): %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			t.Fatalf("BPF verifier rejected handle_openat on kernel %s:\n%+v", uname(), verr)
+		}
+		t.Fatalf("NewCollection (file) on kernel %s: %v", uname(), err)
+	}
+	defer coll.Close()
+	if _, ok := coll.Programs["handle_openat"]; !ok {
+		t.Errorf("loaded collection missing program 'handle_openat'")
+	}
+}
