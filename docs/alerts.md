@@ -150,14 +150,26 @@ the three Matrix vars — the alert would silently no-op otherwise.
 
 ## What fires
 
-| Rule              | Key                          | Trigger                                          |
-| ----------------- | ---------------------------- | ------------------------------------------------ |
-| 5xx spike         | `5xx:<app>`                  | last minute ≥ `THRESH_5XX_WARN` (default 5)      |
-| 4xx spike         | `4xx:<app>`                  | last minute ≥ `THRESH_4XX_WARN` (default 20)    |
-| CPU / MEM / Disk  | `cpu` / `mem` / `disk:/`     | ≥ corresponding `THRESH_*_CRIT`                  |
-| Workers down      | `workers`                    | zero nginx worker processes                      |
-| Exploit match     | `exploit:<app>:<category>`   | `mode_exploits` pattern hit                      |
-| Probe match       | `probe:<app>`                | `mode_probes` pattern hit                        |
+| Rule              | Key                                  | Trigger                                                                       |
+| ----------------- | ------------------------------------ | ----------------------------------------------------------------------------- |
+| 5xx spike         | `5xx:<app>`                          | last minute ≥ `THRESH_5XX_WARN` (default 5)                                  |
+| 4xx spike         | `4xx:<app>`                          | last minute ≥ `THRESH_4XX_WARN` (default 20)                                |
+| CPU / MEM / Disk  | `cpu` / `mem` / `disk:/`             | ≥ corresponding `THRESH_*_CRIT`                                              |
+| Workers down      | `workers`                            | zero nginx worker processes                                                  |
+| Exploit match     | `exploit:<app>:<category>`           | `mode_exploits` pattern hit                                                  |
+| Probe match       | `probe:<app>`                        | `mode_probes` pattern hit                                                    |
+| App pattern       | `app:<source>:<pattern>`             | known error signature (`panic_go`, `traceback_python`, …) in any LOGS source |
+| Anomaly           | `anomaly:<app>:<metric>`             | req / c5xx / p95 > mean + σ at same minute-of-day over 14d (see [Historical metrics](historical-metrics.md#anomaly-detection)) |
+| Audit drift       | `audit:fim_drift:<path>`             | watched-file SHA256 changed                                                  |
+| Audit accounts    | `audit:accounts:<path>:<event>`      | passwd / sudoers / authorized_keys line-level diff                           |
+| Audit persistence | `audit:persistence:<path>`           | new entry under cron / systemd / rc.local re-entry surface                   |
+| Audit ports       | `audit:ports:<proto>:<port>`         | new TCP/UDP listener appeared                                                |
+| Audit YARA        | `audit:yara:<rule>:<path>`           | YARA rule hit on a webroot file                                              |
+| Audit rootkit     | `audit:rootkit:<heuristic>`          | hidden-process / `ld.so.preload` / tmp-exec heuristic                        |
+| Probe — process   | `process:shell_from_web_worker:…` `process:exec_from_tmp:<comm>` `process:suid_escalation:…` | eBPF sidecar — see [`docs/probe.md`](probe.md)        |
+| Probe — file      | `file:sensitive_read:<comm>:<path>`  | non-allowlisted process opened a sensitive file                              |
+| Probe — net       | `net:unexpected_outbound:<comm>` `net:retrans_spike:<dst>:<port>` | outbound connect to non-allowlisted dest, or sustained TCP retransmits      |
+| Probe — kernel    | `proc:ptrace_inject:<comm>` `proc:kmod_load:<module>` `proc:bpf_load:<comm>` `process:syscall_burst:<comm>` | ptrace attach by non-debugger, kernel module load, BPF program load, per-PID syscall σ-anomaly |
 
 Alerts fire from the interactive modes (`monitor`, `exploits`,
 `probes`) and from [`milog daemon`](daemon.md). The rule keys are

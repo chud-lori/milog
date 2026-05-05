@@ -1,8 +1,13 @@
 # MiLog
 
-Bash nginx + system monitor. TUI dashboard, read-only web UI, log tailing,
-heuristic scanner/exploit detection, multi-destination alerts
-(Discord / Slack / Telegram / Matrix), headless daemon, historical metrics.
+Bash nginx + system monitor. TUI dashboard, read-only web UI with
+SSE live-tail, log tailing, heuristic scanner/exploit detection,
+multi-destination alerts (Discord / Slack / Telegram / Matrix),
+headless daemon, historical metrics with σ-based anomaly detection,
+host-integrity audits (FIM / persistence / ports / YARA / accounts /
+rootkit), and an optional **eBPF probe sidecar** that streams kernel
+events (exec / tcp / file / ptrace / kmod / retransmit / syscall-rate /
+bpf-load) through the same alert pipeline.
 
 The shipping artifact is still a single file (`milog.sh` → `/usr/local/bin/milog`),
 but it's **built from modular source under [`src/`](src/README.md)** by
@@ -19,6 +24,7 @@ Everything in-depth lives under [`docs/`](docs/) — skim the
 - [**Web dashboard**](docs/web-dashboard.md) — `milog web`, systemd user service, SSH / Tailscale / Cloudflare Tunnel exposure patterns
 - [**Historical metrics**](docs/historical-metrics.md) — SQLite time series, `trend` / `diff` / `auto-tune`
 - [**`milog daemon`**](docs/daemon.md) — headless mode, systemd service, permissions
+- [**Kernel observability (`milog probe`)**](docs/probe.md) — eBPF sidecar, the 8 probes, `install-service`, allowlist tuning
 - [**GeoIP enrichment**](docs/geoip.md) — MaxMind license + weekly auto-refresh
 - [**Troubleshooting**](docs/troubleshooting.md) — `milog doctor` + common failure modes
 
@@ -117,6 +123,12 @@ milog attacker 13.86.116.180
 
 # What fired overnight?
 milog alerts 24h
+
+# Linux only — install the eBPF probe sidecar (exec / file / net / ptrace
+# / kmod / retransmit / syscall-rate / bpf-load watchers fire through the
+# same alert pipeline)
+sudo milog probe install-service
+sudo journalctl -u milog-probe.service -f
 ```
 
 Full command list: `milog help`.
@@ -152,7 +164,10 @@ milog grep <app> <pattern>
 milog <app>                # raw tail of one app
 
 milog web [install-service|stop|status]
+milog probe [status|install-service|uninstall-service]   # Linux only — eBPF sidecar
 milog alert [on|off|status|test]
+milog audit [fim|persistence|ports|yara|accounts|rootkit] [baseline|check|status]
+milog silence <rule_or_glob> <duration> [msg]
 milog config [init|add|rm|dir|set|edit]
 milog doctor               # diagnostic checklist
 milog help

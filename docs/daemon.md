@@ -85,9 +85,29 @@ On top of the per-tick work, two subshells run `tail -F` loops:
 Cross-rule dedup keyed on `(ip, path)` ensures one scanner line
 doesn't produce two alert embeds.
 
-Once per minute: history write (if enabled).
+Once per minute: history write (if enabled), then — when
+`ANOMALY_ENABLED=1` — a same-minute-of-day σ check across the
+14-day baseline (`anomaly:<app>:<metric>` rule keys; see
+[historical-metrics.md](historical-metrics.md#anomaly-detection)).
 Once per hour: top-IP rollup (if enabled).
 Once per day: history prune (drops rows older than `HISTORY_RETAIN_DAYS`).
+
+The audit watcher (`mode_audit`) ticks alongside the rule evaluator
+when `AUDIT_ENABLED=1`. Each sub-mode (fim / persistence / ports /
+yara / accounts / rootkit) is throttled by its own
+`AUDIT_*_INTERVAL`, so calling them every tick is cheap — the
+intervals do the gating.
+
+## Probe sidecar (Linux only)
+
+`milog daemon` is the bash side. The eBPF probe sidecar is a separate
+systemd unit installed via `sudo milog probe install-service`. The two
+share state via `milog _internal_alert` — when the probe matches a
+rule, it shells out to milog (the same binary the daemon runs) which
+goes through `alert_should_fire` + `alert_fire`. Cooldown / silence /
+dedup / routing / hooks all apply uniformly to probe alerts and bash-
+side alerts. See [probe.md](probe.md) for the probe's own service
+management.
 
 ## Update after `curl | bash`
 

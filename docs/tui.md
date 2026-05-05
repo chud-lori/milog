@@ -64,14 +64,21 @@ milog-tui
 
 Keys (inside the TUI):
 
-| Key         | Action                                       |
-| ----------- | -------------------------------------------- |
-| `q` / `Ctrl+C` | quit                                      |
-| `p`         | pause (freeze sparklines + numbers)          |
-| `r`         | refresh now (bypasses the tick)              |
-| `+` / `=`   | faster refresh (down to 1s)                  |
-| `-` / `_`   | slower refresh (up to 60s)                   |
-| `?`         | toggle help pane                             |
+| Key                      | Action                                                                |
+| ------------------------ | --------------------------------------------------------------------- |
+| `q` / `Ctrl+C`           | quit                                                                  |
+| `p`                      | pause (freeze sparklines + numbers)                                   |
+| `r`                      | refresh now (bypasses the tick)                                       |
+| `+` / `=`                | faster refresh (down to 1s)                                           |
+| `-` / `_`                | slower refresh (up to 60s)                                            |
+| `?`                      | toggle help pane                                                      |
+| `↑` / `k`, `↓` / `j`     | move row cursor in overview                                           |
+| `enter` / `l` / `→`      | drill into the highlighted app — top paths, top IPs, recent alerts    |
+| `esc` / `h` / `←` / `bs` | back to overview from any drill-down or named view                    |
+| `a`                      | global alerts view (last 24h, newest first, capped at 50)             |
+| `P`                      | paths-cross-app view (top 12 paths summed across apps + breakdown)    |
+| `e`                      | errors view (`app:*` rule fires aggregated by pattern → source)       |
+| `t`                      | trend view (per-app 60-minute request-rate sparklines from history DB) |
 
 ## Config
 

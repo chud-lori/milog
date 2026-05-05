@@ -136,6 +136,12 @@ See [alerts.md](alerts.md) for full destination setup.
 | `HISTORY_DB`             | `~/.local/share/milog/metrics.db`       | SQLite path                     |
 | `HISTORY_RETAIN_DAYS`    | `30`                                    | Prune older rows                |
 | `HISTORY_TOP_IP_N`       | `50`                                    | Top-N IPs per app per hour      |
+| `ANOMALY_ENABLED`        | `0`                                     | Run same-minute-of-day σ check on each minute write; fires `anomaly:<app>:<metric>`. Needs `HISTORY_ENABLED=1`. |
+| `ANOMALY_SIGMA`          | `3`                                     | Stddev multiplier for the upper band |
+| `ANOMALY_MIN_DAYS`       | `14`                                    | Distinct days of baseline data required before any fire |
+| `ANOMALY_FLOOR_REQ`      | `10`                                    | Current req/min must clear this absolute floor before σ check runs |
+| `ANOMALY_FLOOR_C5XX`     | `2`                                     | Current 5xx/min floor                                              |
+| `ANOMALY_FLOOR_P95`      | `100`                                   | Current p95 ms floor                                               |
 | `GEOIP_ENABLED`          | `0`                                     | Enable COUNTRY column           |
 | `MMDB_PATH`              | `/var/lib/GeoIP/GeoLite2-Country.mmdb`  | MaxMind DB path                 |
 | `WEB_PORT`               | `8765`                                  | `milog web` listen port         |
@@ -175,6 +181,12 @@ systemd units, one-shot runs, or CI:
 | `MILOG_MMDB_PATH`             | `MMDB_PATH`             |
 | `MILOG_HISTORY_ENABLED`       | `HISTORY_ENABLED`       |
 | `MILOG_HISTORY_DB`            | `HISTORY_DB`            |
+| `MILOG_ANOMALY_ENABLED`       | `ANOMALY_ENABLED`       |
+| `MILOG_ANOMALY_SIGMA`         | `ANOMALY_SIGMA`         |
+| `MILOG_ANOMALY_MIN_DAYS`      | `ANOMALY_MIN_DAYS`      |
+| `MILOG_ANOMALY_FLOOR_REQ`     | `ANOMALY_FLOOR_REQ`     |
+| `MILOG_ANOMALY_FLOOR_C5XX`    | `ANOMALY_FLOOR_C5XX`    |
+| `MILOG_ANOMALY_FLOOR_P95`     | `ANOMALY_FLOOR_P95`     |
 | `MILOG_WEB_PORT`              | `WEB_PORT`              |
 | `MILOG_WEB_BIND`              | `WEB_BIND`              |
 | `MILOG_SLOW_EXCLUDE_PATHS`    | `SLOW_EXCLUDE_PATHS`    |

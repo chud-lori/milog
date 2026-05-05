@@ -17,9 +17,15 @@ quick start; this directory has everything else.
 - [**TUI (`milog tui`)**](tui.md) — bubbletea Go binary, when to pick
   it over bash `milog monitor`
 - [**Historical metrics**](historical-metrics.md) — SQLite-backed
-  `metrics_minute` + `top_ip_hour` tables, `trend` / `diff` / `auto-tune`
+  `metrics_minute` + `top_ip_hour` tables, `trend` / `diff` /
+  `auto-tune`, plus the same-minute-of-day σ anomaly detector
+  (`anomaly:<app>:<metric>` rule keys)
 - [**`milog daemon`**](daemon.md) — headless mode, systemd wiring,
   update flow
+- [**Kernel observability (`milog probe`)**](probe.md) — Linux-only
+  eBPF sidecar; 8 probes (exec / tcp / file / ptrace / kmod /
+  retransmit / syscall-rate / bpf-load), `install-service`, allowlist
+  tuning, anomaly detector
 - [**GeoIP enrichment**](geoip.md) — MaxMind license + `geoipupdate`
   weekly timer + the COUNTRY column
 - [**Troubleshooting**](troubleshooting.md) — `milog doctor`, common
@@ -43,5 +49,10 @@ quick start; this directory has everything else.
 5. After a few days: `milog auto-tune` to calibrate thresholds
 6. Add [GeoIP](geoip.md) and/or the [web dashboard](web-dashboard.md)
    whenever you want them
-7. Run [`milog doctor`](troubleshooting.md) any time to see what's
+7. Linux only: install the eBPF [probe sidecar](probe.md) for
+   kernel-event coverage (`sudo milog probe install-service`)
+8. After 14 days of history: enable the [anomaly
+   detector](historical-metrics.md#anomaly-detection) so daily-pattern
+   spikes page automatically
+9. Run [`milog doctor`](troubleshooting.md) any time to see what's
    wired up and what's degraded
