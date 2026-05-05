@@ -82,40 +82,53 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Three independent event streams: exec (sched_process_exec),
-	// tcp connect (sock:inet_sock_set_state), and file open
-	// (syscalls:sys_enter_openat). Each runs in its own goroutine
-	// with its own BPF collection so a verifier reject on one doesn't
-	// take down the other two — the operator still gets the remaining
-	// probes' coverage with a logged warning for the failed one. Only
-	// when all three die do we exit non-zero so systemd restarts us.
+	// Five independent event streams: exec (sched_process_exec),
+	// tcp connect (sock:inet_sock_set_state), file open
+	// (syscalls:sys_enter_openat), ptrace (syscalls:sys_enter_ptrace),
+	// and kernel module load (module:module_load). Each runs in its
+	// own goroutine with its own BPF collection so a verifier reject
+	// on one doesn't take down the others — operators still get the
+	// remaining probes' coverage with a logged warning for the failed
+	// one. Only when ALL die do we exit non-zero so systemd restarts.
 	events := make(chan probe.Event, 256)
 	netEvents := make(chan probe.NetEvent, 256)
 	fileEvents := make(chan probe.FileEvent, 256)
+	ptraceEvents := make(chan probe.PtraceEvent, 64)
+	kmodEvents := make(chan probe.KmodEvent, 16)
 	execErrCh := make(chan error, 1)
 	netErrCh := make(chan error, 1)
 	fileErrCh := make(chan error, 1)
+	ptraceErrCh := make(chan error, 1)
+	kmodErrCh := make(chan error, 1)
 
 	go func() { execErrCh <- probe.Run(ctx, events) }()
 	go func() { netErrCh <- probe.RunNet(ctx, netEvents) }()
 	go func() { fileErrCh <- probe.RunFile(ctx, fileEvents) }()
+	go func() { ptraceErrCh <- probe.RunPtrace(ctx, ptraceEvents) }()
+	go func() { kmodErrCh <- probe.RunKmod(ctx, kmodEvents) }()
 
-	log.Printf("milog-probe %s — watching exec + tcp connect + file open (json=%v dry-run=%v)",
+	log.Printf("milog-probe %s — watching exec + tcp connect + file open + ptrace + kmod load (json=%v dry-run=%v)",
 		buildVersion, *flagJSON, *flagDryRun)
+
+	// allDead reports whether every probe has surfaced its terminal
+	// error. Once true, we exit non-zero so systemd Restart=on-failure
+	// papers over transient kernel-side issues.
+	allDead := func() bool {
+		return execErrCh == nil && netErrCh == nil && fileErrCh == nil &&
+			ptraceErrCh == nil && kmodErrCh == nil
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			drainErrors(execErrCh, netErrCh, fileErrCh)
+			drainErrors(execErrCh, netErrCh, fileErrCh, ptraceErrCh, kmodErrCh)
 			return
 		case err := <-execErrCh:
-			// One probe died but the others might still be alive. Log,
-			// keep running. Only when ALL three die do we exit non-zero.
 			if err != nil {
 				log.Printf("probe (exec): %v — exec coverage degraded", err)
 			}
 			execErrCh = nil
-			if netErrCh == nil && fileErrCh == nil {
+			if allDead() {
 				os.Exit(1)
 			}
 		case err := <-netErrCh:
@@ -123,7 +136,7 @@ func main() {
 				log.Printf("probe (net): %v — outbound-connect coverage degraded", err)
 			}
 			netErrCh = nil
-			if execErrCh == nil && fileErrCh == nil {
+			if allDead() {
 				os.Exit(1)
 			}
 		case err := <-fileErrCh:
@@ -131,7 +144,23 @@ func main() {
 				log.Printf("probe (file): %v — sensitive-file coverage degraded", err)
 			}
 			fileErrCh = nil
-			if execErrCh == nil && netErrCh == nil {
+			if allDead() {
+				os.Exit(1)
+			}
+		case err := <-ptraceErrCh:
+			if err != nil {
+				log.Printf("probe (ptrace): %v — process-injection coverage degraded", err)
+			}
+			ptraceErrCh = nil
+			if allDead() {
+				os.Exit(1)
+			}
+		case err := <-kmodErrCh:
+			if err != nil {
+				log.Printf("probe (kmod): %v — kernel-module-load coverage degraded", err)
+			}
+			kmodErrCh = nil
+			if allDead() {
 				os.Exit(1)
 			}
 		case ev := <-events:
@@ -140,6 +169,10 @@ func main() {
 			handleNetEvent(nev, *flagJSON, *flagDryRun, *flagMilog)
 		case fev := <-fileEvents:
 			handleFileEvent(fev, *flagJSON, *flagDryRun, *flagMilog)
+		case pev := <-ptraceEvents:
+			handlePtraceEvent(pev, *flagJSON, *flagDryRun, *flagMilog)
+		case kev := <-kmodEvents:
+			handleKmodEvent(kev, *flagJSON, *flagDryRun, *flagMilog)
 		}
 	}
 }
@@ -229,6 +262,49 @@ func handleFileEvent(ev probe.FileEvent, asJSON, dryRun bool, milogBin string) {
 	}
 }
 
+// handlePtraceEvent dispatches one PtraceEvent through MatchPtrace.
+// Anti-injection is per-attach so the volume here is low — debug
+// sessions emit a handful of events, attacker activity emits ones.
+func handlePtraceEvent(ev probe.PtraceEvent, asJSON, dryRun bool, milogBin string) {
+	hits := probe.MatchPtrace(ev)
+	if asJSON {
+		emitPtraceJSON(ev, hits)
+		return
+	}
+	if len(hits) == 0 {
+		return
+	}
+	for _, h := range hits {
+		if dryRun {
+			log.Printf("DRY: %s :: %s", h.RuleKey, h.Title)
+			continue
+		}
+		fireAlert(h, milogBin)
+	}
+}
+
+// handleKmodEvent dispatches one KmodEvent through MatchKmod. Module
+// load is rare on production hosts, so most calls here see zero
+// hits (no allowlist match means alert, allowlist match means
+// silence). Either way the overhead is trivial.
+func handleKmodEvent(ev probe.KmodEvent, asJSON, dryRun bool, milogBin string) {
+	hits := probe.MatchKmod(ev)
+	if asJSON {
+		emitKmodJSON(ev, hits)
+		return
+	}
+	if len(hits) == 0 {
+		return
+	}
+	for _, h := range hits {
+		if dryRun {
+			log.Printf("DRY: %s :: %s", h.RuleKey, h.Title)
+			continue
+		}
+		fireAlert(h, milogBin)
+	}
+}
+
 func emitJSON(ev probe.Event, hits []probe.Hit) {
 	type wire struct {
 		Event probe.Event `json:"event"`
@@ -254,6 +330,24 @@ func emitFileJSON(ev probe.FileEvent, hits []probe.Hit) {
 	}
 	enc := json.NewEncoder(os.Stdout)
 	_ = enc.Encode(wire{FileEvent: ev, Hits: hits})
+}
+
+func emitPtraceJSON(ev probe.PtraceEvent, hits []probe.Hit) {
+	type wire struct {
+		PtraceEvent probe.PtraceEvent `json:"ptrace_event"`
+		Hits        []probe.Hit       `json:"hits"`
+	}
+	enc := json.NewEncoder(os.Stdout)
+	_ = enc.Encode(wire{PtraceEvent: ev, Hits: hits})
+}
+
+func emitKmodJSON(ev probe.KmodEvent, hits []probe.Hit) {
+	type wire struct {
+		KmodEvent probe.KmodEvent `json:"kmod_event"`
+		Hits      []probe.Hit     `json:"hits"`
+	}
+	enc := json.NewEncoder(os.Stdout)
+	_ = enc.Encode(wire{KmodEvent: ev, Hits: hits})
 }
 
 // fireAlert shells out to `milog _internal_alert <key> <title> <body> <color>`.

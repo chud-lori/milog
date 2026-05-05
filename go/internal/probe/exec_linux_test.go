@@ -248,3 +248,121 @@ func TestFileBpfObject_KernelLoad(t *testing.T) {
 		t.Errorf("loaded collection missing program 'handle_openat'")
 	}
 }
+
+// =============================================================================
+// ptrace anti-injection probe — same two-tier shape.
+// =============================================================================
+
+func TestPtraceBpfObject_Spec(t *testing.T) {
+	if len(ptraceBpfObj) == 0 {
+		t.Fatal("ptraceBpfObj is empty — build.sh didn't produce bpf/ptrace.bpf.o " +
+			"(install clang + libbpf-dev and re-run `bash build.sh`)")
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(ptraceBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (ptrace): %v", err)
+	}
+
+	prog, ok := spec.Programs["handle_ptrace"]
+	if !ok {
+		t.Fatalf("expected program 'handle_ptrace', got: %v", programNames(spec))
+	}
+	if prog.Type != ebpf.TracePoint {
+		t.Errorf("handle_ptrace.Type = %v, want TracePoint", prog.Type)
+	}
+
+	m, ok := spec.Maps["ptrace_events"]
+	if !ok {
+		t.Fatalf("expected map 'ptrace_events', got: %v", mapNames(spec))
+	}
+	if m.Type != ebpf.RingBuf {
+		t.Errorf("ptrace_events.Type = %v, want RingBuf", m.Type)
+	}
+	if m.MaxEntries < 16*1024 {
+		t.Errorf("ptrace_events.MaxEntries = %d, want >= 16384", m.MaxEntries)
+	}
+}
+
+func TestPtraceBpfObject_KernelLoad(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (CAP_BPF) — see ci.yml's sudo step")
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit.RemoveMemlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(ptraceBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (ptrace): %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			t.Fatalf("BPF verifier rejected handle_ptrace on kernel %s:\n%+v", uname(), verr)
+		}
+		t.Fatalf("NewCollection (ptrace) on kernel %s: %v", uname(), err)
+	}
+	defer coll.Close()
+	if _, ok := coll.Programs["handle_ptrace"]; !ok {
+		t.Errorf("loaded collection missing program 'handle_ptrace'")
+	}
+}
+
+// =============================================================================
+// Kernel module load probe — same two-tier shape.
+// =============================================================================
+
+func TestKmodBpfObject_Spec(t *testing.T) {
+	if len(kmodBpfObj) == 0 {
+		t.Fatal("kmodBpfObj is empty — build.sh didn't produce bpf/kmod.bpf.o " +
+			"(install clang + libbpf-dev and re-run `bash build.sh`)")
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(kmodBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (kmod): %v", err)
+	}
+
+	prog, ok := spec.Programs["handle_module_load"]
+	if !ok {
+		t.Fatalf("expected program 'handle_module_load', got: %v", programNames(spec))
+	}
+	if prog.Type != ebpf.TracePoint {
+		t.Errorf("handle_module_load.Type = %v, want TracePoint", prog.Type)
+	}
+
+	m, ok := spec.Maps["kmod_events"]
+	if !ok {
+		t.Fatalf("expected map 'kmod_events', got: %v", mapNames(spec))
+	}
+	if m.Type != ebpf.RingBuf {
+		t.Errorf("kmod_events.Type = %v, want RingBuf", m.Type)
+	}
+	if m.MaxEntries < 16*1024 {
+		t.Errorf("kmod_events.MaxEntries = %d, want >= 16384", m.MaxEntries)
+	}
+}
+
+func TestKmodBpfObject_KernelLoad(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (CAP_BPF) — see ci.yml's sudo step")
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit.RemoveMemlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(kmodBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (kmod): %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			t.Fatalf("BPF verifier rejected handle_module_load on kernel %s:\n%+v", uname(), verr)
+		}
+		t.Fatalf("NewCollection (kmod) on kernel %s: %v", uname(), err)
+	}
+	defer coll.Close()
+	if _, ok := coll.Programs["handle_module_load"]; !ok {
+		t.Errorf("loaded collection missing program 'handle_module_load'")
+	}
+}
