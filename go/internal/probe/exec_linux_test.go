@@ -130,3 +130,62 @@ func mapNames(spec *ebpf.CollectionSpec) []string {
 	}
 	return out
 }
+
+// =============================================================================
+// tcp connect probe — same two-tier shape as the exec probe above.
+// =============================================================================
+
+func TestTcpBpfObject_Spec(t *testing.T) {
+	if len(tcpBpfObj) == 0 {
+		t.Fatal("tcpBpfObj is empty — build.sh didn't produce bpf/tcp.bpf.o " +
+			"(install clang + libbpf-dev and re-run `bash build.sh`)")
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(tcpBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (tcp): %v", err)
+	}
+
+	prog, ok := spec.Programs["handle_inet_sock_set_state"]
+	if !ok {
+		t.Fatalf("expected program 'handle_inet_sock_set_state', got: %v", programNames(spec))
+	}
+	if prog.Type != ebpf.TracePoint {
+		t.Errorf("handle_inet_sock_set_state.Type = %v, want TracePoint", prog.Type)
+	}
+
+	m, ok := spec.Maps["tcp_events"]
+	if !ok {
+		t.Fatalf("expected map 'tcp_events', got: %v", mapNames(spec))
+	}
+	if m.Type != ebpf.RingBuf {
+		t.Errorf("tcp_events.Type = %v, want RingBuf", m.Type)
+	}
+	if m.MaxEntries < 64*1024 {
+		t.Errorf("tcp_events.MaxEntries = %d, want >= 65536", m.MaxEntries)
+	}
+}
+
+func TestTcpBpfObject_KernelLoad(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (CAP_BPF) — see ci.yml's sudo step")
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit.RemoveMemlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(tcpBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (tcp): %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			t.Fatalf("BPF verifier rejected handle_inet_sock_set_state on kernel %s:\n%+v", uname(), verr)
+		}
+		t.Fatalf("NewCollection (tcp) on kernel %s: %v", uname(), err)
+	}
+	defer coll.Close()
+	if _, ok := coll.Programs["handle_inet_sock_set_state"]; !ok {
+		t.Errorf("loaded collection missing program 'handle_inet_sock_set_state'")
+	}
+}
