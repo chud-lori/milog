@@ -41,3 +41,8 @@ func RunPtrace(ctx context.Context, out chan<- PtraceEvent) error {
 func RunKmod(ctx context.Context, out chan<- KmodEvent) error {
 	return ErrUnsupported
 }
+
+// RunRetrans stub for non-Linux builds.
+func RunRetrans(ctx context.Context, out chan<- RetransEvent) error {
+	return ErrUnsupported
+}

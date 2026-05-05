@@ -366,3 +366,67 @@ func TestKmodBpfObject_KernelLoad(t *testing.T) {
 		t.Errorf("loaded collection missing program 'handle_module_load'")
 	}
 }
+
+// =============================================================================
+// TCP retransmit observability probe — same two-tier shape, but the
+// map is LRU_HASH instead of RingBuf since this probe samples rather
+// than streams.
+// =============================================================================
+
+func TestRetransBpfObject_Spec(t *testing.T) {
+	if len(retransBpfObj) == 0 {
+		t.Fatal("retransBpfObj is empty — build.sh didn't produce bpf/retrans.bpf.o " +
+			"(install clang + libbpf-dev and re-run `bash build.sh`)")
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(retransBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (retrans): %v", err)
+	}
+
+	prog, ok := spec.Programs["handle_retransmit"]
+	if !ok {
+		t.Fatalf("expected program 'handle_retransmit', got: %v", programNames(spec))
+	}
+	if prog.Type != ebpf.TracePoint {
+		t.Errorf("handle_retransmit.Type = %v, want TracePoint", prog.Type)
+	}
+
+	m, ok := spec.Maps["retrans_counts"]
+	if !ok {
+		t.Fatalf("expected map 'retrans_counts', got: %v", mapNames(spec))
+	}
+	if m.Type != ebpf.LRUHash {
+		t.Errorf("retrans_counts.Type = %v, want LRUHash", m.Type)
+	}
+	// 1024-entry floor — well below the BPF-side 4096 declaration so
+	// regressions that drop the cap (e.g. someone tightens it during
+	// memory tuning) still leave reasonable headroom.
+	if m.MaxEntries < 1024 {
+		t.Errorf("retrans_counts.MaxEntries = %d, want >= 1024", m.MaxEntries)
+	}
+}
+
+func TestRetransBpfObject_KernelLoad(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (CAP_BPF) — see ci.yml's sudo step")
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit.RemoveMemlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(retransBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (retrans): %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			t.Fatalf("BPF verifier rejected handle_retransmit on kernel %s:\n%+v", uname(), verr)
+		}
+		t.Fatalf("NewCollection (retrans) on kernel %s: %v", uname(), err)
+	}
+	defer coll.Close()
+	if _, ok := coll.Programs["handle_retransmit"]; !ok {
+		t.Errorf("loaded collection missing program 'handle_retransmit'")
+	}
+}

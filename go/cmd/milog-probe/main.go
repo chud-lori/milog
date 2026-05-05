@@ -82,32 +82,37 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Five independent event streams: exec (sched_process_exec),
+	// Six independent event streams: exec (sched_process_exec),
 	// tcp connect (sock:inet_sock_set_state), file open
 	// (syscalls:sys_enter_openat), ptrace (syscalls:sys_enter_ptrace),
-	// and kernel module load (module:module_load). Each runs in its
-	// own goroutine with its own BPF collection so a verifier reject
-	// on one doesn't take down the others — operators still get the
-	// remaining probes' coverage with a logged warning for the failed
-	// one. Only when ALL die do we exit non-zero so systemd restarts.
+	// kernel module load (module:module_load), and TCP retransmit
+	// observability (tcp:tcp_retransmit_skb, sampled, not streamed).
+	// Each runs in its own goroutine with its own BPF collection so
+	// a verifier reject on one doesn't take down the others —
+	// operators still get the remaining probes' coverage with a
+	// logged warning for the failed one. Only when ALL die do we
+	// exit non-zero so systemd Restart=on-failure can recover.
 	events := make(chan probe.Event, 256)
 	netEvents := make(chan probe.NetEvent, 256)
 	fileEvents := make(chan probe.FileEvent, 256)
 	ptraceEvents := make(chan probe.PtraceEvent, 64)
 	kmodEvents := make(chan probe.KmodEvent, 16)
+	retransEvents := make(chan probe.RetransEvent, 64)
 	execErrCh := make(chan error, 1)
 	netErrCh := make(chan error, 1)
 	fileErrCh := make(chan error, 1)
 	ptraceErrCh := make(chan error, 1)
 	kmodErrCh := make(chan error, 1)
+	retransErrCh := make(chan error, 1)
 
 	go func() { execErrCh <- probe.Run(ctx, events) }()
 	go func() { netErrCh <- probe.RunNet(ctx, netEvents) }()
 	go func() { fileErrCh <- probe.RunFile(ctx, fileEvents) }()
 	go func() { ptraceErrCh <- probe.RunPtrace(ctx, ptraceEvents) }()
 	go func() { kmodErrCh <- probe.RunKmod(ctx, kmodEvents) }()
+	go func() { retransErrCh <- probe.RunRetrans(ctx, retransEvents) }()
 
-	log.Printf("milog-probe %s — watching exec + tcp connect + file open + ptrace + kmod load (json=%v dry-run=%v)",
+	log.Printf("milog-probe %s — watching exec + tcp connect + file open + ptrace + kmod load + tcp retransmit (json=%v dry-run=%v)",
 		buildVersion, *flagJSON, *flagDryRun)
 
 	// allDead reports whether every probe has surfaced its terminal
@@ -115,13 +120,13 @@ func main() {
 	// papers over transient kernel-side issues.
 	allDead := func() bool {
 		return execErrCh == nil && netErrCh == nil && fileErrCh == nil &&
-			ptraceErrCh == nil && kmodErrCh == nil
+			ptraceErrCh == nil && kmodErrCh == nil && retransErrCh == nil
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			drainErrors(execErrCh, netErrCh, fileErrCh, ptraceErrCh, kmodErrCh)
+			drainErrors(execErrCh, netErrCh, fileErrCh, ptraceErrCh, kmodErrCh, retransErrCh)
 			return
 		case err := <-execErrCh:
 			if err != nil {
@@ -163,6 +168,14 @@ func main() {
 			if allDead() {
 				os.Exit(1)
 			}
+		case err := <-retransErrCh:
+			if err != nil {
+				log.Printf("probe (retrans): %v — tcp-retransmit coverage degraded", err)
+			}
+			retransErrCh = nil
+			if allDead() {
+				os.Exit(1)
+			}
 		case ev := <-events:
 			handleEvent(ev, *flagJSON, *flagDryRun, *flagMilog)
 		case nev := <-netEvents:
@@ -173,6 +186,8 @@ func main() {
 			handlePtraceEvent(pev, *flagJSON, *flagDryRun, *flagMilog)
 		case kev := <-kmodEvents:
 			handleKmodEvent(kev, *flagJSON, *flagDryRun, *flagMilog)
+		case rev := <-retransEvents:
+			handleRetransEvent(rev, *flagJSON, *flagDryRun, *flagMilog)
 		}
 	}
 }
@@ -305,6 +320,29 @@ func handleKmodEvent(ev probe.KmodEvent, asJSON, dryRun bool, milogBin string) {
 	}
 }
 
+// handleRetransEvent dispatches one RetransEvent through MatchRetrans.
+// Volume is bounded by destination cardinality (LRU map cap is 4096)
+// rather than by per-packet retransmit count, so even a flaky link
+// produces at most a few hundred events per tick — most of which
+// won't cross the rule threshold.
+func handleRetransEvent(ev probe.RetransEvent, asJSON, dryRun bool, milogBin string) {
+	hits := probe.MatchRetrans(ev)
+	if asJSON {
+		emitRetransJSON(ev, hits)
+		return
+	}
+	if len(hits) == 0 {
+		return
+	}
+	for _, h := range hits {
+		if dryRun {
+			log.Printf("DRY: %s :: %s", h.RuleKey, h.Title)
+			continue
+		}
+		fireAlert(h, milogBin)
+	}
+}
+
 func emitJSON(ev probe.Event, hits []probe.Hit) {
 	type wire struct {
 		Event probe.Event `json:"event"`
@@ -348,6 +386,15 @@ func emitKmodJSON(ev probe.KmodEvent, hits []probe.Hit) {
 	}
 	enc := json.NewEncoder(os.Stdout)
 	_ = enc.Encode(wire{KmodEvent: ev, Hits: hits})
+}
+
+func emitRetransJSON(ev probe.RetransEvent, hits []probe.Hit) {
+	type wire struct {
+		RetransEvent probe.RetransEvent `json:"retrans_event"`
+		Hits         []probe.Hit        `json:"hits"`
+	}
+	enc := json.NewEncoder(os.Stdout)
+	_ = enc.Encode(wire{RetransEvent: ev, Hits: hits})
 }
 
 // fireAlert shells out to `milog _internal_alert <key> <title> <body> <color>`.
