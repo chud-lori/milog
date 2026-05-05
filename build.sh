@@ -24,6 +24,15 @@
 # ==============================================================================
 set -euo pipefail
 
+# Pin glob/sort collation to byte order. Bash pathname expansion uses
+# LC_COLLATE — same `for f in src/modes/*.sh` produces a different
+# order under en_US.UTF-8 (darwin / dev laptops) vs C / C.UTF-8 (CI
+# Ubuntu, minimal containers). Without this pin, the milog.sh
+# committed from a UTF-8 host fails CI's bash-bundle freshness diff
+# when CI rebuilds it under C locale. Standardising on C.UTF-8 here
+# makes the bundle byte-stable across every host build.sh runs on.
+export LC_ALL=C
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
