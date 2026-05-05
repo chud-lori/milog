@@ -50,10 +50,12 @@ type tcpRawEvent struct {
 // AF_INET / AF_INET6 — same constants the kernel uses. Hardcoded
 // rather than imported from `golang.org/x/sys/unix` to keep the probe
 // dependency-light (cilium/ebpf is the only non-stdlib import here
-// that actually pulls in foreign code).
+// that actually pulls in foreign code). Left UNTYPED so they
+// implicit-convert against either uint32 (tcp probe) or uint16
+// (retrans probe, which packs Family into a 16-bit hash-key field).
 const (
-	afInet  uint32 = 2
-	afInet6 uint32 = 10
+	afInet  = 2
+	afInet6 = 10
 )
 
 // RunNet loads the tcp connect probe, attaches the
