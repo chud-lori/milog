@@ -76,7 +76,9 @@ ${W}OPS${NC}
   ${C}audit rootkit${NC}       hidden-process / ld.so.preload / tmp-exec heuristics
 
 ${W}KERNEL OBSERVABILITY${NC} (Linux only — needs ${C}milog-probe${NC} sidecar)
-  ${C}milog-probe${NC}          eBPF exec watcher: shell-from-web-worker, exec-from-tmp, suid-escalation
+  ${C}probe status${NC}              is the eBPF probe sidecar running?
+  ${C}probe install-service${NC}     install + start systemd unit (needs sudo)
+  ${C}probe uninstall-service${NC}   remove the systemd unit (needs sudo)
   ${C}bench [--full]${NC}     benchmark harness against synthetic fixtures
   ${C}completions <shell>${NC}  install / print bash|zsh|fish completions
 
@@ -183,6 +185,11 @@ _cmd_help() {
             echo -e "${W}milog web${NC} — read-only local HTTP dashboard"
             echo -e "  Subs: start stop status install-service uninstall-service rotate-token"
             ;;
+        probe)
+            echo -e "${W}milog probe${NC} — eBPF probe sidecar (Linux only)"
+            echo -e "  Subs: status install-service uninstall-service"
+            echo -e "  Covers: exec / tcp / file / ptrace / kmod / retrans / syscall-rate / bpf-load"
+            ;;
         bench)    echo -e "${W}milog bench [--full] [--baseline FILE]${NC} — timing harness" ;;
         completions) echo -e "${W}milog completions <install|bash|zsh|fish>${NC} — install shell completion" ;;
         install)
@@ -259,6 +266,7 @@ case "${1:-}" in
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
+    probe)    shift; mode_probe "$@" ;;
     # Hidden subcommand: invoked by milog-probe (eBPF sidecar) once per
     # rule hit. Args are positional: <rule_key> <title> <body> <color>.
     # Goes through the full alert path so cooldown / silence / dedup /
