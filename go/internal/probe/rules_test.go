@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestShellFromWebWorker(t *testing.T) {
@@ -639,5 +640,88 @@ func TestMatchKmod_UnknownModuleNameFallback(t *testing.T) {
 	}
 	if !strings.Contains(hits[0].Title, "<unknown>") {
 		t.Errorf("expected <unknown> placeholder in title, got: %q", hits[0].Title)
+	}
+}
+
+func TestMatchRetrans_BelowThresholdSilent(t *testing.T) {
+	// Default threshold is 10 retransmits per window. A single-digit
+	// count shouldn't fire — every healthy network sees a few
+	// retransmits during connection setup.
+	t.Setenv("MILOG_PROBE_RETRANS_THRESHOLD", "")
+	cases := []RetransEvent{
+		{DAddr: "1.2.3.4", DPort: 443, Count: 1, Window: 60 * time.Second},
+		{DAddr: "1.2.3.4", DPort: 443, Count: 9, Window: 60 * time.Second},
+		{DAddr: "::1", DPort: 80, Count: 0, Window: 60 * time.Second},
+	}
+	for _, ev := range cases {
+		if hits := MatchRetrans(ev); len(hits) != 0 {
+			t.Errorf("count=%d below threshold should not fire: %+v", ev.Count, hits)
+		}
+	}
+}
+
+func TestMatchRetrans_AtAndAboveThresholdFires(t *testing.T) {
+	t.Setenv("MILOG_PROBE_RETRANS_THRESHOLD", "")
+	cases := []RetransEvent{
+		{DAddr: "203.0.113.42", DPort: 443, Count: 10, Window: 60 * time.Second},
+		{DAddr: "203.0.113.42", DPort: 443, Count: 50, Window: 60 * time.Second},
+		{DAddr: "2001:db8::1", DPort: 8080, Count: 100, Window: 30 * time.Second, IsIPv6: true},
+	}
+	for _, ev := range cases {
+		hits := MatchRetrans(ev)
+		if len(hits) != 1 {
+			t.Fatalf("expected 1 hit for %+v, got %d: %+v", ev, len(hits), hits)
+		}
+		h := hits[0]
+		wantKey := "net:retrans_spike:" + ev.DAddr + ":" + uitoa(uint32(ev.DPort))
+		if h.RuleKey != wantKey {
+			t.Errorf("rule key = %q, want %q", h.RuleKey, wantKey)
+		}
+		if !strings.Contains(h.Title, ev.DAddr) {
+			t.Errorf("title missing destination %q: %q", ev.DAddr, h.Title)
+		}
+		if !strings.Contains(h.Body, "retrans=") {
+			t.Errorf("body missing retrans=N counter: %q", h.Body)
+		}
+	}
+}
+
+func TestMatchRetrans_CustomThreshold(t *testing.T) {
+	// Operator on a tight link wants to alert on much smaller spikes.
+	t.Setenv("MILOG_PROBE_RETRANS_THRESHOLD", "3")
+
+	// Count=3 fires now, count=2 doesn't.
+	if hits := MatchRetrans(RetransEvent{DAddr: "1.1.1.1", DPort: 53, Count: 3, Window: 60 * time.Second}); len(hits) != 1 {
+		t.Errorf("count=3 with threshold=3 should fire, got %d hits", len(hits))
+	}
+	if hits := MatchRetrans(RetransEvent{DAddr: "1.1.1.1", DPort: 53, Count: 2, Window: 60 * time.Second}); len(hits) != 0 {
+		t.Errorf("count=2 with threshold=3 should NOT fire, got %d hits", len(hits))
+	}
+}
+
+func TestMatchRetrans_MalformedThresholdFallsBackToDefault(t *testing.T) {
+	// A garbage env value should NOT silently disable the rule. Fall
+	// back to the default 10 so operators don't lose coverage from a
+	// typo.
+	t.Setenv("MILOG_PROBE_RETRANS_THRESHOLD", "not-a-number")
+	if hits := MatchRetrans(RetransEvent{DAddr: "1.1.1.1", DPort: 80, Count: 11, Window: 60 * time.Second}); len(hits) != 1 {
+		t.Errorf("malformed env should fall back to default 10; count=11 should fire, got %d hits", len(hits))
+	}
+	if hits := MatchRetrans(RetransEvent{DAddr: "1.1.1.1", DPort: 80, Count: 5, Window: 60 * time.Second}); len(hits) != 0 {
+		t.Errorf("malformed env fall back to default 10; count=5 should NOT fire, got %d hits", len(hits))
+	}
+}
+
+func TestUitoa64(t *testing.T) {
+	cases := map[uint64]string{
+		0:                    "0",
+		1:                    "1",
+		1234567890:           "1234567890",
+		18446744073709551615: "18446744073709551615", // max uint64
+	}
+	for v, want := range cases {
+		if got := uitoa64(v); got != want {
+			t.Errorf("uitoa64(%d) = %q, want %q", v, got, want)
+		}
 	}
 }

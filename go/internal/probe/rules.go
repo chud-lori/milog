@@ -20,6 +20,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Event is the userspace mirror of the BPF-side `struct exec_event`,
@@ -953,4 +954,92 @@ func matchKmodLoad(e KmodEvent) (Hit, bool) {
 			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
 			" parent=" + e.ParentComm + " module=" + mod + "```",
 	}, true
+}
+
+// =============================================================================
+// TCP retransmit observability — periodic-sample probe.
+// =============================================================================
+
+// RetransEvent is a sampled count, not a per-packet event. The
+// userspace loader (retrans_linux.go) ticks every Window, reads the
+// BPF count map, computes deltas vs the previous sample, and emits
+// one RetransEvent per (DAddr, DPort) whose count grew. No process
+// attribution: tcp_retransmit_skb fires from softirq context where
+// bpf_get_current_pid_tgid would be confidently wrong.
+type RetransEvent struct {
+	DAddr  string        // destination IP, already stringified
+	DPort  uint16
+	IsIPv6 bool
+	Count  uint64        // retransmits to this destination during the window
+	Window time.Duration // sample window — included so alert body shows the rate context
+}
+
+// MatchRetrans runs every retransmit rule against the event. Mirrors
+// MatchNet shape; only one rule for now (`net:retrans_spike`).
+func MatchRetrans(e RetransEvent) []Hit {
+	var hits []Hit
+	if h, ok := matchRetransSpike(e); ok {
+		hits = append(hits, h)
+	}
+	return hits
+}
+
+// defaultRetransThreshold — minimum retransmit count per window
+// before the rule fires. 10 retransmits in 60s is a sustained ~1
+// retransmit every 6s to a single destination, which on most healthy
+// flows is well above noise. Operators on lossy links can raise via
+// MILOG_PROBE_RETRANS_THRESHOLD; on tight links lower it to catch
+// developing problems earlier.
+const defaultRetransThreshold uint64 = 10
+
+func retransThreshold() uint64 {
+	v := os.Getenv("MILOG_PROBE_RETRANS_THRESHOLD")
+	if v == "" {
+		return defaultRetransThreshold
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || n == 0 {
+		return defaultRetransThreshold
+	}
+	return n
+}
+
+// matchRetransSpike fires when a destination's retransmit count
+// during the current sample window exceeds the threshold. Per-(daddr,
+// dport) rule key — distinct flows alert independently, the same
+// flow re-spiking dedups via cooldown.
+//
+// Threshold filtering happens here rather than in the loader so the
+// rule engine's tunable knob lives in one place (alongside the other
+// MILOG_PROBE_* env vars) and unit tests can stage thresholds
+// without spinning up the BPF side.
+func matchRetransSpike(e RetransEvent) (Hit, bool) {
+	if e.Count < retransThreshold() {
+		return Hit{}, false
+	}
+	dest := e.DAddr + ":" + uitoa(uint32(e.DPort))
+	return Hit{
+		RuleKey: "net:retrans_spike:" + e.DAddr + ":" + uitoa(uint32(e.DPort)),
+		Title:   "TCP retransmit spike: " + dest + " (" + uitoa64(e.Count) + " retrans / " + e.Window.String() + ")",
+		Body: "```dst=" + dest + " retrans=" + uitoa64(e.Count) +
+			" window=" + e.Window.String() + "```",
+	}, true
+}
+
+// uitoa64 is the uint64 sibling of uitoa — same stdlib-free formatter
+// constraint, just with a wider value space. Retransmit counts can
+// theoretically exceed uint32 on a long-running probe + busy host
+// (though in practice they reset every window).
+func uitoa64(v uint64) string {
+	if v == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(buf[i:])
 }

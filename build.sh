@@ -134,7 +134,7 @@ if [[ -d go && -f go/go.mod ]]; then
             bpf_objs_ok=1
             if [[ "$uname_s" == "Linux" ]]; then
                 if command -v clang >/dev/null 2>&1; then
-                    for stem in exec tcp file ptrace kmod; do
+                    for stem in exec tcp file ptrace kmod retrans; do
                         src="${probe_dir}/bpf/${stem}.bpf.c"
                         obj="${probe_dir}/bpf/${stem}.bpf.o"
                         if ! bpf_compile "$src" "$obj"; then
