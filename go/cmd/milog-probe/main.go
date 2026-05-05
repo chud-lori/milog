@@ -82,37 +82,40 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Two independent event streams: exec (sched_process_exec) and
-	// tcp connect (sock:inet_sock_set_state). Each runs in its own
-	// goroutine with its own BPF collection so a verifier reject on
-	// one doesn't take down the other — the operator still gets the
-	// remaining probe's coverage with a logged warning for the failed
-	// one.
+	// Three independent event streams: exec (sched_process_exec),
+	// tcp connect (sock:inet_sock_set_state), and file open
+	// (syscalls:sys_enter_openat). Each runs in its own goroutine
+	// with its own BPF collection so a verifier reject on one doesn't
+	// take down the other two — the operator still gets the remaining
+	// probes' coverage with a logged warning for the failed one. Only
+	// when all three die do we exit non-zero so systemd restarts us.
 	events := make(chan probe.Event, 256)
 	netEvents := make(chan probe.NetEvent, 256)
+	fileEvents := make(chan probe.FileEvent, 256)
 	execErrCh := make(chan error, 1)
 	netErrCh := make(chan error, 1)
+	fileErrCh := make(chan error, 1)
 
 	go func() { execErrCh <- probe.Run(ctx, events) }()
 	go func() { netErrCh <- probe.RunNet(ctx, netEvents) }()
+	go func() { fileErrCh <- probe.RunFile(ctx, fileEvents) }()
 
-	log.Printf("milog-probe %s — watching exec + tcp connect (json=%v dry-run=%v)",
+	log.Printf("milog-probe %s — watching exec + tcp connect + file open (json=%v dry-run=%v)",
 		buildVersion, *flagJSON, *flagDryRun)
 
 	for {
 		select {
 		case <-ctx.Done():
-			drainErrors(execErrCh, netErrCh)
+			drainErrors(execErrCh, netErrCh, fileErrCh)
 			return
 		case err := <-execErrCh:
-			// One probe died but the other might still be alive. Log,
-			// keep running. If both die, the second drainErrors call
-			// surfaces the first error and we exit non-zero.
+			// One probe died but the others might still be alive. Log,
+			// keep running. Only when ALL three die do we exit non-zero.
 			if err != nil {
 				log.Printf("probe (exec): %v — exec coverage degraded", err)
 			}
 			execErrCh = nil
-			if netErrCh == nil {
+			if netErrCh == nil && fileErrCh == nil {
 				os.Exit(1)
 			}
 		case err := <-netErrCh:
@@ -120,23 +123,34 @@ func main() {
 				log.Printf("probe (net): %v — outbound-connect coverage degraded", err)
 			}
 			netErrCh = nil
-			if execErrCh == nil {
+			if execErrCh == nil && fileErrCh == nil {
+				os.Exit(1)
+			}
+		case err := <-fileErrCh:
+			if err != nil {
+				log.Printf("probe (file): %v — sensitive-file coverage degraded", err)
+			}
+			fileErrCh = nil
+			if execErrCh == nil && netErrCh == nil {
 				os.Exit(1)
 			}
 		case ev := <-events:
 			handleEvent(ev, *flagJSON, *flagDryRun, *flagMilog)
 		case nev := <-netEvents:
 			handleNetEvent(nev, *flagJSON, *flagDryRun, *flagMilog)
+		case fev := <-fileEvents:
+			handleFileEvent(fev, *flagJSON, *flagDryRun, *flagMilog)
 		}
 	}
 }
 
-// drainErrors picks up any pending non-nil errors from both probes
+// drainErrors picks up any pending non-nil errors from each probe
 // after ctx cancellation. Logs anything that wasn't `nil` — useful
 // signal in the journal when a clean shutdown still had a failing
-// load on one side.
-func drainErrors(execErrCh, netErrCh chan error) {
-	for _, ch := range []chan error{execErrCh, netErrCh} {
+// load on one side. Variadic so adding a fourth probe later doesn't
+// touch this signature.
+func drainErrors(chs ...chan error) {
+	for _, ch := range chs {
 		if ch == nil {
 			continue
 		}
@@ -193,6 +207,28 @@ func handleNetEvent(ev probe.NetEvent, asJSON, dryRun bool, milogBin string) {
 	}
 }
 
+// handleFileEvent runs the file-audit rule engine over one FileEvent.
+// Same dispatch shape as the other handle* helpers — separated so the
+// emitFileJSON wire shape can carry the openat flags field that the
+// other event types don't have.
+func handleFileEvent(ev probe.FileEvent, asJSON, dryRun bool, milogBin string) {
+	hits := probe.MatchFile(ev)
+	if asJSON {
+		emitFileJSON(ev, hits)
+		return
+	}
+	if len(hits) == 0 {
+		return
+	}
+	for _, h := range hits {
+		if dryRun {
+			log.Printf("DRY: %s :: %s", h.RuleKey, h.Title)
+			continue
+		}
+		fireAlert(h, milogBin)
+	}
+}
+
 func emitJSON(ev probe.Event, hits []probe.Hit) {
 	type wire struct {
 		Event probe.Event `json:"event"`
@@ -209,6 +245,15 @@ func emitNetJSON(ev probe.NetEvent, hits []probe.Hit) {
 	}
 	enc := json.NewEncoder(os.Stdout)
 	_ = enc.Encode(wire{NetEvent: ev, Hits: hits})
+}
+
+func emitFileJSON(ev probe.FileEvent, hits []probe.Hit) {
+	type wire struct {
+		FileEvent probe.FileEvent `json:"file_event"`
+		Hits      []probe.Hit     `json:"hits"`
+	}
+	enc := json.NewEncoder(os.Stdout)
+	_ = enc.Encode(wire{FileEvent: ev, Hits: hits})
 }
 
 // fireAlert shells out to `milog _internal_alert <key> <title> <body> <color>`.
