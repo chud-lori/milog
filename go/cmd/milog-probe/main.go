@@ -82,13 +82,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Seven independent event streams: exec (sched_process_exec),
+	// Eight independent event streams: exec (sched_process_exec),
 	// tcp connect (sock:inet_sock_set_state), file open
 	// (syscalls:sys_enter_openat), ptrace (syscalls:sys_enter_ptrace),
 	// kernel module load (module:module_load), TCP retransmit
-	// observability (tcp:tcp_retransmit_skb, sampled), and per-PID
-	// syscall rate (raw_tracepoint:sys_enter, sampled, Welford σ
-	// baselines). Each runs in its own goroutine with its own BPF
+	// observability (tcp:tcp_retransmit_skb, sampled), per-PID
+	// syscall rate (raw_tracepoint:sys_enter, sampled, Welford σ),
+	// and BPF program load (syscalls:sys_enter_bpf filtered to
+	// PROG_LOAD). Each runs in its own goroutine with its own BPF
 	// collection so a verifier reject on one doesn't take down the
 	// others — operators still get the remaining probes' coverage
 	// with a logged warning for the failed one. Only when ALL die
@@ -100,6 +101,7 @@ func main() {
 	kmodEvents := make(chan probe.KmodEvent, 16)
 	retransEvents := make(chan probe.RetransEvent, 64)
 	rateEvents := make(chan probe.RateAnomalyEvent, 256)
+	bpfLoadEvents := make(chan probe.BpfLoadEvent, 16)
 	execErrCh := make(chan error, 1)
 	netErrCh := make(chan error, 1)
 	fileErrCh := make(chan error, 1)
@@ -107,6 +109,7 @@ func main() {
 	kmodErrCh := make(chan error, 1)
 	retransErrCh := make(chan error, 1)
 	rateErrCh := make(chan error, 1)
+	bpfLoadErrCh := make(chan error, 1)
 
 	go func() { execErrCh <- probe.Run(ctx, events) }()
 	go func() { netErrCh <- probe.RunNet(ctx, netEvents) }()
@@ -115,8 +118,9 @@ func main() {
 	go func() { kmodErrCh <- probe.RunKmod(ctx, kmodEvents) }()
 	go func() { retransErrCh <- probe.RunRetrans(ctx, retransEvents) }()
 	go func() { rateErrCh <- probe.RunSyscallRate(ctx, rateEvents) }()
+	go func() { bpfLoadErrCh <- probe.RunBpfLoad(ctx, bpfLoadEvents) }()
 
-	log.Printf("milog-probe %s — watching exec + tcp connect + file open + ptrace + kmod load + tcp retransmit + syscall rate (json=%v dry-run=%v)",
+	log.Printf("milog-probe %s — watching exec + tcp connect + file open + ptrace + kmod load + tcp retransmit + syscall rate + bpf prog-load (json=%v dry-run=%v)",
 		buildVersion, *flagJSON, *flagDryRun)
 
 	// allDead reports whether every probe has surfaced its terminal
@@ -125,13 +129,13 @@ func main() {
 	allDead := func() bool {
 		return execErrCh == nil && netErrCh == nil && fileErrCh == nil &&
 			ptraceErrCh == nil && kmodErrCh == nil && retransErrCh == nil &&
-			rateErrCh == nil
+			rateErrCh == nil && bpfLoadErrCh == nil
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			drainErrors(execErrCh, netErrCh, fileErrCh, ptraceErrCh, kmodErrCh, retransErrCh, rateErrCh)
+			drainErrors(execErrCh, netErrCh, fileErrCh, ptraceErrCh, kmodErrCh, retransErrCh, rateErrCh, bpfLoadErrCh)
 			return
 		case err := <-execErrCh:
 			if err != nil {
@@ -189,6 +193,14 @@ func main() {
 			if allDead() {
 				os.Exit(1)
 			}
+		case err := <-bpfLoadErrCh:
+			if err != nil {
+				log.Printf("probe (bpf-load): %v — bpf-program-load coverage degraded", err)
+			}
+			bpfLoadErrCh = nil
+			if allDead() {
+				os.Exit(1)
+			}
 		case ev := <-events:
 			handleEvent(ev, *flagJSON, *flagDryRun, *flagMilog)
 		case nev := <-netEvents:
@@ -203,6 +215,8 @@ func main() {
 			handleRetransEvent(rev, *flagJSON, *flagDryRun, *flagMilog)
 		case aev := <-rateEvents:
 			handleRateAnomalyEvent(aev, *flagJSON, *flagDryRun, *flagMilog)
+		case bev := <-bpfLoadEvents:
+			handleBpfLoadEvent(bev, *flagJSON, *flagDryRun, *flagMilog)
 		}
 	}
 }
@@ -380,6 +394,28 @@ func handleRateAnomalyEvent(ev probe.RateAnomalyEvent, asJSON, dryRun bool, milo
 	}
 }
 
+// handleBpfLoadEvent dispatches one BpfLoadEvent. Load events are
+// rare on a healthy host (most legitimate loaders happen at boot);
+// per-event delivery is cheap and the rule's allowlist eliminates
+// the steady-state noise.
+func handleBpfLoadEvent(ev probe.BpfLoadEvent, asJSON, dryRun bool, milogBin string) {
+	hits := probe.MatchBpfLoad(ev)
+	if asJSON {
+		emitBpfLoadJSON(ev, hits)
+		return
+	}
+	if len(hits) == 0 {
+		return
+	}
+	for _, h := range hits {
+		if dryRun {
+			log.Printf("DRY: %s :: %s", h.RuleKey, h.Title)
+			continue
+		}
+		fireAlert(h, milogBin)
+	}
+}
+
 func emitJSON(ev probe.Event, hits []probe.Hit) {
 	type wire struct {
 		Event probe.Event `json:"event"`
@@ -441,6 +477,15 @@ func emitRateJSON(ev probe.RateAnomalyEvent, hits []probe.Hit) {
 	}
 	enc := json.NewEncoder(os.Stdout)
 	_ = enc.Encode(wire{RateEvent: ev, Hits: hits})
+}
+
+func emitBpfLoadJSON(ev probe.BpfLoadEvent, hits []probe.Hit) {
+	type wire struct {
+		BpfLoadEvent probe.BpfLoadEvent `json:"bpf_load_event"`
+		Hits         []probe.Hit        `json:"hits"`
+	}
+	enc := json.NewEncoder(os.Stdout)
+	_ = enc.Encode(wire{BpfLoadEvent: ev, Hits: hits})
 }
 
 // fireAlert shells out to `milog _internal_alert <key> <title> <body> <color>`.
