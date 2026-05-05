@@ -16,6 +16,7 @@
 package probe
 
 import (
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -1042,4 +1043,177 @@ func uitoa64(v uint64) string {
 		v /= 10
 	}
 	return string(buf[i:])
+}
+
+// =============================================================================
+// Per-PID syscall rate anomaly probe — sampled with Welford σ baselines.
+// =============================================================================
+
+// Welford is an online (single-pass) mean + variance accumulator. Used
+// to track per-PID syscall counts without storing the full sample
+// history — memory bound is constant per tracked PID. Public so the
+// userspace loader can carry the state alongside other per-PID
+// bookkeeping (`lastSeenAt` for age-out, `last` for delta vs. raw
+// counter), and so unit tests can drive it directly.
+//
+// References: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
+type Welford struct {
+	N    uint64  // sample count
+	Mean float64 // running mean
+	M2   float64 // sum of squared deltas — used to compute variance
+}
+
+// Update folds one new sample into the running statistics. O(1)
+// memory, O(1) time. Numerically stable for the count ranges we'll
+// see (syscalls/window is at most ~10^9 even on a torture-test host).
+func (w *Welford) Update(x float64) {
+	w.N++
+	delta := x - w.Mean
+	w.Mean += delta / float64(w.N)
+	delta2 := x - w.Mean
+	w.M2 += delta * delta2
+}
+
+// Variance returns the sample variance (n-1 denominator). Returns 0
+// for n < 2 — a single sample has no spread, and we use this 0 as
+// the "no-σ-yet" signal in matchSyscallBurst.
+func (w *Welford) Variance() float64 {
+	if w.N < 2 {
+		return 0
+	}
+	return w.M2 / float64(w.N-1)
+}
+
+// Stddev wraps Variance — just sqrt. Kept as a method for callsite
+// readability ("threshold = mean + 3*stddev" reads cleaner).
+func (w *Welford) Stddev() float64 {
+	return math.Sqrt(w.Variance())
+}
+
+// RateAnomalyEvent is the userspace-side projection of one PID's
+// behaviour during one sample window: the count for THIS window plus
+// the running baseline (mean, stddev) computed by Welford from prior
+// windows. The rule decides whether the count is far enough above
+// baseline to alert.
+//
+// Carrying the baseline in the event (rather than recomputing in the
+// rule) is deliberate: it keeps `matchSyscallBurst` pure-functional
+// for unit testing, and lets the alert body show the operator the
+// numbers that drove the decision.
+type RateAnomalyEvent struct {
+	PID        uint32
+	PPID       uint32
+	UID        uint32
+	Comm       string
+	ParentComm string
+	Count      uint64        // syscalls observed in this window
+	Mean       float64       // running mean (samples per window)
+	Stddev     float64       // running stddev (samples per window)
+	Window     time.Duration // sample window (for rate-per-sec rendering)
+	Samples    uint64        // total samples included in mean/stddev — used for burn-in gate
+}
+
+// MatchRateAnomaly runs the rate-anomaly rule against the event.
+// Mirrors the other Match* functions.
+func MatchRateAnomaly(e RateAnomalyEvent) []Hit {
+	var hits []Hit
+	if h, ok := matchSyscallBurst(e); ok {
+		hits = append(hits, h)
+	}
+	return hits
+}
+
+// defaultSyscallFloor — minimum count-per-window before the rule can
+// fire. Suppresses two classes of false positive:
+//   1. Near-idle processes: mean ≈ 0, σ ≈ 0, ANY non-zero count would
+//      otherwise look like an "infinite-σ spike". The floor blocks
+//      those until the absolute count is meaningful on its own.
+//   2. Newly-tracked PIDs whose baseline isn't established yet —
+//      the burn-in gate handles the mean stability part, the floor
+//      handles the absolute-magnitude part.
+//
+// Default scales with the default window (60s); operator on a tight
+// host (rare syscalls, small expected counts) can lower via
+// MILOG_PROBE_SYSCALL_FLOOR; on a database/web-server host the
+// shipped defaults already filter out the bulk of normal load.
+const defaultSyscallFloor uint64 = 1000
+
+// defaultSyscallBurnIn — number of samples the Welford state must
+// see before its (mean, σ) is considered stable enough to gate
+// alerts on. 10 windows × 60s = 10 minutes of warm-up per process.
+const defaultSyscallBurnIn uint64 = 10
+
+func syscallFloor() uint64 {
+	v := os.Getenv("MILOG_PROBE_SYSCALL_FLOOR")
+	if v == "" {
+		return defaultSyscallFloor
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || n == 0 {
+		return defaultSyscallFloor
+	}
+	return n
+}
+
+func syscallBurnIn() uint64 {
+	v := os.Getenv("MILOG_PROBE_SYSCALL_BURNIN")
+	if v == "" {
+		return defaultSyscallBurnIn
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || n == 0 {
+		return defaultSyscallBurnIn
+	}
+	return n
+}
+
+// matchSyscallBurst fires when a PID's syscall count for the current
+// window is more than 3σ above its running mean AND above the
+// absolute floor AND past the burn-in. Per-(comm, pid) rule key —
+// distinct processes alert independently; the same process bursting
+// repeatedly within ALERT_COOLDOWN dedups to one alert.
+//
+// PID reuse is an accepted false-positive source: when a long-idle
+// PID's baseline gets inherited by a new process that reuses the
+// PID after the original exits. Mitigation lives userspace-side via
+// age-out — practical risk is low on hosts with PID-max ~4M.
+func matchSyscallBurst(e RateAnomalyEvent) (Hit, bool) {
+	if e.Count < syscallFloor() {
+		return Hit{}, false
+	}
+	if e.Samples < syscallBurnIn() {
+		return Hit{}, false
+	}
+	threshold := e.Mean + 3.0*e.Stddev
+	if float64(e.Count) <= threshold {
+		return Hit{}, false
+	}
+	windowSec := e.Window.Seconds()
+	if windowSec <= 0 {
+		// Can't compute rate without a positive window — guard
+		// against config error or tests that pass zero. Don't fire.
+		return Hit{}, false
+	}
+	rate := float64(e.Count) / windowSec
+	meanRate := e.Mean / windowSec
+	stddevRate := e.Stddev / windowSec
+	dest := e.Comm + "(pid=" + uitoa(e.PID) + ")"
+	return Hit{
+		RuleKey: "process:syscall_burst:" + e.Comm + ":" + uitoa(e.PID),
+		Title:   "Syscall rate anomaly: " + dest + " — " + ftoa1(rate) + "/s vs baseline " + ftoa1(meanRate) + "/s ±" + ftoa1(stddevRate),
+		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" parent=" + e.ParentComm + " count=" + uitoa64(e.Count) +
+			" rate=" + ftoa1(rate) + "/s mean=" + ftoa1(meanRate) +
+			"/s stddev=" + ftoa1(stddevRate) + "/s samples=" + uitoa64(e.Samples) + "```",
+	}, true
+}
+
+// ftoa1 formats a float64 with one decimal place. Used by the
+// syscall-burst rule to render rate / mean / stddev in alert
+// bodies. Uses strconv (already imported for the netallowlist
+// parser) rather than rolling our own — float formatting isn't
+// hot-path here, runs at most a handful of times per minute.
+func ftoa1(v float64) string {
+	return strconv.FormatFloat(v, 'f', 1, 64)
 }

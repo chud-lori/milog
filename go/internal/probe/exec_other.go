@@ -46,3 +46,8 @@ func RunKmod(ctx context.Context, out chan<- KmodEvent) error {
 func RunRetrans(ctx context.Context, out chan<- RetransEvent) error {
 	return ErrUnsupported
 }
+
+// RunSyscallRate stub for non-Linux builds.
+func RunSyscallRate(ctx context.Context, out chan<- RateAnomalyEvent) error {
+	return ErrUnsupported
+}

@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -723,5 +724,167 @@ func TestUitoa64(t *testing.T) {
 		if got := uitoa64(v); got != want {
 			t.Errorf("uitoa64(%d) = %q, want %q", v, got, want)
 		}
+	}
+}
+
+func TestWelford_TextbookValues(t *testing.T) {
+	// Sample {1, 2, 3, 4, 5}: mean=3, sample-variance=2.5, σ=√2.5
+	w := Welford{}
+	for _, x := range []float64{1, 2, 3, 4, 5} {
+		w.Update(x)
+	}
+	if w.N != 5 {
+		t.Errorf("N = %d, want 5", w.N)
+	}
+	const eps = 1e-9
+	if math.Abs(w.Mean-3.0) > eps {
+		t.Errorf("Mean = %v, want 3.0", w.Mean)
+	}
+	if math.Abs(w.Variance()-2.5) > eps {
+		t.Errorf("Variance = %v, want 2.5", w.Variance())
+	}
+	if math.Abs(w.Stddev()-math.Sqrt(2.5)) > eps {
+		t.Errorf("Stddev = %v, want sqrt(2.5)", w.Stddev())
+	}
+}
+
+func TestWelford_DegenerateCases(t *testing.T) {
+	// n=0: variance is 0 (no data); n=1: variance is 0 (no spread).
+	// Both used as the "no-σ-yet" sentinel by matchSyscallBurst.
+	var w Welford
+	if w.Variance() != 0 || w.Stddev() != 0 {
+		t.Errorf("zero-sample Welford should report 0 variance/stddev")
+	}
+	w.Update(42)
+	if w.N != 1 || w.Mean != 42 {
+		t.Errorf("after one update: N=%d Mean=%v, want 1, 42", w.N, w.Mean)
+	}
+	if w.Variance() != 0 || w.Stddev() != 0 {
+		t.Errorf("one-sample Welford should still report 0 spread, got Var=%v σ=%v", w.Variance(), w.Stddev())
+	}
+}
+
+func TestMatchSyscallBurst_BurnInGate(t *testing.T) {
+	// Even a 100σ spike should not fire while still in burn-in.
+	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "")
+	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
+
+	ev := RateAnomalyEvent{
+		PID: 1234, Comm: "miner",
+		Count:   1_000_000, // huge spike
+		Mean:    1000,
+		Stddev:  100,
+		Window:  60 * time.Second,
+		Samples: 5, // below default burn-in (10)
+	}
+	if hits := MatchRateAnomaly(ev); len(hits) != 0 {
+		t.Errorf("burn-in gate should suppress: got %d hits", len(hits))
+	}
+}
+
+func TestMatchSyscallBurst_FloorGate(t *testing.T) {
+	// A small absolute count shouldn't fire even if it's many σ
+	// above a near-zero baseline. Floor protects against the
+	// "infinite-σ on idle" pathology.
+	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "")
+	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
+
+	ev := RateAnomalyEvent{
+		PID: 1234, Comm: "idle-daemon",
+		Count:   500, // below default floor (1000)
+		Mean:    1,
+		Stddev:  1,
+		Window:  60 * time.Second,
+		Samples: 100, // well past burn-in
+	}
+	if hits := MatchRateAnomaly(ev); len(hits) != 0 {
+		t.Errorf("floor gate should suppress: got %d hits", len(hits))
+	}
+}
+
+func TestMatchSyscallBurst_SpikeAboveBaselineFires(t *testing.T) {
+	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "")
+	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
+
+	// Process normally does ~5000 syscalls/min ± ~500. 50000 is
+	// 90σ above mean, well past 3σ, well past floor (1000), past
+	// burn-in (10).
+	ev := RateAnomalyEvent{
+		PID: 4242, PPID: 1, UID: 33,
+		Comm: "php-fpm8.2", ParentComm: "nginx",
+		Count:   50_000,
+		Mean:    5_000,
+		Stddev:  500,
+		Window:  60 * time.Second,
+		Samples: 60, // 1 hour past burn-in
+	}
+	hits := MatchRateAnomaly(ev)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d: %+v", len(hits), hits)
+	}
+	h := hits[0]
+	wantKey := "process:syscall_burst:php-fpm8.2:4242"
+	if h.RuleKey != wantKey {
+		t.Errorf("rule key = %q, want %q", h.RuleKey, wantKey)
+	}
+	if !strings.Contains(h.Title, "php-fpm8.2") {
+		t.Errorf("title missing comm: %q", h.Title)
+	}
+	// 50000 / 60s = 833.3/s
+	if !strings.Contains(h.Title, "833") {
+		t.Errorf("title missing rate ≈833/s: %q", h.Title)
+	}
+}
+
+func TestMatchSyscallBurst_BelowSigmaSilent(t *testing.T) {
+	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "")
+	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
+
+	// Sample within 2σ of the mean — normal jitter, not anomaly.
+	ev := RateAnomalyEvent{
+		PID: 1234, Comm: "nginx",
+		Count:   12_000, // mean=10000, σ=1000 → 2σ
+		Mean:    10_000,
+		Stddev:  1_000,
+		Window:  60 * time.Second,
+		Samples: 60,
+	}
+	if hits := MatchRateAnomaly(ev); len(hits) != 0 {
+		t.Errorf("2σ jitter should NOT fire, got %d hits", len(hits))
+	}
+}
+
+func TestMatchSyscallBurst_CustomFloor(t *testing.T) {
+	// Operator on a tightly-locked-down host expects all processes
+	// to be near-idle; anything over 100 syscalls/window is signal.
+	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "100")
+	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
+
+	ev := RateAnomalyEvent{
+		PID: 1234, Comm: "weird-binary",
+		Count:   500,
+		Mean:    10,
+		Stddev:  3,
+		Window:  60 * time.Second,
+		Samples: 60,
+	}
+	if hits := MatchRateAnomaly(ev); len(hits) != 1 {
+		t.Errorf("custom-floor 100, count=500 should fire, got %d hits", len(hits))
+	}
+}
+
+func TestMatchSyscallBurst_ZeroWindowSafe(t *testing.T) {
+	// Defensive: a config bug or test passing Window=0 must not
+	// cause divide-by-zero or a NaN-laced alert title.
+	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "")
+	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
+
+	ev := RateAnomalyEvent{
+		PID: 1234, Comm: "x",
+		Count: 100_000, Mean: 100, Stddev: 10,
+		Window: 0, Samples: 60,
+	}
+	if hits := MatchRateAnomaly(ev); len(hits) != 0 {
+		t.Errorf("zero window should be suppressed defensively, got %+v", hits)
 	}
 }
