@@ -3,11 +3,12 @@
 // rules.go holds the rule-matching logic, deliberately OS-independent
 // so it can be unit-tested on any platform. The actual BPF loading +
 // ringbuf consumption lives in exec_linux.go / tcp_linux.go /
-// file_linux.go (and a stub exec_other.go for non-Linux builds).
+// file_linux.go / ptrace_linux.go / kmod_linux.go (and a stub
+// exec_other.go for non-Linux builds).
 //
 // Rule firing is fingerprint-based: the userspace consumer feeds an
-// `Event` (exec), `NetEvent` (tcp connect), or `FileEvent` (openat
-// against a sensitive path) to `Match` / `MatchNet` / `MatchFile`,
+// `Event` / `NetEvent` / `FileEvent` / `PtraceEvent` / `KmodEvent` to
+// `Match` / `MatchNet` / `MatchFile` / `MatchPtrace` / `MatchKmod`,
 // gets back a slice of `Hit` (rule key + body detail) per matching
 // rule, and shells those out to milog's existing alert path. Cooldown
 // / silence / dedup all apply via the rule key — no parallel state in
@@ -695,4 +696,261 @@ func uhex(v uint32) string {
 		v >>= 4
 	}
 	return string(buf[i:])
+}
+
+// =============================================================================
+// ptrace anti-injection probe — cross-process attach monitoring.
+// =============================================================================
+
+// PtraceEvent is the userspace mirror of `struct ptrace_event` from
+// ptrace.bpf.c. Fired once per attach-class ptrace call
+// (PTRACE_TRACEME, PTRACE_ATTACH, PTRACE_SEIZE) — the BPF side filters
+// out per-attached-target operations (PEEK/POKE/CONT/…) so userspace
+// only sees the "begin tracing" events.
+type PtraceEvent struct {
+	PID        uint32
+	PPID       uint32
+	UID        uint32
+	Comm       string
+	ParentComm string
+	TargetPID  uint32
+	Request    uint32 // PTRACE_TRACEME=0, PTRACE_ATTACH=16, PTRACE_SEIZE=0x4206
+}
+
+// MatchPtrace runs every ptrace rule against the event. Mirrors
+// Match / MatchNet / MatchFile.
+func MatchPtrace(e PtraceEvent) []Hit {
+	var hits []Hit
+	if h, ok := matchPtraceInject(e); ok {
+		hits = append(hits, h)
+	}
+	return hits
+}
+
+// defaultPtraceDebuggers — comms that legitimately use ptrace as
+// their primary mechanism. Any of these attaching is part of normal
+// engineering / ops work and shouldn't page anyone. Operators add
+// custom debuggers via MILOG_PROBE_PTRACE_DEBUGGERS (replaces, not
+// appends — same semantics as the other env overrides).
+//
+// `dlv` is the Go debugger. `py-spy` and `bpftrace` use ptrace under
+// the hood for their sampling probes. `criu` is checkpoint/restore.
+// Generic "node" / "python" are NOT here — those would whitelist any
+// scripted attacker who runs their tool as `python rce.py`.
+var defaultPtraceDebuggers = []string{
+	"gdb",
+	"strace",
+	"ltrace",
+	"lldb",
+	"lldb-server",
+	"rr",
+	"perf",
+	"dlv",
+	"dlv-dap",
+	"py-spy",
+	"bpftrace",
+	"criu",
+}
+
+type ptraceRules struct {
+	debuggers map[string]struct{}
+}
+
+func (r *ptraceRules) isDebugger(comm string) bool {
+	_, ok := r.debuggers[comm]
+	return ok
+}
+
+var (
+	cachedPtraceRules ptraceRules
+	ptraceRulesReady  bool
+)
+
+func loadPtraceRules() *ptraceRules {
+	if ptraceRulesReady {
+		return &cachedPtraceRules
+	}
+	cachedPtraceRules = parsePtraceRules(os.Getenv("MILOG_PROBE_PTRACE_DEBUGGERS"))
+	ptraceRulesReady = true
+	return &cachedPtraceRules
+}
+
+func parsePtraceRules(src string) ptraceRules {
+	out := ptraceRules{debuggers: map[string]struct{}{}}
+	list := defaultPtraceDebuggers
+	if strings.TrimSpace(src) != "" {
+		list = nil
+		for _, raw := range strings.Split(src, ",") {
+			c := strings.TrimSpace(raw)
+			if c != "" {
+				list = append(list, c)
+			}
+		}
+	}
+	for _, c := range list {
+		out.debuggers[c] = struct{}{}
+	}
+	return out
+}
+
+// ptraceRequestName returns the human-readable mnemonic for the three
+// attach-class request values the BPF side captures. Other values
+// shouldn't reach here (BPF filtered them out) — fall back to hex
+// rather than swallowing a kernel-side bug.
+func ptraceRequestName(req uint32) string {
+	switch req {
+	case 0:
+		return "TRACEME"
+	case 16:
+		return "ATTACH"
+	case 0x4206:
+		return "SEIZE"
+	default:
+		return "0x" + uhex(req)
+	}
+}
+
+// matchPtraceInject fires when a non-debugger comm performs an
+// attach-class ptrace. The rule key embeds (comm, target_pid) so
+// distinct attacker→victim pairs alert independently. PTRACE_TRACEME
+// from a debugger startup pattern (parent attached BEFORE its child
+// runs the target binary) is permitted by the comm allowlist filter
+// up the call chain — only attacker comms reach here.
+func matchPtraceInject(e PtraceEvent) (Hit, bool) {
+	rules := loadPtraceRules()
+	if rules.isDebugger(e.Comm) {
+		return Hit{}, false
+	}
+	req := ptraceRequestName(e.Request)
+	return Hit{
+		RuleKey: "proc:ptrace_inject:" + e.Comm + ":" + uitoa(e.TargetPID),
+		Title:   "Process injection via ptrace: " + e.Comm + " → pid " + uitoa(e.TargetPID) + " (" + req + ")",
+		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" parent=" + e.ParentComm + " target_pid=" + uitoa(e.TargetPID) +
+			" request=" + req + "```",
+	}, true
+}
+
+// =============================================================================
+// Kernel module load probe — rootkit / persistence monitoring.
+// =============================================================================
+
+// KmodEvent is the userspace mirror of `struct kmod_event` from
+// kmod.bpf.c. Fired once per `module:module_load` tracepoint —
+// covers both init_module(2) and finit_module(2) paths.
+type KmodEvent struct {
+	PID        uint32
+	PPID       uint32
+	UID        uint32
+	Comm       string
+	ParentComm string
+	Module     string // module name, e.g. "nf_conntrack"
+}
+
+// MatchKmod runs every module-load rule against the event.
+func MatchKmod(e KmodEvent) []Hit {
+	var hits []Hit
+	if h, ok := matchKmodLoad(e); ok {
+		hits = append(hits, h)
+	}
+	return hits
+}
+
+// defaultKmodLoaders — comms that legitimately load kernel modules
+// during normal operation. systemd-modules-load runs at boot from
+// /etc/modules-load.d; modprobe is invoked by udev rules + manual
+// admin work; dkms rebuilds modules on kernel upgrade. Anything else
+// loading a kernel module is alert-worthy.
+//
+// Operators on locked-down hosts (kernel.modules_disabled=1 after
+// boot) should set MILOG_PROBE_KMOD_ALLOWLIST="" to alert on EVERY
+// module load — on those hosts a module load shouldn't be possible
+// at all, so any event is signal.
+var defaultKmodLoaders = []string{
+	"systemd-modules",       // systemd kernel-modules-load.service
+	"systemd-modules-load",  // alternate name on some distros
+	"modprobe",
+	"insmod",                // raw load — typically dkms / boot scripts
+	"kmod",
+	"dkms",
+	"systemd-udevd",         // udev triggers module loads via rules
+}
+
+type kmodRules struct {
+	allowedLoaders map[string]struct{}
+}
+
+func (r *kmodRules) isAllowedLoader(comm string) bool {
+	_, ok := r.allowedLoaders[comm]
+	return ok
+}
+
+var (
+	cachedKmodRules kmodRules
+	kmodRulesReady  bool
+)
+
+// loadKmodRules differs subtly from loadFileRules / loadPtraceRules:
+// an EXPLICITLY EMPTY MILOG_PROBE_KMOD_ALLOWLIST="" is a meaningful
+// "no allowlist, alert on EVERY load" setting — the locked-down host
+// pattern (`kernel.modules_disabled=1` post-boot, where any module
+// load attempt is signal). An undefined env var falls back to the
+// shipped defaults. os.LookupEnv distinguishes the two; os.Getenv
+// would conflate them.
+func loadKmodRules() *kmodRules {
+	if kmodRulesReady {
+		return &cachedKmodRules
+	}
+	src, set := os.LookupEnv("MILOG_PROBE_KMOD_ALLOWLIST")
+	if set && strings.TrimSpace(src) == "" {
+		cachedKmodRules = kmodRules{allowedLoaders: map[string]struct{}{}}
+	} else {
+		cachedKmodRules = parseKmodRules(src)
+	}
+	kmodRulesReady = true
+	return &cachedKmodRules
+}
+
+// parseKmodRules takes an env-string override; empty / whitespace-only
+// → shipped defaults, comma-separated → custom list (replaces, not
+// appends — same semantics as the other env overrides).
+func parseKmodRules(src string) kmodRules {
+	out := kmodRules{allowedLoaders: map[string]struct{}{}}
+	list := defaultKmodLoaders
+	if strings.TrimSpace(src) != "" {
+		list = nil
+		for _, raw := range strings.Split(src, ",") {
+			c := strings.TrimSpace(raw)
+			if c != "" {
+				list = append(list, c)
+			}
+		}
+	}
+	for _, c := range list {
+		out.allowedLoaders[c] = struct{}{}
+	}
+	return out
+}
+
+// matchKmodLoad fires when a non-allowlisted process loads a kernel
+// module. The rule key embeds (comm, module) so distinct loads alert
+// independently. Same module reloaded by the same process within
+// cooldown dedups to one alert.
+func matchKmodLoad(e KmodEvent) (Hit, bool) {
+	rules := loadKmodRules()
+	if rules.isAllowedLoader(e.Comm) {
+		return Hit{}, false
+	}
+	mod := e.Module
+	if mod == "" {
+		mod = "<unknown>"
+	}
+	return Hit{
+		RuleKey: "proc:kmod_load:" + e.Comm + ":" + mod,
+		Title:   "Kernel module loaded: " + mod + " by " + e.Comm,
+		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" parent=" + e.ParentComm + " module=" + mod + "```",
+	}, true
 }

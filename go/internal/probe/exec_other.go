@@ -31,3 +31,13 @@ func RunNet(ctx context.Context, out chan<- NetEvent) error {
 func RunFile(ctx context.Context, out chan<- FileEvent) error {
 	return ErrUnsupported
 }
+
+// RunPtrace stub for non-Linux builds.
+func RunPtrace(ctx context.Context, out chan<- PtraceEvent) error {
+	return ErrUnsupported
+}
+
+// RunKmod stub for non-Linux builds.
+func RunKmod(ctx context.Context, out chan<- KmodEvent) error {
+	return ErrUnsupported
+}

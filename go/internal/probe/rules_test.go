@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -456,5 +457,187 @@ func TestUhex(t *testing.T) {
 		if got := uhex(v); got != want {
 			t.Errorf("uhex(0x%x) = %q, want %q", v, got, want)
 		}
+	}
+}
+
+// resetPtraceRulesCache mirrors the reset helpers for the other rule
+// engines — wipes the parsed-config cache so each test stages its own
+// MILOG_PROBE_PTRACE_DEBUGGERS.
+func resetPtraceRulesCache() {
+	cachedPtraceRules = ptraceRules{}
+	ptraceRulesReady = false
+}
+
+func TestMatchPtrace_DebuggersSilent(t *testing.T) {
+	// gdb / strace / lldb / dlv all live cleanly inside the default
+	// allowlist — no operator should ever get paged on a normal debug
+	// session.
+	t.Setenv("MILOG_PROBE_PTRACE_DEBUGGERS", "")
+	resetPtraceRulesCache()
+
+	cases := []PtraceEvent{
+		{Comm: "gdb", TargetPID: 1234, Request: 16},      // ATTACH
+		{Comm: "strace", TargetPID: 5678, Request: 16},
+		{Comm: "lldb", TargetPID: 9999, Request: 0x4206}, // SEIZE
+		{Comm: "dlv", TargetPID: 100, Request: 16},
+		{Comm: "py-spy", TargetPID: 200, Request: 0x4206},
+		{Comm: "bpftrace", TargetPID: 300, Request: 0x4206},
+	}
+	for _, ev := range cases {
+		if hits := MatchPtrace(ev); len(hits) != 0 {
+			t.Errorf("debugger should be silent: %+v → %+v", ev, hits)
+		}
+	}
+}
+
+func TestMatchPtrace_AttackerCommFires(t *testing.T) {
+	// Non-debugger comm performing a cross-process attach is the
+	// canonical post-RCE injection pattern. php-fpm child somehow
+	// running ptrace, sshd-spawned worker attaching to root pid 1, etc.
+	t.Setenv("MILOG_PROBE_PTRACE_DEBUGGERS", "")
+	resetPtraceRulesCache()
+
+	cases := []struct {
+		name string
+		ev   PtraceEvent
+		want string // expected mnemonic in title
+	}{
+		{"php-fpm ATTACH", PtraceEvent{
+			Comm: "php-fpm8.2", ParentComm: "nginx",
+			TargetPID: 1, Request: 16,
+		}, "ATTACH"},
+		{"sh SEIZE", PtraceEvent{
+			Comm: "sh", ParentComm: "nginx",
+			TargetPID: 4242, Request: 0x4206,
+		}, "SEIZE"},
+		{"random binary TRACEME", PtraceEvent{
+			Comm: "dropper", TargetPID: 0, Request: 0,
+		}, "TRACEME"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			hits := MatchPtrace(c.ev)
+			if len(hits) != 1 {
+				t.Fatalf("expected 1 hit, got %d: %+v", len(hits), hits)
+			}
+			h := hits[0]
+			wantKey := "proc:ptrace_inject:" + c.ev.Comm + ":" + uitoa(c.ev.TargetPID)
+			if h.RuleKey != wantKey {
+				t.Errorf("rule key = %q, want %q", h.RuleKey, wantKey)
+			}
+			if !strings.Contains(h.Title, c.want) {
+				t.Errorf("title missing %q mnemonic: %q", c.want, h.Title)
+			}
+		})
+	}
+}
+
+func TestMatchPtrace_CustomDebuggerAllowlist(t *testing.T) {
+	// Operator runs an in-house profiler that uses ptrace. They want
+	// it allowlisted alongside the defaults.
+	t.Setenv("MILOG_PROBE_PTRACE_DEBUGGERS", "myprofiler,gdb")
+	resetPtraceRulesCache()
+
+	if hits := MatchPtrace(PtraceEvent{Comm: "myprofiler", TargetPID: 1, Request: 16}); len(hits) != 0 {
+		t.Errorf("custom-allowlisted comm should be silent, got %+v", hits)
+	}
+	// Custom list REPLACES — so strace (default) is no longer silent.
+	if hits := MatchPtrace(PtraceEvent{Comm: "strace", TargetPID: 1, Request: 16}); len(hits) != 1 {
+		t.Errorf("custom allowlist replaces defaults; strace should now fire, got %+v", hits)
+	}
+}
+
+func TestPtraceRequestName(t *testing.T) {
+	cases := map[uint32]string{
+		0:        "TRACEME",
+		16:       "ATTACH",
+		0x4206:   "SEIZE",
+		0xdead:   "0xdead", // unexpected — fall back to hex
+	}
+	for v, want := range cases {
+		if got := ptraceRequestName(v); got != want {
+			t.Errorf("ptraceRequestName(0x%x) = %q, want %q", v, got, want)
+		}
+	}
+}
+
+// resetKmodRulesCache mirrors the others — clears parsed-config so
+// each test can stage its own MILOG_PROBE_KMOD_ALLOWLIST.
+func resetKmodRulesCache() {
+	cachedKmodRules = kmodRules{}
+	kmodRulesReady = false
+}
+
+func TestMatchKmod_DefaultsAllowKnownLoaders(t *testing.T) {
+	// Defaults apply when the env var is UNSET (vs. the explicit-empty
+	// case, which means "no allowlist at all"). os.Unsetenv plus a
+	// cache reset stages the unset state cleanly — t.Setenv is no help
+	// here because it sets, never unsets.
+	if err := os.Unsetenv("MILOG_PROBE_KMOD_ALLOWLIST"); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+	resetKmodRulesCache()
+
+	cases := []KmodEvent{
+		{Comm: "modprobe", Module: "nf_conntrack"},
+		{Comm: "systemd-udevd", Module: "snd_hda_intel"},
+		{Comm: "dkms", Module: "nvidia"},
+		{Comm: "systemd-modules", Module: "ip_tables"},
+	}
+	for _, ev := range cases {
+		if hits := MatchKmod(ev); len(hits) != 0 {
+			t.Errorf("known loader should be silent: %+v → %+v", ev, hits)
+		}
+	}
+}
+
+func TestMatchKmod_NonAllowlistedFires(t *testing.T) {
+	t.Setenv("MILOG_PROBE_KMOD_ALLOWLIST", "modprobe")
+	resetKmodRulesCache()
+
+	ev := KmodEvent{
+		PID: 4242, UID: 0, Comm: "rootkit-installer", ParentComm: "sh",
+		Module: "evil_lkm",
+	}
+	hits := MatchKmod(ev)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d: %+v", len(hits), hits)
+	}
+	h := hits[0]
+	wantKey := "proc:kmod_load:rootkit-installer:evil_lkm"
+	if h.RuleKey != wantKey {
+		t.Errorf("rule key = %q, want %q", h.RuleKey, wantKey)
+	}
+	if !strings.Contains(h.Title, "evil_lkm") {
+		t.Errorf("title missing module name: %q", h.Title)
+	}
+}
+
+func TestMatchKmod_ExplicitEmptyDisablesAllowlist(t *testing.T) {
+	// Locked-down host pattern: kernel.modules_disabled=1 is set, so
+	// any kmod load is signal. Operator sets MILOG_PROBE_KMOD_ALLOWLIST=""
+	// (empty STRING, not unset) to disable the allowlist entirely.
+	t.Setenv("MILOG_PROBE_KMOD_ALLOWLIST", "")
+	resetKmodRulesCache()
+
+	// modprobe (a default-allowlisted comm) should NOW fire.
+	if hits := MatchKmod(KmodEvent{Comm: "modprobe", Module: "anything"}); len(hits) != 1 {
+		t.Errorf("explicit-empty allowlist should make modprobe fire, got %d hits", len(hits))
+	}
+}
+
+func TestMatchKmod_UnknownModuleNameFallback(t *testing.T) {
+	// Defensive: if BPF couldn't read the module name (data_loc trick
+	// failed on an exotic kernel), the alert should still emit with
+	// a placeholder rather than a blank-name "load by …" title.
+	t.Setenv("MILOG_PROBE_KMOD_ALLOWLIST", "modprobe")
+	resetKmodRulesCache()
+
+	hits := MatchKmod(KmodEvent{Comm: "weird-tool", Module: ""})
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d", len(hits))
+	}
+	if !strings.Contains(hits[0].Title, "<unknown>") {
+		t.Errorf("expected <unknown> placeholder in title, got: %q", hits[0].Title)
 	}
 }

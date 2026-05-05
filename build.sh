@@ -108,10 +108,11 @@ if [[ -d go && -f go/go.mod ]]; then
             # milog-probe is Linux-only (eBPF). On Linux build hosts we
             # also need clang to compile the .bpf.c sources into the
             # .o blobs that exec_linux.go / tcp_linux.go / file_linux.go
-            # embed. Skip path on macOS / BSD, or on a Linux host without
-            # clang installed. Each .bpf.c → .bpf.o pair is independent:
-            # a failure on one doesn't block the other from compiling,
-            # and all objects must succeed before milog-probe builds.
+            # / ptrace_linux.go / kmod_linux.go embed. Skip path on
+            # macOS / BSD, or on a Linux host without clang installed.
+            # Each .bpf.c → .bpf.o pair is independent: a failure on
+            # one doesn't block the others from compiling, and all
+            # objects must succeed before milog-probe builds.
             uname_s=$(uname -s 2>/dev/null || echo unknown)
             probe_dir="internal/probe"
             bpf_target_arch=$(uname -m 2>/dev/null | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
@@ -133,7 +134,7 @@ if [[ -d go && -f go/go.mod ]]; then
             bpf_objs_ok=1
             if [[ "$uname_s" == "Linux" ]]; then
                 if command -v clang >/dev/null 2>&1; then
-                    for stem in exec tcp file; do
+                    for stem in exec tcp file ptrace kmod; do
                         src="${probe_dir}/bpf/${stem}.bpf.c"
                         obj="${probe_dir}/bpf/${stem}.bpf.o"
                         if ! bpf_compile "$src" "$obj"; then
