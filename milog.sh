@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-1-gd898d88-dirty
-# MILOG_BUILT=2026-05-04T13:46:50Z
+# MILOG_VERSION=v0.3.0-3-ge6755d8-dirty
+# MILOG_BUILT=2026-05-05T01:24:21Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -7600,6 +7600,81 @@ mode_suspects() {
 }
 
 # ==============================================================================
+# MODE: top-ip-by-app
+# Per-app top IPs in one report. Complements `milog top`, which collapses
+# the IP set across every app — that view hides "this IP only hits the
+# api app" patterns. Useful for forensics ("who's hammering /finance?")
+# and for spotting per-app scrapers.
+# ==============================================================================
+mode_top_ip_by_app() {
+    local n="${1:-5}"
+
+    if (( ${#LOGS[@]} == 0 )); then
+        echo -e "${R}no apps configured (LOGS=())${NC}" >&2
+        return 1
+    fi
+
+    echo -e "\n${W}── MiLog: Top ${n} IPs per app ──${NC}\n"
+
+    local show_geo=0
+    [[ "${GEOIP_ENABLED:-0}" == "1" && -f "$MMDB_PATH" ]] && show_geo=1
+
+    if (( show_geo )); then
+        printf "%-14s  %-5s  %-18s  %-7s  %10s\n" "APP" "RANK" "IP" "COUNTRY" "REQUESTS"
+        printf "%-14s  %-5s  %-18s  %-7s  %10s\n" "──────────────" "────" "─────────────────" "───────" "────────"
+    else
+        printf "%-14s  %-5s  %-18s  %10s\n" "APP" "RANK" "IP" "REQUESTS"
+        printf "%-14s  %-5s  %-18s  %10s\n" "──────────────" "────" "─────────────────" "────────"
+    fi
+
+    local name path i count ip col country printed_anything=0
+    for name in "${LOGS[@]}"; do
+        path="$LOG_DIR/$name.access.log"
+        [[ -f "$path" ]] || continue
+
+        # Empty-app guard: an empty file produces no rows from sort|uniq, so
+        # we'd silently skip the app. Print a placeholder so the operator
+        # sees "yes the app exists, no it has no traffic" rather than
+        # wondering whether the report dropped it.
+        if [[ ! -s "$path" ]]; then
+            if (( show_geo )); then
+                printf "%-14s  %-5s  %-18s  %-7s  %10s\n" "$name" "-" "(no traffic)" "-" "0"
+            else
+                printf "%-14s  %-5s  %-18s  %10s\n" "$name" "-" "(no traffic)" "0"
+            fi
+            printed_anything=1
+            continue
+        fi
+
+        i=1
+        # The geo lookup forks mmdblookup once per surfaced IP — at most
+        # `n` per app, so cost is bounded by `n × len(LOGS)`.
+        while read -r count ip; do
+            col=""
+            (( i == 1 ))            && col="$R"
+            (( i > 1 && i <= 3 ))   && col="$Y"
+            if (( show_geo )); then
+                country=$(geoip_country "$ip")
+                printf "%-14s  %-5s  %-18s  %-7s  %b%10s%b\n" \
+                    "$name" "#$i" "$ip" "$country" "$col" "$count" "$NC"
+            else
+                printf "%-14s  %-5s  %-18s  %b%10s%b\n" \
+                    "$name" "#$i" "$ip" "$col" "$count" "$NC"
+            fi
+            i=$((i+1))
+        done < <(awk '{print $1}' "$path" | sort | uniq -c | sort -rn | head -n "$n")
+
+        printed_anything=1
+        # Blank separator between apps so the output reads as discrete
+        # blocks rather than one long flat table.
+        echo
+    done
+
+    if (( ! printed_anything )); then
+        echo -e "${D}no readable access logs under $LOG_DIR${NC}"
+    fi
+}
+# ==============================================================================
 # MODE: top-paths — aggregate URLs across all app logs, show per-path stats
 #
 # The single most useful incident question ("what URL is eating traffic?" or
@@ -8383,6 +8458,7 @@ ${W}DASHBOARDS${NC}
 ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
   ${C}top [N]${NC}            top N source IPs  ${D}(default: 10)${NC}
+  ${C}top-ip-by-app [N]${NC}  top N source IPs per app  ${D}(default: 5)${NC}
   ${C}top-paths [N]${NC}      top N URLs — req/4xx/5xx/p95 per path  ${D}(default: 20)${NC}
   ${C}attacker <IP>${NC}      forensic view: one IP's activity across all apps
   ${C}slow [N]${NC}           top N slow endpoints by p95  ${D}(requires \$request_time; excludes WS)${NC}
@@ -8484,6 +8560,11 @@ _cmd_help() {
         health)   echo -e "${W}milog health${NC} — 2xx/3xx/4xx/5xx totals per app" ;;
         top)
             echo -e "${W}milog top [N]${NC} — top N source IPs across all apps (default 10)"
+            echo -e "  ${D}+country column when GEOIP_ENABLED=1${NC}"
+            ;;
+        top-ip-by-app|top-by-app)
+            echo -e "${W}milog top-ip-by-app [N]${NC} — top N source IPs per app (default 5)"
+            echo -e "  ${D}Use when 'milog top' hides per-app scraper patterns${NC}"
             echo -e "  ${D}+country column when GEOIP_ENABLED=1${NC}"
             ;;
         top-paths)
@@ -8590,6 +8671,7 @@ case "${1:-}" in
     rate)     mode_rate ;;
     health)   mode_health ;;
     top)      mode_top "${2:-10}" ;;
+    top-ip-by-app|top-by-app) mode_top_ip_by_app "${2:-5}" ;;
     top-paths|toppaths) mode_top_paths "${2:-20}" "${3:-}" ;;
     attacker) mode_attacker "${2:-}" ;;
     slow)     mode_slow "${2:-10}" ;;

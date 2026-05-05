@@ -14,6 +14,7 @@ ${W}DASHBOARDS${NC}
 ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
   ${C}top [N]${NC}            top N source IPs  ${D}(default: 10)${NC}
+  ${C}top-ip-by-app [N]${NC}  top N source IPs per app  ${D}(default: 5)${NC}
   ${C}top-paths [N]${NC}      top N URLs — req/4xx/5xx/p95 per path  ${D}(default: 20)${NC}
   ${C}attacker <IP>${NC}      forensic view: one IP's activity across all apps
   ${C}slow [N]${NC}           top N slow endpoints by p95  ${D}(requires \$request_time; excludes WS)${NC}
@@ -115,6 +116,11 @@ _cmd_help() {
         health)   echo -e "${W}milog health${NC} — 2xx/3xx/4xx/5xx totals per app" ;;
         top)
             echo -e "${W}milog top [N]${NC} — top N source IPs across all apps (default 10)"
+            echo -e "  ${D}+country column when GEOIP_ENABLED=1${NC}"
+            ;;
+        top-ip-by-app|top-by-app)
+            echo -e "${W}milog top-ip-by-app [N]${NC} — top N source IPs per app (default 5)"
+            echo -e "  ${D}Use when 'milog top' hides per-app scraper patterns${NC}"
             echo -e "  ${D}+country column when GEOIP_ENABLED=1${NC}"
             ;;
         top-paths)
@@ -221,6 +227,7 @@ case "${1:-}" in
     rate)     mode_rate ;;
     health)   mode_health ;;
     top)      mode_top "${2:-10}" ;;
+    top-ip-by-app|top-by-app) mode_top_ip_by_app "${2:-5}" ;;
     top-paths|toppaths) mode_top_paths "${2:-20}" "${3:-}" ;;
     attacker) mode_attacker "${2:-}" ;;
     slow)     mode_slow "${2:-10}" ;;
