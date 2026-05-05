@@ -82,45 +82,103 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Two independent event streams: exec (sched_process_exec) and
+	// tcp connect (sock:inet_sock_set_state). Each runs in its own
+	// goroutine with its own BPF collection so a verifier reject on
+	// one doesn't take down the other — the operator still gets the
+	// remaining probe's coverage with a logged warning for the failed
+	// one.
 	events := make(chan probe.Event, 256)
-	errCh := make(chan error, 1)
+	netEvents := make(chan probe.NetEvent, 256)
+	execErrCh := make(chan error, 1)
+	netErrCh := make(chan error, 1)
 
-	go func() {
-		errCh <- probe.Run(ctx, events)
-	}()
+	go func() { execErrCh <- probe.Run(ctx, events) }()
+	go func() { netErrCh <- probe.RunNet(ctx, netEvents) }()
 
-	log.Printf("milog-probe %s — watching exec() events (json=%v dry-run=%v)",
+	log.Printf("milog-probe %s — watching exec + tcp connect (json=%v dry-run=%v)",
 		buildVersion, *flagJSON, *flagDryRun)
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain the run goroutine so we surface its error if it
-			// stopped on something other than ctx cancellation.
-			if err := <-errCh; err != nil {
-				log.Printf("probe: %v", err)
+			drainErrors(execErrCh, netErrCh)
+			return
+		case err := <-execErrCh:
+			// One probe died but the other might still be alive. Log,
+			// keep running. If both die, the second drainErrors call
+			// surfaces the first error and we exit non-zero.
+			if err != nil {
+				log.Printf("probe (exec): %v — exec coverage degraded", err)
+			}
+			execErrCh = nil
+			if netErrCh == nil {
 				os.Exit(1)
 			}
-			return
-		case err := <-errCh:
+		case err := <-netErrCh:
 			if err != nil {
-				log.Fatalf("probe: %v", err)
+				log.Printf("probe (net): %v — outbound-connect coverage degraded", err)
 			}
-			return
+			netErrCh = nil
+			if execErrCh == nil {
+				os.Exit(1)
+			}
 		case ev := <-events:
 			handleEvent(ev, *flagJSON, *flagDryRun, *flagMilog)
+		case nev := <-netEvents:
+			handleNetEvent(nev, *flagJSON, *flagDryRun, *flagMilog)
 		}
 	}
 }
 
-// handleEvent runs the rule engine over one Event and dispatches the
-// configured side effect (json, dry-run, or shell-out to milog).
+// drainErrors picks up any pending non-nil errors from both probes
+// after ctx cancellation. Logs anything that wasn't `nil` — useful
+// signal in the journal when a clean shutdown still had a failing
+// load on one side.
+func drainErrors(execErrCh, netErrCh chan error) {
+	for _, ch := range []chan error{execErrCh, netErrCh} {
+		if ch == nil {
+			continue
+		}
+		select {
+		case err := <-ch:
+			if err != nil {
+				log.Printf("probe: %v", err)
+			}
+		default:
+		}
+	}
+}
+
+// handleEvent runs the rule engine over one exec Event and dispatches
+// the configured side effect (json, dry-run, or shell-out to milog).
 func handleEvent(ev probe.Event, asJSON, dryRun bool, milogBin string) {
 	hits := probe.Match(ev)
 	if asJSON {
 		// Even when no rule matched, emit the event so debugging
 		// "why didn't it fire?" is straightforward.
 		emitJSON(ev, hits)
+		return
+	}
+	if len(hits) == 0 {
+		return
+	}
+	for _, h := range hits {
+		if dryRun {
+			log.Printf("DRY: %s :: %s", h.RuleKey, h.Title)
+			continue
+		}
+		fireAlert(h, milogBin)
+	}
+}
+
+// handleNetEvent runs the network rule engine over one NetEvent —
+// same dispatch shape as handleEvent. Kept separate so future net
+// rules can grow independently.
+func handleNetEvent(ev probe.NetEvent, asJSON, dryRun bool, milogBin string) {
+	hits := probe.MatchNet(ev)
+	if asJSON {
+		emitNetJSON(ev, hits)
 		return
 	}
 	if len(hits) == 0 {
@@ -142,6 +200,15 @@ func emitJSON(ev probe.Event, hits []probe.Hit) {
 	}
 	enc := json.NewEncoder(os.Stdout)
 	_ = enc.Encode(wire{Event: ev, Hits: hits})
+}
+
+func emitNetJSON(ev probe.NetEvent, hits []probe.Hit) {
+	type wire struct {
+		NetEvent probe.NetEvent `json:"net_event"`
+		Hits     []probe.Hit    `json:"hits"`
+	}
+	enc := json.NewEncoder(os.Stdout)
+	_ = enc.Encode(wire{NetEvent: ev, Hits: hits})
 }
 
 // fireAlert shells out to `milog _internal_alert <key> <title> <body> <color>`.

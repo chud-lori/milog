@@ -2,17 +2,21 @@
 //
 // rules.go holds the rule-matching logic, deliberately OS-independent
 // so it can be unit-tested on any platform. The actual BPF loading +
-// ringbuf consumption lives in exec_linux.go (and a stub exec_other.go
-// for non-Linux builds).
+// ringbuf consumption lives in exec_linux.go / tcp_linux.go (and a
+// stub exec_other.go for non-Linux builds).
 //
 // Rule firing is fingerprint-based: the userspace consumer feeds an
-// `Event` to `Match`, gets back a slice of `Hit` (rule key + body
-// detail) per matching rule, and shells those out to milog's existing
-// alert path. Cooldown / silence / dedup all apply via the rule key —
-// no parallel state in the probe.
+// `Event` (exec) or `NetEvent` (tcp connect) to `Match` / `MatchNet`,
+// gets back a slice of `Hit` (rule key + body detail) per matching
+// rule, and shells those out to milog's existing alert path. Cooldown
+// / silence / dedup all apply via the rule key — no parallel state in
+// the probe.
 package probe
 
 import (
+	"net"
+	"os"
+	"strconv"
 	"strings"
 )
 
@@ -218,4 +222,254 @@ func uitoa(v uint32) string {
 		v /= 10
 	}
 	return string(buf[i:])
+}
+
+// =============================================================================
+// Network probe — outbound TCP connect monitoring.
+// =============================================================================
+
+// NetEvent is the userspace mirror of `struct tcp_event` from
+// tcp.bpf.c. Fired once per outbound TCP connect attempt
+// (TCP_CLOSE → TCP_SYN_SENT transition). DAddr is the destination
+// formatted as a string ("1.2.3.4" for v4, RFC 5952 for v6) so the
+// rule engine doesn't need to handle byte-array/IP conversion in two
+// places.
+type NetEvent struct {
+	PID        uint32
+	PPID       uint32 // looked up via /proc/<pid>/status
+	UID        uint32
+	Comm       string
+	ParentComm string
+	DAddr      string // destination IP, already stringified
+	DPort      uint16
+	IsIPv6     bool
+}
+
+// MatchNet runs every network rule against the event and returns hits.
+// Mirrors Match() for exec events. Currently one rule
+// (`net:unexpected_outbound`); space for `net:retrans_spike` once the
+// retransmit probe lands.
+func MatchNet(e NetEvent) []Hit {
+	var hits []Hit
+	if h, ok := matchUnexpectedOutbound(e); ok {
+		hits = append(hits, h)
+	}
+	return hits
+}
+
+// matchUnexpectedOutbound fires when a process initiates a TCP connect
+// to a destination not on the operator-configured allowlist. Defaults
+// cover loopback + DNS + NTP + RFC1918/ULA private ranges so a
+// freshly-installed milog probe doesn't immediately page on every
+// internal hop. Operators tighten the allowlist via
+// MILOG_PROBE_NET_ALLOWLIST or by silencing the rule key per-flow.
+//
+// The rule key embeds the comm so a single misbehaving process
+// connecting to many destinations shows up as one cooldown group, not
+// fifty. If you need per-destination granularity, swap the key suffix
+// to `:<comm>:<daddr>:<dport>` — but expect cooldown noise on long
+// connection bursts.
+func matchUnexpectedOutbound(e NetEvent) (Hit, bool) {
+	allow := loadNetAllowlist()
+	if allow.permits(e.DAddr, e.DPort) {
+		return Hit{}, false
+	}
+	dest := e.DAddr + ":" + uitoa(uint32(e.DPort))
+	return Hit{
+		RuleKey: "net:unexpected_outbound:" + e.Comm,
+		Title:   "Unexpected outbound: " + e.Comm + " → " + dest,
+		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" parent=" + e.ParentComm + " dst=" + dest + "```",
+	}, true
+}
+
+// netAllowlist holds the parsed allowlist as IP networks + bare ports.
+// Each connect event is checked against three buckets:
+//
+//   1. Wildcard ports — entries like `:53`, match any IP at that port.
+//   2. Networks       — entries like `10.0.0.0/8`, match any port in that net.
+//   3. Network+port   — entries like `10.0.0.0/8:443`, match both.
+//
+// Buckets are computed once via loadNetAllowlist(); subsequent events
+// reuse the cached value.
+type netAllowlist struct {
+	wildcardPorts map[uint16]struct{}
+	nets          []*net.IPNet
+	netPorts      []netPortEntry
+}
+
+type netPortEntry struct {
+	cidr *net.IPNet
+	port uint16
+}
+
+func (a *netAllowlist) permits(addr string, port uint16) bool {
+	if _, ok := a.wildcardPorts[port]; ok {
+		return true
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		// Bad address from the BPF side — better to alert than to
+		// silently allow. Return false so the rule fires.
+		return false
+	}
+	for _, n := range a.nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	for _, np := range a.netPorts {
+		if np.port == port && np.cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultNetAllowlist is the baseline shipped with milog-probe. Picks
+// the conservative set: loopback (always benign), DNS / NTP (every
+// machine does these), and RFC1918 / ULA / link-local (typical
+// private-network infra). Operators on a tightly-firewalled host can
+// override via MILOG_PROBE_NET_ALLOWLIST to drop the private-net
+// entries and force every outbound to be explicit.
+const defaultNetAllowlist = "127.0.0.0/8,::1/128," +
+	":53,:123," +
+	"10.0.0.0/8,172.16.0.0/12,192.168.0.0/16," +
+	"169.254.0.0/16," +
+	"fc00::/7,fe80::/10"
+
+// allowlistCache holds the parsed allowlist so MatchNet doesn't re-parse
+// on every event. Single-shot init via the `cached` flag — if the env
+// changes mid-run the operator restarts milog-probe to pick it up.
+//
+// Not a sync.Once because tests need to clear the cache between cases.
+// resetNetAllowlistCache is a test-only escape hatch declared in
+// rules_test.go.
+var (
+	cachedAllowlist netAllowlist
+	allowlistReady  bool
+)
+
+func loadNetAllowlist() *netAllowlist {
+	if allowlistReady {
+		return &cachedAllowlist
+	}
+	src := os.Getenv("MILOG_PROBE_NET_ALLOWLIST")
+	if src == "" {
+		src = defaultNetAllowlist
+	}
+	cachedAllowlist = parseNetAllowlist(src)
+	allowlistReady = true
+	return &cachedAllowlist
+}
+
+// parseNetAllowlist accepts a comma-separated list. Each entry is one
+// of three shapes:
+//
+//	":<port>"                    — bare port, any IP
+//	"<cidr>"                     — network, any port
+//	"<cidr>:<port>"              — both
+//
+// Bare IPs (no /mask) are normalised to /32 (v4) or /128 (v6).
+// Malformed entries are skipped silently — the only effect of a typo
+// is that the entry doesn't allowlist anything, which fails safe (the
+// alert fires).
+func parseNetAllowlist(src string) netAllowlist {
+	out := netAllowlist{wildcardPorts: map[uint16]struct{}{}}
+	for _, raw := range strings.Split(src, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		// Bare port: ":53" or ":123". Guard against IPv6 literals
+		// like "::1/128" — those also start with ":" but the second
+		// colon means "address", not "port". Distinguish by the
+		// double-colon shape, not by attempting ParseUint (a parse
+		// failure would silently drop the entry, which the v0.1 of
+		// this code did and caused the IPv6 loopback default to never
+		// take effect).
+		if strings.HasPrefix(entry, ":") && !strings.HasPrefix(entry, "::") {
+			if p, err := strconv.ParseUint(entry[1:], 10, 16); err == nil {
+				out.wildcardPorts[uint16(p)] = struct{}{}
+			}
+			continue
+		}
+		// CIDR + optional :port. Tricky bit: ParseCIDR doesn't accept
+		// trailing :port, and IPv6 literals already contain colons —
+		// disambiguate by splitting on the LAST colon only when what
+		// follows looks like a port number (and there's a `/` somewhere
+		// before it, signalling we're past the v6 body).
+		cidr, port, hasPort := splitCIDRPort(entry)
+		ipnet, err := parseCIDROrIP(cidr)
+		if err != nil {
+			continue
+		}
+		if hasPort {
+			out.netPorts = append(out.netPorts, netPortEntry{cidr: ipnet, port: port})
+		} else {
+			out.nets = append(out.nets, ipnet)
+		}
+	}
+	return out
+}
+
+// splitCIDRPort separates an entry like "10.0.0.0/8:443" into
+// "10.0.0.0/8" + 443. For pure-IPv6 CIDRs ("fc00::/7") with no port,
+// returns the input unchanged with hasPort=false. For an IPv6 entry
+// WITH a port we require the bracket form ("[fc00::/7]:443") to
+// disambiguate from the v6 colons themselves; that's standard URL
+// notation and matches what `net.JoinHostPort` produces.
+func splitCIDRPort(entry string) (cidr string, port uint16, hasPort bool) {
+	// Bracketed v6: "[<cidr>]:<port>"
+	if strings.HasPrefix(entry, "[") {
+		end := strings.Index(entry, "]")
+		if end < 0 || end+1 >= len(entry) || entry[end+1] != ':' {
+			return entry, 0, false
+		}
+		body := entry[1:end]
+		p, err := strconv.ParseUint(entry[end+2:], 10, 16)
+		if err != nil {
+			return entry, 0, false
+		}
+		return body, uint16(p), true
+	}
+	// IPv4-style "<cidr>:<port>". A v6 literal without brackets has
+	// multiple colons; we explicitly only treat the LAST colon as a
+	// port separator if the part after parses as a uint16 AND the
+	// part before contains a slash (i.e. it's a CIDR).
+	last := strings.LastIndex(entry, ":")
+	if last < 0 {
+		return entry, 0, false
+	}
+	candidate := entry[last+1:]
+	p, err := strconv.ParseUint(candidate, 10, 16)
+	if err != nil {
+		return entry, 0, false
+	}
+	body := entry[:last]
+	// IPv6 cidr without brackets ("fc00::/7"): body would have multiple
+	// colons. Don't treat as port-suffixed.
+	if strings.Count(body, ":") > 0 && !strings.Contains(body, "/") {
+		return entry, 0, false
+	}
+	return body, uint16(p), true
+}
+
+// parseCIDROrIP wraps net.ParseCIDR so a bare "1.2.3.4" or "fe80::1"
+// works as if `/32` or `/128` was specified. Saves operators having
+// to remember the mask suffix for single-host allowlist entries.
+func parseCIDROrIP(s string) (*net.IPNet, error) {
+	if strings.Contains(s, "/") {
+		_, n, err := net.ParseCIDR(s)
+		return n, err
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return nil, &net.ParseError{Type: "IP address", Text: s}
+	}
+	if ip.To4() != nil {
+		return &net.IPNet{IP: ip.To4(), Mask: net.CIDRMask(32, 32)}, nil
+	}
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}, nil
 }

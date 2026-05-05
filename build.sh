@@ -106,30 +106,45 @@ if [[ -d go && -f go/go.mod ]]; then
             done
 
             # milog-probe is Linux-only (eBPF). On Linux build hosts we
-            # also need clang to compile the .bpf.c source into the .o
-            # blob that exec_linux.go embeds. Skip path on macOS / BSD,
-            # or on a Linux host without clang installed.
+            # also need clang to compile the .bpf.c sources into the
+            # .o blobs that exec_linux.go / tcp_linux.go embed. Skip
+            # path on macOS / BSD, or on a Linux host without clang
+            # installed. Each .bpf.c → .bpf.o pair is independent: a
+            # failure on one doesn't block the other from compiling,
+            # and both objects must succeed before milog-probe builds.
             uname_s=$(uname -s 2>/dev/null || echo unknown)
             probe_dir="internal/probe"
-            bpf_src="${probe_dir}/bpf/exec.bpf.c"
-            bpf_obj="${probe_dir}/bpf/exec.bpf.o"
+            bpf_target_arch=$(uname -m 2>/dev/null | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
+            bpf_inc="/usr/include/$(uname -m 2>/dev/null)-linux-gnu"
+            # bpf_compile <src> <obj> — returns 0 on success, non-zero
+            # otherwise. Tries the include-path-prefixed invocation
+            # first (Debian / Ubuntu layout) and falls back to no-I
+            # (Fedora / Arch / minimal containers put libbpf headers
+            # at /usr/include directly).
+            bpf_compile() {
+                local src="$1" obj="$2"
+                clang -target bpf -O2 -g -Wall \
+                    -D__TARGET_ARCH_${bpf_target_arch} \
+                    -I"$bpf_inc" \
+                    -c "$src" -o "$obj" 2>/dev/null && return 0
+                clang -target bpf -O2 -g -Wall \
+                    -c "$src" -o "$obj"
+            }
+            bpf_objs_ok=1
             if [[ "$uname_s" == "Linux" ]]; then
                 if command -v clang >/dev/null 2>&1; then
-                    if clang -target bpf -O2 -g -Wall \
-                        -D__TARGET_ARCH_$(uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/') \
-                        -I/usr/include/$(uname -m)-linux-gnu \
-                        -c "$bpf_src" -o "$bpf_obj" 2>/dev/null; then
-                        :
-                    else
-                        # Retry without the -I path (some distros put
-                        # libbpf headers in /usr/include directly).
-                        clang -target bpf -O2 -g -Wall \
-                            -c "$bpf_src" -o "$bpf_obj" 2>&1 || {
-                            echo "build.sh: clang failed to compile BPF object — skipping milog-probe" >&2
-                            bpf_obj=""
-                        }
-                    fi
-                    if [[ -s "$bpf_obj" ]]; then
+                    for stem in exec tcp; do
+                        src="${probe_dir}/bpf/${stem}.bpf.c"
+                        obj="${probe_dir}/bpf/${stem}.bpf.o"
+                        if ! bpf_compile "$src" "$obj"; then
+                            echo "build.sh: clang failed to compile ${src} — skipping milog-probe" >&2
+                            bpf_objs_ok=0
+                        elif [[ ! -s "$obj" ]]; then
+                            echo "build.sh: ${obj} produced empty — skipping milog-probe" >&2
+                            bpf_objs_ok=0
+                        fi
+                    done
+                    if (( bpf_objs_ok )); then
                         if go build \
                             -ldflags "-X main.buildVersion=${MILOG_VERSION}" \
                             -o "bin/milog-probe" \
@@ -140,7 +155,7 @@ if [[ -d go && -f go/go.mod ]]; then
                         fi
                     fi
                 else
-                    echo "build.sh: clang missing — skipping milog-probe (apt install clang llvm)" >&2
+                    echo "build.sh: clang missing — skipping milog-probe (apt install clang llvm libbpf-dev)" >&2
                 fi
             fi
             # Non-Linux build hosts skip the probe silently. Probe is
