@@ -96,6 +96,7 @@ mode_daemon() {
         if (( cur_min > last_min )); then
             local write_ts=$(( last_min * 60 ))
             history_write_minute "$write_ts" "$(_cur_time_at "$write_ts")"
+            _anomaly_check_minute "$write_ts"
             last_min=$cur_min
         fi
         if (( cur_hour > last_hour )); then
