@@ -38,9 +38,10 @@ SCRIPT_URL="${MILOG_SCRIPT_URL:-https://raw.githubusercontent.com/chud-lori/milo
 SCRIPT_SRC=""           # populated by resolve_script_src
 _CLEANUP_TMP=""         # set if we downloaded — trap removes on exit
 
-# GitHub repo that hosts prebuilt Go binaries (milog-web, milog-tui)
-# under its Releases. Overridable for forks. The "latest" tag follows
-# the most recent non-draft release automatically.
+# GitHub repo that hosts prebuilt Go binaries (milog-web, milog-tui,
+# and on Linux also milog-probe) under its Releases. Overridable for
+# forks. The "latest" tag follows the most recent non-draft release
+# automatically.
 MILOG_RELEASE_REPO="${MILOG_RELEASE_REPO:-chud-lori/milog}"
 # Default to the tracking `latest` endpoint — GitHub resolves it to
 # whichever release is currently marked Latest. Pin to an exact tag
@@ -142,9 +143,14 @@ _md5() {
 }
 
 # ---- prebuilt-binary download (Go companion path) --------------------------
-# Fetches milog-web / milog-tui from a GitHub Release asset that matches
-# the host OS + architecture. Used in the curl-pipe install flow so end
-# users don't need Go on their server — the toolchain work happens in CI.
+# Fetches milog-web / milog-tui (and milog-probe on Linux) from a GitHub
+# Release asset that matches the host OS + architecture. Used in the
+# curl-pipe install flow so end users don't need Go (or clang+libbpf-dev)
+# on their server — the toolchain work happens in CI.
+#
+# milog-probe is Linux-only (eBPF). The Linux release tarball includes
+# it; macOS / BSD tarballs don't. The companion loop below skips it on
+# non-Linux automatically.
 #
 # Silent no-op when the release doesn't publish a matching asset (e.g.
 # the project hasn't cut its first binary release yet, or the arch isn't
@@ -214,11 +220,11 @@ _release_download_binary() {
     info "Installed ${name} → ${dst_dir}/${name} (from ${tag})"
 }
 
-# Top-level entry: try to fetch milog-web + milog-tui from the latest
-# release. Prints one line per binary; silent when a binary isn't
-# published for this arch. Never fails hard — bash milog.sh already
-# installed, and a missing Go binary just means `milog tui` will print
-# its install hint.
+# Top-level entry: try to fetch milog-web + milog-tui (+ milog-probe on
+# Linux) from the latest release. Prints one line per binary; silent
+# when a binary isn't published for this arch. Never fails hard — bash
+# milog.sh already installed, and a missing Go binary just means
+# `milog tui` will print its install hint.
 _release_install_companions() {
     local dst_dir="$1"
     local os arch tag
@@ -233,8 +239,16 @@ _release_install_companions() {
         info "prebuilt binaries: no release tagged yet — skipping (milog monitor / bash-only install still works)"
         return 0
     fi
+    # Names list. milog-probe is Linux-only — eBPF doesn't exist on
+    # other kernels, and the goreleaser config only emits it for
+    # goos: linux. Adding it to the macOS/BSD download list would
+    # always-fail the fetch loop and noise up the install output.
+    local names=(milog-web milog-tui)
+    if [[ "$os" == "linux" ]]; then
+        names+=(milog-probe)
+    fi
     local downloaded=0 name
-    for name in milog-web milog-tui; do
+    for name in "${names[@]}"; do
         if _release_download_binary "$name" "$dst_dir" "$tag" "$os" "$arch"; then
             downloaded=$((downloaded + 1))
         fi
@@ -284,10 +298,12 @@ uninstall() {
     fi
 
     # Companion Go binaries (installed by install_go_companion() above
-    # when a clone with built binaries was present).
+    # when a clone with built binaries was present, or fetched from the
+    # release). milog-probe is Linux-only but harmless to attempt to
+    # remove on any platform — the path-exists guard short-circuits.
     local companion_dir; companion_dir=$(dirname "$BIN_DST")
     local name
-    for name in milog-web milog-tui; do
+    for name in milog-web milog-tui milog-probe; do
         local path="${companion_dir}/${name}"
         if [[ -e "$path" ]]; then
             info "Removing $path"
@@ -512,11 +528,26 @@ main() {
     }
     install_go_companion milog-web
     install_go_companion milog-tui
+    # milog-probe only built by build.sh on Linux clones with clang
+    # installed; install_go_companion's `[[ -x "$src" ]] || return 0`
+    # silently skips it on macOS / freshly-cloned hosts without clang.
+    install_go_companion milog-probe
 
     # Prebuilt binaries from GitHub Releases — only runs if the clone
     # path didn't already place them (the companion check above is
     # silent when go/bin/* doesn't exist, matching the curl-pipe flow).
+    # On Linux we additionally check milog-probe — clones built without
+    # clang/libbpf-dev (which is most contributor laptops on darwin
+    # cross-mounting via NFS) will be missing it and we fetch from the
+    # release.
+    local need_release=0
     if [[ ! -x "${dst_dir}/milog-web" || ! -x "${dst_dir}/milog-tui" ]]; then
+        need_release=1
+    fi
+    if [[ "$(_release_os_slug)" == "linux" && ! -x "${dst_dir}/milog-probe" ]]; then
+        need_release=1
+    fi
+    if (( need_release )); then
         _release_install_companions "$dst_dir"
     fi
 

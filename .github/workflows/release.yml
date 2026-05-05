@@ -40,6 +40,19 @@ jobs:
           cache: true
           cache-dependency-path: go/go.sum
 
+      - name: Install BPF toolchain
+        # clang + libbpf headers so .goreleaser.yaml's `before.hooks:
+        # bash build.sh` can compile the milog-probe eBPF objects
+        # (bpf/*.bpf.o) before goreleaser builds the milog-probe Go
+        # binary. Without these, exec_linux.go / tcp_linux.go / etc.
+        # //go:embed lines fail at compile time and goreleaser aborts.
+        # ubuntu-latest ships clang but not libbpf-dev. Same install
+        # block as ci.yml; kept duplicated rather than DRY'd into a
+        # composite action because there are only two callers.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+
       - name: Run goreleaser
         uses: goreleaser/goreleaser-action@v6
         with:
