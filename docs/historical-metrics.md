@@ -101,6 +101,48 @@ Ready to apply (copy-paste to set):
 Re-run whenever traffic patterns change (new service, traffic source
 shift, seasonal change).
 
+## Anomaly detection
+
+Once you've banked **at least 14 days** of `HISTORY_ENABLED=1` data,
+flip the same-minute-of-day σ detector on:
+
+```bash
+milog config set ANOMALY_ENABLED 1
+sudo systemctl restart milog.service
+```
+
+On every minute write, the daemon compares the just-landed row to the
+last `ANOMALY_MIN_DAYS` (default 14) days of rows at the **same minute
+of day**. If req / c5xx / p95 exceeds `mean + ANOMALY_SIGMA * stddev`
+AND clears the per-metric absolute floor, an alert fires keyed
+`anomaly:<app>:<metric>`.
+
+**Why same-minute-of-day:** daily traffic patterns dwarf weekly ones
+on a typical nginx host. A naive "anomalous vs all of yesterday" check
+pages on every 9am rush because the average includes the 3am quiet.
+The same-minute-of-day baseline absorbs the daily curve so what's left
+is genuine deviation.
+
+**Hard gates** (silent until met):
+
+- `ANOMALY_MIN_DAYS` distinct days of baseline data — silent during
+  ramp-up so you don't get noise while history accumulates.
+- Per-metric absolute floor (`ANOMALY_FLOOR_REQ` default 10,
+  `_C5XX` default 2, `_P95` default 100ms) — current value must
+  clear it before the σ band is consulted. Avoids "single hit at zero
+  baseline = mathematically infinite z" false positives.
+- `stddev > 0` — all-zero baseline + first-ever event silently passes
+  (cannot meaningfully σ-test against constant zero).
+
+Tune the per-metric floors and σ multiplier to your workload. A
+chatty API serving 5k req/min wants a higher `ANOMALY_FLOOR_REQ`
+than a low-traffic admin app, or you'll alert on rounding noise.
+
+Rule keys are stable per (app, metric); the existing
+`ALERT_COOLDOWN` keeps a sustained anomaly from spamming the
+webhook every minute. Silence with `milog silence anomaly:api:req
+2h "investigating CDN purge spike"` while you investigate.
+
 ## History is daemon-only
 
 The interactive modes (`monitor`, `rate`, etc.) **don't** write to the

@@ -10,10 +10,15 @@ headlessly. A read-only web dashboard (`milog web`) exposes the same data
 over HTTP with a minimal single-page HTML UI.
 
 **Runtime deps:** bash 4+, coreutils, `awk` (gawk preferred), `ps`, `df`,
-`curl` (alerts), `sqlite3` (history/trend/diff/auto-tune). The web
-dashboard ships as the `milog-web` Go binary (pulled by `install.sh`
-from GitHub releases, no system listener needed). `mmdblookup` is
-optional for GeoIP enrichment.
+`curl` (alerts), `sqlite3` (history/trend/diff/auto-tune/anomaly).
+The web dashboard ships as the `milog-web` Go binary (pulled by
+`install.sh` from GitHub releases, no system listener needed). The
+`milog-tui` Go binary provides the bubbletea TUI. The `milog-probe`
+Go binary (Linux only) is the eBPF kernel-event sidecar — runs as a
+root systemd service (`milog probe install-service`) and shells out
+to milog for every rule hit. `journalctl` and `docker` are needed
+only for the matching `journal:` / `docker:` LOGS source types.
+`mmdblookup` is optional for GeoIP enrichment.
 
 **Target:** Linux VMs, `/var/log/nginx` (or an arbitrary dir via `LOG_DIR`).
 
@@ -31,15 +36,27 @@ milog/
 │   ├── README.md     # contributor guide
 │   ├── core.sh       # shebang, set -euo, config defaults, env overrides,
 │   │                 # colors. This is the only file that executes at load.
-│   ├── alerts.sh     # alert_discord, alert_should_fire, _exploit_category
+│   ├── alerts.sh     # alert_fire, alert_should_fire, silence + dedup state
 │   ├── ui.sh         # box rules, geometry, milog_update_geometry
 │   ├── system.sh     # cpu_usage, mem_info, disk_info, sparkline_render
 │   ├── history.sh    # SQLite schema + writes, percentiles
+│   ├── anomaly.sh    # _anomaly_check_minute — same-minute-of-day σ check
 │   ├── nginx.sh      # nginx_minute_counts, nginx_row, sys_check_alerts
-│   ├── web.sh        # _web_* helpers for the read-only dashboard
-│   ├── modes/*.sh    # one file per subcommand (mode_<name>)
+│   ├── web.sh        # _web_* helpers for the read-only dashboard launcher
+│   ├── modes/*.sh    # one file per subcommand (mode_<name>) — includes
+│   │                 # probe / web / audit / silence / digest / errors / ws / search …
 │   └── dispatch.sh   # show_help + the final `case "${1:-}"`
-├── install.sh        # downloads + installs milog.sh (unchanged UX)
+├── go/
+│   ├── cmd/milog-web/    # SSE web dashboard daemon
+│   ├── cmd/milog-tui/    # bubbletea TUI
+│   ├── cmd/milog-probe/  # eBPF kernel-event sidecar (Linux only)
+│   └── internal/
+│       ├── probe/        # cilium/ebpf loaders + rule matchers + bpf/*.bpf.c
+│       ├── nginxlog/     # combined-format parser shared by web + tui
+│       ├── tail/         # polling tailer with inode-rotation handling
+│       ├── alertlog/     # alerts.log reader for the TUI alerts/errors views
+│       └── promtext/     # plaintext 0.0.4 Prometheus encoder
+├── install.sh        # curl-pipe installer (bash bundle + Go binaries from Release)
 └── docs/*.md
 ```
 
@@ -104,20 +121,29 @@ line numbers):
 | Function                  | Role                                              |
 | ------------------------- | ------------------------------------------------- |
 | `mode_monitor`            | Full TUI loop                                     |
-| `mode_daemon`             | Headless rule evaluator                           |
+| `mode_daemon`             | Headless rule evaluator + minute/hour rollovers   |
 | `mode_rate`               | Nginx-only req/min TUI                            |
 | `mode_health`             | Per-app 2xx/3xx/4xx/5xx totals                    |
-| `mode_top`                | Top-N source IPs                                  |
+| `mode_top` / `mode_top_ip_by_app` | Top-N source IPs (global / per-app)       |
+| `mode_top_paths`          | Per-URL req / 4xx / 5xx / p95 (query-stripped)    |
+| `mode_slow` / `mode_ws`   | Slowest endpoints by p95; WebSocket session table |
+| `mode_attacker`           | Forensic per-IP view across all apps              |
 | `mode_stats`              | Hourly histogram for one app                      |
-| `mode_grep`               | Filter-tail one app                               |
-| `mode_errors`             | Multi-app 4xx/5xx live tail                       |
+| `mode_grep` / `mode_search` | Filter-tail one app; archive-aware grep         |
+| `mode_errors`             | Live 4xx/5xx tail + `app:*` pattern fires         |
 | `mode_exploits`           | L7 attack payload live tail                       |
 | `mode_probes`             | Scanner/bot UA live tail                          |
+| `mode_patterns`           | App-error pattern catalog watcher (`app:*` rule keys) |
 | `mode_suspects`           | Behavioral IP ranking                             |
-| `mode_top_paths`          | Per-URL req / 4xx / 5xx / p95 (query-stripped)    |
+| `mode_replay`             | Postmortem summary for one archived log           |
 | `mode_trend`              | Sparkline chart from `metrics_minute`             |
 | `mode_diff`               | Hour-level now vs 1d ago vs 7d ago                |
 | `mode_auto_tune`          | Suggest thresholds from history percentiles       |
+| `mode_digest`             | Exec-summary view (alerts + traffic + capacity)   |
+| `mode_alert` / `mode_alerts` / `mode_silence` | Alert lifecycle, fire history, mute  |
+| `mode_audit`              | FIM / persistence / ports / YARA / accounts / rootkit |
+| `mode_web`                | Launcher for `milog-web` Go daemon (token + lifecycle) |
+| `mode_probe`              | `status` / `install-service` / `uninstall-service` for `milog-probe` (Linux only) |
 | `mode_doctor`             | Runtime health/config checklist                   |
 | `mode_config`             | Config-file subcommand router                     |
 | `color_prefix`            | Default merged log tail                           |
@@ -130,8 +156,11 @@ Shared helpers (must be callable from any mode):
 | `nginx_check_http_alerts`   | Fire 4xx/5xx spike rules                          |
 | `sys_check_alerts`          | Fire CPU/MEM/DISK/workers rules                   |
 | `nginx_row`                 | Render one table row (calls the two above)        |
-| `alert_discord`             | POST embed to webhook (noop when disabled)        |
-| `alert_should_fire`         | Cooldown gate                                     |
+| `alert_fire`                | Single fan-out entry — silence + dedup + routing + hooks + per-dest sends |
+| `alert_should_fire`         | Per-rule cooldown gate                            |
+| `alert_silence_add` / `_list_active` | Silence state file CRUD (glob-aware)     |
+| `_anomaly_check_minute`     | Same-minute-of-day σ check at history rollover; fires `anomaly:<app>:<metric>` |
+| `_log_path_for` / `_log_reader_cmd` | Resolve / spawn reader for typed LOGS entries (`text:`, `journal:`, `docker:`) |
 | `json_escape`               | Minimal JSON string escaper                       |
 | `_exploit_category`         | Classify an exploit match into a category slug    |
 | `_dlog`                     | Timestamped stderr log (daemon)                   |
@@ -296,16 +325,28 @@ yellow for warn, green for info.
 
 Stable, grep-friendly strings used by the cooldown gate:
 
-| Rule              | Key                          |
-| ----------------- | ---------------------------- |
-| 5xx spike         | `5xx:<app>`                  |
-| 4xx spike         | `4xx:<app>`                  |
-| CPU crit          | `cpu`                        |
-| MEM crit          | `mem`                        |
-| Disk crit         | `disk:<mount>` (currently `disk:/`) |
-| Workers zero      | `workers`                    |
-| Exploit match     | `exploit:<app>:<category>`   |
-| Probe match       | `probe:<app>`                |
+| Rule                   | Key                                                                       |
+| ---------------------- | ------------------------------------------------------------------------- |
+| 5xx spike              | `5xx:<app>`                                                               |
+| 4xx spike              | `4xx:<app>`                                                               |
+| CPU crit               | `cpu`                                                                     |
+| MEM crit               | `mem`                                                                     |
+| Disk crit              | `disk:<mount>` (currently `disk:/`)                                       |
+| Workers zero           | `workers`                                                                 |
+| Exploit match          | `exploit:<app>:<category>`                                                |
+| Probe match            | `probe:<app>`                                                             |
+| App-error pattern      | `app:<source>:<pattern>`                                                  |
+| Anomaly                | `anomaly:<app>:<metric>` — `metric ∈ {req, c5xx, p95}`                    |
+| Audit FIM              | `audit:fim_drift:<path>`                                                  |
+| Audit accounts         | `audit:accounts:<path>:<event>`                                           |
+| Audit persistence      | `audit:persistence:<path>`                                                |
+| Audit ports            | `audit:ports:<proto>:<port>`                                              |
+| Audit YARA             | `audit:yara:<rule>:<path>`                                                |
+| Audit rootkit          | `audit:rootkit:<heuristic>`                                               |
+| Probe — process        | `process:shell_from_web_worker:<parent>:<child>`, `process:exec_from_tmp:<comm>`, `process:suid_escalation:<parent>:<child>`, `process:syscall_burst:<comm>` |
+| Probe — file           | `file:sensitive_read:<comm>:<path>`                                       |
+| Probe — net            | `net:unexpected_outbound:<comm>`, `net:retrans_spike:<dst>:<port>`        |
+| Probe — kernel         | `proc:ptrace_inject:<comm>`, `proc:kmod_load:<module>`, `proc:bpf_load:<comm>` |
 
 Categories emitted by `_exploit_category`: `traversal`, `infra`, `device`,
 `wordpress`, `phpmyadmin`, `dotfile`, `log4shell`, `sqli`, `xss`, `rce`,
