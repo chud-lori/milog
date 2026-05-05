@@ -495,3 +495,62 @@ func TestSyscallBpfObject_KernelLoad(t *testing.T) {
 		t.Errorf("loaded collection missing program 'handle_sys_enter'")
 	}
 }
+
+// =============================================================================
+// BPF program-load probe — anti-rootkit.
+// =============================================================================
+
+func TestBpfLoadBpfObject_Spec(t *testing.T) {
+	if len(bpfLoadBpfObj) == 0 {
+		t.Fatal("bpfLoadBpfObj is empty — build.sh didn't produce bpf/bpfload.bpf.o " +
+			"(install clang + libbpf-dev and re-run `bash build.sh`)")
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfLoadBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (bpfload): %v", err)
+	}
+
+	prog, ok := spec.Programs["handle_bpf_enter"]
+	if !ok {
+		t.Fatalf("expected program 'handle_bpf_enter', got: %v", programNames(spec))
+	}
+	if prog.Type != ebpf.TracePoint {
+		t.Errorf("handle_bpf_enter.Type = %v, want TracePoint", prog.Type)
+	}
+
+	m, ok := spec.Maps["bpfload_events"]
+	if !ok {
+		t.Fatalf("expected map 'bpfload_events', got: %v", mapNames(spec))
+	}
+	if m.Type != ebpf.RingBuf {
+		t.Errorf("bpfload_events.Type = %v, want RingBuf", m.Type)
+	}
+	if m.MaxEntries < 16*1024 {
+		t.Errorf("bpfload_events.MaxEntries = %d, want >= 16384", m.MaxEntries)
+	}
+}
+
+func TestBpfLoadBpfObject_KernelLoad(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (CAP_BPF) — see ci.yml's sudo step")
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit.RemoveMemlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfLoadBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (bpfload): %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			t.Fatalf("BPF verifier rejected handle_bpf_enter on kernel %s:\n%+v", uname(), verr)
+		}
+		t.Fatalf("NewCollection (bpfload) on kernel %s: %v", uname(), err)
+	}
+	defer coll.Close()
+	if _, ok := coll.Programs["handle_bpf_enter"]; !ok {
+		t.Errorf("loaded collection missing program 'handle_bpf_enter'")
+	}
+}

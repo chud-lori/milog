@@ -51,3 +51,8 @@ func RunRetrans(ctx context.Context, out chan<- RetransEvent) error {
 func RunSyscallRate(ctx context.Context, out chan<- RateAnomalyEvent) error {
 	return ErrUnsupported
 }
+
+// RunBpfLoad stub for non-Linux builds.
+func RunBpfLoad(ctx context.Context, out chan<- BpfLoadEvent) error {
+	return ErrUnsupported
+}

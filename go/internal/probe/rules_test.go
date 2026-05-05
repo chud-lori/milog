@@ -888,3 +888,70 @@ func TestMatchSyscallBurst_ZeroWindowSafe(t *testing.T) {
 		t.Errorf("zero window should be suppressed defensively, got %+v", hits)
 	}
 }
+
+func resetBpfLoadRulesCache() {
+	cachedBpfLoadRules = bpfLoadRules{}
+	bpfLoadRulesReady = false
+}
+
+func TestMatchBpfLoad_DefaultsAllowKnownLoaders(t *testing.T) {
+	t.Setenv("MILOG_PROBE_BPFLOAD_ALLOWLIST", "")
+	resetBpfLoadRulesCache()
+
+	cases := []BpfLoadEvent{
+		{Comm: "milog-probe"},
+		{Comm: "systemd"},
+		{Comm: "systemd-networkd"},
+		{Comm: "bpftrace"},
+		{Comm: "containerd"},
+		{Comm: "dockerd"},
+		{Comm: "runc"},
+		{Comm: "cilium-agent"},
+	}
+	for _, ev := range cases {
+		if hits := MatchBpfLoad(ev); len(hits) != 0 {
+			t.Errorf("default-allowlisted comm should be silent: %+v → %+v", ev, hits)
+		}
+	}
+}
+
+func TestMatchBpfLoad_NonAllowlistedFires(t *testing.T) {
+	t.Setenv("MILOG_PROBE_BPFLOAD_ALLOWLIST", "")
+	resetBpfLoadRulesCache()
+
+	ev := BpfLoadEvent{
+		PID: 4242, UID: 0, Comm: "rootkit-bin", ParentComm: "sh",
+		Cmd: 5,
+	}
+	hits := MatchBpfLoad(ev)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d: %+v", len(hits), hits)
+	}
+	h := hits[0]
+	if h.RuleKey != "proc:bpf_load:rootkit-bin" {
+		t.Errorf("rule key = %q, want proc:bpf_load:rootkit-bin", h.RuleKey)
+	}
+	if !strings.Contains(h.Title, "rootkit-bin") {
+		t.Errorf("title missing comm: %q", h.Title)
+	}
+	if !strings.Contains(h.Body, "BPF_PROG_LOAD") {
+		t.Errorf("body missing cmd label: %q", h.Body)
+	}
+}
+
+func TestMatchBpfLoad_CustomTightAllowlist(t *testing.T) {
+	// Locked-down host: only milog-probe is allowed to load BPF.
+	// systemd / bpftrace / docker now all fire.
+	t.Setenv("MILOG_PROBE_BPFLOAD_ALLOWLIST", "milog-probe")
+	resetBpfLoadRulesCache()
+
+	if hits := MatchBpfLoad(BpfLoadEvent{Comm: "milog-probe"}); len(hits) != 0 {
+		t.Errorf("milog-probe still allowed, got %+v", hits)
+	}
+	if hits := MatchBpfLoad(BpfLoadEvent{Comm: "systemd"}); len(hits) != 1 {
+		t.Errorf("custom allowlist replaces; systemd should now fire, got %d hits", len(hits))
+	}
+	if hits := MatchBpfLoad(BpfLoadEvent{Comm: "bpftrace"}); len(hits) != 1 {
+		t.Errorf("custom allowlist replaces; bpftrace should now fire, got %d hits", len(hits))
+	}
+}

@@ -1217,3 +1217,126 @@ func matchSyscallBurst(e RateAnomalyEvent) (Hit, bool) {
 func ftoa1(v float64) string {
 	return strconv.FormatFloat(v, 'f', 1, 64)
 }
+
+// =============================================================================
+// BPF program-load probe — anti-rootkit / competing-instance monitoring.
+// =============================================================================
+
+// BpfLoadEvent is the userspace mirror of `struct bpfload_event` from
+// bpfload.bpf.c. Fired once per `bpf(BPF_PROG_LOAD, ...)` syscall —
+// the BPF side filters all other bpf() cmds (map ops, prog attach,
+// btf load) so userspace only sees actual program loads.
+type BpfLoadEvent struct {
+	PID        uint32
+	PPID       uint32
+	UID        uint32
+	Cmd        uint32 // always BPF_PROG_LOAD (5) given current BPF-side filter
+	Comm       string
+	ParentComm string
+}
+
+// MatchBpfLoad runs every bpf-load rule against the event.
+func MatchBpfLoad(e BpfLoadEvent) []Hit {
+	var hits []Hit
+	if h, ok := matchBpfLoad(e); ok {
+		hits = append(hits, h)
+	}
+	return hits
+}
+
+// defaultBpfLoaders — comms that legitimately load BPF programs as
+// part of normal operation. systemd 240+ uses BPF for cgroup-v2
+// socket/cgroup attach (so it loads programs at boot AND on cgroup
+// reconfigure); container runtimes load network policies; observability
+// tools (bpftrace, bcc) load on every invocation. Allowing these
+// is the price of running on a modern systemd host with containers.
+//
+// `milog-probe` MUST be in this list — we'd alert on ourselves
+// otherwise. Operators on extremely locked-down hosts (no containers,
+// no ad-hoc bpftrace) can shrink this via MILOG_PROBE_BPFLOAD_ALLOWLIST
+// to just "milog-probe" and alert on every other load.
+var defaultBpfLoaders = []string{
+	"milog-probe",
+	"systemd",
+	"systemd-networkd",
+	"systemd-resolved",
+	"systemd-logind",
+	"systemd-udevd",
+	"systemd-journald",
+	"bpftrace",
+	"bpftool",
+	"bcc",
+	"perf",
+	"docker",
+	"dockerd",
+	"containerd",
+	"runc",
+	"crun",
+	"snapd",
+	"node_exporter",
+	"istio-proxy",
+	"envoy",
+	"falco",
+	"tetragon",
+	"cilium-agent",
+}
+
+type bpfLoadRules struct {
+	allowed map[string]struct{}
+}
+
+func (r *bpfLoadRules) isAllowed(comm string) bool {
+	_, ok := r.allowed[comm]
+	return ok
+}
+
+var (
+	cachedBpfLoadRules bpfLoadRules
+	bpfLoadRulesReady  bool
+)
+
+func loadBpfLoadRules() *bpfLoadRules {
+	if bpfLoadRulesReady {
+		return &cachedBpfLoadRules
+	}
+	cachedBpfLoadRules = parseBpfLoadRules(os.Getenv("MILOG_PROBE_BPFLOAD_ALLOWLIST"))
+	bpfLoadRulesReady = true
+	return &cachedBpfLoadRules
+}
+
+func parseBpfLoadRules(src string) bpfLoadRules {
+	out := bpfLoadRules{allowed: map[string]struct{}{}}
+	list := defaultBpfLoaders
+	if strings.TrimSpace(src) != "" {
+		list = nil
+		for _, raw := range strings.Split(src, ",") {
+			c := strings.TrimSpace(raw)
+			if c != "" {
+				list = append(list, c)
+			}
+		}
+	}
+	for _, c := range list {
+		out.allowed[c] = struct{}{}
+	}
+	return out
+}
+
+// matchBpfLoad fires when a non-allowlisted process loads a BPF
+// program. Per-comm rule key — multiple loads from the same comm
+// dedupe via cooldown. Different attacker-driven comms (an attacker
+// who renames their loader) would each alert independently, which
+// is fine — the alert path handles cardinality.
+func matchBpfLoad(e BpfLoadEvent) (Hit, bool) {
+	rules := loadBpfLoadRules()
+	if rules.isAllowed(e.Comm) {
+		return Hit{}, false
+	}
+	return Hit{
+		RuleKey: "proc:bpf_load:" + e.Comm,
+		Title:   "BPF program loaded by non-allowlisted process: " + e.Comm,
+		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" parent=" + e.ParentComm + " cmd=BPF_PROG_LOAD```",
+	}, true
+}
