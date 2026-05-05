@@ -54,6 +54,26 @@ builds:
       - arm64
     ldflags:
       - -s -w -X main.buildVersion={{.Version}}
+  # --- milog-probe: eBPF kernel-event watcher (Linux-only) ---
+  # Embeds compiled .bpf.o blobs via //go:embed — those are produced by
+  # the `before.hooks: bash build.sh` step above (which calls clang on
+  # the .bpf.c sources). The release workflow installs clang + libbpf-dev
+  # so build.sh's BPF compile path succeeds; without those packages the
+  # //go:embed bpf/*.bpf.o lines fail at compile time and goreleaser
+  # surfaces the error directly.
+  - id: milog-probe
+    main: ./cmd/milog-probe
+    dir: go
+    binary: milog-probe
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.buildVersion={{.Version}}
 
 archives:
   # One tarball per (os, arch) carrying the Go binaries + bash bundle +
@@ -67,6 +87,12 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
+    # Linux tarballs carry an extra binary (milog-probe) that macOS
+    # tarballs don't — eBPF doesn't exist outside Linux. Goreleaser's
+    # default sanity check flags this as user-confusing; we explicitly
+    # opt in so the asymmetry is documented + acknowledged. Users on
+    # macOS see milog-web + milog-tui only, which is correct.
+    allow_different_binary_count: true
     files:
       - milog.sh
       - install.sh
@@ -85,6 +111,7 @@ archives:
 #   /usr/bin/milog                                     — bash entry point
 #   /usr/bin/milog-web                                 — Go SSE daemon
 #   /usr/bin/milog-tui                                 — Go bubbletea TUI
+#   /usr/bin/milog-probe                               — eBPF watcher (linux only)
 #   /usr/share/bash-completion/completions/milog       — bash completions
 #   /usr/share/zsh/site-functions/_milog               — zsh completions
 #   /usr/share/fish/vendor_completions.d/milog.fish    — fish completions
@@ -100,6 +127,7 @@ nfpms:
     ids:
       - milog-web
       - milog-tui
+      - milog-probe
     formats: [deb, rpm, apk]
     vendor: chud-lori
     homepage: https://github.com/chud-lori/milog
