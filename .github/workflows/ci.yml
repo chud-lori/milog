@@ -68,6 +68,22 @@ jobs:
         working-directory: go
         run: go test -race -count=1 ./...
 
+      - name: Probe kernel-load smoke (sudo)
+        # The non-sudo Go test above runs the structural BPF spec test
+        # (parses the .bpf.o, asserts program/map names) — that catches
+        # ~95% of probe regressions. The remaining 5% is "compiles
+        # clean but the BPF verifier rejects on this kernel," which
+        # only surfaces when you actually load the program. CAP_BPF
+        # isn't granted to the runner user by default, so this step
+        # bumps to root via sudo. The test self-skips when EUID != 0,
+        # so this is the only place it ever runs in CI.
+        working-directory: go
+        run: |
+          sudo --preserve-env=PATH,HOME \
+            $(which go) test -count=1 -v \
+              -run TestExecBpfObject_KernelLoad \
+              ./internal/probe/
+
       - name: goreleaser config check
         uses: goreleaser/goreleaser-action@v6
         with:
