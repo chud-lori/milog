@@ -430,3 +430,68 @@ func TestRetransBpfObject_KernelLoad(t *testing.T) {
 		t.Errorf("loaded collection missing program 'handle_retransmit'")
 	}
 }
+
+// =============================================================================
+// Per-PID syscall rate probe — raw_tracepoint program, LRU_PERCPU_HASH map.
+// =============================================================================
+
+func TestSyscallBpfObject_Spec(t *testing.T) {
+	if len(syscallBpfObj) == 0 {
+		t.Fatal("syscallBpfObj is empty — build.sh didn't produce bpf/syscall.bpf.o " +
+			"(install clang + libbpf-dev and re-run `bash build.sh`)")
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(syscallBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (syscall): %v", err)
+	}
+
+	prog, ok := spec.Programs["handle_sys_enter"]
+	if !ok {
+		t.Fatalf("expected program 'handle_sys_enter', got: %v", programNames(spec))
+	}
+	// raw_tracepoint programs report Type == RawTracepoint, distinct
+	// from the regular TracePoint type the other probes use. Asserting
+	// the exact type catches a regression where someone "fixes" the
+	// SEC() name to tracepoint/raw_syscalls/sys_enter and silently
+	// burns CPU on the per-event arg formatting we deliberately
+	// avoided.
+	if prog.Type != ebpf.RawTracepoint {
+		t.Errorf("handle_sys_enter.Type = %v, want RawTracepoint", prog.Type)
+	}
+
+	m, ok := spec.Maps["syscall_counts"]
+	if !ok {
+		t.Fatalf("expected map 'syscall_counts', got: %v", mapNames(spec))
+	}
+	if m.Type != ebpf.LRUCPUHash {
+		t.Errorf("syscall_counts.Type = %v, want LRUCPUHash", m.Type)
+	}
+	if m.MaxEntries < 4096 {
+		t.Errorf("syscall_counts.MaxEntries = %d, want >= 4096", m.MaxEntries)
+	}
+}
+
+func TestSyscallBpfObject_KernelLoad(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (CAP_BPF) — see ci.yml's sudo step")
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("rlimit.RemoveMemlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(syscallBpfObj))
+	if err != nil {
+		t.Fatalf("LoadCollectionSpecFromReader (syscall): %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			t.Fatalf("BPF verifier rejected handle_sys_enter on kernel %s:\n%+v", uname(), verr)
+		}
+		t.Fatalf("NewCollection (syscall) on kernel %s: %v", uname(), err)
+	}
+	defer coll.Close()
+	if _, ok := coll.Programs["handle_sys_enter"]; !ok {
+		t.Errorf("loaded collection missing program 'handle_sys_enter'")
+	}
+}
