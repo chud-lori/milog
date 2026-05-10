@@ -6,7 +6,7 @@ set -euo pipefail
 
 # --- Configuration (defaults; overridable via config file or env) ---
 LOG_DIR="/var/log/nginx"
-LOGS=("dolanan" "ethok" "finance" "ldr" "profile" "sinepil")
+LOGS=()
 REFRESH=5
 
 # Alerts — configure ONE or MORE destinations; alert_fire() fans out to
@@ -539,4 +539,3 @@ R="\033[0;31m"  G="\033[0;32m"  Y="\033[0;33m"  B="\033[0;34m"
 M="\033[0;35m"  C="\033[0;36m"  W="\033[1;37m"  D="\033[0;90m"
 RBLINK="\033[0;31;5m"
 NC="\033[0m"
-

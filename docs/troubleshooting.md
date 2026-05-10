@@ -29,13 +29,23 @@ file naming doesn't match:
 ```bash
 ls -la "$LOG_DIR"                              # what's actually there?
 milog config set LOG_DIR /actual/path          # fix path
-milog config set APPS "myapp other"            # or set explicitly
+milog config add myapp                         # or set apps explicitly
+milog config add other
 ```
 
 File naming must be `<app>.access.log` (not `access.log.myapp`, not
 `myapp.log`). If your nginx writes differently, add per-vhost
 `access_log /var/log/nginx/<app>.access.log;` lines — see
 [configuration.md](configuration.md#nginx-log-format).
+
+Auto-discovery is the default behavior, but it only runs when `LOGS` is
+empty. If you previously set apps explicitly and want MiLog to discover
+everything under `LOG_DIR` again, remove the `LOGS=(...)` line from
+`$MILOG_CONFIG` or set:
+
+```bash
+LOGS=()
+```
 
 ### Empty dashboard / zero counts
 
