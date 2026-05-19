@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MiLog — bash nginx + system monitor with eBPF kernel observability</title>
+  <meta name="description" content="Single-file bash monitor for nginx + host. TUI dashboard, multi-destination alerts, historical metrics, σ-based anomaly detection, host integrity audits, and an optional eBPF probe sidecar.">
+  <meta property="og:title" content="MiLog">
+  <meta property="og:description" content="Bash-first nginx + system monitor. eBPF probe sidecar. Discord / Slack / Telegram / Matrix alerts. Anomaly detection.">
+  <meta property="og:type" content="website">
+  <meta name="theme-color" content="#0b0d10">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2300d18f'/%3E%3Cpath d='M7 22V10h3l4 7 4-7h3v12h-2.5v-7.5L15.2 22h-2.4L9.5 14.5V22z' fill='%23000'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      --bg: #0b0d10;
+      --bg-2: #121519;
+      --bg-3: #1a1e24;
+      --fg: #e4e7eb;
+      --fg-2: #a4adb8;
+      --fg-3: #6b7480;
+      --accent: #00d18f;
+      --accent-2: #00a06d;
+      --red: #ff6b6b;
+      --amber: #ffb454;
+      --border: #2a2f37;
+      --shadow: 0 1px 0 rgba(255,255,255,0.04), 0 8px 24px rgba(0,0,0,0.4);
+      --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Monaco, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #fafbfc;
+        --bg-2: #ffffff;
+        --bg-3: #f1f3f5;
+        --fg: #1a1e24;
+        --fg-2: #4a525c;
+        --fg-3: #8a939e;
+        --accent: #00a06d;
+        --accent-2: #00805a;
+        --border: #e1e4e8;
+        --shadow: 0 1px 0 rgba(0,0,0,0.02), 0 8px 24px rgba(0,0,0,0.08);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--sans);
+      font-size: 16px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre, .mono { font-family: var(--mono); }
+    code {
+      background: var(--bg-3);
+      border: 1px solid var(--border);
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    pre {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      overflow-x: auto;
+      box-shadow: var(--shadow);
+      font-size: 0.92em;
+      line-height: 1.55;
+    }
+    pre code {
+      background: transparent;
+      border: 0;
+      padding: 0;
+      font-size: inherit;
+    }
+    .container {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* Nav */
+    nav.top {
+      border-bottom: 1px solid var(--border);
+      background: rgba(11,13,16,0.7);
+      backdrop-filter: blur(8px);
+      position: sticky; top: 0; z-index: 10;
+    }
+    @media (prefers-color-scheme: light) {
+      nav.top { background: rgba(250,251,252,0.85); }
+    }
+    nav.top .container {
+      display: flex; align-items: center; justify-content: space-between;
+      height: 56px;
+    }
+    nav.top .brand {
+      font-weight: 700; font-size: 17px;
+      display: inline-flex; align-items: center; gap: 8px;
+      color: var(--fg);
+    }
+    nav.top .brand .dot {
+      width: 10px; height: 10px; border-radius: 3px;
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+    nav.top .links { display: flex; gap: 22px; font-size: 14px; }
+    nav.top .links a { color: var(--fg-2); }
+    nav.top .links a:hover { color: var(--fg); text-decoration: none; }
+    @media (max-width: 640px) {
+      nav.top .links a:not(.gh) { display: none; }
+    }
+
+    /* Hero */
+    .hero {
+      padding: 80px 0 64px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .hero::before {
+      content: "";
+      position: absolute; inset: 0;
+      background:
+        radial-gradient(800px 300px at 50% -50px, rgba(0,209,143,0.18), transparent 60%),
+        radial-gradient(600px 200px at 20% 80%, rgba(0,209,143,0.08), transparent 60%);
+      pointer-events: none;
+    }
+    .hero > * { position: relative; }
+    .hero .badges {
+      display: inline-flex; gap: 8px; margin-bottom: 24px;
+      flex-wrap: wrap; justify-content: center;
+    }
+    .badge {
+      font-family: var(--mono); font-size: 12px;
+      padding: 4px 10px; border-radius: 999px;
+      background: var(--bg-3); border: 1px solid var(--border);
+      color: var(--fg-2);
+    }
+    .badge.green { color: var(--accent); border-color: var(--accent-2); }
+    .hero h1 {
+      font-size: clamp(40px, 7vw, 64px);
+      line-height: 1.05; margin: 0 0 16px;
+      letter-spacing: -0.02em; font-weight: 800;
+    }
+    .hero h1 .accent {
+      background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      -webkit-background-clip: text; background-clip: text;
+      color: transparent;
+    }
+    .hero p.lead {
+      font-size: clamp(17px, 2.2vw, 20px);
+      max-width: 720px; margin: 0 auto 12px;
+      color: var(--fg-2);
+    }
+    .hero p.sub {
+      font-size: 15px; color: var(--fg-3);
+      max-width: 640px; margin: 0 auto 32px;
+    }
+    .cta-row {
+      display: inline-flex; gap: 12px; flex-wrap: wrap;
+      justify-content: center;
+    }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 12px 22px; border-radius: 8px;
+      font-weight: 600; font-size: 15px;
+      border: 1px solid var(--border);
+      transition: transform 0.06s ease, background 0.15s ease;
+    }
+    .btn:hover { text-decoration: none; transform: translateY(-1px); }
+    .btn.primary {
+      background: var(--accent); color: #0a0d10;
+      border-color: var(--accent);
+    }
+    .btn.primary:hover { background: var(--accent-2); }
+    .btn.ghost {
+      background: var(--bg-2); color: var(--fg);
+    }
+    .btn.ghost:hover { background: var(--bg-3); }
+
+    /* Terminal preview */
+    .terminal {
+      max-width: 760px; margin: 48px auto 0;
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      text-align: left;
+    }
+    .terminal .bar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 14px;
+      background: var(--bg-3);
+      border-bottom: 1px solid var(--border);
+      font-family: var(--mono); font-size: 12px; color: var(--fg-3);
+    }
+    .terminal .bar .dots { display: inline-flex; gap: 6px; margin-right: 8px; }
+    .terminal .bar .dots span {
+      width: 11px; height: 11px; border-radius: 50%;
+      background: var(--fg-3); opacity: 0.5;
+    }
+    .terminal .bar .dots span:nth-child(1) { background: #ff5f57; opacity: 0.8; }
+    .terminal .bar .dots span:nth-child(2) { background: #febc2e; opacity: 0.8; }
+    .terminal .bar .dots span:nth-child(3) { background: #28c840; opacity: 0.8; }
+    .terminal pre {
+      margin: 0; border: 0; border-radius: 0;
+      background: transparent; box-shadow: none;
+      font-size: 13px; line-height: 1.5;
+      padding: 18px 20px;
+    }
+    .term-row { display: flex; gap: 16px; }
+    .term-col-1 { color: var(--fg); white-space: pre; }
+    .term-col-2 { color: var(--fg-2); }
+    .red { color: var(--red); }
+    .amber { color: var(--amber); }
+    .green { color: var(--accent); }
+    .dim { color: var(--fg-3); }
+
+    /* Sections */
+    section { padding: 72px 0; border-top: 1px solid var(--border); }
+    section.no-border { border-top: 0; }
+    h2 {
+      font-size: clamp(28px, 4vw, 36px);
+      margin: 0 0 12px;
+      letter-spacing: -0.01em;
+    }
+    h2 + p.section-lead {
+      color: var(--fg-2); font-size: 17px;
+      max-width: 720px; margin: 0 0 40px;
+    }
+
+    /* Why grid */
+    .why-grid {
+      display: grid; gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    }
+    .card {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 22px 24px;
+      transition: border-color 0.15s ease, transform 0.06s ease;
+    }
+    .card:hover { border-color: var(--accent-2); transform: translateY(-2px); }
+    .card .icon {
+      width: 32px; height: 32px; margin-bottom: 14px;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: rgba(0,209,143,0.12); border-radius: 8px;
+      color: var(--accent); font-family: var(--mono); font-weight: 700;
+    }
+    .card h3 { margin: 0 0 8px; font-size: 17px; }
+    .card p { margin: 0; color: var(--fg-2); font-size: 14.5px; }
+
+    /* Feature columns */
+    .features {
+      display: grid; gap: 32px 40px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+    .feat h3 {
+      font-size: 16px; margin: 0 0 10px;
+      display: inline-flex; align-items: center; gap: 10px;
+    }
+    .feat h3 .tag {
+      font-family: var(--mono); font-size: 11px;
+      padding: 2px 8px; border-radius: 999px;
+      background: var(--bg-3); border: 1px solid var(--border);
+      color: var(--fg-3); font-weight: 500;
+    }
+    .feat ul { margin: 0; padding: 0; list-style: none; }
+    .feat ul li {
+      padding: 6px 0 6px 18px; position: relative;
+      color: var(--fg-2); font-size: 14.5px;
+    }
+    .feat ul li::before {
+      content: "›"; position: absolute; left: 0; top: 4px;
+      color: var(--accent); font-weight: 700;
+    }
+
+    /* Quickstart */
+    .quickstart-grid {
+      display: grid; gap: 24px;
+      grid-template-columns: 1fr;
+    }
+    .step { display: flex; gap: 18px; align-items: flex-start; }
+    .step .num {
+      flex-shrink: 0;
+      width: 32px; height: 32px;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: var(--bg-3); border: 1px solid var(--border);
+      border-radius: 50%; font-family: var(--mono); font-weight: 700;
+      color: var(--accent);
+    }
+    .step .body { flex: 1; min-width: 0; }
+    .step h4 { margin: 4px 0 8px; font-size: 16px; }
+    .step pre { margin: 0; }
+    .step .note { color: var(--fg-3); font-size: 13.5px; margin-top: 8px; }
+
+    /* Docs grid */
+    .docs-grid {
+      display: grid; gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+    .doc-link {
+      display: block;
+      padding: 16px 20px;
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--fg);
+      transition: border-color 0.15s ease;
+    }
+    .doc-link:hover { border-color: var(--accent-2); text-decoration: none; }
+    .doc-link strong { display: block; margin-bottom: 4px; font-size: 15px; }
+    .doc-link span { color: var(--fg-3); font-size: 13.5px; }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 32px 0 48px;
+      color: var(--fg-3); font-size: 13.5px;
+      text-align: center;
+    }
+    footer a { color: var(--fg-2); }
+
+    /* Utility */
+    .center { text-align: center; }
+    .muted { color: var(--fg-3); }
+    .small { font-size: 13.5px; }
+  </style>
+</head>
+<body>
+
+<nav class="top">
+  <div class="container">
+    <a class="brand" href="#">
+      <span class="dot"></span> MiLog
+    </a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#docs">Docs</a>
+      <a class="gh" href="https://github.com/chud-lori/milog">GitHub →</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="container">
+    <div class="badges">
+      <span class="badge green">v0.5 · eBPF probe sidecar</span>
+      <span class="badge">single-file bash</span>
+      <span class="badge">Linux / macOS</span>
+    </div>
+    <h1>Watch your nginx box,<br><span class="accent">not your dashboards.</span></h1>
+    <p class="lead">
+      A single-file bash monitor for nginx + host. TUI dashboard, multi-destination
+      alerts, historical metrics, σ-based anomaly detection, host integrity audits,
+      and an optional eBPF probe sidecar streaming kernel events through the same
+      alert pipeline.
+    </p>
+    <p class="sub">
+      Designed for the people who run one or three servers themselves — not for SREs
+      with a Datadog budget.
+    </p>
+    <div class="cta-row">
+      <a class="btn primary" href="#install">Install in 30s →</a>
+      <a class="btn ghost" href="https://github.com/chud-lori/milog">View on GitHub</a>
+    </div>
+
+    <div class="terminal" aria-hidden="true">
+      <div class="bar">
+        <span class="dots"><span></span><span></span><span></span></span>
+        <span class="mono">milog monitor</span>
+      </div>
+<pre><span class="dim">HOST  </span>cpu <span class="green">12%</span>   mem <span class="green">38%</span>   disk <span class="green">41%</span>   workers <span class="green">4</span>
+<span class="dim">─────────────────────────────────────────────────────────────</span>
+<span class="dim">APP</span>          <span class="dim">REQ/MIN  2xx   3xx   4xx   5xx   p95     STATE</span>
+api          <span class="green">  842</span>   811     8     <span class="amber">22</span>     <span class="green">1</span>   <span class="green">87ms</span>    <span class="green">ok</span>
+admin        <span class="green">   14</span>    13     0      <span class="green">1</span>     <span class="green">0</span>   <span class="green">42ms</span>    <span class="green">ok</span>
+storefront   <span class="amber">  301</span>   268    12     <span class="red">19</span>     <span class="red">2</span>  <span class="amber">412ms</span>   <span class="amber">warn</span>
+<span class="dim">─────────────────────────────────────────────────────────────</span>
+<span class="dim">[14:02:18]</span> <span class="red">▲ alert</span>  exploit:storefront:sqli  (3 hits, 1 IP)
+<span class="dim">[14:02:51]</span> <span class="amber">▲ alert</span>  anomaly:api:p95  z=4.2 vs 14d baseline
+<span class="dim">[14:03:04]</span> <span class="green">→ webhook</span> fired to discord (2 keys)</pre>
+    </div>
+  </div>
+</header>
+
+<section id="why">
+  <div class="container">
+    <h2>Why MiLog?</h2>
+    <p class="section-lead">
+      Most server-monitor tooling assumes either a team or a SaaS budget. MiLog
+      assumes one operator, one or three boxes, and a Discord channel.
+    </p>
+    <div class="why-grid">
+      <div class="card">
+        <div class="icon">$</div>
+        <h3>Single-file bash</h3>
+        <p>One <code>milog.sh</code> drops into <code>/usr/local/bin</code>. No
+        daemons-on-daemons, no Python venv, no Node, no Docker.</p>
+      </div>
+      <div class="card">
+        <div class="icon">▲</div>
+        <h3>Alerts that don't spam</h3>
+        <p>Per-rule cooldown, cross-rule dedup keyed on
+        <code>(ip, path)</code>. Discord, Slack, Telegram, Matrix — all behind
+        the same rule catalog.</p>
+      </div>
+      <div class="card">
+        <div class="icon">σ</div>
+        <h3>Same-minute-of-day anomaly</h3>
+        <p>Compares each minute against the same minute over the last 14 days.
+        Absorbs the daily traffic curve so you don't page on the 9am rush.</p>
+      </div>
+      <div class="card">
+        <div class="icon">⌬</div>
+        <h3>eBPF probe sidecar</h3>
+        <p>Optional Linux-only Go binary. Streams kernel events — exec, tcp,
+        file, ptrace, kmod, retransmit, syscall-rate, bpf-load — through the
+        same alert pipeline.</p>
+      </div>
+      <div class="card">
+        <div class="icon">⎔</div>
+        <h3>Host integrity audits</h3>
+        <p>FIM, persistence, ports, YARA scans, accounts, rootkit checks.
+        Baselines once, diffs every tick.</p>
+      </div>
+      <div class="card">
+        <div class="icon">⌖</div>
+        <h3>Built for forensics</h3>
+        <p><code>milog attacker &lt;ip&gt;</code>, <code>milog replay</code>,
+        archived-log search, hourly top-IP rollup — the postmortem tooling is
+        first-class, not bolted on.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="container">
+    <h2>What it watches</h2>
+    <p class="section-lead">
+      One process, six surfaces. Everything fires through the same alert pipeline
+      with cooldown and dedup.
+    </p>
+    <div class="features">
+      <div class="feat">
+        <h3>nginx <span class="tag">access logs</span></h3>
+        <ul>
+          <li>Per-app req/min sparklines</li>
+          <li>4xx / 5xx spike alerts (configurable thresholds)</li>
+          <li>p50 / p95 / p99 latency tracking</li>
+          <li>Top paths, top IPs, slowest endpoints</li>
+        </ul>
+      </div>
+      <div class="feat">
+        <h3>System <span class="tag">/proc</span></h3>
+        <ul>
+          <li>CPU / MEM / disk / nginx-workers thresholds</li>
+          <li>POSIX-only — no <code>sar</code>, <code>iostat</code>, etc.</li>
+        </ul>
+      </div>
+      <div class="feat">
+        <h3>Exploit patterns <span class="tag">heuristic</span></h3>
+        <ul>
+          <li>LFI / RCE / SQLi / XSS in URLs</li>
+          <li>Infra probes (.git, .env, wp-admin, phpMyAdmin, …)</li>
+          <li>CMS scans, dotfile probes</li>
+        </ul>
+      </div>
+      <div class="feat">
+        <h3>Scanner bots <span class="tag">UA catalog</span></h3>
+        <ul>
+          <li>zgrab, masscan, nikto, sqlmap</li>
+          <li>Shodan, CensysInspect, generic HTTP libs</li>
+          <li>AI crawlers (GPTBot, Claude-Web, …)</li>
+        </ul>
+      </div>
+      <div class="feat">
+        <h3>Host integrity <span class="tag">audit</span></h3>
+        <ul>
+          <li>FIM — <code>/etc</code> + binaries + cron + ~/.ssh</li>
+          <li>Persistence — services, timers, MOTD, rc.local</li>
+          <li>Ports — listening sockets diff</li>
+          <li>YARA — webshells, common malware families</li>
+          <li>Accounts — UID 0, sudoers, new users</li>
+          <li>Rootkit — preload, hidden PIDs, modules</li>
+        </ul>
+      </div>
+      <div class="feat">
+        <h3>Kernel events <span class="tag">eBPF · Linux</span></h3>
+        <ul>
+          <li><code>exec</code> — process spawns matching allowlist</li>
+          <li><code>tcp</code> — outbound connect to non-allowlisted CIDRs</li>
+          <li><code>file</code> — writes to <code>/etc</code>, binaries, etc.</li>
+          <li><code>ptrace</code>, <code>kmod</code>, <code>bpf-load</code></li>
+          <li>Retransmit + syscall-rate (Welford σ)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="container">
+    <h2>Install</h2>
+    <p class="section-lead">
+      Native packages on Debian/Ubuntu, Fedora/RHEL, Alpine. Or the universal
+      curl one-liner.
+    </p>
+    <div class="quickstart-grid">
+      <div class="step">
+        <div class="num">1</div>
+        <div class="body">
+          <h4>Drop the binary</h4>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
+  | sudo bash</code></pre>
+          <p class="note">
+            Installs <code>milog</code> + the <code>milog-tui</code> and
+            <code>milog-web</code> Go binaries from the latest release.
+            Ensures <code>gawk</code> / <code>curl</code> / <code>sqlite3</code>
+            via your distro's package manager.
+          </p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num">2</div>
+        <div class="body">
+          <h4>Live dashboard</h4>
+<pre><code>milog monitor          <span class="dim"># bash dashboard, refresh-and-redraw</span>
+milog tui              <span class="dim"># richer bubbletea TUI, same data</span></code></pre>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num">3</div>
+        <div class="body">
+          <h4>Turn on Discord alerts</h4>
+<pre><code>sudo milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'
+milog alert status
+milog alert test</code></pre>
+          <p class="note">
+            Installs the systemd unit, enables it, fires a test embed. Slack /
+            Telegram / Matrix work the same way — see
+            <a href="https://github.com/chud-lori/milog/blob/main/docs/alerts.md">docs/alerts.md</a>.
+          </p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num">4</div>
+        <div class="body">
+          <h4>Bank history for anomaly detection</h4>
+<pre><code>milog config set HISTORY_ENABLED 1
+sudo systemctl restart milog.service
+<span class="dim"># ...wait 14 days, then:</span>
+milog config set ANOMALY_ENABLED 1
+milog auto-tune 7      <span class="dim"># calibrate thresholds from history</span></code></pre>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num">5</div>
+        <div class="body">
+          <h4>Optional: eBPF probe sidecar <span class="muted small">— Linux only</span></h4>
+<pre><code>sudo milog probe install-service
+sudo journalctl -u milog-probe.service -f</code></pre>
+          <p class="note">
+            Streams kernel events through the same Discord / Slack / Telegram
+            webhook config, with the same cooldown + dedup. See
+            <a href="https://github.com/chud-lori/milog/blob/main/docs/probe.md">docs/probe.md</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="docs">
+  <div class="container">
+    <h2>Documentation</h2>
+    <p class="section-lead">
+      Topical guides. Every doc starts with what the thing is, then why you'd
+      turn it on, then how — with the gotchas spelled out.
+    </p>
+    <div class="docs-grid">
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/configuration.md">
+        <strong>Configuration</strong>
+        <span>Config file, env-var overrides, nginx <code>log_format</code> recipe</span>
+      </a>
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/alerts.md">
+        <strong>Alerts</strong>
+        <span>Discord / Slack / Telegram / Matrix setup, rule catalog, history</span>
+      </a>
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/daemon.md">
+        <strong><code>milog daemon</code></strong>
+        <span>Headless mode, systemd service, permissions, decision log</span>
+      </a>
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/historical-metrics.md">
+        <strong>Historical metrics</strong>
+        <span>SQLite, <code>trend</code>/<code>diff</code>/<code>auto-tune</code>, σ-anomaly detector</span>
+      </a>
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/probe.md">
+        <strong>Kernel observability</strong>
+        <span>eBPF probe sidecar, 8 probes, <code>install-service</code>, allowlist tuning</span>
+      </a>
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/audit.md">
+        <strong>Host integrity audits</strong>
+        <span>FIM / rootkit / persistence / ports / YARA / accounts</span>
+      </a>
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/web-dashboard.md">
+        <strong>Web dashboard</strong>
+        <span><code>milog web</code> + SSH / Tailscale / Cloudflare exposure</span>
+      </a>
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/tui.md">
+        <strong>TUI</strong>
+        <span>bubbletea Go binary, when to pick it over bash monitor</span>
+      </a>
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/geoip.md">
+        <strong>GeoIP enrichment</strong>
+        <span>MaxMind license + weekly auto-refresh + COUNTRY column</span>
+      </a>
+      <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/troubleshooting.md">
+        <strong>Troubleshooting</strong>
+        <span><code>milog doctor</code> + common failure modes</span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section id="philosophy" class="no-border">
+  <div class="container" style="max-width: 760px;">
+    <h2>Design rules</h2>
+    <ul style="padding-left: 20px; color: var(--fg-2);">
+      <li><strong>Bash stays bash.</strong> If POSIX bash + gawk can do it well,
+      it stays in bash. Go is for what bash genuinely can't reach (eBPF, raw
+      tracepoints, real TUIs).</li>
+      <li><strong>One artifact per install.</strong> Ship a bundled
+      <code>milog.sh</code> from modular <code>src/*.sh</code>. Users install
+      one file; contributors edit small ones.</li>
+      <li><strong>Cooldown + dedup are non-negotiable.</strong> Every rule has
+      a cooldown key. Cross-rule dedup on <code>(ip, path)</code>. The day a
+      scanner shows up shouldn't be the day your Discord channel breaks.</li>
+      <li><strong>Hard gates over heuristics.</strong> Anomaly detection has
+      three independent silence gates (<code>MIN_DAYS</code>, per-metric floor,
+      <code>stddev &gt; 0</code>). Better to under-alert during ramp-up than
+      cry wolf.</li>
+      <li><strong>No black boxes.</strong> Every decision the daemon makes
+      goes to stderr — fired, suppressed-by-cooldown, dedup-collapsed.
+      <code>journalctl -u milog.service -f</code> tells the whole story.</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div>
+      <a href="https://github.com/chud-lori/milog">github.com/chud-lori/milog</a>
+      · built with bash, awk, and a little Go
+    </div>
+    <div style="margin-top: 8px;" class="small">
+      Not affiliated with nginx, Inc.
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
