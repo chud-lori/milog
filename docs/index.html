@@ -9,7 +9,7 @@
   <meta property="og:description" content="Bash-first nginx + system monitor. eBPF probe sidecar. Discord / Slack / Telegram / Matrix alerts. Anomaly detection.">
   <meta property="og:type" content="website">
   <meta name="theme-color" content="#0b0d10">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2300d18f'/%3E%3Cpath d='M7 22V10h3l4 7 4-7h3v12h-2.5v-7.5L15.2 22h-2.4L9.5 14.5V22z' fill='%23000'/%3E%3C/svg%3E">
+  <link rel="icon" href="assets/milog-icon.png" type="image/png">
   <style>
     :root {
       --bg: #0b0d10;
@@ -102,10 +102,9 @@
       display: inline-flex; align-items: center; gap: 8px;
       color: var(--fg);
     }
-    nav.top .brand .dot {
-      width: 10px; height: 10px; border-radius: 3px;
-      background: var(--accent);
-      box-shadow: 0 0 12px var(--accent);
+    nav.top .brand img {
+      width: 28px; height: 28px;
+      display: block;
     }
     nav.top .links { display: flex; gap: 22px; font-size: 14px; }
     nav.top .links a { color: var(--fg-2); }
@@ -130,6 +129,12 @@
       pointer-events: none;
     }
     .hero > * { position: relative; }
+    .hero .mark {
+      width: clamp(88px, 13vw, 128px);
+      height: clamp(88px, 13vw, 128px);
+      display: block;
+      margin: 0 auto 22px;
+    }
     .hero .badges {
       display: inline-flex; gap: 8px; margin-bottom: 24px;
       flex-wrap: wrap; justify-content: center;
@@ -338,7 +343,7 @@
 <nav class="top">
   <div class="container">
     <a class="brand" href="#">
-      <span class="dot"></span> MiLog
+      <img src="assets/milog-icon.png" alt="" width="28" height="28"> MiLog
     </a>
     <div class="links">
       <a href="#features">Features</a>
@@ -351,6 +356,7 @@
 
 <header class="hero">
   <div class="container">
+    <img class="mark" src="assets/milog-icon.png" alt="MiLog icon" width="128" height="128">
     <div class="badges">
       <span class="badge green">v0.5 · eBPF probe sidecar</span>
       <span class="badge">single-file bash</span>

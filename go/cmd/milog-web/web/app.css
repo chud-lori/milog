@@ -1,7 +1,8 @@
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
 body { margin:0; background:#0b0d10; color:#d6d9dc; font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-header { display:flex; align-items:baseline; gap:1rem; padding:1rem 1.2rem; border-bottom:1px solid #1b1f24; }
+header { display:flex; align-items:center; gap:.65rem; padding:1rem 1.2rem; border-bottom:1px solid #1b1f24; }
+header .brand-icon { width:30px; height:30px; display:block; flex:0 0 auto; }
 header h1 { margin:0; font-size:1.05rem; font-weight:600; letter-spacing:.05em; }
 header .ts { color:#6b7177; font-size:.85rem; }
 header .pill { margin-left:auto; padding:.1rem .5rem; border:1px solid #30363d; border-radius:.3rem; font-size:.8rem; }

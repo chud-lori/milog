@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/milog-icon.png" alt="MiLog icon" width="112" height="112">
+</p>
+
 # MiLog
 
 Bash nginx + system monitor. TUI dashboard, read-only web UI with

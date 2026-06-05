@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/milog-icon.png" alt="MiLog icon" width="88" height="88">
+</p>
+
 # MiLog documentation
 
 Topical guides. The main [README](../README.md) covers install + 5-minute
