@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-36-gb3c0ffd-dirty
-# MILOG_BUILT=2026-06-27T13:26:18Z
+# MILOG_VERSION=v0.3.0-37-g135dfb1-dirty
+# MILOG_BUILT=2026-06-27T13:35:36Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -6240,7 +6240,7 @@ mode_exploits() {
 
     for name in "${LOGS[@]}"; do
         local file="$LOG_DIR/$name.access.log"
-        local col="${colors[$i]}" label
+        local col="${colors[$(( i % ${#colors[@]} ))]}" label
         label=$(printf "%-8s" "$name")
         if [[ -f "$file" ]]; then
             (
@@ -6267,7 +6267,6 @@ mode_exploits() {
     trap 'kill "${pids[@]}" 2>/dev/null; exit' INT TERM
     wait
 }
-
 # ==============================================================================
 # MODE: grep — filter-tail one source (any type: nginx / text / journal / docker)
 # ==============================================================================
