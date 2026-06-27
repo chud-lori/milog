@@ -386,9 +386,10 @@ backward compatibility (history is default; the web dashboard now ships
 as a Go binary, no socat needed).
 
 The Go companion binaries milog-web (the dashboard server) and
-milog-tui are pulled automatically from the latest GitHub release. They
-also get picked up when sitting next to install.sh — that happens if you
-cloned the repo and ran \`bash build.sh\` yourself (contributor path).
+milog-tui are refreshed automatically from the latest GitHub release in
+curl-pipe installs. They also get picked up when sitting next to
+install.sh — that happens if you cloned the repo and ran \`bash build.sh\`
+yourself (contributor path).
 EOF
 }
 
@@ -564,9 +565,9 @@ main() {
         if [[ "$self_path" == /* || "$self_path" == */* ]] && [[ -f "$self_path" ]]; then
             self_dir=$(cd -P "$(dirname "$self_path")" 2>/dev/null && pwd) || self_dir=""
         fi
-        [[ -z "$self_dir" ]] && return 0
+        [[ -z "$self_dir" ]] && return 1
         src="$self_dir/go/bin/$name"
-        [[ -x "$src" ]] || return 0
+        [[ -x "$src" ]] || return 1
 
         local dst="${dst_dir}/${name}"
         local tmp_bin
@@ -576,28 +577,27 @@ main() {
         mv "$tmp_bin" "$dst"
         info "Installed ${name} → ${dst}"
     }
-    install_go_companion milog-web
-    install_go_companion milog-tui
+    local local_companions=0
+    if install_go_companion milog-web; then
+        local_companions=$((local_companions + 1))
+    fi
+    if install_go_companion milog-tui; then
+        local_companions=$((local_companions + 1))
+    fi
     # milog-probe only built by build.sh on Linux clones with clang
-    # installed; install_go_companion's `[[ -x "$src" ]] || return 0`
+    # installed; install_go_companion returns non-zero when absent, which
     # silently skips it on macOS / freshly-cloned hosts without clang.
-    install_go_companion milog-probe
+    if install_go_companion milog-probe; then
+        local_companions=$((local_companions + 1))
+    fi
 
-    # Prebuilt binaries from GitHub Releases — only runs if the clone
-    # path didn't already place them (the companion check above is
-    # silent when go/bin/* doesn't exist, matching the curl-pipe flow).
-    # On Linux we additionally check milog-probe — clones built without
-    # clang/libbpf-dev (which is most contributor laptops on darwin
-    # cross-mounting via NFS) will be missing it and we fetch from the
-    # release.
-    local need_release=0
-    if [[ ! -x "${dst_dir}/milog-web" || ! -x "${dst_dir}/milog-tui" ]]; then
-        need_release=1
-    fi
-    if [[ "$(_release_os_slug)" == "linux" && ! -x "${dst_dir}/milog-probe" ]]; then
-        need_release=1
-    fi
-    if (( need_release )); then
+    # Prebuilt binaries from GitHub Releases. In curl-pipe mode there is no
+    # local go/bin/* tree, so always refresh companions from the release,
+    # even if old binaries already exist. That keeps `milog`, `milog-tui`,
+    # `milog-web`, and `milog-probe` on the same user-visible version after
+    # every installer rerun. Clone installs keep locally-built companions as
+    # authoritative; they are the contributor path after `bash build.sh`.
+    if (( local_companions == 0 )); then
         _release_install_companions "$dst_dir"
     fi
 
