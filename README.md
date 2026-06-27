@@ -110,8 +110,8 @@ prints a one-line fix for each degraded piece.
 
 ```bash
 milog monitor              # bash dashboard — CPU/MEM/DISK + per-app nginx table
-milog tui                  # richer bubbletea TUI (same data; needs milog-tui Go binary)
-# q quit   p pause   r refresh   +/- change refresh rate
+milog tui                  # richer Charm TUI (same data; needs milog-tui Go binary)
+# q quit   p pause   r refresh   ? help   ↑/↓ select   enter drill   esc back
 
 # Turn on Discord alerts in one command (installs systemd service too)
 sudo milog alert on 'https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN'
@@ -142,7 +142,7 @@ Full command list: `milog help`.
 ```
 milog              # merged color-prefixed tail of all apps
 milog monitor      # bash dashboard (refresh-and-redraw, POSIX-everywhere)
-milog tui          # bubbletea TUI (Go binary; richer panels, same data)
+milog tui          # Charm Bubble Tea TUI (richer panels, help footer, same data)
 milog rate         # nginx-only req/min dashboard
 milog daemon       # headless — fire alerts, no TUI
 
@@ -185,6 +185,16 @@ milog help
 | `p`        | pause (freezes sparklines) |
 | `r`        | refresh now                |
 | `+` / `-`  | decrease / increase rate   |
+
+### `tui` keys
+
+`milog tui` uses a context-aware footer and `?` help pane, so the
+available keys stay visible as you move between overview, drill-down,
+alerts, paths, errors, and trend views. Use `↑`/`↓` or `k`/`j` to move
+the overview cursor, `enter`/`l`/`→` to drill into an app, and
+`esc`/`h`/`←`/backspace to return. In focused views, `↑`/`↓` or `k`/`j`
+scroll, `f`/page-down and `b`/page-up page through longer output, and
+`r` reloads the current view.
 
 ## Uninstall
 

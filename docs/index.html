@@ -364,10 +364,10 @@
     </div>
     <h1>Watch your nginx box,<br><span class="accent">not your dashboards.</span></h1>
     <p class="lead">
-      A single-file bash monitor for nginx + host. TUI dashboard, multi-destination
-      alerts, historical metrics, σ-based anomaly detection, host integrity audits,
-      and an optional eBPF probe sidecar streaming kernel events through the same
-      alert pipeline.
+      A single-file bash monitor for nginx + host. Bash dashboard or richer Charm
+      TUI, multi-destination alerts, historical metrics, σ-based anomaly detection,
+      host integrity audits, and an optional eBPF probe sidecar streaming kernel
+      events through the same alert pipeline.
     </p>
     <p class="sub">
       Designed for the people who run one or three servers themselves — not for SREs
@@ -540,7 +540,12 @@ storefront   <span class="amber">  301</span>   268    12     <span class="red">
         <div class="body">
           <h4>Live dashboard</h4>
 <pre><code>milog monitor          <span class="dim"># bash dashboard, refresh-and-redraw</span>
-milog tui              <span class="dim"># richer bubbletea TUI, same data</span></code></pre>
+milog tui              <span class="dim"># richer Charm TUI, help footer, same data</span></code></pre>
+          <p class="note">
+            The Charm TUI keeps active keys in the footer, opens full help with
+            <code>?</code>, and scrolls longer alert/path/error/trend output in
+            focused views so navigation stays predictable.
+          </p>
         </div>
       </div>
       <div class="step">
@@ -623,7 +628,7 @@ sudo journalctl -u milog-probe.service -f</code></pre>
       </a>
       <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/tui.md">
         <strong>TUI</strong>
-        <span>bubbletea Go binary, when to pick it over bash monitor</span>
+        <span>Charm Bubble Tea binary, key help, scrollable focused views</span>
       </a>
       <a class="doc-link" href="https://github.com/chud-lori/milog/blob/main/docs/geoip.md">
         <strong>GeoIP enrichment</strong>
@@ -643,7 +648,7 @@ sudo journalctl -u milog-probe.service -f</code></pre>
     <ul style="padding-left: 20px; color: var(--fg-2);">
       <li><strong>Bash stays bash.</strong> If POSIX bash + gawk can do it well,
       it stays in bash. Go is for what bash genuinely can't reach (eBPF, raw
-      tracepoints, real TUIs).</li>
+      tracepoints, real TUIs with contextual key help and scrollable focused views).</li>
       <li><strong>One artifact per install.</strong> Ship a bundled
       <code>milog.sh</code> from modular <code>src/*.sh</code>. Users install
       one file; contributors edit small ones.</li>

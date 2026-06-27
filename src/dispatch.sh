@@ -7,7 +7,7 @@ ${W}USAGE${NC}  $0 [command] [args]
 ${W}DASHBOARDS${NC}
   ${C}monitor${NC}            bash dashboard: nginx + CPU/MEM/DISK + workers
                      ${D}keys: q=quit  p=pause  r=refresh  +/-=rate${NC}
-  ${C}tui${NC}                rich bubbletea TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
+  ${C}tui${NC}                rich Charm TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
   ${C}rate${NC}               nginx-only req/min dashboard
   ${C}daemon${NC}             headless alerter — no TUI, fires Discord webhooks
 
@@ -101,11 +101,13 @@ _cmd_help() {
             echo -e "${W}milog monitor${NC} — bash dashboard (refresh-and-redraw)"
             echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- change rate"
             echo -e "  ${D}Tunes:${NC} REFRESH, THRESH_* (see \`milog config\`)"
-            echo -e "  ${D}Richer view:${NC} \`milog tui\` (Go bubbletea, same data)"
+            echo -e "  ${D}Richer view:${NC} \`milog tui\` (Go Charm TUI, same data)"
             ;;
         tui)
-            echo -e "${W}milog tui${NC} — bubbletea TUI (Go binary)"
-            echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- change rate  ? help"
+            echo -e "${W}milog tui${NC} — Charm Bubble Tea TUI (Go binary)"
+            echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- rate  ? help"
+            echo -e "        overview: ↑/k ↓/j select  enter/l drill  a alerts  P paths  e errors  t trend"
+            echo -e "        focused:  ↑/k ↓/j scroll  f/pgdn page down  b/pgup page up  esc/h back"
             echo -e "  ${D}Tunes:${NC} MILOG_REFRESH env / REFRESH config key"
             echo -e "  ${D}Install:${NC} \`bash build.sh\` in a clone; distro packages land later."
             ;;

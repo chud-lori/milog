@@ -40,6 +40,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -59,7 +62,7 @@ var buildVersion = "unknown"
 var sparkChars = []rune{'▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
 
 const (
-	sparkLen        = 30                    // samples kept per app
+	sparkLen        = 30 // samples kept per app
 	minRefreshSec   = 1
 	maxRefreshSec   = 60
 	defaultRefreshS = 5
@@ -203,17 +206,17 @@ type alertsMsg struct {
 // column. byApp is sorted (by count desc) at sample time so the
 // renderer doesn't pay the cost.
 type pathRow struct {
-	path   string
-	total  int
-	byApp  []kv // {app: count}, sorted count-desc
+	path  string
+	total int
+	byApp []kv // {app: count}, sorted count-desc
 }
 
 // pathsData is the cross-app paths payload computed off the UI thread.
 type pathsData struct {
-	rows         []pathRow
-	totalLines   int      // total parsed lines across every app
-	appsSampled  []string // apps that produced at least one parsed line
-	appsErrored  []string // apps whose log couldn't be tailed (missing, perm)
+	rows        []pathRow
+	totalLines  int      // total parsed lines across every app
+	appsSampled []string // apps that produced at least one parsed line
+	appsErrored []string // apps whose log couldn't be tailed (missing, perm)
 }
 
 type pathsMsg struct {
@@ -231,10 +234,10 @@ type errorRow struct {
 }
 
 type errorsData struct {
-	rows         []errorRow
-	totalFires   int      // total app:* rule fires within window
-	sourcesSeen  []string // distinct sources that had at least one fire
-	err          error    // alertlog read failure (rare)
+	rows        []errorRow
+	totalFires  int      // total app:* rule fires within window
+	sourcesSeen []string // distinct sources that had at least one fire
+	err         error    // alertlog read failure (rare)
 }
 
 type errorsMsg struct {
@@ -265,6 +268,56 @@ type trendMsg struct {
 	data trendData
 }
 
+type keyMap struct {
+	Quit    key.Binding
+	Pause   key.Binding
+	Refresh key.Binding
+	Faster  key.Binding
+	Slower  key.Binding
+	Help    key.Binding
+
+	Up    key.Binding
+	Down  key.Binding
+	Drill key.Binding
+
+	Alerts key.Binding
+	Paths  key.Binding
+	Errors key.Binding
+	Trend  key.Binding
+	Back   key.Binding
+
+	PageDown key.Binding
+	PageUp   key.Binding
+	HalfDown key.Binding
+	HalfUp   key.Binding
+}
+
+func newKeyMap() keyMap {
+	return keyMap{
+		Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+		Pause:   key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
+		Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Faster:  key.NewBinding(key.WithKeys("+", "="), key.WithHelp("+/-", "rate")),
+		Slower:  key.NewBinding(key.WithKeys("-", "_"), key.WithHelp("+/-", "rate")),
+		Help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+
+		Up:    key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
+		Down:  key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+		Drill: key.NewBinding(key.WithKeys("enter", "l", "right"), key.WithHelp("enter/l", "drill")),
+
+		Alerts: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "alerts")),
+		Paths:  key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "paths")),
+		Errors: key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "errors")),
+		Trend:  key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "trend")),
+		Back:   key.NewBinding(key.WithKeys("esc", "h", "left", "backspace"), key.WithHelp("esc", "back")),
+
+		PageDown: key.NewBinding(key.WithKeys("pgdown", " ", "f"), key.WithHelp("f/pgdn", "page down")),
+		PageUp:   key.NewBinding(key.WithKeys("pgup", "b"), key.WithHelp("b/pgup", "page up")),
+		HalfDown: key.NewBinding(key.WithKeys("d", "ctrl+d"), key.WithHelp("d", "½ down")),
+		HalfUp:   key.NewBinding(key.WithKeys("u", "ctrl+u"), key.WithHelp("u", "½ up")),
+	}
+}
+
 type model struct {
 	cfg        *config.Config
 	width      int
@@ -279,6 +332,9 @@ type model struct {
 	status  string           // last error, if any
 
 	showHelp bool
+	keys     keyMap
+	help     help.Model
+	viewport viewport.Model
 
 	view        viewMode
 	selectedIdx int           // highlighted row in overview
@@ -440,7 +496,7 @@ func trendSampleCmd(cfg *config.Config) tea.Cmd {
 		// so "now - 1h" might miss the row that just landed seconds
 		// ago. Cheap insurance against a confusing "rate=0 cur" in
 		// the right column.
-		since := time.Now().Add(-time.Duration(trendWindowMinutes+1)*time.Minute).Unix()
+		since := time.Now().Add(-time.Duration(trendWindowMinutes+1) * time.Minute).Unix()
 		raw, err := history.LoadMinutes(cfg.HistoryDB, since)
 		if err != nil {
 			d.loadErr = err
@@ -701,6 +757,13 @@ func ruleMentionsApp(rule, app string) bool {
 
 // ---- Init / Update ----------------------------------------------------
 
+func (m model) controls() keyMap {
+	if !m.keys.Quit.Enabled() {
+		return newKeyMap()
+	}
+	return m.keys
+}
+
 func (m model) Init() tea.Cmd {
 	// Kick off with an immediate sample + the first tick.
 	return tea.Batch(sampleCmd(m.cfg), tickCmd(m.refreshSec))
@@ -712,49 +775,70 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.help.Width = msg.Width
+		m.viewport.Width = msg.Width
+		m.viewport.Height = m.viewportHeight()
+		m.viewport.SetYOffset(m.viewport.YOffset)
 		return m, nil
 
 	case tea.KeyMsg:
+		keys := m.controls()
 		// Global keys — same behaviour in both views.
-		switch msg.String() {
-		case "q", "ctrl+c":
+		switch {
+		case key.Matches(msg, keys.Quit):
 			return m, tea.Quit
-		case "p":
+		case key.Matches(msg, keys.Pause):
 			m.paused = !m.paused
 			return m, nil
-		case "+", "=":
+		case key.Matches(msg, keys.Faster):
 			// `=` is the unshifted `+` on US layouts — accept both so
 			// users don't have to hold Shift.
 			if m.refreshSec > minRefreshSec {
 				m.refreshSec--
 			}
 			return m, nil
-		case "-", "_":
+		case key.Matches(msg, keys.Slower):
 			if m.refreshSec < maxRefreshSec {
 				m.refreshSec++
 			}
 			return m, nil
-		case "?":
+		case key.Matches(msg, keys.Help):
 			m.showHelp = !m.showHelp
 			return m, nil
+		case key.Matches(msg, keys.Refresh):
+			switch m.view {
+			case viewDrilldown:
+				if m.selectedIdx < len(m.apps) {
+					return m, drilldownSampleCmd(m.cfg, m.apps[m.selectedIdx].name)
+				}
+				return m, nil
+			case viewAlerts:
+				return m, alertsSampleCmd(m.cfg)
+			case viewPaths:
+				return m, pathsSampleCmd(m.cfg)
+			case viewErrors:
+				return m, errorsSampleCmd(m.cfg)
+			case viewTrend:
+				return m, trendSampleCmd(m.cfg)
+			default:
+				return m, sampleCmd(m.cfg)
+			}
 		}
 		// View-specific keys.
 		switch m.view {
 		case viewOverview:
-			switch msg.String() {
-			case "r":
-				return m, sampleCmd(m.cfg)
-			case "up", "k":
+			switch {
+			case key.Matches(msg, keys.Up):
 				if m.selectedIdx > 0 {
 					m.selectedIdx--
 				}
 				return m, nil
-			case "down", "j":
+			case key.Matches(msg, keys.Down):
 				if m.selectedIdx < len(m.apps)-1 {
 					m.selectedIdx++
 				}
 				return m, nil
-			case "enter", "l", "right":
+			case key.Matches(msg, keys.Drill):
 				if len(m.apps) == 0 {
 					return m, nil
 				}
@@ -762,72 +846,75 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedIdx = len(m.apps) - 1
 				}
 				m.view = viewDrilldown
+				m.resetViewport()
 				return m, drilldownSampleCmd(m.cfg, m.apps[m.selectedIdx].name)
-			case "a":
+			case key.Matches(msg, keys.Alerts):
 				m.view = viewAlerts
+				m.resetViewport()
 				return m, alertsSampleCmd(m.cfg)
-			case "P":
+			case key.Matches(msg, keys.Paths):
 				// Capital P (shift+p) — `p` on its own is the global
 				// pause toggle, kept that way for muscle memory. The
 				// paths view is reachable from overview only, so the
 				// capital binding lives here in the per-view branch.
 				m.view = viewPaths
+				m.resetViewport()
 				return m, pathsSampleCmd(m.cfg)
-			case "e":
+			case key.Matches(msg, keys.Errors):
 				m.view = viewErrors
+				m.resetViewport()
 				return m, errorsSampleCmd(m.cfg)
-			case "t":
+			case key.Matches(msg, keys.Trend):
 				m.view = viewTrend
+				m.resetViewport()
 				return m, trendSampleCmd(m.cfg)
 			}
 		case viewDrilldown:
-			switch msg.String() {
-			case "esc", "h", "left", "backspace":
+			switch {
+			case key.Matches(msg, keys.Back):
 				m.view = viewOverview
 				m.drill = drilldownData{}
-				return m, nil
-			case "r":
-				if m.selectedIdx < len(m.apps) {
-					return m, drilldownSampleCmd(m.cfg, m.apps[m.selectedIdx].name)
-				}
+				m.resetViewport()
 				return m, nil
 			}
 		case viewAlerts:
-			switch msg.String() {
-			case "esc", "h", "left", "backspace":
+			switch {
+			case key.Matches(msg, keys.Back):
 				m.view = viewOverview
 				m.alerts = alertsData{}
+				m.resetViewport()
 				return m, nil
-			case "r":
-				return m, alertsSampleCmd(m.cfg)
 			}
 		case viewPaths:
-			switch msg.String() {
-			case "esc", "h", "left", "backspace":
+			switch {
+			case key.Matches(msg, keys.Back):
 				m.view = viewOverview
 				m.paths = pathsData{}
+				m.resetViewport()
 				return m, nil
-			case "r":
-				return m, pathsSampleCmd(m.cfg)
 			}
 		case viewErrors:
-			switch msg.String() {
-			case "esc", "h", "left", "backspace":
+			switch {
+			case key.Matches(msg, keys.Back):
 				m.view = viewOverview
 				m.errors = errorsData{}
+				m.resetViewport()
 				return m, nil
-			case "r":
-				return m, errorsSampleCmd(m.cfg)
 			}
 		case viewTrend:
-			switch msg.String() {
-			case "esc", "h", "left", "backspace":
+			switch {
+			case key.Matches(msg, keys.Back):
 				m.view = viewOverview
 				m.trend = trendData{}
+				m.resetViewport()
 				return m, nil
-			case "r":
-				return m, trendSampleCmd(m.cfg)
 			}
+		}
+		if m.view != viewOverview {
+			m.syncViewportContent()
+			var cmd tea.Cmd
+			m.viewport, cmd = m.viewport.Update(msg)
+			return m, cmd
 		}
 
 	case tickMsg:
@@ -891,27 +978,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.data.err != nil {
 			m.status = "drill: " + msg.data.err.Error()
 		}
+		m.syncViewportContent()
 
 	case alertsMsg:
 		m.alerts = msg.data
 		if msg.data.err != nil {
 			m.status = "alerts: " + msg.data.err.Error()
 		}
+		m.syncViewportContent()
 
 	case pathsMsg:
 		m.paths = msg.data
+		m.syncViewportContent()
 
 	case errorsMsg:
 		m.errors = msg.data
 		if msg.data.err != nil {
 			m.status = "errors: " + msg.data.err.Error()
 		}
+		m.syncViewportContent()
 
 	case trendMsg:
 		m.trend = msg.data
 		// Don't set m.status — the trend view renders its own
 		// loadErr inline so the operator sees the diagnostic in
 		// context rather than as a generic footer status.
+		m.syncViewportContent()
 	}
 	return m, nil
 }
@@ -923,22 +1015,11 @@ func (m model) View() string {
 
 	b.WriteString(m.renderHeader())
 	b.WriteString("\n\n")
-	switch m.view {
-	case viewDrilldown:
-		b.WriteString(m.renderDrilldown())
-	case viewAlerts:
-		b.WriteString(m.renderAlertsView())
-	case viewPaths:
-		b.WriteString(m.renderPathsView())
-	case viewErrors:
-		b.WriteString(m.renderErrorsView())
-	case viewTrend:
-		b.WriteString(m.renderTrendView())
-	default:
-		b.WriteString(m.renderSystem())
-		b.WriteString("\n\n")
-		b.WriteString(m.renderApps())
+	body := m.renderBodyContent()
+	if m.view != viewOverview {
+		body = m.renderViewport(body)
 	}
+	b.WriteString(body)
 	b.WriteString("\n")
 	b.WriteString(m.renderFooter())
 	if m.showHelp {
@@ -946,6 +1027,67 @@ func (m model) View() string {
 		b.WriteString(m.renderHelp())
 	}
 	return b.String()
+}
+
+func (m *model) resetViewport() {
+	m.viewport.YOffset = 0
+}
+
+func (m *model) syncViewportContent() {
+	if m.view == viewOverview {
+		return
+	}
+	m.viewport.Width = m.width
+	m.viewport.Height = m.viewportHeight()
+	m.viewport.SetContent(m.renderBodyContent())
+	m.viewport.SetYOffset(m.viewport.YOffset)
+}
+
+func (m model) viewportHeight() int {
+	if m.height <= 0 {
+		return 0
+	}
+	h := m.height - 4 // header, spacer, footer, and body/footer separator.
+	if m.showHelp {
+		h -= lipgloss.Height(m.renderHelp()) + 2
+	}
+	if h < 1 {
+		return 1
+	}
+	return h
+}
+
+func (m model) renderViewport(content string) string {
+	h := m.viewportHeight()
+	if h <= 0 {
+		return content
+	}
+	vp := m.viewport
+	vp.Width = m.width
+	vp.Height = h
+	vp.SetContent(content)
+	return vp.View()
+}
+
+func (m model) renderBodyContent() string {
+	switch m.view {
+	case viewDrilldown:
+		return m.renderDrilldown()
+	case viewAlerts:
+		return m.renderAlertsView()
+	case viewPaths:
+		return m.renderPathsView()
+	case viewErrors:
+		return m.renderErrorsView()
+	case viewTrend:
+		return m.renderTrendView()
+	default:
+		var overview strings.Builder
+		overview.WriteString(m.renderSystem())
+		overview.WriteString("\n\n")
+		overview.WriteString(m.renderApps())
+		return overview.String()
+	}
 }
 
 func (m model) renderHeader() string {
@@ -1513,68 +1655,92 @@ func (m model) renderFooter() string {
 	if m.status != "" {
 		status = " · " + critStyle.Render(m.status)
 	}
-	keys := "  q:quit  p:pause  r:refresh  +/-:rate (%ds)  ?:help"
+	keys := m.controls()
+	parts := []string{
+		bindingHint(keys.Quit),
+		bindingHint(keys.Pause),
+		bindingHint(keys.Refresh),
+		fmt.Sprintf("%s (%ds)", bindingHint(keys.Faster), m.refreshSec),
+		bindingHint(keys.Help),
+	}
 	switch m.view {
 	case viewOverview:
-		keys += "  ↑↓:select  enter:drill  a:alerts  P:paths  e:errors  t:trend"
+		parts = append(parts,
+			"↑↓:select",
+			bindingHint(keys.Drill),
+			bindingHint(keys.Alerts),
+			bindingHint(keys.Paths),
+			bindingHint(keys.Errors),
+			bindingHint(keys.Trend),
+		)
 	case viewDrilldown:
-		keys += "  esc:back"
+		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	case viewAlerts:
-		keys += "  esc:back"
+		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	case viewPaths:
-		keys += "  esc:back"
+		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	case viewErrors:
-		keys += "  esc:back"
+		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	case viewTrend:
-		keys += "  esc:back"
+		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	}
-	return dimStyle.Render(fmt.Sprintf(keys, m.refreshSec) + status)
+	return dimStyle.Render("  " + strings.Join(parts, "  ") + status)
 }
 
 func (m model) renderHelp() string {
-	help := strings.TrimSpace(`
-  q / Ctrl+C   quit
-  p            pause (freezes sparklines + numbers)
-  r            refresh right now (bypasses the tick)
-  + / =        faster refresh (down to 1s)
-  - / _        slower refresh (up to 60s)
-  ?            toggle this help
-
-  Overview view:
-    ↑/k ↓/j         move row selection
-    enter / l       drill into the highlighted app
-    a               open the global alerts view
-    P               open the paths-cross-app view (capital P; lowercase p is pause)
-    e               open the errors aggregation view
-    t               open the trend view (per-app sparklines, last hour)
-
-  Drill-down view:
-    esc / h         back to overview
-    r               refresh the focused-app data now
-
-  Alerts view:
-    esc / h         back to overview
-    r               reload alerts.log
-
-  Paths view:
-    esc / h         back to overview
-    r               re-tail every app's log
-
-  Errors view:
-    esc / h         back to overview
-    r               re-aggregate alerts.log
-
-  Trend view:
-    esc / h         back to overview
-    r               re-query the SQLite history DB
-
-  MILOG_APPS / MILOG_LOG_DIR pick the apps shown. Config loaded from
-  env vars matching the bash side — no separate TUI config.`)
+	h := m.help
+	if h.Width == 0 {
+		h = help.New()
+	}
+	h.Width = m.width
+	h.ShowAll = true
+	help := h.View(m)
+	if help == "" {
+		return ""
+	}
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("8")).
 		Padding(0, 2)
 	return box.Render(help)
+}
+
+func bindingHint(b key.Binding) string {
+	h := b.Help()
+	return h.Key + ":" + h.Desc
+}
+
+func (m model) ShortHelp() []key.Binding {
+	keys := m.controls()
+	out := []key.Binding{keys.Quit, keys.Pause, keys.Refresh, keys.Faster, keys.Help}
+	switch m.view {
+	case viewOverview:
+		out = append(out, keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend)
+	default:
+		out = append(out, keys.Up, keys.Down, keys.PageDown, keys.PageUp, keys.Back)
+	}
+	return out
+}
+
+func (m model) FullHelp() [][]key.Binding {
+	keys := m.controls()
+	groups := [][]key.Binding{
+		{keys.Quit, keys.Pause, keys.Refresh, keys.Faster, keys.Slower, keys.Help},
+	}
+	switch m.view {
+	case viewOverview:
+		groups = append(groups, []key.Binding{
+			keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend,
+		})
+	default:
+		groups = append(groups, []key.Binding{
+			keys.Up, keys.Down, keys.Back,
+		})
+		groups = append(groups, []key.Binding{
+			keys.PageDown, keys.PageUp, keys.HalfDown, keys.HalfUp,
+		})
+	}
+	return groups
 }
 
 // ---- Entry ------------------------------------------------------------
@@ -1608,6 +1774,7 @@ KEYS (inside the TUI)
   P            open paths-cross-app view (capital P; lowercase p is pause)
   e            open errors aggregation view
   t            open trend view (per-app sparklines, last hour)
+  ↑/k ↓/j      scroll focused views; f/pgdn and b/pgup page
   esc / h      back from drill-down / alerts / paths / errors / trend`)
 			return
 		}
@@ -1626,6 +1793,9 @@ KEYS (inside the TUI)
 		cfg:        cfg,
 		refreshSec: refresh,
 		history:    map[string][]int{},
+		keys:       newKeyMap(),
+		help:       help.New(),
+		viewport:   viewport.New(0, 0),
 	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {

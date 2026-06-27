@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-31-g0cc846e-dirty
-# MILOG_BUILT=2026-05-10T06:41:49Z
+# MILOG_VERSION=v0.3.0-36-gb3c0ffd-dirty
+# MILOG_BUILT=2026-06-27T13:26:18Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -6533,11 +6533,11 @@ later additions without rerunning install.sh.${NC}
 # MODE: monitor  +  tui
 #
 # `milog monitor` runs the bash refresh-and-redraw dashboard (works on any
-# POSIX box, no extra binary). `milog tui` execs the Go bubbletea TUI
-# when available — richer UI, same data source. Both coexist.
+# POSIX box, no extra binary). `milog tui` execs the Go Charm Bubble Tea
+# TUI when available — richer UI, same data source. Both coexist.
 # ==============================================================================
 
-# Locate milog-tui, the Go bubbletea binary. Preference order mirrors
+# Locate milog-tui, the Go Charm Bubble Tea binary. Preference order mirrors
 # _web_go_binary so install layouts stay consistent across companions.
 _tui_go_binary() {
     if [[ -n "${MILOG_TUI_BIN:-}" && -x "$MILOG_TUI_BIN" ]]; then
@@ -6558,7 +6558,7 @@ _tui_go_binary() {
     return 1
 }
 
-# `milog tui` — run the Go bubbletea TUI. Separate subcommand from
+# `milog tui` — run the Go Charm Bubble Tea TUI. Separate subcommand from
 # `milog monitor` so both coexist and users pick. Clear install hint
 # when the binary is missing.
 mode_tui() {
@@ -6741,7 +6741,6 @@ mode_monitor() {
         esac
     done
 }
-
 # ==============================================================================
 # MODE: patterns — generic app-error detection across all LOGS source types
 # Watches every configured source through `_log_reader_cmd`, runs each line
@@ -8876,7 +8875,7 @@ ${W}USAGE${NC}  $0 [command] [args]
 ${W}DASHBOARDS${NC}
   ${C}monitor${NC}            bash dashboard: nginx + CPU/MEM/DISK + workers
                      ${D}keys: q=quit  p=pause  r=refresh  +/-=rate${NC}
-  ${C}tui${NC}                rich bubbletea TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
+  ${C}tui${NC}                rich Charm TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
   ${C}rate${NC}               nginx-only req/min dashboard
   ${C}daemon${NC}             headless alerter — no TUI, fires Discord webhooks
 
@@ -8970,11 +8969,13 @@ _cmd_help() {
             echo -e "${W}milog monitor${NC} — bash dashboard (refresh-and-redraw)"
             echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- change rate"
             echo -e "  ${D}Tunes:${NC} REFRESH, THRESH_* (see \`milog config\`)"
-            echo -e "  ${D}Richer view:${NC} \`milog tui\` (Go bubbletea, same data)"
+            echo -e "  ${D}Richer view:${NC} \`milog tui\` (Go Charm TUI, same data)"
             ;;
         tui)
-            echo -e "${W}milog tui${NC} — bubbletea TUI (Go binary)"
-            echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- change rate  ? help"
+            echo -e "${W}milog tui${NC} — Charm Bubble Tea TUI (Go binary)"
+            echo -e "  ${D}Keys:${NC} q quit  p pause  r refresh  +/- rate  ? help"
+            echo -e "        overview: ↑/k ↓/j select  enter/l drill  a alerts  P paths  e errors  t trend"
+            echo -e "        focused:  ↑/k ↓/j scroll  f/pgdn page down  b/pgup page up  esc/h back"
             echo -e "  ${D}Tunes:${NC} MILOG_REFRESH env / REFRESH config key"
             echo -e "  ${D}Install:${NC} \`bash build.sh\` in a clone; distro packages land later."
             ;;

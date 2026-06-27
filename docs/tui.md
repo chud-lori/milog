@@ -1,15 +1,17 @@
 # TUI — `milog tui`
 
-A richer bubbletea-based TUI that runs alongside the existing bash
-`milog monitor`. Same data source (system /proc readers + nginx log
-tail), different render path.
+A richer Charm Bubble Tea-based TUI that runs alongside the existing
+bash `milog monitor`. Same data source (system /proc readers + nginx
+log tail), different render path: app overview, focused drill-downs,
+global alerts, cross-app paths, pattern errors, trends, and contextual
+key help.
 
 ## When to pick which
 
 | Want                                            | Use               |
 | ----------------------------------------------- | ----------------- |
 | Works on any POSIX shell with no extra binary   | `milog monitor`   |
-| Richer layout, nicer colors, built-in help pane | `milog tui`       |
+| Richer layout, nicer colors, contextual key help | `milog tui`      |
 | Script-wrap or embed in a pager                 | `milog monitor`   |
 | A TUI you can ship in a terminal-first dev loop | `milog tui`       |
 
@@ -62,6 +64,13 @@ milog tui
 milog-tui
 ```
 
+The footer always shows the keys that matter for the current view.
+Press `?` for the full in-app help pane. Overview and list-style views
+keep navigation predictable as rows grow: move the selection with arrow
+keys or Vim-style keys, drill into the selected app, and use the named
+views for longer alert/path/error/trend lists instead of letting the
+overview overflow the terminal.
+
 Keys (inside the TUI):
 
 | Key                      | Action                                                                |
@@ -71,14 +80,25 @@ Keys (inside the TUI):
 | `r`                      | refresh now (bypasses the tick)                                       |
 | `+` / `=`                | faster refresh (down to 1s)                                           |
 | `-` / `_`                | slower refresh (up to 60s)                                            |
-| `?`                      | toggle help pane                                                      |
-| `↑` / `k`, `↓` / `j`     | move row cursor in overview                                           |
+| `?`                      | toggle the contextual help pane                                       |
+| `↑` / `k`, `↓` / `j`     | move row cursor in overview; scroll focused views                     |
 | `enter` / `l` / `→`      | drill into the highlighted app — top paths, top IPs, recent alerts    |
 | `esc` / `h` / `←` / `bs` | back to overview from any drill-down or named view                    |
+| `f` / `pgdn` / space     | page down in focused views                                            |
+| `b` / `pgup`             | page up in focused views                                              |
+| `d` / `Ctrl+D`           | half-page down in focused views                                       |
+| `u` / `Ctrl+U`           | half-page up in focused views                                         |
 | `a`                      | global alerts view (last 24h, newest first, capped at 50)             |
 | `P`                      | paths-cross-app view (top 12 paths summed across apps + breakdown)    |
 | `e`                      | errors view (`app:*` rule fires aggregated by pattern → source)       |
 | `t`                      | trend view (per-app 60-minute request-rate sparklines from history DB) |
+
+Scrolling / long-view behavior is intentionally operator-oriented:
+the TUI keeps dense summaries on screen, caps the expensive top lists,
+and routes deeper inspection into focused views with their own key
+footer, reload action, and Bubbles viewport scrolling. The same
+selection/back/help model applies across panes instead of introducing
+one-off keys per pane.
 
 ## Config
 

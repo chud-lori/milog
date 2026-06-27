@@ -2,11 +2,11 @@
 # MODE: monitor  +  tui
 #
 # `milog monitor` runs the bash refresh-and-redraw dashboard (works on any
-# POSIX box, no extra binary). `milog tui` execs the Go bubbletea TUI
-# when available — richer UI, same data source. Both coexist.
+# POSIX box, no extra binary). `milog tui` execs the Go Charm Bubble Tea
+# TUI when available — richer UI, same data source. Both coexist.
 # ==============================================================================
 
-# Locate milog-tui, the Go bubbletea binary. Preference order mirrors
+# Locate milog-tui, the Go Charm Bubble Tea binary. Preference order mirrors
 # _web_go_binary so install layouts stay consistent across companions.
 _tui_go_binary() {
     if [[ -n "${MILOG_TUI_BIN:-}" && -x "$MILOG_TUI_BIN" ]]; then
@@ -27,7 +27,7 @@ _tui_go_binary() {
     return 1
 }
 
-# `milog tui` — run the Go bubbletea TUI. Separate subcommand from
+# `milog tui` — run the Go Charm Bubble Tea TUI. Separate subcommand from
 # `milog monitor` so both coexist and users pick. Clear install hint
 # when the binary is missing.
 mode_tui() {
@@ -210,4 +210,3 @@ mode_monitor() {
         esac
     done
 }
-
