@@ -60,6 +60,9 @@ jobs:
       - name: Bash bundle syntax check
         run: bash -n milog.sh
 
+      - name: Shell smoke tests
+        run: bash tests/smoke_exploits.sh
+
       - name: Go vet
         working-directory: go
         run: go vet ./...
