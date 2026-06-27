@@ -45,12 +45,18 @@ per-app nginx tables. Keys: \fBq\fR quit, \fBp\fR pause, \fBr\fR refresh,
 \fB+\fR/\fB-\fR change rate.
 .TP
 .B tui
-Richer bubbletea TUI in Go. Same data as
+Richer Charm Bubble Tea TUI in Go, with contextual key help, focused
+views for alerts / paths / errors / trends, and predictable navigation
+for longer lists. Same data as
 .BR monitor .
 Requires the
 .B milog-tui
 companion binary on
 .BR PATH .
+Keys include \fBq\fR quit, \fBp\fR pause, \fBr\fR refresh,
+\fB?\fR help, arrows/\fBk\fR/\fBj\fR select, enter/\fBl\fR drill in,
+arrows/\fBk\fR/\fBj\fR scroll focused views, \fBf\fR/page-down and
+\fBb\fR/page-up page, and esc/\fBh\fR/backspace return.
 .TP
 .B rate
 Nginx-only req/min dashboard.

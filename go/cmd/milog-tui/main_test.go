@@ -33,6 +33,10 @@ func keyMsg(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyRight}
 	case "backspace":
 		return tea.KeyMsg{Type: tea.KeyBackspace}
+	case "pgdown":
+		return tea.KeyMsg{Type: tea.KeyPgDown}
+	case "pgup":
+		return tea.KeyMsg{Type: tea.KeyPgUp}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 }
@@ -327,6 +331,71 @@ func TestUpdate_EscFromAlertsReturnsToOverview(t *testing.T) {
 	}
 }
 
+func TestUpdate_FocusedViewScrollsViewport(t *testing.T) {
+	rows := make([]alertlog.Row, 0, 20)
+	for i := 0; i < 20; i++ {
+		rows = append(rows, alertlog.Row{
+			TS:   int64(1714000000 + i),
+			Sev:  "warn",
+			Rule: fmt.Sprintf("rule:%02d", i),
+			Body: fmt.Sprintf("body %02d", i),
+		})
+	}
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		height:     10,
+		refreshSec: 5,
+		view:       viewAlerts,
+		keys:       newKeyMap(),
+		alerts:     alertsData{total: len(rows), rows: rows},
+	}
+	m.syncViewportContent()
+	updated, _ := m.Update(keyMsg("j"))
+	got := updated.(model)
+	if got.viewport.YOffset <= 0 {
+		t.Fatalf("expected j/down to scroll focused viewport; offset=%d", got.viewport.YOffset)
+	}
+	if got.view != viewAlerts {
+		t.Fatalf("scrolling should stay in alerts view; got %v", got.view)
+	}
+}
+
+func TestSyncViewportContentClampsAfterShrink(t *testing.T) {
+	rows := make([]alertlog.Row, 0, 40)
+	for i := 0; i < 40; i++ {
+		rows = append(rows, alertlog.Row{
+			TS:   int64(1714000000 + i),
+			Sev:  "warn",
+			Rule: fmt.Sprintf("rule:%02d", i),
+			Body: fmt.Sprintf("body %02d", i),
+		})
+	}
+	m := model{
+		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
+		width:      120,
+		height:     10,
+		refreshSec: 5,
+		view:       viewAlerts,
+		keys:       newKeyMap(),
+		alerts:     alertsData{total: len(rows), rows: rows},
+	}
+	m.syncViewportContent()
+	m.viewport.GotoBottom()
+	if m.viewport.YOffset == 0 {
+		t.Fatalf("precondition: long content should be scrollable")
+	}
+
+	m.alerts = alertsData{
+		total: 1,
+		rows:  []alertlog.Row{{TS: 1714000000, Sev: "warn", Rule: "rule:single", Body: "body"}},
+	}
+	m.syncViewportContent()
+	if m.viewport.YOffset != 0 {
+		t.Fatalf("expected shrink to clamp viewport offset to top; offset=%d", m.viewport.YOffset)
+	}
+}
+
 func TestUpdate_AKeyDoesNothingFromDrilldown(t *testing.T) {
 	// `a` is overview-only; pressing it from drill-down must NOT switch.
 	m := model{
@@ -571,9 +640,9 @@ func TestUpdate_PCapitalDoesNothingFromDrilldown(t *testing.T) {
 
 func TestParseAppRule(t *testing.T) {
 	cases := []struct {
-		rule              string
-		wantSrc, wantPat  string
-		wantOK            bool
+		rule             string
+		wantSrc, wantPat string
+		wantOK           bool
 	}{
 		{"app:api:panic_go", "api", "panic_go", true},
 		{"app:web:py_traceback", "web", "py_traceback", true},

@@ -13,11 +13,12 @@ over HTTP with a minimal single-page HTML UI.
 `curl` (alerts), `sqlite3` (history/trend/diff/auto-tune/anomaly).
 The web dashboard ships as the `milog-web` Go binary (pulled by
 `install.sh` from GitHub releases, no system listener needed). The
-`milog-tui` Go binary provides the bubbletea TUI. The `milog-probe`
-Go binary (Linux only) is the eBPF kernel-event sidecar — runs as a
-root systemd service (`milog probe install-service`) and shells out
-to milog for every rule hit. `journalctl` and `docker` are needed
-only for the matching `journal:` / `docker:` LOGS source types.
+`milog-tui` Go binary provides the Charm Bubble Tea TUI with Lip Gloss
+styling, contextual key help, and focused views for longer lists. The
+`milog-probe` Go binary (Linux only) is the eBPF kernel-event sidecar
+— runs as a root systemd service (`milog probe install-service`) and
+shells out to milog for every rule hit. `journalctl` and `docker` are
+needed only for the matching `journal:` / `docker:` LOGS source types.
 `mmdblookup` is optional for GeoIP enrichment.
 
 **Target:** Linux VMs, `/var/log/nginx` (or an arbitrary dir via `LOG_DIR`).
@@ -183,6 +184,15 @@ box-drawing section before touching widths.
 Sparklines use 8 Unicode block characters (`▁▂▃…█`). Each app's ring buffer
 lives in a global associative array `HIST`. When paused (`p` key), the
 sampler skips pushing new samples so the displayed line freezes.
+
+The Go `milog-tui` is the richer Charm path. It should keep the same data
+contract as the bash monitor, but can use Bubble Tea/Lip Gloss affordances:
+context-aware footer keys, a `?` help pane, overview row selection,
+drill-downs, and named alerts/paths/errors/trend views. Long or growing
+data should remain navigable through focused views, caps, or Bubbles-style
+scrolling while preserving the same mental model: selection keys move within
+the current view, viewport keys page through focused views, `r` reloads,
+`?` explains, and `esc`/`h`/left/backspace returns to overview.
 
 ## Alerts
 

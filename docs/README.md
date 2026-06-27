@@ -18,8 +18,9 @@ quick start; this directory has everything else.
   detection, known false positives
 - [**Web dashboard**](web-dashboard.md) — `milog web`, systemd user
   service, three exposure patterns (SSH tunnel, Tailscale, Cloudflare)
-- [**TUI (`milog tui`)**](tui.md) — bubbletea Go binary, when to pick
-  it over bash `milog monitor`
+- [**TUI (`milog tui`)**](tui.md) — Charm Bubble Tea Go binary,
+  contextual key help, focused views, and when to pick it over bash
+  `milog monitor`
 - [**Historical metrics**](historical-metrics.md) — SQLite-backed
   `metrics_minute` + `top_ip_hour` tables, `trend` / `diff` /
   `auto-tune`, plus the same-minute-of-day σ anomaly detector
@@ -47,7 +48,8 @@ quick start; this directory has everything else.
 ## Typical onboarding order
 
 1. Install (one-liner in the root README)
-2. Start the dashboard: `milog monitor`
+2. Start the dashboard: `milog monitor` or the richer `milog tui`
+   when `milog-tui` is installed
 3. Turn on alerts → [alerts.md](alerts.md)
 4. Enable `HISTORY_ENABLED` to bank data → [historical-metrics.md](historical-metrics.md)
 5. After a few days: `milog auto-tune` to calibrate thresholds
