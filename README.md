@@ -4,14 +4,26 @@
 
 # MiLog
 
-Bash nginx + system monitor. TUI dashboard, read-only web UI with
-SSE live-tail, log tailing, heuristic scanner/exploit detection,
-multi-destination alerts (Discord / Slack / Telegram / Matrix),
-headless daemon, historical metrics with σ-based anomaly detection,
-host-integrity audits (FIM / persistence / ports / YARA / accounts /
-rootkit), and an optional **eBPF probe sidecar** that streams kernel
-events (exec / tcp / file / ptrace / kmod / retransmit / syscall-rate /
-bpf-load) through the same alert pipeline.
+The monitor for the box you run yourself. One bash file watches your logs,
+your host, your file integrity and your kernel, then tells you on Discord when
+something changes.
+
+Request logs come from nginx, and also from journald, docker, or any text file
+via the typed `LOGS` entries in
+[configuration](docs/configuration.md#logs--source-types). The counting modes
+(req/min, status classes, p95) need the nginx combined format; tail, grep and
+search work on every source type.
+
+Host-integrity audits (FIM / persistence / ports / YARA / accounts / rootkit)
+and the optional **eBPF probe sidecar** (exec / tcp / file / ptrace / kmod /
+retransmit / syscall-rate / bpf-load) read no logs at all, so they run on a
+host that serves nothing.
+
+Also included: TUI dashboard, read-only web UI with SSE live-tail, heuristic
+scanner and exploit detection, multi-destination alerts (Discord / Slack /
+Telegram / Matrix), headless daemon, and historical metrics with σ-based
+anomaly detection. Everything fires through one alert pipeline with per-rule
+cooldown and cross-rule dedup.
 
 The shipping artifact is still a single file (`milog.sh` → `/usr/local/bin/milog`),
 but it's **built from modular source under [`src/`](src/README.md)** by
