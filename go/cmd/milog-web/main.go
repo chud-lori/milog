@@ -220,8 +220,12 @@ func latencyHandler(cfg *config.Config) http.HandlerFunc {
 			lineN = 10000
 		}
 
-		file := filepath.Join(cfg.LogDir, app+".access.log")
-		if app == "" || !fileExists(file) {
+		file, ok := appLogPath(cfg, app)
+		if !ok {
+			http.Error(w, `{"app":"","count":0,"error":"unknown app"}`, http.StatusBadRequest)
+			return
+		}
+		if !fileExists(file) {
 			http.Error(w, `{"app":"","count":0,"error":"no such app"}`, http.StatusNotFound)
 			return
 		}
@@ -395,7 +399,11 @@ func logsStreamHandler(cfg *config.Config) http.HandlerFunc {
 			http.Error(w, "app is required", http.StatusBadRequest)
 			return
 		}
-		file := filepath.Join(cfg.LogDir, app+".access.log")
+		file, ok := appLogPath(cfg, app)
+		if !ok {
+			http.Error(w, "unknown app", http.StatusBadRequest)
+			return
+		}
 		if !fileExists(file) {
 			http.Error(w, "no such app", http.StatusNotFound)
 			return
@@ -663,8 +671,12 @@ func logsHandler(cfg *config.Config) http.HandlerFunc {
 		pathPfx := q.Get("path")
 		cls := q.Get("class")
 
-		file := filepath.Join(cfg.LogDir, app+".access.log")
-		if app == "" || !fileExists(file) {
+		file, ok := appLogPath(cfg, app)
+		if !ok {
+			http.Error(w, `{"app":"","lines":[],"error":"unknown app"}`, http.StatusBadRequest)
+			return
+		}
+		if !fileExists(file) {
 			http.Error(w, `{"app":"","lines":[],"error":"no such app"}`, http.StatusNotFound)
 			return
 		}
@@ -715,8 +727,12 @@ func logsHistogramHandler(cfg *config.Config) http.HandlerFunc {
 		if minutes <= 0 {
 			minutes = 60
 		}
-		file := filepath.Join(cfg.LogDir, app+".access.log")
-		if app == "" || !fileExists(file) {
+		file, ok := appLogPath(cfg, app)
+		if !ok {
+			http.Error(w, `{"app":"","buckets":[]}`, http.StatusBadRequest)
+			return
+		}
+		if !fileExists(file) {
 			http.Error(w, `{"app":"","buckets":[]}`, http.StatusNotFound)
 			return
 		}
@@ -729,6 +745,23 @@ func logsHistogramHandler(cfg *config.Config) http.HandlerFunc {
 			Buckets []nginxlog.Bucket  `json:"buckets"`
 		}{App: app, Buckets: buckets})
 	}
+}
+
+// appLogPath returns the access log for app only if app is one of cfg.Apps
+// and the resulting path sits directly inside LogDir.
+func appLogPath(cfg *config.Config, app string) (string, bool) {
+	for _, a := range cfg.Apps {
+		if a != app {
+			continue
+		}
+		dir := filepath.Clean(cfg.LogDir)
+		file := filepath.Join(dir, a+".access.log")
+		if filepath.Dir(file) != dir {
+			return "", false
+		}
+		return file, true
+	}
+	return "", false
 }
 
 func fileExists(p string) bool {

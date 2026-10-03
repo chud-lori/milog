@@ -31,6 +31,11 @@ _audit_sha256() {
     fi
 }
 
+# Without a hash tool every path hashes to UNREADABLE and FIM never drifts.
+_audit_have_sha256() {
+    command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1
+}
+
 # Portable mtime + size in epoch seconds + bytes. Returns "<mtime>\t<size>"
 # on stdout, empty on missing-file. GNU stat (`-c`) on Linux, BSD stat
 # (`-f`) on macOS — same outputs, different flags.
@@ -81,6 +86,10 @@ _audit_fim_expand_paths() {
 # right now" moment. Use `milog audit fim check` to compare against the
 # baseline later.
 _audit_fim_baseline() {
+    if ! _audit_have_sha256; then
+        echo "milog: no sha256sum or shasum on PATH — refusing to write a FIM baseline" >&2
+        return 1
+    fi
     local dir; dir=$(_audit_state_dir)
     local out="$dir/fim.baseline"
     local tmp; tmp=$(mktemp "$dir/fim.baseline.tmp.XXXXXX") || return 1
@@ -123,6 +132,7 @@ _audit_fim_diff() {
     local dir; dir=$(_audit_state_dir)
     local baseline="$dir/fim.baseline"
     [[ -f "$baseline" ]] || return 1
+    _audit_have_sha256 || return 1
 
     local path old_sha old_mtime old_size old_recorded
     local new_sha new_mtime new_size st
@@ -165,6 +175,12 @@ _audit_fim_tick() {
     [[ -f "$marker" ]] && last=$(cat "$marker" 2>/dev/null || echo 0)
     [[ -z "$last" ]] && last=0
     if (( now - last < AUDIT_FIM_INTERVAL )); then
+        return 0
+    fi
+
+    if ! _audit_have_sha256; then
+        echo "milog: FIM skipped — no sha256sum or shasum on PATH" >&2
+        printf '%s' "$now" > "$marker"
         return 0
     fi
 
@@ -243,8 +259,9 @@ Rootkit scan is Linux-only (relies on /proc); silent no-op on macOS / BSD.
 _audit_fim_subcmd() {
     case "${1:-status}" in
         baseline)
-            local present missing path
-            read -r present missing path < <(_audit_fim_baseline)
+            local present missing path out
+            out=$(_audit_fim_baseline) || return 1
+            read -r present missing path <<< "$out"
             echo -e "${G}baseline${NC} written to ${C}$path${NC}"
             echo -e "  ${D}tracked: ${present:-0} present, ${missing:-0} missing${NC}"
             ;;
@@ -252,6 +269,10 @@ _audit_fim_subcmd() {
             local dir; dir=$(_audit_state_dir)
             if [[ ! -f "$dir/fim.baseline" ]]; then
                 echo -e "${Y}no baseline yet — run \`milog audit fim baseline\` first${NC}"
+                return 1
+            fi
+            if ! _audit_have_sha256; then
+                echo -e "${R}no sha256sum or shasum on PATH — FIM cannot hash anything${NC}" >&2
                 return 1
             fi
             local out; out=$(_audit_fim_diff)
@@ -332,6 +353,10 @@ _audit_persistence_expand() {
     shopt -s nullglob
     for pat in "${AUDIT_PERSISTENCE_PATHS[@]}"; do
         local -a matches=( $pat )
+        # nullglob keeps glob-free words, so an absent /etc/rc.local would count as present.
+        if (( ${#matches[@]} == 1 )) && [[ "${matches[0]}" == "$pat" && ! -e "$pat" ]]; then
+            continue
+        fi
         if (( ${#matches[@]} > 0 )); then
             for path in "${matches[@]}"; do
                 # Skip directories — cron drops and systemd units are files.
@@ -838,11 +863,10 @@ _audit_yara_scan_path() {
         # from AUDIT_YARA_PATHS / AUDIT_YARA_RULES_DIR (operator config),
         # so a leading-dash filename isn't a realistic attack surface.
         yara -r -w "$yar" "$target" 2>/dev/null | awk '{
-            rule = $1
-            # File path can contain spaces; everything from $2 to EOL.
-            $1 = ""
-            sub(/^ /, "")
-            printf "%s\t%s\n", rule, $0
+            # Split on the first space only; the path keeps its exact bytes.
+            i = index($0, " ")
+            if (i == 0) next
+            printf "%s\t%s\n", substr($0, 1, i - 1), substr($0, i + 1)
         }'
     done
 }
@@ -851,7 +875,7 @@ _audit_yara_scan_path() {
 # matches log. Stdout: one NEW match per line, `<rule>\t<file>\t<sha256>`.
 # Already-recorded (rule, file, sha) tuples are filtered out.
 #
-# Dedup uses fgrep against the matches log rather than an in-memory set.
+# Dedup uses awk against the matches log rather than an in-memory set.
 # Reasons: (a) typical webroot finds ≤ a handful of hits per scan, so
 # fork-per-match is cheap; (b) sidesteps bash-3.2's empty-array
 # `unbound variable` trap under `set -u`; (c) one less in-memory data
@@ -861,21 +885,28 @@ _audit_yara_scan_all() {
     local matches_log="$dir/yara.matches"
     [[ -f "$matches_log" ]] || : > "$matches_log"
 
-    local p rule file sha line
+    local p rule file sha line esc
     for p in "${AUDIT_YARA_PATHS[@]}"; do
         [[ -e "$p" ]] || continue
-        while IFS=$'\t' read -r rule file; do
+        while IFS= read -r line; do
+            # The path is everything after the first tab — it may hold tabs itself.
+            [[ "$line" == *$'\t'* ]] || continue
+            rule="${line%%$'\t'*}"
+            file="${line#*$'\t'}"
             [[ -z "$rule" || -z "$file" ]] && continue
             sha=$(_audit_sha256 "$file")
             [[ -z "$sha" ]] && sha="UNREADABLE"
-            line=$(printf '%s\t%s\t%s\t' "$rule" "$file" "$sha")
-            # Fixed-string match — rule/file/sha can't contain regex
-            # metacharacters that matter, but fgrep is faster anyway.
-            if ! grep -Fq "$line" "$matches_log"; then
+            # Escaped so every log row keeps exactly four tab-separated fields.
+            esc="${file//\\/\\\\}"
+            esc="${esc//$'\t'/\\t}"
+            # ENVIRON, not -v: awk -v would unescape the backslashes.
+            if ! R="$rule" F="$esc" S="$sha" awk -F'\t' '
+                    $1 == ENVIRON["R"] && $2 == ENVIRON["F"] && $3 == ENVIRON["S"] { found = 1; exit }
+                    END { exit !found }' "$matches_log"; then
                 printf '%s\t%s\t%s\n' "$rule" "$file" "$sha"
                 # Record immediately so a same-tick duplicate path (e.g.
                 # the same file matched by two rules) doesn't double-fire.
-                _audit_yara_record_match "$rule" "$file" "$sha"
+                _audit_yara_record_match "$rule" "$esc" "$sha"
             fi
         done < <(_audit_yara_scan_path "$p")
     done
@@ -914,8 +945,10 @@ _audit_yara_tick() {
 
     # _audit_yara_scan_all records matches inline — we just fire alerts
     # for what comes through (which is already deduped against the log).
-    local rule file sha key body
-    while IFS=$'\t' read -r rule file sha; do
+    local rule file sha key body line
+    while IFS= read -r line; do
+        rule="${line%%$'\t'*}"; sha="${line##*$'\t'}"
+        file="${line#*$'\t'}"; file="${file%$'\t'*}"
         [[ -z "$rule" ]] && continue
         key="audit:yara:$rule:$file"
         if alert_should_fire "$key"; then
@@ -963,8 +996,10 @@ _audit_yara_subcmd() {
                 return 0
             fi
             echo -e "${R}new YARA matches:${NC}"
-            local rule file sha
-            while IFS=$'\t' read -r rule file sha; do
+            local rule file sha line
+            while IFS= read -r line; do
+                rule="${line%%$'\t'*}"; sha="${line##*$'\t'}"
+                file="${line#*$'\t'}"; file="${file%$'\t'*}"
                 printf "  \033[31m%-30s\033[0m  %s  \033[90m%s\033[0m\n" \
                     "$rule" "$file" "${sha:0:16}"
             done <<< "$out"
@@ -1028,8 +1063,8 @@ _audit_yara_subcmd() {
 #
 # Storage: $ALERT_STATE_DIR/audit/accounts/<sanitised-path> — full file
 # content captured at baseline time. comm against current state to find
-# ADDED / REMOVED lines. Sanitisation: `/` → `_`, leading underscore
-# stripped (so `/etc/passwd` becomes `etc_passwd`).
+# ADDED / REMOVED lines. Sanitisation: `%`/`_` percent-encoded, `/` → `_`,
+# leading slash stripped (so `/etc/passwd` becomes `etc_passwd`).
 #
 # Drift policy:
 #   ADDED   fires alert. Each baseline-vs-current run reports up to 5
@@ -1048,10 +1083,17 @@ _audit_accounts_state_dir() {
 _audit_accounts_sanitise() {
     # `/etc/sudoers.d/foo` → `etc_sudoers.d_foo`. Leading slash stripped
     # so we don't end up with a hidden `_etc_...` file the operator can't
-    # see in `ls`. Backslash + colon also escaped for paranoia even
-    # though they're vanishingly unlikely in account-file paths.
+    # see in `ls`. `%` and `_` are percent-encoded so `/a_b` and `/a/b` differ.
     local p="$1"
     p="${p#/}"
+    p="${p//%/%25}"
+    p="${p//_/%5F}"
+    printf '%s' "${p//\//_}"
+}
+
+# Pre-encoding name, read only until the first baseline that writes `.encoded`.
+_audit_accounts_legacy_name() {
+    local p="${1#/}"
     printf '%s' "${p//\//_}"
 }
 
@@ -1077,19 +1119,26 @@ _audit_accounts_expand() {
 # scope variable leakage.
 _audit_accounts_baseline() {
     local dir; dir=$(_audit_accounts_state_dir)
-    local count=0 path safe
-    # Wipe the baseline dir on full re-baseline so files removed from
-    # AUDIT_ACCOUNTS_PATHS don't linger as ghost rows on subsequent diffs.
-    rm -f "$dir"/*.baseline 2>/dev/null
+    local count=0 path safe tmp f kept="/"
+    # Renamed into place so a concurrent diff never sees a missing or partial baseline.
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
         safe=$(_audit_accounts_sanitise "$path")
+        tmp=$(mktemp "$dir/.baseline.tmp.XXXXXX") || return 1
         # `cp -f` would dereference symlinks; we want the actual content
         # at this instant, which `cat >` accomplishes with no metadata.
-        if cat "$path" 2>/dev/null > "$dir/$safe.baseline"; then
+        if cat "$path" 2>/dev/null > "$tmp" && mv -f "$tmp" "$dir/$safe.baseline"; then
+            kept="$kept$safe.baseline/"
             (( count++ )) || true
+        else
+            rm -f "$tmp"
         fi
     done < <(_audit_accounts_expand)
+    : > "$dir/.encoded"
+    # Pruned last so paths dropped from AUDIT_ACCOUNTS_PATHS stop showing up.
+    for f in "$dir"/*.baseline; do
+        [[ -e "$f" && "$kept" != */"${f##*/}"/* ]] && rm -f "$f"
+    done
     printf '%d %s\n' "$count" "$dir"
 }
 
@@ -1105,6 +1154,9 @@ _audit_accounts_diff() {
         [[ -z "$path" ]] && continue
         safe=$(_audit_accounts_sanitise "$path")
         baseline="$dir/$safe.baseline"
+        if [[ ! -f "$baseline" && ! -f "$dir/.encoded" ]]; then
+            baseline="$dir/$(_audit_accounts_legacy_name "$path").baseline"
+        fi
         if [[ ! -f "$baseline" ]]; then
             # File appeared since last baseline — every line is ADDED.
             awk -v p="$path" 'NF { printf "ADDED\t%s\t%s\n", p, $0 }' "$path" 2>/dev/null
@@ -1252,7 +1304,8 @@ _audit_accounts_subcmd() {
 # Rootkit hint scanner — point-in-time heuristics, no baseline. Each
 # heuristic is a yes/no signal that's worth firing on its own:
 #
-#   hidden_process       /proc dir count > `ps -e` count (slack for racing)
+#   hidden_process       /proc dir count > `ps -e` count (slack for racing),
+#                        or a PID that answers stat but is not listed
 #   ld_preload_present   /etc/ld.so.preload exists at all
 #   exec_from_tmp        a running process's exe lives under /tmp,
 #                        /dev/shm, or /var/tmp
@@ -1282,6 +1335,43 @@ _audit_rootkit_check_hidden() {
         printf 'hidden_process\tps_count=%d /proc_count=%d (delta=%d > slack=%d)\n' \
             "$ps_count" "$proc_count" "$((proc_count - ps_count))" "$slack"
     fi
+}
+
+# ps, ls and globs list /proc via readdir, which LD_PRELOAD can filter; stat on /proc/<pid> it cannot.
+# Kernel-module rootkits and stat hooks are out of reach here; the eBPF exec probe covers those.
+_audit_rootkit_check_hidden_stat() {
+    local pid_max last_pid limit n p k v tgid comm _
+    local -A listed=() relisted=()
+    local -a candidates=()
+    pid_max=$(cat /proc/sys/kernel/pid_max 2>/dev/null) || pid_max=32768
+    read -r _ _ _ _ last_pid 2>/dev/null < /proc/loadavg || last_pid=0
+    limit=$pid_max
+    for p in /proc/[0-9]*; do
+        n=${p#/proc/}
+        listed[$n]=1
+        (( n > last_pid )) && last_pid=$n
+    done
+    # Above 64k pid_max only PIDs up to the newest are scanned; a hidden PID from before a wrap is missed.
+    (( pid_max > 65536 )) && limit=$last_pid
+    for (( n = 1; n <= limit; n++ )); do
+        [[ -e /proc/$n && -z "${listed[$n]:-}" ]] && candidates+=("$n")
+    done
+    (( ${#candidates[@]} > 0 )) || return 0
+
+    # Re-list so processes spawned during the scan don't count as hidden.
+    for p in /proc/[0-9]*; do relisted[${p#/proc/}]=1; done
+    for n in "${candidates[@]}"; do
+        [[ -n "${relisted[$n]:-}" ]] && continue
+        tgid=""
+        while read -r k v _; do
+            [[ "$k" == "Tgid:" ]] && { tgid="$v"; break; }
+        done 2>/dev/null < "/proc/$n/status" || continue
+        # Thread IDs stat fine but are never listed; only thread-group leaders count.
+        [[ "$tgid" == "$n" ]] || continue
+        comm=$(cat "/proc/$n/comm" 2>/dev/null) || comm="?"
+        printf 'hidden_process:%s\tpid=%s comm=%s answers stat but is missing from the /proc listing\n' \
+            "${comm:-?}" "$n" "${comm:-?}"
+    done
 }
 
 _audit_rootkit_check_preload() {
@@ -1325,6 +1415,7 @@ _audit_rootkit_walk_proc() {
 _audit_rootkit_run_all() {
     _audit_rootkit_supported || return 0
     _audit_rootkit_check_hidden
+    _audit_rootkit_check_hidden_stat
     _audit_rootkit_check_preload
     _audit_rootkit_walk_proc
 }
