@@ -59,7 +59,7 @@ mode_attacker() {
     for name in "${LOGS[@]}"; do
         local f="$LOG_DIR/$name.access.log"
         [[ -f "$f" ]] || continue
-        awk -v ip="$ip" -v app="$name" '$1 == ip { print app "\t" $0 }' "$f" >> "$tmp"
+        awk -v ip="$ip" -v app="$name" '$1 == ip { print app "\t" $0 }' "$f" | _tty_safe >> "$tmp"
     done
 
     local total; total=$(wc -l < "$tmp" | tr -d ' ')

@@ -47,6 +47,11 @@ milog_update_geometry    # initialise for non-TUI modes that use draw_row
 spc() { printf '%*s' "$1" ''; }
 hrule() { printf '─%.0s' $(seq 1 "$1"); }
 
+# Filter: replace C0 controls (except tab), DEL and UTF-8 C1 with '?' so log text can't drive the terminal.
+_tty_safe() {
+    LC_ALL=C awk '{ gsub(/[\001-\010\013-\037\177]/, "?"); gsub(/\302[\200-\237]/, "?"); print; fflush() }'
+}
+
 # Single-box rules — all share INNER=74
 bdr_top() { printf "${W}┌$(hrule $((W_APP+2)))┬$(hrule $((W_REQ+2)))┬$(hrule $((W_ST+2)))┬$(hrule $((W_BAR+2)))┐${NC}\n"; }
 bdr_hdr() { printf "${W}├$(hrule $((W_APP+2)))┼$(hrule $((W_REQ+2)))┼$(hrule $((W_ST+2)))┼$(hrule $((W_BAR+2)))┤${NC}\n"; }

@@ -47,7 +47,7 @@ mode_probes() {
                 tail -F "$file" 2>/dev/null | \
                     grep --line-buffered -Ei "$pat" | \
                 while IFS= read -r line; do
-                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$line"
+                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$(_tty_safe <<< "$line")"
                     # Fingerprint gate runs AFTER cooldown — see exploits.sh
                     # for rationale. Scanner hits commonly match both rules.
                     fp=$(alert_fingerprint_from_line "$line")
