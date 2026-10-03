@@ -1,5 +1,6 @@
-// milog-web serves the `milog web` dashboard. /healthz is public; every
-// other route needs the token from web.token. Standard library only.
+// milog-web serves the `milog web` dashboard. /healthz and the /static/*
+// app shell are public; every other route needs the token from web.token.
+// Standard library only.
 package main
 
 import (
@@ -45,29 +46,13 @@ func main() {
 	}
 
 	tokenPath := token.Resolve()
-	auth := token.Middleware(tokenPath)
 
 	staticFS, err := fs.Sub(webFS, "web")
 	if err != nil {
 		log.Fatalf("milog-web: embed: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthz)                        // public
-	mux.Handle("/api/meta.json", auth(metaHandler(cfg)))       // token-gated
-	mux.Handle("/api/summary.json", auth(summaryHandler(cfg))) // token-gated
-	mux.Handle("/api/alerts.json", auth(alertsHandler(cfg)))   // token-gated
-	mux.Handle("/api/logs.json", auth(logsHandler(cfg)))       // token-gated
-	mux.Handle("/api/logs/histogram.json", auth(logsHistogramHandler(cfg)))
-	mux.Handle("/api/stream", auth(streamHandler(cfg)))
-	mux.Handle("/api/logs/stream", auth(logsStreamHandler(cfg)))
-	mux.Handle("/metrics", auth(metricsHandler(cfg)))
-	mux.Handle("/api/latency.json", auth(latencyHandler(cfg)))
-	mux.Handle("/debug", auth(debugHandler(cfg)))
-	mux.Handle("/static/", auth(http.StripPrefix("/static/", http.FileServer(http.FS(staticFS)))))
-	mux.Handle("/", auth(rootHandler(staticFS)))
-
-	handler := securityHeaders(mux)
+	handler := newHandler(cfg, tokenPath, staticFS)
 
 	addr := net.JoinHostPort(cfg.Bind, cfg.Port)
 	srv := &http.Server{
@@ -93,6 +78,29 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+}
+
+// newHandler wires every route; only /healthz and /static/* skip auth.
+func newHandler(cfg *config.Config, tokenPath string, staticFS fs.FS) http.Handler {
+	auth := token.Middleware(tokenPath)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthz)                        // public
+	mux.Handle("/api/meta.json", auth(metaHandler(cfg)))       // token-gated
+	mux.Handle("/api/summary.json", auth(summaryHandler(cfg))) // token-gated
+	mux.Handle("/api/alerts.json", auth(alertsHandler(cfg)))   // token-gated
+	mux.Handle("/api/logs.json", auth(logsHandler(cfg)))       // token-gated
+	mux.Handle("/api/logs/histogram.json", auth(logsHistogramHandler(cfg)))
+	mux.Handle("/api/stream", auth(streamHandler(cfg)))
+	mux.Handle("/api/logs/stream", auth(logsStreamHandler(cfg)))
+	mux.Handle("/metrics", auth(metricsHandler(cfg)))
+	mux.Handle("/api/latency.json", auth(latencyHandler(cfg)))
+	mux.Handle("/debug", auth(debugHandler(cfg)))
+	// Public: index.html loads these before app.js can attach the token.
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	mux.Handle("/", auth(rootHandler(staticFS)))
+
+	return securityHeaders(mux)
 }
 
 // healthz is public so liveness checks don't need the token.
