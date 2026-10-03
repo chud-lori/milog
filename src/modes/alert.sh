@@ -72,17 +72,27 @@ _alert_read_webhook() {
 }
 
 # Read the (possibly multiline) ALERT_ROUTES value from a config file.
-# Sources the file in a subshell to get the real bash-parsed value, then
-# echoes it. `_alert_read_key` grep-hack can't handle heredoc-style
-# multiline assignments, so routing gets its own helper.
+# `_alert_read_key` grep-hack can't handle multiline quoted assignments,
+# so routing gets its own helper.
 #
 # Silent + empty on any error — caller treats empty as "no routing".
 _alert_read_routes() {
     local file="$1"
     [[ -r "$file" ]] || return 0
-    # Subshell insulation: ALERT_ROUTES from the target config overrides
-    # any env-loaded value only for the duration of this subshell.
-    ( set +u; ALERT_ROUTES=""; . "$file" 2>/dev/null; printf '%s' "$ALERT_ROUTES" ) || true
+    # Parsed, never sourced: under sudo this is another user's file and we're root.
+    awk '
+        !on && /^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/ {
+            sub(/^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/, ""); val = ""
+            q = substr($0, 1, 1)
+            if (q != "\"" && q != "\047") { sub(/[[:space:]].*$/, ""); val = $0; next }
+            $0 = substr($0, 2); on = 1
+        }
+        on {
+            i = index($0, q)
+            if (i) { val = val substr($0, 1, i - 1); on = 0; next }
+            val = val $0 "\n"
+        }
+        END { printf "%s", val }' "$file" 2>/dev/null || true
 }
 
 # Read a simple KEY's value from the config file — same no-fail contract.
