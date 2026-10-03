@@ -14,7 +14,7 @@
 # Duration grammar: <N><s|m|h|d>  — `30s`, `5m`, `2h`, `1d`. A bare integer is
 # treated as seconds.
 #
-# Glob matching: bash glob syntax. `exploits:*` matches every `exploits:<cat>`
+# Glob matching: bash glob syntax. `exploit:*` matches every `exploit:<app>:<cat>`
 # key fired by the exploits classifier. Be careful with overly broad globs —
 # `*` would silence literally every rule.
 #
@@ -138,7 +138,7 @@ ${W}EXAMPLES${NC}
   milog silence 5xx:api 2h 'investigating deploy, auth service'
 
   ${D}# Glob — silence every exploit category at once:${NC}
-  milog silence 'exploits:*' 30m 'pentester doing authorized scan'
+  milog silence 'exploit:*' 30m 'pentester doing authorized scan'
 
   ${D}# Done early, unmute:${NC}
   milog silence clear 5xx:api

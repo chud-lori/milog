@@ -170,8 +170,8 @@ ALERT_HOOK_TIMEOUT=10
 #
 # Format: one `key: destinations` pair per line. Whitespace-tolerant, `#`
 # begins a comment. Keys:
-#   - exact rule (`cpu`, `mem`, `workers`, `5xx:api`, `exploits:log4shell`)
-#   - prefix before the first `:` (`5xx`, `exploits`, `probes`)
+#   - exact rule (`cpu`, `mem`, `workers`, `5xx:api`, `exploit:api:log4shell`)
+#   - prefix before the first `:` (`5xx`, `exploit`, `probe`)
 #   - `default`     — fallback when no other key matches
 # Resolution order: exact → prefix → default → empty. Leftmost wins.
 #
@@ -181,13 +181,13 @@ ALERT_HOOK_TIMEOUT=10
 #
 # Example — route exploits to security, system alerts to ops, rest to discord:
 #   ALERT_ROUTES="
-#     exploits: slack telegram
+#     exploit:  slack telegram
 #     audit:    slack
 #     cpu:      discord
 #     mem:      discord
 #     disk:/:   discord
 #     5xx:      slack discord
-#     probes:   skip
+#     probe:    skip
 #     default:  discord
 #   "
 ALERT_ROUTES=""

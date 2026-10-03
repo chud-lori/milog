@@ -227,7 +227,7 @@ ${body}"
 #
 # State file: $ALERT_STATE_DIR/alerts.silences
 #   Format:   <rule_key_or_glob>\t<until_epoch>\t<added_epoch>\t<added_by>\t<message>
-#   Globs:    bash glob syntax — `exploits:*` silences every exploits:<cat>
+#   Globs:    bash glob syntax — `exploit:*` silences every exploit:<app>:<cat>
 #             rule. Literal matches are checked first, then globs.
 #   Expiry:   passive — compared on each check; the prune path lazily removes
 #             rows whose until_epoch has passed. No cron needed.
@@ -274,7 +274,7 @@ alert_silence_prune() {
 # in their telemetry.
 #
 # Bash `[[ $x == $pat ]]` does glob matching (not regex), which is exactly
-# what we want: `exploits:*` matches `exploits:log4shell` / `exploits:sqli`.
+# what we want: `exploit:*` matches `exploit:api:log4shell` / `exploit:api:sqli`.
 alert_is_silenced() {
     local rule="${1:-}"
     [[ -n "$rule" ]] || return 1
@@ -369,7 +369,7 @@ alert_silence_list_active() {
 #
 # Resolution:
 #   1. Exact match on rule_key  (e.g. `5xx:api` → line `5xx:api: slack`)
-#   2. Prefix match (first segment before `:`)  (e.g. `exploits:sqli` → `exploits:`)
+#   2. Prefix match (first segment before `:`)  (e.g. `exploit:api:sqli` → `exploit:`)
 #   3. `default:` line
 #   4. No match → empty string → caller fans out to all configured dests
 #      (back-compat: today's behavior when ALERT_ROUTES is unset)
@@ -387,7 +387,7 @@ _alert_route_for() {
 
     # Parse the multiline config block. Tolerates leading/trailing whitespace
     # and `#` comments. Only the first occurrence of each key wins (so
-    # `exploits: slack` before `exploits: discord` in the config means slack).
+    # `exploit: slack` before `exploit: discord` in the config means slack).
     while IFS= read -r line; do
         line="${line%%#*}"
         # trim whitespace both sides
@@ -447,7 +447,7 @@ _alert_route_for() {
 # broken hook.
 #
 # Env passed to each hook:
-#   MILOG_RULE_KEY   the rule that fired (e.g. `5xx:api`, `exploits:sqli`)
+#   MILOG_RULE_KEY   the rule that fired (e.g. `5xx:api`, `exploit:api:sqli`)
 #   MILOG_TITLE      short alert title
 #   MILOG_BODY       longer alert body (may contain newlines stripped to spaces)
 #   MILOG_SEV        "crit" | "warn" | "info"
