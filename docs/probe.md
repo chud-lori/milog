@@ -52,6 +52,14 @@ enables it. The unit captures the **invoking user's** `HOME` and
 DISCORD_WEBHOOK + silences + alerts.log — not root's. Re-run
 install-service after `milog config set` to pick up changes.
 
+The probe itself stays root, but each alert runs as that user
+(`MILOG_PROBE_ALERT_USER`), so your config and hooks never execute as
+root. The unit also limits capabilities to what eBPF needs
+(`CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE`, plus `CAP_SYS_ADMIN` on kernels
+before 5.8, and `CAP_SETUID CAP_SETGID` for the alert switch) and adds
+systemd sandboxing. `install-service` refuses a `milog-probe` binary
+that is not root-owned or is group/other-writable.
+
 ## Pre-flight checklist
 
 Run these before installing on a host you've never used the probe on:
@@ -155,6 +163,7 @@ lines. To change one: `sudoedit` the unit, `daemon-reload`, restart.
 | -------------------------------- | --------------------------------------------- | ------------------------------------------------------------ |
 | `HOME`                           | (unset → root's `/root`)                      | Resolves the bash side's `ALERT_STATE_DIR` and `MILOG_CONFIG` lookups. **Set this** or alerts log to `/root/.cache/milog/`. |
 | `MILOG_CONFIG`                   | `$HOME/.config/milog/config.sh`               | Bash-side config the probe-spawned milog reads               |
+| `MILOG_PROBE_ALERT_USER`         | (unset → alerts run as root)                  | User the probe-spawned milog runs as. Without it, milog running as root only sources a root-owned, non-group/other-writable `MILOG_CONFIG`. |
 | `MILOG_PROBE_FILE_ALLOWLIST`     | conservative system-tools list                | Comma-separated `comm` names exempt from `file:sensitive_read` |
 | `MILOG_PROBE_FILE_SENSITIVE`     | `/etc/shadow`, `/etc/sudoers`, `/root/.ssh/`, etc. | Comma-separated paths the probe watches                |
 | `MILOG_PROBE_NET_ALLOWLIST`      | loopback + private CIDRs + DNS / NTP          | CIDR list + bare port (`:53`) entries; CIDR+port (`10.0.0.0/8:443`) supported |
