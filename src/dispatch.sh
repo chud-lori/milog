@@ -229,6 +229,17 @@ if [[ "${2:-}" == "--help" || "${2:-}" == "-h" ]]; then
     exit $?
 fi
 
+# Setup and host-level commands must work before any app is configured.
+if [[ ${#LOGS[@]} -eq 0 ]]; then
+    case "${1:-}" in
+        -h|--help|help|config|doctor|completions|install|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
+        *)
+            echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
+            echo "  Run 'milog config init', set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
+            exit 1 ;;
+    esac
+fi
+
 case "${1:-}" in
     monitor)  mode_monitor ;;
     tui)      shift; mode_tui "$@" ;;

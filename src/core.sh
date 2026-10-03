@@ -318,12 +318,6 @@ if [[ ${#LOGS[@]} -eq 0 ]]; then
     shopt -u nullglob
 fi
 
-if [[ ${#LOGS[@]} -eq 0 ]]; then
-    echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
-    echo "  Set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
-    exit 1
-fi
-
 # --- Typed log sources -------------------------------------------------------
 # LOGS entries are bare names by default (`LOGS=(api web)`) and resolve to
 # nginx-format files at `$LOG_DIR/<name>.access.log`. A typed prefix makes
