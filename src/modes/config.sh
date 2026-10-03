@@ -446,7 +446,7 @@ color_prefix() {
         {
             local idx
             for idx in "${!F_files[@]}"; do
-                tail -n 10 "${F_files[$idx]}" 2>/dev/null | \
+                tail -n 10 "${F_files[$idx]}" 2>/dev/null | _tty_safe | \
                     awk -v col="${F_fcols[$idx]}" -v lbl="${F_flabels[$idx]}" -v nc="$NC" '
                     {
                         if (match($0, /\[[0-9]{2}\/[A-Za-z]+\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
@@ -471,7 +471,7 @@ color_prefix() {
     # the same way; awk prefixes each with the coloured app label.
     local idx
     for idx in "${!S_cmds[@]}"; do
-        bash -c "${S_cmds[$idx]}" 2>/dev/null | \
+        bash -c "${S_cmds[$idx]}" 2>/dev/null | _tty_safe | \
             awk -v col="${S_cols[$idx]}" -v lbl="${S_labels[$idx]}" -v nc="$NC" \
                 '{print col"["lbl"]"nc" "$0; fflush()}' &
         pids+=($!)

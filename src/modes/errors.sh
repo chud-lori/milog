@@ -78,6 +78,7 @@ _errors_live() {
                 # combined-format access line. Same regex as v1.
                 ( bash -c "$cmd" 2>/dev/null \
                     | grep --line-buffered -E ' [45][0-9][0-9] ' \
+                    | _tty_safe \
                     | awk -v col="$col" -v lbl="$label" -v nc="$NC" \
                         '{print col"["lbl"]"nc" "$0; fflush()}' ) &
                 pids+=($!)
@@ -90,6 +91,7 @@ _errors_live() {
                     ( bash -c "$cmd" 2>/dev/null \
                         | grep --line-buffered -v '^#' \
                         | grep --line-buffered -E -i -- "$pattern_union" \
+                        | _tty_safe \
                         | awk -v col="$col" -v lbl="$label" -v nc="$NC" \
                             '{print col"["lbl"]"nc" "$0; fflush()}' ) &
                     pids+=($!)
@@ -198,7 +200,7 @@ _errors_summary() {
         sample="${body#\`\`\`}"; sample="${sample%\`\`\`}"
         (( ${#sample} > 60 )) && sample="${sample:0:57}..."
         printf "  %-16s  ${R}%-12s${NC}  ${Y}%-22s${NC}  %s\n" "$when" "$src" "$pat" "$sample"
-    done < <(tail -n "$list_cap" "$filtered")
+    done < <(tail -n "$list_cap" "$filtered" | _tty_safe)
 
     echo -e "\n  ${D}total: $total fire(s) — log at $log_file${NC}\n"
 }

@@ -196,6 +196,7 @@ _search_one_file() {
     # failure modes are intentionally swallowed too — search is best-effort.
     $reader_cmd "$f" 2>/dev/null \
         | { grep "$grep_flag" -- "$pattern" || true; } \
+        | _tty_safe \
         | "$awk_bin" -v app="$app" -v col="$col" -v nc="$NC" -v label="$label" \
               -v pathf="$path_filter" -v cutoff="$cutoff_epoch" '
             BEGIN {

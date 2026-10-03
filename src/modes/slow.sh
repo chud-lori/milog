@@ -83,7 +83,8 @@ mode_slow() {
             }
             END { emit() }' \
         | sort -t $'\t' -k2,2 -rn \
-        | head -n "$n")
+        | head -n "$n" \
+        | _tty_safe)
 
     if [[ -z "$top_rows" ]]; then
         echo -e "${D}No timed samples in window — is \$request_time in your log_format?${NC}"

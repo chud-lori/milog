@@ -1274,7 +1274,7 @@ func renderAlertRow(r alertlog.Row) string {
 	if len(ruleShort) > 32 {
 		ruleShort = ruleShort[:29] + "…"
 	}
-	body := strings.TrimSpace(strings.Trim(r.Body, "`"))
+	body := ttySafe(strings.TrimSpace(strings.Trim(r.Body, "`")))
 	if len(body) > 60 {
 		body = body[:57] + "…"
 	}
@@ -1392,7 +1392,7 @@ func (m model) renderPathsView() string {
 		pathW = 20
 	}
 	for _, r := range d.rows {
-		key := r.path
+		key := ttySafe(r.path)
 		if len(key) > pathW {
 			key = key[:pathW-1] + "…"
 		}
@@ -1579,6 +1579,16 @@ func formatPathsBreakdown(rows []kv, width int) string {
 	return b.String()
 }
 
+// ttySafe replaces C0 controls (except tab), DEL and C1 with '?' so log text can't drive the terminal.
+func ttySafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r < 0x20 && r != '\t') || (r >= 0x7f && r <= 0x9f) {
+			return '?'
+		}
+		return r
+	}, s)
+}
+
 func renderTopPane(title string, rows []kv, width int) string {
 	var b strings.Builder
 	b.WriteString("  ")
@@ -1594,7 +1604,7 @@ func renderTopPane(title string, rows []kv, width int) string {
 		keyW = 12
 	}
 	for _, r := range rows {
-		k := r.key
+		k := ttySafe(r.key)
 		if len(k) > keyW {
 			k = k[:keyW-1] + "…"
 		}

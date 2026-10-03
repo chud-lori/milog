@@ -104,7 +104,8 @@ mode_top_paths() {
             }
             END { emit() }' \
         | sort -t $'\t' -k2,2 -rn \
-        | head -n "$n")
+        | head -n "$n" \
+        | _tty_safe)
 
     if [[ -z "$rows" ]]; then
         echo -e "${D}No loglines matched in window.${NC}\n"
