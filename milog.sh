@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-37-g135dfb1-dirty
-# MILOG_BUILT=2026-06-27T13:35:36Z
+# MILOG_VERSION=v0.3.0-40-gd861b11-dirty
+# MILOG_BUILT=2026-10-03T14:56:11Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -3458,20 +3458,19 @@ _audit_persistence_diff() {
     [[ -f "$baseline" ]] || return 1
 
     local current; current=$(mktemp "$dir/persistence.current.XXXXXX") || return 1
+    local sorted_baseline; sorted_baseline=$(mktemp "$dir/persistence.sortedb.XXXXXX") || return 1
+    # Never end on an external command: in $(...)/<(...) bash execs it and skips RETURN.
     # shellcheck disable=SC2064
-    trap "rm -f '$current'" RETURN
+    trap "rm -f '$current' '$sorted_baseline'" RETURN
     _audit_persistence_expand > "$current"
 
     # comm needs sorted inputs. Strip baseline to its path column first.
-    local sorted_baseline; sorted_baseline=$(mktemp "$dir/persistence.sortedb.XXXXXX") || return 1
     awk -F'\t' '{print $1}' "$baseline" | sort -u > "$sorted_baseline"
 
     # APPEARED: in current, not in baseline.
     comm -23 "$current" "$sorted_baseline" | awk '{print "APPEARED\t" $0}'
     # REMOVED: in baseline, not in current.
     comm -13 "$current" "$sorted_baseline" | awk '{print "REMOVED\t" $0}'
-
-    rm -f "$sorted_baseline"
 }
 
 _audit_persistence_tick() {
