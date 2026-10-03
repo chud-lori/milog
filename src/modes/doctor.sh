@@ -57,6 +57,15 @@ mode_doctor() {
         _doc_warn "mmdblookup missing" "GeoIP column disabled — install 'mmdb-bin' / 'libmaxminddb'"
         warn=$(( warn + 1 ))
     fi
+    if _audit_have_sha256; then
+        _doc_ok "sha256 tool present" "audit fim can hash watched files"
+    elif [[ "${AUDIT_ENABLED:-0}" == "1" ]]; then
+        _doc_fail "no sha256sum or shasum on PATH" "AUDIT_ENABLED=1 but FIM refuses to baseline — install coreutils"
+        fail=$(( fail + 1 ))
+    else
+        _doc_warn "no sha256sum or shasum on PATH" "audit fim will refuse to baseline — install coreutils"
+        warn=$(( warn + 1 ))
+    fi
 
     # ---- log dir + per-app logs ---------------------------------------------
     _doc_head "log directory"
