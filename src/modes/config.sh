@@ -288,7 +288,7 @@ config_validate() {
         THRESH_4XX_WARN THRESH_5XX_WARN
     )
     # Families — prefix-matched for per-app overrides like THRESH_REQ_CRIT_finance.
-    local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ )
+    local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ AUDIT_ )
 
     echo -e "\n${W}── MiLog: Config validate ──${NC}\n"
     echo -e "  ${D}config: $MILOG_CONFIG${NC}"

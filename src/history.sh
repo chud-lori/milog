@@ -76,11 +76,13 @@ history_write_minute() {
     local ts="$1" cur_time="$2"
     [[ -n "$cur_time" ]] || { _dlog "history: empty cur_time for ts=$ts; skipping"; return 0; }
 
-    local sql="" app count c2 c3 c4 c5 p50 p95 p99
+    local sql="" app name count c2 c3 c4 c5 p50 p95 p99
     for app in "${LOGS[@]}"; do
-        read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$app" "$cur_time")"
+        [[ "$(_log_type_for "$app")" == "nginx" ]] || continue
+        name=$(_log_name_for "$app")
+        read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$cur_time")"
         count=${count:-0}; c2=${c2:-0}; c3=${c3:-0}; c4=${c4:-0}; c5=${c5:-0}
-        read -r p50 p95 p99 <<< "$(percentiles "$app" "$cur_time")"
+        read -r p50 p95 p99 <<< "$(percentiles "$name" "$cur_time")"
         [[ "$p50" =~ ^[0-9]+$ ]] || p50="NULL"
         [[ "$p95" =~ ^[0-9]+$ ]] || p95="NULL"
         [[ "$p99" =~ ^[0-9]+$ ]] || p99="NULL"
@@ -106,14 +108,15 @@ history_write_hour() {
 
     local sql="" app file hits ip
     for app in "${LOGS[@]}"; do
-        file="$LOG_DIR/$app.access.log"
+        [[ "$(_log_type_for "$app")" == "nginx" ]] || continue
+        file=$(_log_path_for "$app")
         [[ -f "$file" ]] || continue
         while read -r hits ip; do
             [[ -n "$ip" ]] || continue
             sql+="INSERT OR REPLACE INTO top_ip_hour VALUES"
             sql+=" ($ts_hour, $(_sql_quote "$app"), $(_sql_quote "$ip"), $hits);"$'\n'
-        done < <(grep -F "$hour_pat" "$file" 2>/dev/null \
-                 | awk '{print $1}' | sort | uniq -c | sort -rn \
+        done < <(awk -v p="$hour_pat" 'index($4, p) == 2 {print $1}' "$file" 2>/dev/null \
+                 | sort | uniq -c | sort -rn \
                  | head -n "${HISTORY_TOP_IP_N:-50}")
     done
 

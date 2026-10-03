@@ -29,6 +29,26 @@ _digest_window_to_secs() {
     esac
 }
 
+# Epoch math is hand-rolled because BSD awk and busybox awk lack mktime().
+_digest_in_window() {
+    awk -v cutoff="$1" '
+        BEGIN {
+            split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", m, " ")
+            for (i = 1; i <= 12; i++) mon[m[i]] = i
+        }
+        {
+            split(substr($4, 2), t, /[\/:]/)
+            if (!(t[2] in mon)) next
+            y = t[3] + 0; mo = mon[t[2]]
+            if (mo <= 2) { y--; mo += 12 }
+            days = 365*y + int(y/4) - int(y/100) + int(y/400) + int((153*(mo-3) + 2) / 5) + t[1] - 719469
+            ts = days*86400 + t[4]*3600 + t[5]*60 + t[6]
+            off = (substr($5, 2, 2)*60 + substr($5, 4, 2)) * 60
+            ts += (substr($5, 1, 1) == "-") ? off : -off
+            if (ts >= cutoff) print
+        }' "$2"
+}
+
 mode_digest() {
     local window="${1:-day}"
     local secs; secs=$(_digest_window_to_secs "$window") || { echo -e "${R}digest: invalid window: $window${NC}" >&2; return 1; }
@@ -77,23 +97,18 @@ mode_digest() {
         name=$(_log_name_for "$entry")
         file=$(_log_path_for "$entry")
         [[ -f "$file" ]] || continue
-        # Count lines in-window via nginx timestamp. Shell out to awk with a
-        # cutoff; safe-fallback emits zeros if the date format unexpectedly
-        # doesn't match our scan.
-        read -r req c4 c5 <<< "$(awk -v cutoff="$cutoff" '
+        read -r req c4 c5 <<< "$(_digest_in_window "$cutoff" "$file" 2>/dev/null | awk '
             {
-                # [24/Apr/2026:12:34:56 +0000] → crude parse: keep any row,
-                # count by status class (fields reliable in combined format).
                 n++
                 if ($9 ~ /^4/) c4++
                 else if ($9 ~ /^5/) c5++
             }
-            END { printf "%d %d %d\n", n+0, c4+0, c5+0 }' "$file" 2>/dev/null)"
+            END { printf "%d %d %d\n", n+0, c4+0, c5+0 }')"
         printf "  %-14s  %10d  ${Y}%8d${NC}  ${R}%8d${NC}\n" "$name" "${req:-0}" "${c4:-0}" "${c5:-0}"
     done
     echo
 
-    # --- Top attacker IPs (window-agnostic: scans whole access logs) ---------
+    # --- Top attacker IPs ----------------------------------------------------
     echo -e "${W}Top attacker IPs (this window)${NC}"
     local ip_rollup
     ip_rollup=$(
@@ -101,7 +116,7 @@ mode_digest() {
             [[ "$(_log_type_for "$entry")" == "nginx" ]] || continue
             file=$(_log_path_for "$entry")
             [[ -f "$file" ]] || continue
-            awk '{print $1}' "$file"
+            _digest_in_window "$cutoff" "$file" | awk '{print $1}'
         done | sort | uniq -c | sort -rn | head -10
     )
     if [[ -n "$ip_rollup" ]]; then
