@@ -17,7 +17,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"runtime"
+	"strconv"
 	"syscall"
 
 	"github.com/chud-lori/milog/internal/probe"
@@ -25,6 +27,9 @@ import (
 
 // buildVersion is set at link time with -ldflags -X.
 var buildVersion = "dev"
+
+// alertCred is the identity `milog _internal_alert` runs as; nil keeps the probe's own.
+var alertCred *syscall.Credential
 
 func main() {
 	var (
@@ -51,6 +56,16 @@ func main() {
 	// Fail clearly on non-Linux instead of stalling inside probe.Run.
 	if runtime.GOOS != "linux" {
 		log.Fatalf("milog-probe needs Linux for eBPF; running on %s", runtime.GOOS)
+	}
+
+	if name := os.Getenv("MILOG_PROBE_ALERT_USER"); name != "" {
+		cred, err := lookupCredential(name)
+		if err != nil {
+			log.Fatalf("milog-probe: MILOG_PROBE_ALERT_USER=%s: %v", name, err)
+		}
+		if int(cred.Uid) != os.Getuid() {
+			alertCred = cred
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -430,10 +445,42 @@ func fireAlert(h probe.Hit, milogBin string) {
 	cmd := exec.Command(milogBin, "_internal_alert", h.RuleKey, h.Title, h.Body, color)
 	// Pass the env through so MILOG_CONFIG reaches milog.
 	cmd.Env = os.Environ()
+	if alertCred != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: alertCred}
+	}
 	if err := cmd.Start(); err != nil {
 		log.Printf("milog-probe: failed to invoke %s: %v", milogBin, err)
 		return
 	}
 	// Reap in the background so the child doesn't linger as a zombie.
 	go func() { _ = cmd.Wait() }()
+}
+
+// lookupCredential sets supplementary groups too, else the child keeps root's.
+func lookupCredential(name string) (*syscall.Credential, error) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		return nil, err
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	gid, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := u.GroupIds()
+	if err != nil {
+		return nil, err
+	}
+	groups := make([]uint32, 0, len(ids))
+	for _, id := range ids {
+		g, err := strconv.ParseUint(id, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		groups = append(groups, uint32(g))
+	}
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, nil
 }

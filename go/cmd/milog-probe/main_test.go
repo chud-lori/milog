@@ -5,8 +5,12 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/user"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chud-lori/milog/internal/probe"
 )
@@ -81,4 +85,56 @@ func TestHandleEvent_jsonModeAlwaysEmits(t *testing.T) {
 	if !strings.Contains(out, `"hits":null`) && !strings.Contains(out, `"hits":[]`) {
 		t.Fatalf("expected empty hits array, got %q", out)
 	}
+}
+
+func TestLookupCredential_currentUser(t *testing.T) {
+	u, err := user.Current()
+	if err != nil {
+		t.Skipf("no current user: %v", err)
+	}
+	cred, err := lookupCredential(u.Username)
+	if err != nil {
+		t.Fatalf("lookupCredential(%q): %v", u.Username, err)
+	}
+	if int(cred.Uid) != os.Getuid() {
+		t.Fatalf("uid = %d, want %d", cred.Uid, os.Getuid())
+	}
+	if _, err := lookupCredential("milog-no-such-user"); err == nil {
+		t.Fatal("expected an error for an unknown user")
+	}
+}
+
+func TestFireAlert_runsAsAlertUser(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root to switch the alert child's uid")
+	}
+	cred, err := lookupCredential("nobody")
+	if err != nil {
+		t.Skipf("no nobody user: %v", err)
+	}
+	alertCred = cred
+	defer func() { alertCred = nil }()
+
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "uid")
+	bin := filepath.Join(dir, "milog")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nid -u > \"$MILOG_TEST_OUT\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MILOG_TEST_OUT", out)
+
+	fireAlert(probe.Hit{RuleKey: "probe:test", Title: "t", Body: "b"}, bin)
+	for i := 0; i < 50; i++ {
+		if b, err := os.ReadFile(out); err == nil && len(b) > 0 {
+			if got := strings.TrimSpace(string(b)); got != strconv.Itoa(int(cred.Uid)) {
+				t.Fatalf("alert child uid = %s, want %d", got, cred.Uid)
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("alert child never ran")
 }

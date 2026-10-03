@@ -134,8 +134,24 @@ WEB_STATE_DIR="$HOME/.cache/milog"
 WEB_TOKEN_FILE="$HOME/.config/milog/web.token"
 
 MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
-# shellcheck disable=SC1090
-[[ -f "$MILOG_CONFIG" ]] && . "$MILOG_CONFIG"
+
+# True when root owns the path and its directory and neither is group/other-writable.
+_root_trusted_path() {
+    local p meta
+    for p in "$1" "$(dirname "$1")"; do
+        meta=$(stat -c '%u %a' "$p" 2>/dev/null || stat -f '%u %Lp' "$p" 2>/dev/null) || return 1
+        [[ "${meta%% *}" == 0 ]] && (( (8#${meta#* } & 8#022) == 0 )) || return 1
+    done
+}
+
+if [[ -f "$MILOG_CONFIG" ]]; then
+    if [[ $EUID -ne 0 ]] || _root_trusted_path "$MILOG_CONFIG"; then
+        # shellcheck disable=SC1090
+        . "$MILOG_CONFIG"
+    else
+        echo "milog: running as root, refusing to source $MILOG_CONFIG (not root-owned or group/other-writable)" >&2
+    fi
+fi
 
 # MILOG_* env vars win over the config file.
 [[ -n "${MILOG_LOG_DIR:-}"         ]] && LOG_DIR="$MILOG_LOG_DIR"

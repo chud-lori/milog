@@ -1,5 +1,24 @@
-# milog probe status|install-service|uninstall-service: the root-run eBPF sidecar's systemd unit.
-# The unit pins the invoking user's HOME, so alerts the probe fires via `milog _internal_alert` land in that user's cache, not root's.
+# ==============================================================================
+# MODE: probe — manage the eBPF probe sidecar (milog-probe) via systemd
+#
+# Counterpart to `milog web install-service`. The probe is Linux-only and
+# privileged (eBPF needs root or CAP_BPF + CAP_PERFMON), so its unit lives
+# in /etc/systemd/system/ rather than the user-mode location web uses.
+#
+# Subcommands:
+#   milog probe status                run state + journal pointer
+#   sudo milog probe install-service  write + enable + start the unit
+#   sudo milog probe uninstall-service stop + disable + remove the unit
+#
+# Why HOME is baked into the unit:
+#   The probe shells out to `milog _internal_alert` for every rule hit.
+#   Since the probe runs as root, milog inherits root's $HOME and resolves
+#   ALERT_STATE_DIR to /root/.cache/milog — invisible to the regular user
+#   running `milog alerts` from their shell. Capturing the invoking user's
+#   $HOME at install time and pinning it via Environment= keeps alerts +
+#   silences in the user's cache where they belong. The alert child runs
+#   as that user too (MILOG_PROBE_ALERT_USER), never as root.
+# ==============================================================================
 
 _PROBE_SYSTEMD_UNIT="/etc/systemd/system/milog-probe.service"
 
@@ -66,6 +85,48 @@ disk for the systemd unit to start. Pick one:
 " >&2
 }
 
+# Args: probe_bin target_user target_home target_config allowlist caps
+_probe_unit() {
+    cat <<EOF
+[Unit]
+Description=MiLog eBPF probe (exec / file / net / ptrace / kmod / retrans / syscall-rate / bpf-load)
+Documentation=https://github.com/chud-lori/milog
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=${1}
+Restart=on-failure
+RestartSec=5s
+# HOME + MILOG_CONFIG point at the invoking user's home so probe-fired
+# alerts route through that user's bash config (DISCORD_WEBHOOK, silences,
+# alerts.log) rather than root's. Edit + daemon-reload + restart to retune.
+Environment=HOME=${3}
+Environment=MILOG_CONFIG=${4}
+Environment=MILOG_PROBE_FILE_ALLOWLIST=${5}
+# Alerts run as this user so their config and hooks never execute as root.
+Environment=MILOG_PROBE_ALERT_USER=${2}
+
+# ProtectHome / ProtectSystem=strict stay off: the alert child writes the user's ~/.cache/milog.
+CapabilityBoundingSet=${6}
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 _probe_service_install() {
     local kernel; kernel=$(uname -s 2>/dev/null)
     if [[ "$kernel" != "Linux" ]]; then
@@ -84,6 +145,12 @@ _probe_service_install() {
     fi
     local probe_bin
     probe_bin=$(_probe_binary) || { _probe_no_binary_error; return 1; }
+    probe_bin=$(readlink -f "$probe_bin")
+    if ! _root_trusted_path "$probe_bin"; then
+        echo -e "${R}refusing to run ${probe_bin} as root: it or its directory is not root-owned or is group/other-writable${NC}" >&2
+        echo -e "${D}  fix:  sudo install -o root -g root -m 0755 ${probe_bin} /usr/local/bin/milog-probe${NC}" >&2
+        return 1
+    fi
 
     # SUDO_USER, else logname, else root.
     local target_user="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
@@ -102,28 +169,16 @@ _probe_service_install() {
 
     local allowlist="${MILOG_PROBE_FILE_ALLOWLIST:-$_PROBE_DEFAULT_FILE_ALLOWLIST}"
 
-    cat > "$_PROBE_SYSTEMD_UNIT" <<EOF
-[Unit]
-Description=MiLog eBPF probe (exec / file / net / ptrace / kmod / retrans / syscall-rate / bpf-load)
-Documentation=https://github.com/chud-lori/milog
-After=network.target
-Wants=network.target
+    # CAP_BPF / CAP_PERFMON only exist from 5.8; older kernels gate eBPF on CAP_SYS_ADMIN.
+    local caps="CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID"
+    local kver; kver=$(uname -r 2>/dev/null)
+    local kmaj="${kver%%.*}" kmin; kmin="${kver#*.}"; kmin="${kmin%%[!0-9]*}"
+    if [[ "$kmaj" =~ ^[0-9]+$ && "$kmin" =~ ^[0-9]+$ ]] && (( kmaj < 5 || (kmaj == 5 && kmin < 8) )); then
+        caps="$caps CAP_SYS_ADMIN"
+    fi
 
-[Service]
-Type=simple
-ExecStart=${probe_bin}
-Restart=on-failure
-RestartSec=5s
-# HOME + MILOG_CONFIG point at the invoking user's home so probe-fired
-# alerts route through that user's bash config (DISCORD_WEBHOOK, silences,
-# alerts.log) rather than root's. Edit + daemon-reload + restart to retune.
-Environment=HOME=${target_home}
-Environment=MILOG_CONFIG=${target_config}
-Environment=MILOG_PROBE_FILE_ALLOWLIST=${allowlist}
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    _probe_unit "$probe_bin" "$target_user" "$target_home" "$target_config" "$allowlist" "$caps" \
+        > "$_PROBE_SYSTEMD_UNIT"
 
     echo -e "${G}✓${NC} wrote $_PROBE_SYSTEMD_UNIT"
 
@@ -192,8 +247,8 @@ ${W}milog probe${NC} — manage the eBPF probe sidecar (Linux only)
 
   ${D}The probe runs as a system service (root) and shells out to milog
   for every rule hit. HOME + MILOG_CONFIG in the unit pin to the user
-  who ran install-service so alerts route through that user's webhook
-  config + silences, not root's.${NC}
+  who ran install-service so alerts run as that user and route through
+  their webhook config + silences, not root's.${NC}
 
   ${W}covers:${NC}
     exec  ·  tcp connect  ·  file open  ·  ptrace  ·  kmod load

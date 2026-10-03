@@ -47,6 +47,15 @@ mode_doctor() {
         _doc_warn "mmdblookup missing" "GeoIP column disabled — install 'mmdb-bin' / 'libmaxminddb'"
         warn=$(( warn + 1 ))
     fi
+    if _audit_have_sha256; then
+        _doc_ok "sha256 tool present" "audit fim can hash watched files"
+    elif [[ "${AUDIT_ENABLED:-0}" == "1" ]]; then
+        _doc_fail "no sha256sum or shasum on PATH" "AUDIT_ENABLED=1 but FIM refuses to baseline — install coreutils"
+        fail=$(( fail + 1 ))
+    else
+        _doc_warn "no sha256sum or shasum on PATH" "audit fim will refuse to baseline — install coreutils"
+        warn=$(( warn + 1 ))
+    fi
 
     # Log dir and per-app logs.
     _doc_head "log directory"
@@ -246,6 +255,24 @@ mode_doctor() {
         else
             _doc_warn "milog.service installed but inactive" "start: sudo systemctl start milog.service"
             warn=$(( warn + 1 ))
+        fi
+        # milog-probe.service runs as root: anything it executes or sources must be root-controlled.
+        if [[ -f "$_PROBE_SYSTEMD_UNIT" ]]; then
+            local probe_exec probe_cfg
+            probe_exec=$(sed -n 's/^ExecStart=//p' "$_PROBE_SYSTEMD_UNIT" | head -1)
+            probe_cfg=$(sed -n 's/^Environment=MILOG_CONFIG=//p' "$_PROBE_SYSTEMD_UNIT" | head -1)
+            if ! grep -q '^Environment=MILOG_PROBE_ALERT_USER=' "$_PROBE_SYSTEMD_UNIT" \
+                && [[ -n "$probe_cfg" && -e "$probe_cfg" ]] && ! _root_trusted_path "$probe_cfg"; then
+                _doc_fail "milog-probe.service sources $probe_cfg as root" \
+                          "it is user-writable — reinstall: sudo milog probe install-service"
+                fail=$(( fail + 1 ))
+            elif [[ -n "$probe_exec" ]] && ! _root_trusted_path "$probe_exec"; then
+                _doc_fail "milog-probe binary writable by non-root  ($probe_exec)" \
+                          "make it and its directory root-owned and not group/other-writable"
+                fail=$(( fail + 1 ))
+            else
+                _doc_ok "milog-probe.service config + binary are root-controlled"
+            fi
         fi
         # milog-web.service is reported only once someone has tried to install it.
         local web_unit="${HOME}/.config/systemd/user/milog-web.service"
