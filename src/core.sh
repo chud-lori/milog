@@ -256,8 +256,24 @@ WEB_TOKEN_FILE="$HOME/.config/milog/web.token"
 #     LOGS=(myapp api web)          # or leave unset to auto-discover
 #     REFRESH=3
 MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
-# shellcheck disable=SC1090
-[[ -f "$MILOG_CONFIG" ]] && . "$MILOG_CONFIG"
+
+# True when root owns the path and its directory and neither is group/other-writable.
+_root_trusted_path() {
+    local p meta
+    for p in "$1" "$(dirname "$1")"; do
+        meta=$(stat -c '%u %a' "$p" 2>/dev/null || stat -f '%u %Lp' "$p" 2>/dev/null) || return 1
+        [[ "${meta%% *}" == 0 ]] && (( (8#${meta#* } & 8#022) == 0 )) || return 1
+    done
+}
+
+if [[ -f "$MILOG_CONFIG" ]]; then
+    if [[ $EUID -ne 0 ]] || _root_trusted_path "$MILOG_CONFIG"; then
+        # shellcheck disable=SC1090
+        . "$MILOG_CONFIG"
+    else
+        echo "milog: running as root, refusing to source $MILOG_CONFIG (not root-owned or group/other-writable)" >&2
+    fi
+fi
 
 # Env var overrides win over the config file. MILOG_* prefix keeps them
 # from colliding with generic shell env. Add new knobs here when you want
