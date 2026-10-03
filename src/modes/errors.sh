@@ -132,9 +132,10 @@ _errors_summary() {
         return 0
     fi
 
-    local cutoff cutoff_fmt
+    local cutoff cutoff_fmt end
     cutoff=$(_alerts_window_to_epoch "$window") || return 1
     cutoff_fmt=$(_alerts_fmt_epoch "$cutoff")
+    end=$(_alerts_window_end_epoch "$window")
 
     # Filter once: in-window AND rule_key starts with `app:`. Optional
     # source/pattern filters refine further. awk does the heavy lift; bash
@@ -145,9 +146,11 @@ _errors_summary() {
 
     awk -F'\t' \
         -v cutoff="$cutoff" \
+        -v end="$end" \
         -v want_src="$want_source" \
         -v want_pat="$want_pattern" '
         $1 < cutoff { next }
+        end != 0 && $1 >= end { next }
         $2 !~ /^app:/ { next }
         {
             n = split($2, parts, ":")
