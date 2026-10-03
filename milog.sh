@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-43-g5ba2834-dirty
+# MILOG_VERSION=v0.3.0-53-g325fd34
 # MILOG_BUILT=2026-10-03T16:18:19Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
