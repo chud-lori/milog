@@ -1,30 +1,7 @@
-# ==============================================================================
-# MODE: silence — mute a rule (or glob of rules) while on-call works the fix
-#
-# Counterpart to the fire path: when a MiLog rule keeps pinging Discord every
-# ALERT_COOLDOWN seconds and you're already fixing the cause, mute it. The
-# silence outranks cooldown + dedup and even blocks the alerts.log record so
-# history stays signal-only.
-#
-# Subcommands:
-#   milog silence <rule_or_glob> <duration> [message]   add or extend
-#   milog silence list                                  show active silences
-#   milog silence clear <rule_or_glob>                  remove early
-#
-# Duration grammar: <N><s|m|h|d>  — `30s`, `5m`, `2h`, `1d`. A bare integer is
-# treated as seconds.
-#
-# Glob matching: bash glob syntax. `exploits:*` matches every `exploits:<cat>`
-# key fired by the exploits classifier. Be careful with overly broad globs —
-# `*` would silence literally every rule.
-#
-# Attribution: $USER (or `id -un` fallback) is recorded alongside each silence
-# so `milog silence list` shows WHO muted what. Useful even on single-user
-# hosts — the daemon writes as its own user; manual silences show as yours.
-# ==============================================================================
+# milog silence <rule_or_glob> <duration> [message] | list | clear <rule_or_glob>.
+# A silence outranks cooldown and dedup and also skips the alerts.log record; globs use bash syntax, so `*` mutes everything.
 
-# Human-readable "time remaining" from a future epoch. 0+ only (caller
-# guarantees unexpired rows).
+# Remaining time until a future epoch.
 _silence_fmt_remaining() {
     local now target delta
     now=$(date +%s)
@@ -41,7 +18,6 @@ _silence_fmt_remaining() {
     fi
 }
 
-# Human-readable absolute time, GNU/BSD portable (same trick as alerts.sh).
 _silence_fmt_epoch() {
     date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
     || date -r  "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
@@ -169,8 +145,6 @@ mode_silence() {
             _silence_help
             ;;
         *)
-            # Otherwise treat the first arg as the rule key and the rest as
-            # `<duration> [message]` — the most-used path.
             _silence_add "$@"
             ;;
     esac

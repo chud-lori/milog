@@ -92,8 +92,8 @@ ALERT_HOOK_TIMEOUT=10
 # Per-rule destinations, one `key: dest ...` per line; lookup is exact rule, then prefix before `:`, then `default`.
 # Destinations: discord slack telegram matrix webhook, or `skip`; empty fans out to everything.
 #   ALERT_ROUTES="
-#     exploits: slack telegram
-#     probes:   skip
+#     exploit:  slack telegram
+#     probe:    skip
 #     default:  discord
 #   "
 ALERT_ROUTES=""

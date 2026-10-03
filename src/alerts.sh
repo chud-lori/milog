@@ -189,7 +189,7 @@ alert_silence_prune() {
     mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
 }
 
-# Prints the matching row; `[[ == $key ]]` is a glob match, so `exploits:*` covers every exploits rule.
+# Prints the matching row; `[[ == $key ]]` is a glob match, so `exploit:*` covers every exploit rule.
 alert_is_silenced() {
     local rule="${1:-}"
     [[ -n "$rule" ]] || return 1

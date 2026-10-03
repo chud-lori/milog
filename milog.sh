@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-41-gbabfd28-dirty
-# MILOG_BUILT=2026-10-03T15:46:38Z
+# MILOG_VERSION=v0.3.0-42-g1394298-dirty
+# MILOG_BUILT=2026-10-03T15:52:41Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -94,8 +94,8 @@ ALERT_HOOK_TIMEOUT=10
 # Per-rule destinations, one `key: dest ...` per line; lookup is exact rule, then prefix before `:`, then `default`.
 # Destinations: discord slack telegram matrix webhook, or `skip`; empty fans out to everything.
 #   ALERT_ROUTES="
-#     exploits: slack telegram
-#     probes:   skip
+#     exploit:  slack telegram
+#     probe:    skip
 #     default:  discord
 #   "
 ALERT_ROUTES=""
@@ -537,7 +537,7 @@ alert_silence_prune() {
     mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
 }
 
-# Prints the matching row; `[[ == $key ]]` is a glob match, so `exploits:*` covers every exploits rule.
+# Prints the matching row; `[[ == $key ]]` is a glob match, so `exploit:*` covers every exploit rule.
 alert_is_silenced() {
     local rule="${1:-}"
     [[ -n "$rule" ]] || return 1
@@ -1698,26 +1698,8 @@ _web_stop() {
     fi
     rm -f "$pf"
 }
-# ==============================================================================
-# MODE: alert — toggle alerting + manage the systemd service
-#
-# Subcommands:
-#   on [WEBHOOK_URL]  — set Discord webhook (optional), enable, install+start systemd
-#   off               — disable alerts, stop + disable systemd
-#   status            — show destinations / service / recent-fire state
-#   test              — fire a one-off alert to EVERY configured destination
-#                       (Discord + Slack + Telegram + Matrix), bypassing
-#                       cooldown and ALERTS_ENABLED. Any silent channel is
-#                       a wire issue, not config.
-#
-# `milog alert on` wires only Discord (historical default). Other
-# destinations are opt-in via config file or env var — see docs/alerts.md.
-#
-# When invoked via sudo, we write config into the *invoking* user's home
-# (resolved from SUDO_USER) and run the systemd service as that user — not
-# as root. Matches user intuition: `sudo milog alert on` sets up alerting
-# for the person who ran it, not for root.
-# ==============================================================================
+# milog alert on|off|status|test: toggle alerting and the systemd service.
+# Under sudo, config goes to SUDO_USER's home and the service runs as that user, not root.
 
 _alert_target_user() {
     if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
@@ -1733,8 +1715,7 @@ _alert_target_home() {
     [[ -n "$h" ]] && printf '%s' "$h" || printf '%s' "${HOME:-/root}"
 }
 
-# Upsert a single KEY=VALUE line in the target user's config file. Handles
-# dir creation + ownership fix when running as root on behalf of a user.
+# Upserts KEY=VALUE in the target user's config.
 _alert_write_config() {
     local target_user="$1" target_home="$2" line="$3"
     local dir="$target_home/.config/milog" file="$target_home/.config/milog/config.sh"
@@ -1750,16 +1731,12 @@ _alert_write_config() {
     else
         printf '%s\n' "$line" >> "$file"
     fi
-    # Fix ownership so the target user can read/edit their own config when
-    # the write happened as root.
     if [[ $(id -u) -eq 0 && "$target_user" != "root" ]]; then
         chown -R "$target_user:$target_user" "$dir" 2>/dev/null || true
     fi
 }
 
-# Read DISCORD_WEBHOOK from a config file (strips surrounding quotes).
-# Always returns 0 and emits empty string when the config doesn't exist or
-# doesn't set the key — keeps callers simple under `set -euo pipefail`.
+# Always returns 0, printing nothing when the file or key is missing, to stay safe under `set -e`.
 _alert_read_webhook() {
     local file="$1"
     [[ -f "$file" ]] || return 0
@@ -1771,21 +1748,13 @@ _alert_read_webhook() {
     return 0
 }
 
-# Read the (possibly multiline) ALERT_ROUTES value from a config file.
-# Sources the file in a subshell to get the real bash-parsed value, then
-# echoes it. `_alert_read_key` grep-hack can't handle heredoc-style
-# multiline assignments, so routing gets its own helper.
-#
-# Silent + empty on any error — caller treats empty as "no routing".
+# Sources the file in a subshell because ALERT_ROUTES is usually a multi-line string the grep readers can't parse.
 _alert_read_routes() {
     local file="$1"
     [[ -r "$file" ]] || return 0
-    # Subshell insulation: ALERT_ROUTES from the target config overrides
-    # any env-loaded value only for the duration of this subshell.
     ( set +u; ALERT_ROUTES=""; . "$file" 2>/dev/null; printf '%s' "$ALERT_ROUTES" ) || true
 }
 
-# Read a simple KEY's value from the config file — same no-fail contract.
 _alert_read_key() {
     local file="$1" key="$2"
     [[ -f "$file" ]] || return 0
@@ -1797,7 +1766,7 @@ _alert_read_key() {
     return 0
 }
 
-# Write + enable the milog systemd unit. Caller must already be root.
+# Caller must be root.
 _alert_install_service() {
     local target_user="$1" target_config="$2"
     local exe unit="/etc/systemd/system/milog.service"
@@ -1823,7 +1792,6 @@ EOF
     systemctl restart milog.service
 }
 
-# Short human-readable duration — "12s", "3m", "5h", "2d".
 _alert_fmt_dur() {
     local s="$1"
     if   (( s < 60 ));    then printf '%ds' "$s"
@@ -1908,9 +1876,7 @@ alert_status() {
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
 
-    # Read all destinations from the target config. Done via _alert_read_key
-    # (not env) so `sudo milog alert status` shows alice's real config,
-    # not root's. Empty strings when unset.
+    # Read from the target config, not env, so `sudo milog alert status` shows the user's settings rather than root's.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url
     d_url=$(_alert_read_webhook "$target_config")
     s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
@@ -1948,9 +1914,6 @@ alert_status() {
     printf "  %-18s %s\n"  "config"          "$target_config"
     printf "  %-18s %b\n"  "systemd service" "$svc_state"
 
-    # Routing block — only shown when ALERT_ROUTES is configured. Reads the
-    # full block from the target config (not env) for the same sudo-vs-user
-    # reason as destinations above.
     local routes_raw
     routes_raw=$(_alert_read_routes "$target_config")
     if [[ -n "$routes_raw" ]]; then
@@ -1998,10 +1961,7 @@ alert_test() {
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
 
-    # Pull every destination from the target-user's config file, not the
-    # env this process started with. Makes `sudo milog alert test` test
-    # alice's full fanout (Discord + Slack + Telegram + Matrix + Webhook),
-    # not just whatever happens to live in root's env.
+    # Target user's config, not this process's env, for the same sudo reason as alert_status.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url wh_template wh_ctype
     d_url=$(      _alert_read_webhook "$target_config")
     s_url=$(      _alert_read_key "$target_config" "SLACK_WEBHOOK")
@@ -2014,9 +1974,6 @@ alert_test() {
     wh_template=$(_alert_read_key "$target_config" "WEBHOOK_TEMPLATE")
     wh_ctype=$(   _alert_read_key "$target_config" "WEBHOOK_CONTENT_TYPE")
 
-    # Track which destinations will actually fire so we can print a
-    # per-destination line. Mirrors the readiness logic in each
-    # _alert_send_* guard.
     local -a dests_ok=() dests_partial=()
     [[ -n "$d_url"    ]] && dests_ok+=("discord")
     [[ -n "$s_url"    ]] && dests_ok+=("slack")
@@ -2036,10 +1993,7 @@ alert_test() {
         return 1
     fi
 
-    # Swap every destination var into the process env so alert_fire's
-    # fanout picks them all up. Saved + restored so a subsequent interactive
-    # alert (same bash session) still sees the original state. Force
-    # ALERTS_ENABLED=1 — test bypasses the master switch by design.
+    # Swap the target's destinations into the env for alert_fire, forcing ALERTS_ENABLED=1, then restore them.
     local _s_enabled="$ALERTS_ENABLED" _s_dw="$DISCORD_WEBHOOK" _s_sw="$SLACK_WEBHOOK"
     local _s_tt="$TELEGRAM_BOT_TOKEN" _s_tc="$TELEGRAM_CHAT_ID"
     local _s_mh="$MATRIX_HOMESERVER"  _s_mt="$MATRIX_TOKEN"    _s_mr="$MATRIX_ROOM"
@@ -2050,7 +2004,6 @@ alert_test() {
     TELEGRAM_BOT_TOKEN="$tg_token"; TELEGRAM_CHAT_ID="$tg_chat"
     MATRIX_HOMESERVER="$mx_hs";     MATRIX_TOKEN="$mx_token";  MATRIX_ROOM="$mx_room"
     WEBHOOK_URL="$wh_url"
-    # Empty template / ctype from target config → keep the process defaults.
     [[ -n "$wh_template" ]] && WEBHOOK_TEMPLATE="$wh_template"
     [[ -n "$wh_ctype"    ]] && WEBHOOK_CONTENT_TYPE="$wh_ctype"
 
@@ -2111,44 +2064,15 @@ mode_alert() {
     esac
 }
 
-# ==============================================================================
-# MODE: alerts — read the local alert history log
-#
-# The log itself is appended to by `_alert_record` (called from
-# `alert_discord`) — one TSV row per fired alert. This mode presents the
-# "what fired overnight? / this week?" view that was previously
-# unanswerable (the cooldown state file tracks last-fire per rule but
-# not history).
-#
-# Window grammar:
-#   today        since local midnight today
-#   yesterday    24h window ending at today's midnight
-#   all          no cutoff
-#   <N>m         last N minutes
-#   <N>h         last N hours
-#   <N>d         last N days
-#   <N>w         last N weeks
-# Default: today.
-#
-# Log file:       $ALERT_STATE_DIR/alerts.log
-# Rotation:       automatic, in-place, on each append. When the file
-#                 exceeds ALERT_LOG_MAX_BYTES (default 10 MB) it's truncated
-#                 to ~50% keeping the most recent records. No `.1` backup.
-#                 Set ALERT_LOG_MAX_BYTES=0 to disable.
-# ==============================================================================
+# milog alerts [window]: what fired, read from alerts.log.
 
-# Parse a window spec (today/yesterday/all/Nh/Nd/Nw) to a Unix epoch cutoff.
-# Echoes the cutoff on success; non-zero exit + stderr message on invalid
-# input. Separated from mode_alerts so tests can exercise it independently.
+# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; there is no upper bound, so `yesterday` includes today.
 _alerts_window_to_epoch() {
     local w="$1"
     local now; now=$(date +%s)
     case "$w" in
         today)
-            # Local midnight today — (now % 86400) is seconds since UTC
-            # midnight, not local, but on most servers localtime=UTC and it
-            # doesn't meaningfully drift. Precise-to-the-timezone is overkill
-            # for an "alerts today" view.
+            # UTC midnight, not local; close enough for this view.
             echo $(( now - (now % 86400) ))
             ;;
         yesterday)
@@ -2184,8 +2108,6 @@ _alerts_window_to_epoch() {
     esac
 }
 
-# Human-readable timestamp from epoch, portable across GNU/BSD date.
-# Used for the WHEN column in the table.
 _alerts_fmt_epoch() {
     date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
     || date -r  "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
@@ -2208,7 +2130,6 @@ mode_alerts() {
 
     echo -e "\n${W}── MiLog: Alerts since ${cutoff_fmt} (window=$window) ──${NC}\n"
 
-    # Filter once by epoch, feed the result to both the list and the summary.
     local filtered; filtered=$(mktemp -t milog_alerts.XXXXXX) || return 1
     # shellcheck disable=SC2064
     trap "rm -f '$filtered'" RETURN
@@ -2223,9 +2144,7 @@ mode_alerts() {
         return 0
     fi
 
-    # --- Timeline (last ~30 rows, chronological) ---------------------------
-    # Most recent is most relevant, but humans read top-down and expect
-    # chronological order. Cap at 30 so the table stays glanceable.
+    # Newest 30 rows, oldest first.
     local list_cap=30
     local shown=$total
     (( shown > list_cap )) && shown=$list_cap
@@ -2233,9 +2152,7 @@ mode_alerts() {
     printf "  %-16s  %-28s  %s\n" "WHEN" "RULE" "TITLE"
     printf "  %-16s  %-28s  %s\n" "────────────────" "────────────────────────────" "──────"
 
-    # Per-row format in bash — calling _alerts_fmt_epoch (which forks date)
-    # inside awk's strftime is gawk-only; BSD awk on macOS lacks strftime.
-    # 30 row cap keeps the fork count trivial.
+    # Format dates in bash: awk strftime is gawk-only.
     local epoch rule color title body when rule_disp title_disp col
     while IFS=$'\t' read -r epoch rule color title body; do
         [[ -z "$epoch" ]] && continue
@@ -2244,10 +2161,6 @@ mode_alerts() {
         (( ${#rule_disp} > 28 )) && rule_disp="${rule_disp:0:25}..."
         title_disp="$title"
         (( ${#title_disp} > 50 )) && title_disp="${title_disp:0:47}..."
-        # Color the rule column by severity (derived from Discord color int):
-        #   15158332 / 16711680 → crit  (red)    — exploits, 5xx, sys crit
-        #   16753920 / 15844367 → warn  (yellow) — 4xx spike, probes
-        #   other               → info  (green)  — test alert etc.
         case "$color" in
             15158332|16711680)    col="$R" ;;
             16753920|15844367)    col="$Y" ;;
@@ -2256,7 +2169,6 @@ mode_alerts() {
         printf "  %-16s  %b%-28s%b  %s\n" "$when" "$col" "$rule_disp" "$NC" "$title_disp"
     done < <(tail -n "$list_cap" "$filtered")
 
-    # --- Summary by rule ----------------------------------------------------
     echo -e "\n  ${W}by rule (top 10)${NC}"
     awk -F'\t' '{c[$2]++} END {for (r in c) printf "%d\t%s\n", c[r], r}' "$filtered" \
         | sort -rn | head -n 10 \
@@ -2264,31 +2176,7 @@ mode_alerts() {
 
     echo -e "\n  ${D}total: $total alert(s) in window — log at $log_file${NC}\n"
 }
-# ==============================================================================
-# MODE: attacker <IP> — forensic view of one IP's activity across all apps
-#
-# Used during/after an incident: given an IP pulled from `milog top`,
-# `milog suspects`, a Discord alert, or a fail2ban ban event — this mode
-# shows everything that IP did, across all configured apps, in one report.
-#
-# Output sections (in order):
-#   1. Header:         ip, geo country, scan window
-#   2. Summary:        total hits, first-seen, last-seen, unique apps
-#   3. Per-app:        hits / 4xx / 5xx per app
-#   4. Top paths:      most-requested URLs (query strings stripped)
-#   5. Top UAs:        distinct user-agents, ranked
-#   6. Classification: exploit vs probe vs normal distribution
-#   7. Sample:         first 3 + last 3 raw loglines for context
-#
-# Scope: reads current `.access.log` files only. Rotated logs (.1, .gz)
-# are ignored — run multiple times with different `LOG_DIR` overrides if
-# you need older data, or add a --archives flag later.
-#
-# IP is passed through a character-class regex guard (digits / hex / . / :)
-# before it ever reaches grep, so an attacker can't inject regex metachars
-# via, say, a webhook-triggered invocation. grep uses -F for fixed-string
-# matching too.
-# ==============================================================================
+# milog attacker <IP>: everything one IP did across all apps' current access logs (rotated logs are not read).
 mode_attacker() {
     local ip="${1:-}"
     if [[ -z "$ip" ]]; then
@@ -2296,14 +2184,12 @@ mode_attacker() {
         echo -e "${D}  scans all apps' current access.log for one IP's activity${NC}" >&2
         return 1
     fi
-    # Allow v4 (dots + digits) and v6 (hex + colons). Reject everything else
-    # so no regex metacharacter ever reaches awk/grep.
+    # Only hex digits, dots and colons get through to awk.
     if [[ ! "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
         echo -e "${R}invalid IP: $ip${NC}" >&2
         return 1
     fi
 
-    # Gather files.
     local files=() name
     for name in "${LOGS[@]}"; do
         [[ -f "$LOG_DIR/$name.access.log" ]] && files+=("$LOG_DIR/$name.access.log")
@@ -2313,15 +2199,12 @@ mode_attacker() {
         return 1
     fi
 
-    # Tmp: one tab-separated row per request: "<app>\t<raw_logline>".
+    # One "<app>\t<raw line>" row per request.
     local tmp; tmp=$(mktemp -t milog_attacker.XXXXXX) || return 1
-    # Use RETURN trap so tmp is cleaned even on a `return` path below.
     # shellcheck disable=SC2064
     trap "rm -f '$tmp'" RETURN
 
-    # Stream each app's log, keep only lines where field 1 == $ip. awk's
-    # exact-field match beats grep here — avoids matching "10.0.0.10" when
-    # probing for "10.0.0.1".
+    # Exact field match, so 10.0.0.1 doesn't also match 10.0.0.10.
     for name in "${LOGS[@]}"; do
         local f="$LOG_DIR/$name.access.log"
         [[ -f "$f" ]] || continue
@@ -2331,7 +2214,6 @@ mode_attacker() {
     local total; total=$(wc -l < "$tmp" | tr -d ' ')
     total=${total:-0}
 
-    # --- Header --------------------------------------------------------------
     local country=""
     country=$(geoip_country "$ip" 2>/dev/null || true)
     local tag=""
@@ -2344,9 +2226,7 @@ mode_attacker() {
         return 0
     fi
 
-    # --- Summary -------------------------------------------------------------
-    # Timestamp extraction: portable awk (POSIX match returns RSTART/RLENGTH —
-    # the gawk-only 3-arg form breaks on BSD awk / mawk).
+    # 2-arg match() only; the 3-arg form is gawk-only.
     local first_seen last_seen apps_hit
     first_seen=$(head -n 1 "$tmp" | awk -F'\t' '
         { if (match($2, /\[[^]]+\]/)) print substr($2, RSTART+1, RLENGTH-2) }')
@@ -2359,7 +2239,6 @@ mode_attacker() {
     printf "  %-14s %s\n"  "last seen:"  "${last_seen:-?}"
     printf "  %-14s %d of %d\n" "apps touched:" "$apps_hit" "${#LOGS[@]}"
 
-    # --- Per-app breakdown ---------------------------------------------------
     echo -e "\n  ${W}per-app${NC}"
     awk -F'\t' '
         {
@@ -2386,7 +2265,6 @@ mode_attacker() {
                    $2, $1, c4col, $3, c4end, c5col, $4, c5end
         }'
 
-    # --- Top paths -----------------------------------------------------------
     echo -e "\n  ${W}top paths${NC}"
     awk -F'\t' '
         {
@@ -2407,7 +2285,6 @@ mode_attacker() {
         printf "    %5d  %s\n", $1, p
     }'
 
-    # --- Top user-agents -----------------------------------------------------
     echo -e "\n  ${W}top user-agents${NC}"
     awk -F'\t' '
         {
@@ -2437,10 +2314,7 @@ mode_attacker() {
         printf "    %5d  %s\n", $1, u
     }'
 
-    # --- Classification ------------------------------------------------------
-    # Substring-matched against the path — cheap, deterministic, close enough
-    # for "is this exploit/probe traffic?" not "CVE-level precision".
-    # Categories mirror src/alerts.sh::_exploit_category.
+    # Rough path-substring buckets, close to but not identical to _exploit_category.
     echo -e "\n  ${W}classification${NC}"
     awk -F'\t' '
         {
@@ -2469,7 +2343,6 @@ mode_attacker() {
             printf "    %s%5d  %-12s%s\n", col, $1, $2, nc
         }'
 
-    # --- Sample loglines -----------------------------------------------------
     echo -e "\n  ${W}sample (first 3 + last 3)${NC}"
     local head_lines tail_lines
     head_lines=$(( total < 3 ? total : 3 ))
@@ -2482,29 +2355,11 @@ mode_attacker() {
     fi
     echo
 }
-# ==============================================================================
-# MODE: audit — point-in-time host integrity scans
-#
-# Today: file integrity monitoring (FIM). SHA256 baseline of a configurable
-# watchlist (AUDIT_FIM_PATHS) re-checked on a timer. Drift fires
-# `audit:fim:<path>` through the existing alert path — silence + cooldown
-# + dedup all apply for free.
-#
-# Layout: `audit` is the umbrella subcommand. `fim` is the first scanner;
-# more land beside it (persistence diff, listening-port baseline, SSH key
-# audit, rootkit hints) without renaming anything.
-#
-# Storage: $ALERT_STATE_DIR/audit/fim.baseline (TSV, one row per path)
-#   <path>\t<sha256>\t<mtime_epoch>\t<size_bytes>\t<recorded_epoch>
-# Special sha256 value `MISSING` means the path was absent at baseline
-# time — alerts fire when an absent path subsequently appears.
-# ==============================================================================
+# milog audit: host integrity scanners (fim, persistence, ports, yara, accounts, rootkit).
+# Drift goes through alert_fire, so silence, cooldown and dedup apply.
+# fim.baseline rows: path, sha256, mtime, size, recorded; sha256 MISSING means absent at baseline time.
 
-# --- helpers ------------------------------------------------------------------
-
-# Portable sha256 of one file. Returns the hex digest on stdout, empty on
-# error (unreadable / nonexistent). Avoids forking the same binary
-# differently across distros.
+# Hex digest, or empty when unreadable.
 _audit_sha256() {
     local path="$1"
     [[ -r "$path" ]] || return 0
@@ -2515,9 +2370,7 @@ _audit_sha256() {
     fi
 }
 
-# Portable mtime + size in epoch seconds + bytes. Returns "<mtime>\t<size>"
-# on stdout, empty on missing-file. GNU stat (`-c`) on Linux, BSD stat
-# (`-f`) on macOS — same outputs, different flags.
+# "<mtime>\t<size>" via GNU stat -c, falling back to BSD stat -f.
 _audit_stat() {
     local path="$1"
     [[ -e "$path" ]] || return 0
@@ -2531,10 +2384,7 @@ _audit_state_dir() {
     printf '%s' "$d"
 }
 
-# Expand AUDIT_FIM_PATHS with shell globbing into a deduped, sorted list of
-# concrete paths. Patterns that match nothing contribute the literal
-# pattern itself — so a watchlist entry pointing at a path that doesn't
-# exist yet is still tracked (and fires the moment it does appear).
+# Watchlist globs expanded to a sorted, deduped path list.
 _audit_fim_expand_paths() {
     local pat path
     local -a out=()
@@ -2546,24 +2396,15 @@ _audit_fim_expand_paths() {
                 out+=("$path")
             done
         else
-            # No match — keep the literal pattern so absence is auditable.
-            # (Globless paths fall through here too — `/etc/shadow` with no
-            # glob chars matches itself if present, lands in this branch
-            # otherwise.)
+            # nullglob only drops patterns with glob chars, so this branch is unmatched globs; literal paths never reach it.
             out+=("$pat")
         fi
     done
     shopt -u nullglob
-    # Dedupe + sort for stable diff output.
     printf '%s\n' "${out[@]}" | sort -u
 }
 
-# --- baseline / check ---------------------------------------------------------
-
-# (Re)build the FIM baseline from the current filesystem state. Overwrites
-# the previous baseline. No alerts fire — this is the "I trust the host
-# right now" moment. Use `milog audit fim check` to compare against the
-# baseline later.
+# Overwrites the baseline without alerting.
 _audit_fim_baseline() {
     local dir; dir=$(_audit_state_dir)
     local out="$dir/fim.baseline"
@@ -2589,20 +2430,11 @@ _audit_fim_baseline() {
     done < <(_audit_fim_expand_paths)
 
     mv "$tmp" "$out"
-    # Stdout: `<count_present> <count_missing> <path>` — read with
-    # `read present missing path` in the caller. Three fields on one
-    # line dodges the subshell-scope problem that bites globals when
-    # this function is invoked via $().
+    # One "<present> <missing> <path>" line so callers can `read` it; globals don't survive $(...).
     printf '%d %d %s\n' "$count" "$missing" "$out"
 }
 
-# Compare current state against the baseline. Stdout: one line per
-# drifted path, format `<change>\t<path>\t<old>→<new>`. Change types:
-#   MODIFIED   sha256 differs
-#   APPEARED   was MISSING, now present
-#   REMOVED    was present, now MISSING
-#   UNREADABLE was readable, now denied (perm change is itself signal)
-# Empty stdout = no drift.
+# One `<change>\t<path>\t<old>→<new>` line per drifted path: MODIFIED, APPEARED, REMOVED or UNREADABLE.
 _audit_fim_diff() {
     local dir; dir=$(_audit_state_dir)
     local baseline="$dir/fim.baseline"
@@ -2618,8 +2450,7 @@ _audit_fim_diff() {
             if [[ "$old_sha" == "MISSING" ]]; then
                 printf 'APPEARED\t%s\t%s→%s\n' "$path" "$old_sha" "${new_sha:0:16}"
             elif [[ "$old_sha" == "UNREADABLE" && "$new_sha" != "UNREADABLE" ]]; then
-                # Was perm-blocked at baseline, now readable — record as
-                # APPEARED-equivalent so the operator sees the new content.
+                # Readable for the first time since baseline, so report it like a new file.
                 printf 'APPEARED\t%s\t%s→%s\n' "$path" "$old_sha" "${new_sha:0:16}"
             elif [[ "$old_sha" != "$new_sha" ]]; then
                 if [[ "$new_sha" == "UNREADABLE" ]]; then
@@ -2636,9 +2467,7 @@ _audit_fim_diff() {
     done < "$baseline"
 }
 
-# Daemon-side periodic check. Auto-baselines on first run (no alerts);
-# later runs alert on drift. Throttled by AUDIT_FIM_INTERVAL via an
-# epoch marker file so multiple daemon ticks per minute don't all hash.
+# Daemon check, at most once per AUDIT_FIM_INTERVAL; the first run baselines silently.
 _audit_fim_tick() {
     [[ "${AUDIT_ENABLED:-0}" == "1" ]] || return 0
     local dir; dir=$(_audit_state_dir)
@@ -2653,16 +2482,11 @@ _audit_fim_tick() {
     fi
 
     if [[ ! -f "$baseline" ]]; then
-        # First run: silently baseline. The user's own
-        # `milog audit fim check` is how to verify the watchlist —
-        # surprise-firing on the first daemon tick would be noise.
-        # We discard the count line; the daemon doesn't print it.
         _audit_fim_baseline >/dev/null 2>&1
         printf '%s' "$now" > "$marker"
         return 0
     fi
 
-    # Drift check; one alert per drifted path.
     local change path detail key body
     while IFS=$'\t' read -r change path detail; do
         [[ -z "$change" ]] && continue
@@ -2675,8 +2499,6 @@ _audit_fim_tick() {
 
     printf '%s' "$now" > "$marker"
 }
-
-# --- user-facing subcommands --------------------------------------------------
 
 mode_audit() {
     case "${1:-}" in
@@ -2694,9 +2516,7 @@ mode_audit() {
 }
 
 _audit_help() {
-    # printf '%b' interprets the \033 escape sequences in $W / $C / $NC.
-    # `cat <<EOF` would pass them through as the literal 4-char string
-    # \033[…m, which is what users on real terminals would actually see.
+    # printf '%b' renders the \033 escapes in $W/$C/$NC; a heredoc would print them literally.
     printf '%b' "
 ${W}milog audit${NC} — point-in-time host integrity scans
 
@@ -2792,23 +2612,8 @@ _audit_fim_subcmd() {
     esac
 }
 
-# ==============================================================================
-# Persistence diff — file-existence drift across the classic re-entry surface
-# (cron drops, systemd units, rc.local, ld.so.preload). Tracks "did a file
-# appear that wasn't there before?" — the high-signal half of post-compromise
-# scanning. Hash-drift on existing files is FIM's job; this scanner watches
-# directories where attackers DROP NEW FILES.
-#
-# Storage: $ALERT_STATE_DIR/audit/persistence.baseline (TSV)
-#   <path>\t<size>\t<mtime_epoch>\t<recorded_epoch>
-#
-# Drift policy:
-#   APPEARED  fires alert. Sysadmin adding a unit usually goes through
-#             config management; a new file in /etc/cron.d/ that wasn't
-#             planned is exactly what we want to know about.
-#   REMOVED   informational on `check` output but does NOT alert. Pruning
-#             stale units is normal sysadmin housekeeping.
-# ==============================================================================
+# Persistence: file-existence diff over cron, systemd and rc paths. Only APPEARED alerts; removals are housekeeping.
+# persistence.baseline rows: path, size, mtime, recorded.
 
 _audit_persistence_expand() {
     local pat path
@@ -2818,17 +2623,12 @@ _audit_persistence_expand() {
         local -a matches=( $pat )
         if (( ${#matches[@]} > 0 )); then
             for path in "${matches[@]}"; do
-                # Skip directories — cron drops and systemd units are files.
-                # A bare directory entry from the glob would match every
-                # daemon tick and produce no useful baseline.
+                # Only files; a directory match would never change.
                 [[ -d "$path" ]] && continue
                 out+=("$path")
             done
         fi
-        # Globs that match nothing contribute zero entries — different from
-        # FIM where literal-tracked-as-absent is desirable. For persistence
-        # we only care about presence; a never-populated /etc/cron.d/ tree
-        # is the steady state, not signal.
+        # Unmatched globs add nothing, but nullglob leaves literal paths in place even when they don't exist.
     done
     shopt -u nullglob
     printf '%s\n' "${out[@]}" | sort -u
@@ -2854,9 +2654,7 @@ _audit_persistence_baseline() {
     printf '%d %s\n' "$count" "$out"
 }
 
-# Diff current vs baseline. Stdout: `<change>\t<path>` per line.
-# Changes: APPEARED, REMOVED. APPEARED fires alerts; REMOVED is shown
-# in `check` output but doesn't fire.
+# `<change>\t<path>` lines, APPEARED or REMOVED.
 _audit_persistence_diff() {
     local dir; dir=$(_audit_state_dir)
     local baseline="$dir/persistence.baseline"
@@ -2869,7 +2667,7 @@ _audit_persistence_diff() {
     trap "rm -f '$current' '$sorted_baseline'" RETURN
     _audit_persistence_expand > "$current"
 
-    # comm needs sorted inputs. Strip baseline to its path column first.
+    # comm needs sorted input.
     awk -F'\t' '{print $1}' "$baseline" | sort -u > "$sorted_baseline"
 
     # APPEARED: in current, not in baseline.
@@ -2897,7 +2695,6 @@ _audit_persistence_tick() {
         return 0
     fi
 
-    # Only APPEARED entries fire — REMOVED is intentional silent (housekeeping).
     local change path key body
     while IFS=$'\t' read -r change path; do
         [[ "$change" == "APPEARED" ]] || continue
@@ -2982,27 +2779,13 @@ _audit_persistence_subcmd() {
     esac
 }
 
-# ==============================================================================
-# Listening-port baseline — snapshot every TCP/UDP listener at first run,
-# diff each subsequent tick. NEW listener fires; gone listener is silent
-# (services restart routinely; the brief gap shouldn't page anyone).
-#
-# Storage: $ALERT_STATE_DIR/audit/ports.baseline (TSV)
-#   <proto>\t<bind>\t<port>\t<recorded>
-#
-# Capture: prefers `ss -tulnH` (iproute2). Falls back to `netstat -tunl`
-# on hosts where ss isn't available — same fields, slower. PID/process
-# columns intentionally NOT captured: `ss -p` requires CAP_NET_ADMIN /
-# root and we never escalate ourselves; the bind+port tuple is enough
-# to fire the alert and let the operator investigate with `lsof -i`.
-# ==============================================================================
+# Ports: new TCP/UDP listeners alert, vanished ones don't. ports.baseline rows: proto, bind, port, recorded.
+# PIDs aren't captured because `ss -p` needs root.
 
-# Capture current listeners as TSV `<proto>\t<bind>\t<port>` rows.
-# Output is sorted+deduped so set-diff against baseline is straight `comm`.
+# Sorted `<proto>\t<bind>\t<port>` rows, ready for comm.
 _audit_ports_capture() {
     if command -v ss >/dev/null 2>&1; then
-        # `-H` (no header) is iproute2-recent; older versions ignore it
-        # and emit a header row that the awk filter below drops anyway.
+        # Older iproute2 ignores -H and prints a header, which the awk skips.
         ss -tulnH 2>/dev/null | awk '
             # Columns: Netid State Recv-Q Send-Q Local-Addr:Port Peer-Addr:Port ...
             # State col absent for UDP (where it would be UNCONN, not LISTEN);
@@ -3039,9 +2822,7 @@ _audit_ports_capture() {
             }
         ' | sort -u
     fi
-    # Both missing → empty stdout. Caller treats that as "no listeners",
-    # which is not great signal — but not our problem to fix; install a
-    # tools layer.
+    # With neither ss nor netstat the output is empty.
 }
 
 _audit_ports_baseline() {
@@ -3062,9 +2843,7 @@ _audit_ports_baseline() {
     printf '%d %s\n' "$count" "$out"
 }
 
-# Diff current vs baseline. Stdout: `<change>\t<proto>\t<bind>\t<port>` per
-# line. Changes: NEW (in current, not baseline), GONE (in baseline, not
-# current). Only NEW fires alerts.
+# `<change>\t<proto>\t<bind>\t<port>` lines, NEW or GONE.
 _audit_ports_diff() {
     local dir; dir=$(_audit_state_dir)
     local baseline="$dir/ports.baseline"
@@ -3184,34 +2963,10 @@ _audit_ports_subcmd() {
     esac
 }
 
-# ==============================================================================
-# YARA scan over webroot — pattern-match against a curated rule catalogue
-# every AUDIT_YARA_INTERVAL seconds. Daily default; webroots are large and
-# the regex pass is the heaviest of the audit scans.
-#
-# This module **shells out** to the system `yara` binary rather than
-# binding libyara directly. Two reasons:
-#   1. Curl-pipe install path stays single-file bash. Users on Debian
-#      run `apt install yara` once; daemon picks it up next tick.
-#   2. We don't yet need the live-fsnotify trigger that would justify
-#      the cgo cost — daily scans catch attacker-dropped webshells
-#      well before they're useful, and a missed window of < 24h is
-#      acceptable signal-vs-effort.
-#
-# Off until both of these are true:
-#   - `yara` binary is on PATH (logged-once warning otherwise)
-#   - AUDIT_YARA_PATHS contains at least one directory
-#
-# Match dedup: TSV at $ALERT_STATE_DIR/audit/yara.matches stores
-# `<rule>\t<file>\t<sha256>\t<first_seen>`. A second tick that finds
-# the same (rule, file, sha) tuple is silent — only NEW matches alert.
-# A modified file with the same rule firing alerts again (sha changed).
-# ==============================================================================
+# YARA over AUDIT_YARA_PATHS via the system yara binary; idle until the binary exists and a path is set.
+# yara.matches records rule, file, sha256, first_seen, so only new (rule, file, sha) combinations alert.
 
-# Embedded starter ruleset. Three conservative rules — high signal,
-# minimal false-positive risk on legit PHP webroots. User extends by
-# dropping more `.yar` files into AUDIT_YARA_RULES_DIR; we never
-# overwrite user files.
+# Starter rules, written once by `milog audit yara init` and never overwritten.
 _audit_yara_default_rules() {
     cat <<'YARA_RULES'
 /*
@@ -3271,8 +3026,6 @@ rule milog_webshell_families
 YARA_RULES
 }
 
-# Init the rules dir if missing. Returns 0 on success (dir exists with at
-# least one .yar file), 1 on failure to create.
 _audit_yara_init_rules() {
     local dir="${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}"
     mkdir -p "$dir" 2>/dev/null || return 1
@@ -3283,8 +3036,7 @@ _audit_yara_init_rules() {
     return 0
 }
 
-# `yara` binary present?  Caches the answer in a marker file so we don't
-# log the "missing" warning more than once per daemon lifetime.
+# The marker keeps the missing-binary warning to once.
 _audit_yara_have_binary() {
     if command -v yara >/dev/null 2>&1; then
         return 0
@@ -3298,29 +3050,18 @@ _audit_yara_have_binary() {
     return 1
 }
 
-# Scan one path with all .yar files in the rules dir. Stdout: one match
-# per line, format `<rule>\t<file>` (yara's `-s` for full match details
-# is too noisy for the alert body — we record the rule name + path and
-# leave deeper triage to the operator).
+# `<rule>\t<file>` per match.
 _audit_yara_scan_path() {
     local target="$1"
     local rules_dir="${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}"
     [[ -d "$target" || -f "$target" ]] || return 0
     [[ -d "$rules_dir" ]] || return 0
 
-    # `yara -r` recursive; per-file invocation per rule file lets us
-    # recover gracefully from one bad rule file without aborting the
-    # whole scan.
+    # One yara run per rule file so a broken file doesn't abort the scan.
     local yar
     for yar in "$rules_dir"/*.yar; do
         [[ -f "$yar" ]] || continue
-        # `yara` exit codes: 0 = no match, 1 = match, >1 = error.
-        # Output format `<rule_name> <file_path>` (space-separated).
-        # Convert to TSV for downstream parsing.
-        # NB: no `--` separator — `yara` 4.x treats `--` as a literal
-        # filename, not an end-of-options sentinel. Path arguments come
-        # from AUDIT_YARA_PATHS / AUDIT_YARA_RULES_DIR (operator config),
-        # so a leading-dash filename isn't a realistic attack surface.
+        # yara exits 1 on match. No `--`: yara 4.x treats it as a filename.
         yara -r -w "$yar" "$target" 2>/dev/null | awk '{
             rule = $1
             # File path can contain spaces; everything from $2 to EOL.
@@ -3331,15 +3072,7 @@ _audit_yara_scan_path() {
     done
 }
 
-# Run the full scan over every configured path, dedup against the
-# matches log. Stdout: one NEW match per line, `<rule>\t<file>\t<sha256>`.
-# Already-recorded (rule, file, sha) tuples are filtered out.
-#
-# Dedup uses fgrep against the matches log rather than an in-memory set.
-# Reasons: (a) typical webroot finds ≤ a handful of hits per scan, so
-# fork-per-match is cheap; (b) sidesteps bash-3.2's empty-array
-# `unbound variable` trap under `set -u`; (c) one less in-memory data
-# structure to keep coherent with the on-disk log.
+# Prints `<rule>\t<file>\t<sha256>` for matches not already in yara.matches.
 _audit_yara_scan_all() {
     local dir; dir=$(_audit_state_dir)
     local matches_log="$dir/yara.matches"
@@ -3353,12 +3086,9 @@ _audit_yara_scan_all() {
             sha=$(_audit_sha256 "$file")
             [[ -z "$sha" ]] && sha="UNREADABLE"
             line=$(printf '%s\t%s\t%s\t' "$rule" "$file" "$sha")
-            # Fixed-string match — rule/file/sha can't contain regex
-            # metacharacters that matter, but fgrep is faster anyway.
             if ! grep -Fq "$line" "$matches_log"; then
                 printf '%s\t%s\t%s\n' "$rule" "$file" "$sha"
-                # Record immediately so a same-tick duplicate path (e.g.
-                # the same file matched by two rules) doesn't double-fire.
+                # Record now so a file matched by two rules in one scan doesn't double-fire.
                 _audit_yara_record_match "$rule" "$file" "$sha"
             fi
         done < <(_audit_yara_scan_path "$p")
@@ -3388,16 +3118,12 @@ _audit_yara_tick() {
         return 0
     fi
 
-    # Bootstrap rules dir on first tick (also handles the case where
-    # the user wiped it). Failure is logged, not fatal.
     if ! _audit_yara_init_rules; then
         echo "milog: failed to init yara rules dir at ${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}" >&2
         printf '%s' "$now" > "$marker"
         return 0
     fi
 
-    # _audit_yara_scan_all records matches inline — we just fire alerts
-    # for what comes through (which is already deduped against the log).
     local rule file sha key body
     while IFS=$'\t' read -r rule file sha; do
         [[ -z "$rule" ]] && continue
@@ -3504,24 +3230,8 @@ _audit_yara_subcmd() {
     esac
 }
 
-# ==============================================================================
-# Account / SSH-key audit — line-level diff over the files where new
-# privileges materialise. Stronger than FIM here: FIM tells you "passwd
-# changed", this tells you "user `eve` was added with UID 0 and shell
-# /bin/bash". Same machinery as persistence-diff but per-file.
-#
-# Storage: $ALERT_STATE_DIR/audit/accounts/<sanitised-path> — full file
-# content captured at baseline time. comm against current state to find
-# ADDED / REMOVED lines. Sanitisation: `/` → `_`, leading underscore
-# stripped (so `/etc/passwd` becomes `etc_passwd`).
-#
-# Drift policy:
-#   ADDED   fires alert. Each baseline-vs-current run reports up to 5
-#           new lines in the body (capped to fit Discord's 4000-char
-#           limit even with many keys at once).
-#   REMOVED informational on `check` output but does NOT alert. Admins
-#           routinely revoke old SSH keys and clean up sudoers entries.
-# ==============================================================================
+# Accounts: line diff of passwd, sudoers and authorized_keys; only ADDED lines alert.
+# Baselines are full copies under audit/accounts/, named by path with `/` -> `_`.
 
 _audit_accounts_state_dir() {
     local d; d=$(_audit_state_dir)/accounts
@@ -3530,10 +3240,7 @@ _audit_accounts_state_dir() {
 }
 
 _audit_accounts_sanitise() {
-    # `/etc/sudoers.d/foo` → `etc_sudoers.d_foo`. Leading slash stripped
-    # so we don't end up with a hidden `_etc_...` file the operator can't
-    # see in `ls`. Backslash + colon also escaped for paranoia even
-    # though they're vanishingly unlikely in account-file paths.
+    # `/etc/sudoers.d/foo` -> `etc_sudoers.d_foo`; no leading `_`, so the file isn't hidden from `ls`.
     local p="$1"
     p="${p#/}"
     printf '%s' "${p//\//_}"
@@ -3556,20 +3263,15 @@ _audit_accounts_expand() {
     printf '%s\n' "${out[@]}" | sort -u
 }
 
-# Capture each tracked file's contents into the baseline dir. Returns
-# `<count> <baseline_dir>` so the caller can `read` it without subshell-
-# scope variable leakage.
+# Prints `<count> <dir>`.
 _audit_accounts_baseline() {
     local dir; dir=$(_audit_accounts_state_dir)
     local count=0 path safe
-    # Wipe the baseline dir on full re-baseline so files removed from
-    # AUDIT_ACCOUNTS_PATHS don't linger as ghost rows on subsequent diffs.
+    # Clear old baselines so paths dropped from the watchlist don't linger.
     rm -f "$dir"/*.baseline 2>/dev/null
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
         safe=$(_audit_accounts_sanitise "$path")
-        # `cp -f` would dereference symlinks; we want the actual content
-        # at this instant, which `cat >` accomplishes with no metadata.
         if cat "$path" 2>/dev/null > "$dir/$safe.baseline"; then
             (( count++ )) || true
         fi
@@ -3577,11 +3279,7 @@ _audit_accounts_baseline() {
     printf '%d %s\n' "$count" "$dir"
 }
 
-# Diff every currently-tracked file against its baseline. Stdout per
-# line: `<change>\t<file>\t<line>` where change ∈ {ADDED, REMOVED}.
-# A missing baseline file is treated as if every line in the current
-# file is ADDED — which is exactly the signal we want when an attacker
-# creates a new authorized_keys for an existing or freshly-added user.
+# `<change>\t<file>\t<line>`, ADDED or REMOVED; a file with no baseline reports every line as ADDED.
 _audit_accounts_diff() {
     local dir; dir=$(_audit_accounts_state_dir)
     local path safe baseline
@@ -3590,13 +3288,9 @@ _audit_accounts_diff() {
         safe=$(_audit_accounts_sanitise "$path")
         baseline="$dir/$safe.baseline"
         if [[ ! -f "$baseline" ]]; then
-            # File appeared since last baseline — every line is ADDED.
             awk -v p="$path" 'NF { printf "ADDED\t%s\t%s\n", p, $0 }' "$path" 2>/dev/null
             continue
         fi
-        # comm wants sorted inputs; account files are small enough that
-        # sorting per tick is cheap (passwd ≈ 50 lines, authorized_keys
-        # rarely beyond ~20 keys).
         comm -23 <(sort -u "$path" 2>/dev/null) <(sort -u "$baseline") \
             | awk -v p="$path" 'NF { printf "ADDED\t%s\t%s\n", p, $0 }'
         comm -13 <(sort -u "$path" 2>/dev/null) <(sort -u "$baseline") \
@@ -3616,19 +3310,14 @@ _audit_accounts_tick() {
         return 0
     fi
 
-    # First-run silent baseline. Marker file used to detect bootstrap
-    # state because the per-file baselines may legitimately be missing
-    # (file glob matches zero entries on a freshly-installed host).
+    # The marker, not the per-file baselines, marks bootstrap: the globs can match nothing on a fresh host.
     if [[ ! -f "$marker" ]]; then
         _audit_accounts_baseline >/dev/null 2>&1
         printf '%s' "$now" > "$marker"
         return 0
     fi
 
-    # Group ADDED lines by file so we fire one alert per file rather
-    # than one per added key — critical when an attacker drops 5 new
-    # keys at once into authorized_keys. Body is capped at 5 lines plus
-    # an "… and N more" tail to stay under Discord's 4000-char limit.
+    # One alert per file, listing at most 5 new lines.
     local prev_file="" body="" capped=""
     local change file line lines_count=0 key b
     while IFS=$'\t' read -r change file line; do
@@ -3732,31 +3421,13 @@ _audit_accounts_subcmd() {
     esac
 }
 
-# ==============================================================================
-# Rootkit hint scanner — point-in-time heuristics, no baseline. Each
-# heuristic is a yes/no signal that's worth firing on its own:
-#
-#   hidden_process       /proc dir count > `ps -e` count (slack for racing)
-#   ld_preload_present   /etc/ld.so.preload exists at all
-#   exec_from_tmp        a running process's exe lives under /tmp,
-#                        /dev/shm, or /var/tmp
-#   deleted_exe          /proc/<pid>/exe symlink ends with `(deleted)`
-#                        — backing file unlinked, classic memory-resident
-#                        malware tell
-#
-# Linux-only (relies on /proc). On macOS / BSD the support check fails
-# fast and the module no-ops. Same design as ports — the existing
-# point-in-time scanners stay coherent across OS detection.
-# ==============================================================================
+# Rootkit hints: baseline-free heuristics (hidden_process, ld_preload_present, exec_from_tmp, deleted_exe). Needs /proc.
 
 _audit_rootkit_supported() {
     [[ -d /proc ]] && [[ -d /proc/1 ]]
 }
 
-# Hidden-process check. Returns one line `hidden_process\t<detail>` if the
-# /proc directory count exceeds `ps -e` count by more than the slack.
-# The slack accommodates the race window between the two enumerations
-# (a process can spawn or die in the microseconds between them).
+# The slack covers processes that start or exit between the two counts.
 _audit_rootkit_check_hidden() {
     local ps_count proc_count slack=5
     ps_count=$(ps -eo pid 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
@@ -3776,16 +3447,10 @@ _audit_rootkit_check_preload() {
     fi
 }
 
-# Walk /proc/<pid>/exe symlinks. Two heuristics share the walk so we
-# don't pay for it twice per tick:
-#   - exec_from_tmp:    exe path resolves under /tmp / /dev/shm / /var/tmp
-#   - deleted_exe:      exe symlink target ends with " (deleted)"
-# kernel-thread exe links are unreadable (-EPERM) — silently skipped.
+# One /proc walk for both exec_from_tmp and deleted_exe; unreadable kernel-thread exe links are skipped.
 _audit_rootkit_walk_proc() {
     local pid exe comm
     for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-        # readlink on /proc/<pid>/exe returns either the absolute path or
-        # `<path> (deleted)` for unlinked-but-still-running binaries.
         exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
         [[ -z "$exe" ]] && continue
         comm=$(cat "/proc/$pid/comm" 2>/dev/null | tr -d '\n')
@@ -3803,9 +3468,7 @@ _audit_rootkit_walk_proc() {
     done
 }
 
-# Run every heuristic; emit one line per finding, format
-# `<heuristic_key>\t<detail>`. heuristic_key may be suffixed with the
-# process comm for per-process keys (so cooldown groups correctly).
+# `<heuristic>\t<detail>` per finding; per-process keys carry the comm so cooldown groups by process.
 _audit_rootkit_run_all() {
     _audit_rootkit_supported || return 0
     _audit_rootkit_check_hidden
@@ -3879,29 +3542,9 @@ _audit_rootkit_subcmd() {
             _audit_help; return 1 ;;
     esac
 }
-# ==============================================================================
-# MODE: auto-tune — suggest thresholds from history baselines
-#
-# Picks thresholds that would have fired ~rarely on your actual traffic
-# instead of making users guess "what's a reasonable 5xx/min for this box?".
-# Reads metrics_minute over a recent window and prints:
-#   1) side-by-side table of CURRENT vs SUGGESTED
-#   2) a copy-paste block of `milog config set …` commands
-#
-# Percentile picks:
-#   THRESH_REQ_WARN  = p90(req)       — alert on the top 10% of minutes
-#   THRESH_REQ_CRIT  = p99(req)       — alert on clear outliers
-#   THRESH_4XX_WARN  = p95(c4xx)      — floor at 5 so tiny clients don't spam
-#   THRESH_5XX_WARN  = p95(c5xx)      — floor at 1 (any 5xx > 0 is worth a ping)
-#   P95_WARN_MS      = p75(p95_ms)    — warn when current p95 worse than 3-in-4 historical minutes
-#   P95_CRIT_MS      = p99(p95_ms)    — crit on top 1% latency outliers
-#
-# CPU/MEM/DISK are not in the DB, so those thresholds aren't tuned here.
-# ==============================================================================
+# milog auto-tune [days]: suggests HTTP thresholds from percentiles of metrics_minute. CPU/MEM/DISK aren't in the DB.
 
-# Stdin-to-percentile helper: read newline-separated numbers, print the
-# p-th percentile (1..100) using the existing `sort -n | awk positional`
-# idiom (same logic as percentiles() but for a generic stream).
+# p-th percentile (1..100) of newline-separated numbers on stdin.
 _pct_from_stdin() {
     local p=$1
     sort -n | awk -v p="$p" '
@@ -3915,7 +3558,7 @@ _pct_from_stdin() {
         }'
 }
 
-# Format one table row. Visual widths: METRIC(20) CURRENT(11) SUGGESTED(11) DELTA(9)
+# Columns: METRIC(20) CURRENT(11) SUGGESTED(11) DELTA(9).
 _tune_row() {
     local metric="$1" current="$2" suggested="$3"
     local delta=""
@@ -3948,8 +3591,7 @@ mode_auto_tune() {
 
     echo -e "\n${W}── MiLog: auto-tune (window=${days}d, ${count} rows) ──${NC}\n"
 
-    # 100 rows ≈ 100 minutes ≈ 1.6h of data — anything less and percentiles
-    # are too noisy to base thresholds on.
+    # Rows are per app per minute; fewer than 100 makes the percentiles noise.
     if (( count < 100 )); then
         echo -e "${R}Not enough history (${count} rows — need ≥100).${NC}"
         echo -e "${D}  let 'milog daemon' run for a few hours with HISTORY_ENABLED=1,${NC}"
@@ -3957,9 +3599,7 @@ mode_auto_tune() {
         return 1
     fi
 
-    # Pull each metric's samples once. Filtering req>0 excludes quiet-hour
-    # zeros so the percentile reflects real traffic — otherwise a mostly-idle
-    # server would suggest THRESH_REQ_WARN=0.
+    # req > 0 drops idle minutes, which would otherwise pull suggestions toward 0.
     local p95_samples req_samples c4_samples c5_samples
     p95_samples=$(sqlite3 "$HISTORY_DB" \
         "SELECT p95_ms FROM metrics_minute WHERE ts >= $since AND p95_ms IS NOT NULL AND req > 0;" 2>/dev/null)
@@ -3978,13 +3618,11 @@ mode_auto_tune() {
     s_p95_warn=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 75)
     s_p95_crit=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 99)
 
-    # Floors so "empty" days don't suggest zeros that fire on any activity.
+    # Floors stop quiet history from suggesting thresholds that fire on any activity.
     [[ "$s_c4_warn"  =~ ^[0-9]+$ ]] && (( s_c4_warn  < 5 )) && s_c4_warn=5
     [[ "$s_c5_warn"  =~ ^[0-9]+$ ]] && (( s_c5_warn  < 1 )) && s_c5_warn=1
     [[ "$s_req_warn" =~ ^[0-9]+$ ]] && (( s_req_warn < 5 )) && s_req_warn=5
 
-    # Fall back to blank when we had zero samples for a metric (no timed
-    # traffic at all means p95 tuning is impossible).
     : "${s_req_warn:=}"; : "${s_req_crit:=}"; : "${s_c4_warn:=}"; : "${s_c5_warn:=}"
     : "${s_p95_warn:=}"; : "${s_p95_crit:=}"
 
@@ -3997,7 +3635,6 @@ mode_auto_tune() {
     _tune_row "P95_WARN_MS"      "$P95_WARN_MS"      "${s_p95_warn:--}"
     _tune_row "P95_CRIT_MS"      "$P95_CRIT_MS"      "${s_p95_crit:--}"
 
-    # Ready-to-apply block — skip lines we couldn't tune.
     echo -e "\n${W}Ready to apply${NC} ${D}(copy-paste to set):${NC}"
     local line printed=0
     for line in \
@@ -4022,27 +3659,11 @@ mode_auto_tune() {
     return 0
 }
 
-# ==============================================================================
-# MODE: bench — synthetic log fixtures + timing harness
-#
-# Measures what affects user-perceived latency of the common modes:
-#   - tail scan throughput at 10k / 100k / 1M lines
-#   - `slow` + `top-paths` end-to-end against a known fixture
-#   - `search` throughput including archive read path
-#
-# Output is a short report plus a machine-readable TSV so CI can compare to
-# a committed baseline (tools/bench-baseline.tsv). Regression >20% fails.
-#
-# Usage:
-#   milog bench               # quick run (10k + 100k lines)
-#   milog bench --full        # adds 1M-line pass (slower, more stable)
-#   milog bench --baseline F  # write baseline TSV to F
-# ==============================================================================
+# milog bench [--full] [--baseline FILE]: times tail scan, slow, top-paths, top and search on synthetic logs.
 
 _bench_gen_fixture() {
     local dst="$1" n="$2"
-    # Vary IP, path, status, latency to exercise grouping + percentile paths.
-    # 80 distinct paths, ~200 distinct IPs, 90/8/2 status class split.
+    # ~80 paths, random IPs, a 90/8/2 split of 200/404/500.
     awk -v n="$n" 'BEGIN {
         srand(42)
         for (i = 0; i < n; i++) {
@@ -4063,8 +3684,7 @@ _bench_gen_fixture() {
 }
 
 _bench_time_ms() {
-    # Portable millisecond timer. Falls back to second granularity on
-    # hosts without nanosecond `date`.
+    # Falls back to whole seconds where `date +%N` is unsupported.
     if date +%N >/dev/null 2>&1 && [[ "$(date +%N)" != "N" ]]; then
         local s ns
         s=$(date +%s); ns=$(date +%N)
@@ -4083,7 +3703,6 @@ _bench_run_one() {
     t1=$(_bench_time_ms)
     local elapsed=$(( t1 - t0 ))
     printf "%-34s  %6d ms  rc=%d\n" "$label" "$elapsed" "$rc"
-    # Also emit TSV for baseline/CI comparison.
     if [[ -n "${BENCH_TSV:-}" ]]; then
         printf '%s\t%d\t%d\n' "$label" "$elapsed" "$rc" >> "$BENCH_TSV"
     fi
@@ -4110,7 +3729,6 @@ mode_bench() {
     local sizes=(10000 100000)
     (( full )) && sizes+=(1000000)
 
-    # Export tsv target so _bench_run_one writes machine-readable rows.
     if [[ -n "$baseline" ]]; then
         : > "$baseline"
         export BENCH_TSV="$baseline"
@@ -4125,7 +3743,6 @@ mode_bench() {
         local mb; mb=$(( bytes / 1024 / 1024 ))
         printf "${W}─── %d lines  (%d MB) ───${NC}\n" "$n" "$mb"
 
-        # Run as milog modes against the fixture.
         local env_prefix="MILOG_APPS=bench MILOG_LOG_DIR=$tmp/logs MILOG_CONFIG=/dev/null"
         _bench_run_one "tail-scan ($n lines)" \
             "wc -l < $file"
@@ -4159,38 +3776,16 @@ ${W}MEASURES${NC}
   tail-scan throughput, slow / top-paths / top end-to-end, search
 "
 }
-# ==============================================================================
-# MODE: completions — install shell completion files
-#
-# Static completion scripts live under completions/ in the repo, baked into
-# the milog bundle. This mode extracts them back out to the user's shell
-# lookup paths. Two flavours:
-#
-#   milog completions install      # drop to /usr/share or ~/.local
-#   milog completions <shell>      # print a single shell's completion to stdout
-#                                    (for curl-pipe-bash install paths)
-#
-# Supported: bash / zsh / fish.
-# ==============================================================================
+# milog completions install | bash | zsh | fish.
 
-# Embedded completion payloads live in the bundled milog.sh, written there
-# by build.sh from completions/*.  Here we extract them via heredocs — the
-# content is literally duplicated because bash can't do "read this file
-# from inside the bundle" without the source layout.
-#
-# To stay DRY, we ship a sentinel approach: each completion body lives in
-# its own helper below. If a user is on a clone (bundle built from src/),
-# we defer to completions/*. Otherwise we use the fallback bodies.
+# Bodies come from completions/ in a repo clone, else from _completions_payload_<shell>, which build.sh does not generate.
 
 _completions_src_dir() {
-    # Return the repo's completions/ dir if we're running from a clone and
-    # it exists; empty otherwise.
     local me self_dir
     me="${BASH_SOURCE[0]:-$0}"
     [[ -n "$me" && -f "$me" ]] || return 1
     self_dir=$(cd -P "$(dirname "$me")" 2>/dev/null && pwd) || return 1
-    # Walk up — src/modes/completions.sh → repo/completions; or
-    # /usr/local/bin/milog (bundle) → no src/ nearby.
+    # src/modes/ in a clone, or the repo root for a built milog.sh.
     local candidate
     for candidate in "$self_dir/../../completions" "$self_dir/../completions" "$self_dir/completions"; do
         [[ -d "$candidate" ]] && { printf '%s' "$(cd -P "$candidate" && pwd)"; return 0; }
@@ -4229,7 +3824,6 @@ _completions_install() {
     local src; src=$(_completions_src_dir) || src=""
     local installed=0
 
-    # Target paths (system when root, user otherwise).
     local bash_dst zsh_dst fish_dst
     if [[ $(id -u) -eq 0 ]]; then
         bash_dst="/usr/share/bash-completion/completions/milog"
@@ -4283,8 +3877,6 @@ _completions_emit() {
             return 0
         fi
     fi
-    # Fallback: the bundle ships a copy of each completion script inline
-    # via build.sh heredocs. If that's missing too, we truly can't emit.
     local fn="_completions_payload_${shell}"
     if declare -F "$fn" >/dev/null 2>&1; then
         "$fn"
@@ -4293,8 +3885,7 @@ _completions_emit() {
         return 1
     fi
 }
-# MODE: config — manage the user config file without opening an editor
-# ==============================================================================
+# milog config: edit the user config file from the CLI.
 
 _cfg_ensure_dir() {
     local d; d=$(dirname "$MILOG_CONFIG")
@@ -4302,8 +3893,7 @@ _cfg_ensure_dir() {
         echo -e "${R}Cannot create config directory: $d${NC}" >&2; return 1; }
 }
 
-# Read LOGS array as defined LITERALLY in the config file (ignores the
-# hardcoded script defaults). Outputs one app per line; empty if no LOGS= line.
+# LOGS as written in the config file, ignoring script defaults; one app per line.
 _cfg_read_logs() {
     [[ -f "$MILOG_CONFIG" ]] || return 0
     (
@@ -4314,7 +3904,6 @@ _cfg_read_logs() {
     )
 }
 
-# Replace or append a single-line assignment `KEY=VALUE` in the config file.
 _cfg_write_line() {
     local line="$1" key="${1%%=*}"
     _cfg_ensure_dir || return 1
@@ -4356,10 +3945,7 @@ config_show() {
         "$HISTORY_ENABLED" "$HISTORY_DB" "$HISTORY_RETAIN_DAYS"
     printf "  %-22s enabled=%s cooldown=%ss dedup=%ss\n" "alerts" \
         "$ALERTS_ENABLED" "$ALERT_COOLDOWN" "${ALERT_DEDUP_WINDOW:-300}"
-    # Render per-destination status from the process-sourced env (same
-    # values the running daemon/TUI would use). For a target-user view
-    # under sudo, use `milog alert status` instead — it reads the
-    # target's config file directly.
+    # Process env view; `milog alert status` reads a target user's config under sudo.
     _alert_destinations_status \
         "${DISCORD_WEBHOOK:-}" \
         "${SLACK_WEBHOOK:-}" \
@@ -4441,12 +4027,11 @@ config_set() {
         echo -e "${R}Usage:${NC} milog config set <KEY> <VALUE>"
         return 1
     fi
-    # Numeric values unquoted; strings double-quoted; empty string → ""
+    # Integers stay bare; everything else is double-quoted.
     local quoted
     if [[ "$val" =~ ^-?[0-9]+$ ]]; then
         quoted="$val"
     else
-        # Escape any embedded double-quotes
         quoted="\"${val//\"/\\\"}\""
     fi
     _cfg_write_line "${key}=${quoted}"
@@ -4467,8 +4052,7 @@ config_add() {
     cur+=("$name")
     _cfg_write_line "LOGS=(${cur[*]})"
     echo -e "${G}Added${NC} '$name' → LOGS=(${cur[*]})"
-    # Type-aware existence hint. Only surfaces when we can check cheaply;
-    # docker/journal liveness is better diagnosed at stream time.
+    # Only file-backed sources can be checked cheaply here.
     local _type; _type=$(_log_type_for "$name")
     case "$_type" in
         nginx|text)
@@ -4551,18 +4135,10 @@ mode_config() {
     esac
 }
 
-# Config validator — checks the RESOLVED config (after file + env overrides).
-# Surfaces typos (unknown keys), invalid ranges, unreachable paths, and
-# malformed destinations. Two modes:
-#   - called standalone → prints a report + returns 0 if clean, 2 if warnings,
-#     1 if errors. Useful for CI / pre-flight.
-#   - imported from `milog daemon` startup → same logic, only errors are
-#     fatal; the daemon refuses to start with a clearly-broken config.
+# Validates the resolved config (file plus env). Returns 0 clean, 2 warnings only, 1 errors.
 config_validate() {
     local errors=0 warnings=0
 
-    # Known top-level keys + per-app-threshold families. Any VAR starting
-    # with these is legal; anything else in the user's config is suspicious.
     local known_exact=(
         LOG_DIR LOGS REFRESH SPARK_LEN
         DISCORD_WEBHOOK SLACK_WEBHOOK
@@ -4582,13 +4158,13 @@ config_validate() {
         THRESH_DISK_WARN THRESH_DISK_CRIT
         THRESH_4XX_WARN THRESH_5XX_WARN
     )
-    # Families — prefix-matched for per-app overrides like THRESH_REQ_CRIT_finance.
+    # Prefixes for per-app overrides like THRESH_REQ_CRIT_finance.
     local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ )
 
     echo -e "\n${W}── MiLog: Config validate ──${NC}\n"
     echo -e "  ${D}config: $MILOG_CONFIG${NC}"
 
-    # 1. Unknown keys in the user's config file (source-level, not env).
+    # Unknown keys, read from the config file itself rather than the environment.
     if [[ -r "$MILOG_CONFIG" ]]; then
         local line key known fam
         while IFS= read -r line; do
@@ -4613,7 +4189,6 @@ config_validate() {
         done < "$MILOG_CONFIG"
     fi
 
-    # 2. Numeric range checks.
     local v
     _check_int() {
         local name="$1" min="${2:-}" max="${3:-}" val
@@ -4644,7 +4219,6 @@ config_validate() {
     _check_int P95_CRIT_MS 0
     _check_int SLOW_WINDOW 1
 
-    # 3. LOG_DIR readable.
     if [[ ! -d "$LOG_DIR" ]]; then
         echo -e "  ${R}err${NC}   LOG_DIR does not exist: $LOG_DIR"
         errors=$((errors+1))
@@ -4653,7 +4227,7 @@ config_validate() {
         errors=$((errors+1))
     fi
 
-    # 4. Destinations syntactically valid (lightweight — no network).
+    # Syntax only; nothing touches the network.
     if [[ -n "${DISCORD_WEBHOOK:-}" && ! "$DISCORD_WEBHOOK" =~ ^https:// ]]; then
         echo -e "  ${Y}warn${NC}  DISCORD_WEBHOOK should start with https://"
         warnings=$((warnings+1))
@@ -4670,7 +4244,7 @@ config_validate() {
         echo -e "  ${Y}warn${NC}  MATRIX_HOMESERVER should start with https://"
         warnings=$((warnings+1))
     fi
-    # Partial Telegram / Matrix — hard errors because the destination won't fire.
+    # A partial Telegram or Matrix config can never send, so it's an error.
     if [[ -n "${TELEGRAM_BOT_TOKEN:-}$TELEGRAM_CHAT_ID" ]]; then
         if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
             echo -e "  ${R}err${NC}   Telegram partial config — need both BOT_TOKEN and CHAT_ID"
@@ -4695,15 +4269,10 @@ config_validate() {
     return 2
 }
 
-# ==============================================================================
-# COLOR PREFIX — merged initial dump sorted by nginx timestamp, then live tails
-# ==============================================================================
+# Default `milog` view: the last 10 lines of every file source merged by timestamp, then live tails of every source.
 color_prefix() {
     local pids=()
     local colors=("$B" "$C" "$G" "$M" "$Y" "$R")
-    # File-based sources (nginx / text) can participate in the initial
-    # merged-by-timestamp dump. Streaming-only sources (journal /
-    # docker) skip it — their commands come through separately.
     local -a F_files=() F_fcols=() F_flabels=()
     local -a S_cmds=()  S_cols=()  S_labels=()
     local i=0
@@ -4721,7 +4290,6 @@ color_prefix() {
         S_cols+=("$col")
         S_labels+=("$label")
 
-        # Gather file-type sources for the initial merged-dump pass.
         if [[ "$type" == "nginx" || "$type" == "text" ]]; then
             local file; file=$(_log_path_for "$entry")
             if [[ -f "$file" ]]; then
@@ -4733,10 +4301,7 @@ color_prefix() {
         (( i++ )) || true
     done
 
-    # Initial dump: last 10 lines from every FILE source, merged and
-    # sorted by log timestamp. Streaming sources (journal / docker)
-    # stream live-only — no retrospective view since their readers don't
-    # cheaply support "last N matching lines".
+    # journal and docker sources have no cheap "last N lines", so they only stream live.
     if (( ${#F_files[@]} > 0 )); then
         {
             local idx
@@ -4761,9 +4326,6 @@ color_prefix() {
         } | sort -k1,1 | cut -f2-
     fi
 
-    # Live tails from every source — files via tail -F, journal via
-    # journalctl -f, docker via the unwrap pipeline. All reach stdout
-    # the same way; awk prefixes each with the coloured app label.
     local idx
     for idx in "${!S_cmds[@]}"; do
         bash -c "${S_cmds[$idx]}" 2>/dev/null | \
@@ -4775,26 +4337,16 @@ color_prefix() {
     wait
 }
 
-# ==============================================================================
-# HELP
-# ==============================================================================
-# ==============================================================================
-# MODE: daemon — headless sampler + rule evaluator (no TUI)
-# Fires the same rules as the live modes. stderr decision log only;
-# webhook sends are backgrounded so a slow Discord never wedges the loop.
-# ==============================================================================
+# milog daemon: headless sampler and rule evaluator, logging to stderr.
 
 mode_daemon() {
-    # Config sanity gate — refuse to start with ERROR-level findings so a
-    # broken config doesn't silently degrade at 3am. Warnings don't block;
-    # they're printed via stderr alongside the normal _dlog output.
+    # Refuse to start on config errors; warnings only get printed.
     if ! config_validate >&2; then
         local rc=$?
         if (( rc == 1 )); then
             _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
             exit 1
         fi
-        # rc=2 means warnings only → continue, user's been told.
     fi
 
     local hook_state
@@ -4806,9 +4358,7 @@ mode_daemon() {
 
     history_init   # no-op when HISTORY_ENABLED=0; disables itself on error
 
-    # Live-tail watchers for exploit + probe + app-pattern rules. Their stdout
-    # is suppressed; the alert call sites inside each mode fire webhooks
-    # directly. `mode_patterns` self-suppresses when PATTERNS_ENABLED=0.
+    # Watcher stdout is discarded; their alerts fire from inside each mode.
     local watcher_pids=()
     ( mode_exploits > /dev/null ) & watcher_pids+=($!)
     ( mode_probes   > /dev/null ) & watcher_pids+=($!)
@@ -4821,9 +4371,7 @@ mode_daemon() {
     '
     trap "$_cleanup" INT TERM
 
-    # Init rollover state — start at "current" so the first write happens
-    # only once we've crossed a real minute/hour/day boundary, never mid-
-    # minute on start-up with partial counts.
+    # Start at the current period so the first write covers a complete minute, never a partial one.
     local last_min last_hour last_day now
     now=$(date +%s)
     last_min=$((  now / 60   ))
@@ -4834,7 +4382,6 @@ mode_daemon() {
         local CUR_TIME
         CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
 
-        # System metrics — same helpers mode_monitor uses.
         local cpu mem_pct mem_used mem_total disk_pct disk_used disk_total
         cpu=$(cpu_usage)
         [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
@@ -4847,7 +4394,6 @@ mode_daemon() {
         sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
                          "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
 
-        # Per-app HTTP rules.
         local name cnt c2 c3 c4 c5
         for name in "${LOGS[@]}"; do
             read -r cnt c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
@@ -4855,12 +4401,7 @@ mode_daemon() {
             nginx_check_http_alerts "$name" "$c4" "$c5"
         done
 
-        # Audit scanners — file integrity, persistence surface, listening
-        # ports, YARA, account/SSH-key drift, rootkit hints. Self-throttled
-        # by their respective AUDIT_*_INTERVAL — cheap to call every tick
-        # (returns immediately when not due). No-op when AUDIT_ENABLED=0.
-        # YARA additionally no-ops when `yara` isn't installed or
-        # AUDIT_YARA_PATHS is empty; rootkit no-ops on macOS / BSD.
+        # Each scanner throttles itself by its AUDIT_*_INTERVAL and no-ops when disabled.
         _audit_fim_tick
         _audit_persistence_tick
         _audit_ports_tick
@@ -4868,8 +4409,7 @@ mode_daemon() {
         _audit_accounts_tick
         _audit_rootkit_tick
 
-        # History rollover. Write the *previous* complete minute so nothing
-        # lands partial. Hour rollup runs similarly on the hour edge.
+        # Write the previous minute and hour, which are complete.
         now=$(date +%s)
         local cur_min=$((  now / 60   ))
         local cur_hour=$(( now / 3600 ))
@@ -4894,11 +4434,7 @@ mode_daemon() {
     done
 }
 
-# ==============================================================================
-# MODE: diff — hour-level comparison: now vs 1d ago vs 7d ago, per app
-# Same-hour windows against metrics_minute. Percent deltas computed in the
-# shell because bash arithmetic handles the small integer math cleanly.
-# ==============================================================================
+# milog diff: this hour vs the same hour 1 and 7 days ago, per app, from metrics_minute.
 mode_diff() {
     _history_precheck || return 1
 
@@ -4935,9 +4471,7 @@ SQL
         return 0
     fi
 
-    # ASCII header labels — Δ is a 2-byte 1-column char that confuses
-    # printf byte-width formatting. Divider em-dashes are counted to match
-    # each column's VISUAL width (12/10/10/10/8/8) so rows line up.
+    # ASCII labels and dividers sized to visual width; Δ is multi-byte and breaks printf padding.
     printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \
            "APP" "NOW" "1d ago" "7d ago" "d1 %" "d7 %"
     printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \
@@ -4972,23 +4506,7 @@ SQL
     echo
 }
 
-# ==============================================================================
-# MODE: digest — exec-summary view over the last day / week
-#
-# Uses the same data the other modes do: alerts.log for fire counts, the
-# history DB for capacity trend (when HISTORY_ENABLED), and a short scan of
-# the live log files for traffic / error / latency rollups.
-#
-# Designed to be piped into alert destinations as a scheduled summary for
-# quiet servers where live alerts rarely fire — you still want the weekly
-# "nothing happened, here's what happened anyway" email.
-#
-# Usage:
-#   milog digest          # last 24h (default)
-#   milog digest day
-#   milog digest week
-#   milog digest 12h      # arbitrary N<h|d|w>
-# ==============================================================================
+# milog digest [day|week|N<h|d|w>]: summary of alert fires, per-app traffic and top IPs.
 
 _digest_window_to_secs() {
     local w="${1:-day}"
@@ -5018,7 +4536,6 @@ mode_digest() {
     echo -e "\n${W}── MiLog: Digest (${window_human}) ──${NC}\n"
     echo -e "${D}  generated $(date -Iseconds 2>/dev/null || date) · host $(hostname 2>/dev/null || echo host)${NC}\n"
 
-    # --- Alerts ---------------------------------------------------------------
     local alog="${ALERT_STATE_DIR:-$HOME/.cache/milog}/alerts.log"
     echo -e "${W}Alerts fired${NC}"
     if [[ ! -f "$alog" ]]; then
@@ -5041,7 +4558,6 @@ mode_digest() {
     fi
     echo
 
-    # --- Traffic + errors per app --------------------------------------------
     echo -e "${W}Traffic${NC}"
     printf "  %-14s  %10s  %8s  %8s\n" "APP" "REQ" "4XX" "5XX"
     printf "  %-14s  %10s  %8s  %8s\n" "────────────" "──────────" "────────" "────────"
@@ -5051,9 +4567,7 @@ mode_digest() {
         name=$(_log_name_for "$entry")
         file=$(_log_path_for "$entry")
         [[ -f "$file" ]] || continue
-        # Count lines in-window via nginx timestamp. Shell out to awk with a
-        # cutoff; safe-fallback emits zeros if the date format unexpectedly
-        # doesn't match our scan.
+        # cutoff is passed but never used, so these counts cover the whole file.
         read -r req c4 c5 <<< "$(awk -v cutoff="$cutoff" '
             {
                 # [24/Apr/2026:12:34:56 +0000] → crude parse: keep any row,
@@ -5067,7 +4581,7 @@ mode_digest() {
     done
     echo
 
-    # --- Top attacker IPs (window-agnostic: scans whole access logs) ---------
+    # Not windowed: reads the whole access logs.
     echo -e "${W}Top attacker IPs (this window)${NC}"
     local ip_rollup
     ip_rollup=$(
@@ -5088,7 +4602,6 @@ mode_digest() {
     fi
     echo
 
-    # --- Capacity (if history DB is available) -------------------------------
     if [[ "${HISTORY_ENABLED:-0}" == "1" && -f "$HISTORY_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
         echo -e "${W}Capacity (start of window → now)${NC}"
         local cap
@@ -5107,17 +4620,7 @@ mode_digest() {
     fi
     echo
 }
-# ==============================================================================
-# MODE: doctor — checklist of what's installed/configured/reachable
-#
-# The tool no-ops gracefully when sqlite3, mmdblookup, a webhook, or the
-# extended log format are missing — which is friendly but can hide a
-# misconfigured install. `doctor` makes every degraded capability visible
-# with a one-line hint on how to enable it.
-#
-# Output: ✓ (ready) / ! (degraded, works-but-limited) / ✗ (broken/required).
-# Exit code: 0 if all required deps are present; 1 otherwise. CI-friendly.
-# ==============================================================================
+# milog doctor: shows every missing or degraded capability with a hint. Exits 1 only when a required dep is missing.
 _doc_line() {
     # $1=marker (colored glyph)  $2=headline  $3=optional hint
     printf "  %b %s\n" "$1" "$2"
@@ -5133,7 +4636,7 @@ mode_doctor() {
     local fail=0 warn=0
     echo -e "\n${W}── MiLog: doctor ──${NC}"
 
-    # ---- core tools (required) ----------------------------------------------
+    # Core tools (required).
     _doc_head "core tools"
     local tool
     for tool in bash gawk curl; do
@@ -5152,7 +4655,7 @@ mode_doctor() {
         warn=$(( warn + 1 ))
     fi
 
-    # ---- optional tools ------------------------------------------------------
+    # Optional tools.
     _doc_head "optional tools"
     if command -v sqlite3 >/dev/null 2>&1; then
         _doc_ok "sqlite3 present  ($(sqlite3 --version 2>/dev/null | awk '{print $1}'))"
@@ -5167,7 +4670,7 @@ mode_doctor() {
         warn=$(( warn + 1 ))
     fi
 
-    # ---- log dir + per-app logs ---------------------------------------------
+    # Log dir and per-app logs.
     _doc_head "log directory"
     if [[ -d "$LOG_DIR" && -r "$LOG_DIR" ]]; then
         _doc_ok "$LOG_DIR readable"
@@ -5204,14 +4707,7 @@ mode_doctor() {
         done
     fi
 
-    # ---- nginx log format — does it carry $request_time? --------------------
-    #
-    # Scan the tail of every configured app's log and look for any timed line
-    # (numeric last field, NF>=12). One app's tail might still be pre-reload
-    # old-format while others are already new-format — we report ✓ as long
-    # as at least one app has timed samples recently. Simultaneously tracks
-    # apps with only old-format lines so the hint can call them out for
-    # manual verification.
+    # $request_time check: ✓ if any app's latest line ends in a number with NF >= 12; others may predate a reload.
     _doc_head "nginx log format"
     if (( ${#LOGS[@]} == 0 )); then
         _doc_warn "no configured apps"
@@ -5249,7 +4745,7 @@ mode_doctor() {
         fi
     fi
 
-    # ---- Discord alerting ----------------------------------------------------
+    # Discord.
     _doc_head "alerting (Discord)"
     if [[ -z "${DISCORD_WEBHOOK:-}" ]]; then
         _doc_warn "DISCORD_WEBHOOK not configured" \
@@ -5257,9 +4753,7 @@ mode_doctor() {
         warn=$(( warn + 1 ))
     else
         _doc_ok "DISCORD_WEBHOOK configured  (${DISCORD_WEBHOOK:0:40}…)"
-        # Reachability — a POST with an empty content is ignored by Discord,
-        # so we GET the webhook metadata instead (returns 200 + JSON on valid
-        # webhooks, 404 on stale). 5s cap so doctor never hangs.
+        # GET the webhook: Discord ignores an empty POST, and GET returns 404 for stale webhooks.
         local http
         http=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 \
                "$DISCORD_WEBHOOK" 2>/dev/null || echo 000)
@@ -5276,15 +4770,13 @@ mode_doctor() {
         _doc_warn "ALERTS_ENABLED=0" "alerts are armed but disabled — 'milog alert on' to flip"
         warn=$(( warn + 1 ))
     fi
-    # Report other destinations when configured — each is opt-in, so
-    # "not configured" is informational (not a warning).
+    # Other destinations are opt-in, so "not configured" is informational.
     [[ -n "${SLACK_WEBHOOK:-}" ]] \
         && _doc_ok "Slack webhook configured  (${SLACK_WEBHOOK:0:40}…)"
     [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] \
         && _doc_ok "Telegram bot configured  (chat=$TELEGRAM_CHAT_ID)"
     [[ -n "${MATRIX_HOMESERVER:-}" && -n "${MATRIX_TOKEN:-}" && -n "${MATRIX_ROOM:-}" ]] \
         && _doc_ok "Matrix configured  (${MATRIX_HOMESERVER} room=$MATRIX_ROOM)"
-    # Alert history log — surface count since "today" so users know it works.
     local alog="$ALERT_STATE_DIR/alerts.log"
     if [[ -f "$alog" ]]; then
         local now_epoch today_cutoff today_count total_count
@@ -5296,7 +4788,7 @@ mode_doctor() {
                 "view with: milog alerts [today|Nh|Nd|all]"
     fi
 
-    # ---- history DB ---------------------------------------------------------
+    # History DB.
     _doc_head "history (SQLite)"
     if [[ "${HISTORY_ENABLED:-0}" != "1" ]]; then
         _doc_warn "HISTORY_ENABLED=0" "set to 1 to let 'milog daemon' persist metrics for trend/diff/auto-tune"
@@ -5323,7 +4815,7 @@ mode_doctor() {
         fi
     fi
 
-    # ---- GeoIP --------------------------------------------------------------
+    # GeoIP.
     _doc_head "geoip"
     if [[ "${GEOIP_ENABLED:-0}" != "1" ]]; then
         _doc_warn "GEOIP_ENABLED=0" "optional — set to 1 + install the MaxMind MMDB to enable country column"
@@ -5345,11 +4837,8 @@ mode_doctor() {
         fi
     fi
 
-    # ---- web dashboard ------------------------------------------------------
+    # Web dashboard.
     _doc_head "web dashboard"
-    # milog-web is the Go binary served by `milog web`. _web_go_binary
-    # checks the same path order the launcher uses, so the warning here
-    # mirrors what users will hit at start time.
     local web_bin
     if web_bin=$(_web_go_binary 2>/dev/null) && [[ -n "$web_bin" ]]; then
         _doc_ok "milog-web binary present  ($web_bin)"
@@ -5368,10 +4857,9 @@ mode_doctor() {
         fi
     fi
 
-    # ---- systemd units (only meaningful where systemd is installed) ---------
+    # systemd units.
     if command -v systemctl >/dev/null 2>&1; then
         _doc_head "systemd"
-        # milog.service (system unit) — the alert daemon.
         if [[ ! -f /etc/systemd/system/milog.service ]]; then
             _doc_warn "milog.service not installed" "run: sudo milog alert on (installs + enables the unit)"
             warn=$(( warn + 1 ))
@@ -5381,8 +4869,7 @@ mode_doctor() {
             _doc_warn "milog.service installed but inactive" "start: sudo systemctl start milog.service"
             warn=$(( warn + 1 ))
         fi
-        # milog-web.service (user unit) — optional dashboard. Only report if
-        # something has attempted to install it; absent-by-choice is fine.
+        # milog-web.service is reported only once someone has tried to install it.
         local web_unit="${HOME}/.config/systemd/user/milog-web.service"
         if [[ -f "$web_unit" ]]; then
             if systemctl --user is-active --quiet milog-web.service 2>/dev/null; then
@@ -5395,7 +4882,6 @@ mode_doctor() {
         fi
     fi
 
-    # ---- summary -------------------------------------------------------------
     echo
     if (( fail > 0 )); then
         echo -e "  ${R}${fail} failure(s)${NC}, ${Y}${warn} warning(s)${NC} — required functionality is missing."
@@ -5409,28 +4895,9 @@ mode_doctor() {
     fi
 }
 
-# ==============================================================================
-# ==============================================================================
-# MODE: errors — show what's broken right now, across every log source
-#
-# Two faces:
-#
-#   1. Live tail (default, backward-compatible)
-#      `milog errors`      → tail every source. nginx-typed sources show
-#                            4xx/5xx lines; journal/docker/text sources show
-#                            app-pattern matches (Go panics, OOM kills, …).
-#
-#   2. Summary report (any flag triggers it)
-#      `milog errors --since 24h [--source X] [--pattern Y]`
-#                          → scan alerts.log for `app:<source>:<pattern>`
-#                            fires in the window, group counts, list samples.
-#
-# Window grammar mirrors `milog alerts`: today / yesterday / all / Nh/Nd/Nw.
-# ==============================================================================
+# milog errors: live tail of failures per source by default; any flag switches to a summary of `app:` fires from alerts.log.
 
 mode_errors() {
-    # Flag-driven summary mode. Plain `milog errors` keeps doing the live
-    # mixed tail — that's what existing scripts and muscle memory expect.
     case "${1:-}" in
         --since|--since=*|--source|--source=*|--pattern|--pattern=*|--summary|summary)
             _errors_summary "$@"; return $? ;;
@@ -5445,8 +4912,7 @@ mode_errors() {
 }
 
 _errors_help() {
-    # printf '%b' interprets the \033 escapes embedded in the color vars.
-    # `cat <<EOF` would dump them as literal text on real terminals.
+    # printf '%b' renders the colour escapes; a heredoc would print them literally.
     printf '%b' "
 ${W}milog errors${NC} — what's broken right now, across every log source
 
@@ -5465,10 +4931,7 @@ within the window. Window grammar: today / yesterday / all / Nm / Nh / Nd / Nw.
 "
 }
 
-# --- Live tail ----------------------------------------------------------------
-# Nginx sources: classic 4xx/5xx line filter.
-# Non-nginx sources: pattern union from the patterns module — same source of
-# truth as `milog patterns`, so adding a pattern there extends this view too.
+# nginx sources show 4xx/5xx lines; others show matches of the `milog patterns` union.
 _errors_live() {
     echo -e "${D}Watching errors across all sources... (Ctrl+C)${NC}"
     echo -e "${D}  nginx sources: 4xx/5xx tail   |   other sources: app-pattern matches${NC}\n"
@@ -5486,8 +4949,6 @@ _errors_live() {
 
         case "$type" in
             nginx)
-                # Backward-compat tail: 4xx/5xx HTTP status filter on the
-                # combined-format access line. Same regex as v1.
                 ( bash -c "$cmd" 2>/dev/null \
                     | grep --line-buffered -E ' [45][0-9][0-9] ' \
                     | awk -v col="$col" -v lbl="$label" -v nc="$NC" \
@@ -5495,9 +4956,7 @@ _errors_live() {
                 pids+=($!)
                 ;;
             *)
-                # App-pattern tail — only spawn when at least one pattern is
-                # defined; otherwise the union ERE is empty and grep would
-                # match every line.
+                # An empty union would make grep match every line.
                 if [[ -n "$pattern_union" ]]; then
                     ( bash -c "$cmd" 2>/dev/null \
                         | grep --line-buffered -v '^#' \
@@ -5518,10 +4977,7 @@ _errors_live() {
     wait
 }
 
-# --- Summary report -----------------------------------------------------------
-# Reads alerts.log for `app:<source>:<pattern>` fires in the window. Optional
-# --source / --pattern filters narrow the report; both are exact match on the
-# rule-key segment so users can paste from `milog patterns list`.
+# --source and --pattern match rule-key segments exactly, so names pasted from `milog patterns list` work.
 _errors_summary() {
     local window="today" want_source="" want_pattern="" arg
     while (( $# )); do
@@ -5548,9 +5004,6 @@ _errors_summary() {
     cutoff=$(_alerts_window_to_epoch "$window") || return 1
     cutoff_fmt=$(_alerts_fmt_epoch "$cutoff")
 
-    # Filter once: in-window AND rule_key starts with `app:`. Optional
-    # source/pattern filters refine further. awk does the heavy lift; bash
-    # consumes the small filtered result.
     local filtered; filtered=$(mktemp -t milog_errors.XXXXXX) || return 1
     # shellcheck disable=SC2064
     trap "rm -f '$filtered'" RETURN
@@ -5602,8 +5055,7 @@ _errors_summary() {
     while IFS=$'\t' read -r epoch rule color title body src pat; do
         [[ -z "$epoch" ]] && continue
         when=$(_alerts_fmt_epoch "$epoch")
-        # Body is the matched line wrapped in ```; strip the fences and cap
-        # at 60 chars so the row stays scanable.
+        # Strip the ``` fences from the body for the sample column.
         sample="${body#\`\`\`}"; sample="${sample%\`\`\`}"
         (( ${#sample} > 60 )) && sample="${sample:0:57}..."
         printf "  %-16s  ${R}%-12s${NC}  ${Y}%-22s${NC}  %s\n" "$when" "$src" "$pat" "$sample"
@@ -5611,21 +5063,12 @@ _errors_summary() {
 
     echo -e "\n  ${D}total: $total fire(s) — log at $log_file${NC}\n"
 }
-# ==============================================================================
-# MODE: exploits — L7 attack payloads + scanner fingerprints
-# Catches path traversal, LFI, RCE, SQLi, XSS, Log4Shell, dotfile/secret probes,
-# infra-API probes (Docker/actuator/etc), CMS admin scans, and known scanner UAs.
-# Example matches:
-#   GET /index.php?lang=../../../../tmp/foo      (path traversal)
-#   GET /containers/json                         (docker API probe)
-#   GET /SDK/webLanguage                         (hikvision probe)
-#   "libredtail-http" user-agent                 (scanner UA)
-# ==============================================================================
+# milog exploits: tails access logs for L7 attack payloads and scanner fingerprints.
 mode_exploits() {
     echo -e "${D}Watching exploit attempts across all apps... (Ctrl+C)${NC}\n"
     local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
 
-    # Pattern built in groups for readability. ERE, case-insensitive.
+    # ERE, matched case-insensitively.
     local pat='\.\./|%2e%2e'                                                   # path traversal
     pat+='|/etc/passwd|/etc/shadow|/proc/self/environ'                         # target files
     pat+='|/containers/json|/actuator/|/server-status|/console(/|\?)|/druid/'  # infra probes
@@ -5654,9 +5097,7 @@ mode_exploits() {
                 while IFS= read -r line; do
                     printf '%b[%s]%b %b[EXPLOIT]%b %s\n' "$col" "$label" "$NC" "$R" "$NC" "$line"
                     cat_slug=$(_exploit_category "$line")
-                    # Fingerprint gate runs AFTER cooldown — both must pass.
-                    # Suppresses duplicate alerts when `probes` also matches
-                    # the same line (common on scanner traffic like zgrab).
+                    # The fingerprint gate stops a second alert when probes matches the same line.
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "exploit:$app:$cat_slug" \
                        && alert_fingerprint_fresh "$fp"; then
@@ -5671,9 +5112,7 @@ mode_exploits() {
     trap 'kill "${pids[@]}" 2>/dev/null; exit' INT TERM
     wait
 }
-# ==============================================================================
-# MODE: grep — filter-tail one source (any type: nginx / text / journal / docker)
-# ==============================================================================
+# milog grep <app> <pattern>: filtered tail of one source of any type.
 mode_grep() {
     local name="${1:-}" pattern="${2:-.}"
     if [[ -z "$name" ]]; then
@@ -5693,9 +5132,7 @@ mode_grep() {
     bash -c "$cmd" 2>/dev/null | grep --line-buffered -i "$pattern"
 }
 
-# ==============================================================================
-# MODE: health
-# ==============================================================================
+# milog health: status-class totals per app.
 mode_health() {
     echo -e "\n${W}── MiLog: Status Code Health ──${NC}\n"
     printf "%-12s  %8s  %8s  %8s  %8s  %8s\n" "APP" "TOTAL" "2xx" "3xx" "4xx" "5xx"
@@ -5720,29 +5157,10 @@ mode_health() {
     echo ""
 }
 
-# ==============================================================================
-# MODE: install — on-demand feature installer
-#
-# Complement to install.sh's --with-X flags. Lets users add optional
-# capabilities AFTER initial install, without re-running the one-liner with
-# a different flag set. Idempotent: `install <feature>` is safe to re-run.
-#
-# Each feature is a declarative spec — package-manager deps + optional
-# post-install hint. Binary downloads (for Go-binary features) will plug
-# into the same shape once those land.
-#
-# Usage:
-#   milog install list                   # matrix of features + installed status
-#   milog install <feature>              # install feature + its system deps
-#   milog install remove <feature>       # uninstall (keeps config/data)
-#
-# Scope today: geoip, web, history. Future: ebpf, audit, sse — they need
-# the corresponding Go binaries to land first.
-# ==============================================================================
+# milog install list | <feature> | remove <feature>: add optional system deps after the first install.
+# `remove` only prints the package manager command; other tools may depend on the package.
 
-# Feature catalog. Each feature is a colon-separated record:
-#   name : check_cmd : apt_pkg : dnf_pkg : pacman_pkg : description
-# check_cmd is what we run to decide "installed=yes/no".
+# name : check_cmd : apt_pkg : dnf_pkg : pacman_pkg : description; check_cmd on PATH means installed.
 _install_catalog() {
     cat <<"EOF"
 geoip:mmdblookup:mmdb-bin:libmaxminddb:libmaxminddb:GeoIP COUNTRY column via MaxMind lookup
@@ -5932,16 +5350,9 @@ ${D}install.sh --with-X flags are the \"first-install\" path; this subcommand is
 later additions without rerunning install.sh.${NC}
 "
 }
-# ==============================================================================
-# MODE: monitor  +  tui
-#
-# `milog monitor` runs the bash refresh-and-redraw dashboard (works on any
-# POSIX box, no extra binary). `milog tui` execs the Go Charm Bubble Tea
-# TUI when available — richer UI, same data source. Both coexist.
-# ==============================================================================
+# milog monitor is the bash dashboard; milog tui execs the Go Bubble Tea binary when installed.
 
-# Locate milog-tui, the Go Charm Bubble Tea binary. Preference order mirrors
-# _web_go_binary so install layouts stay consistent across companions.
+# Same lookup order as _web_go_binary.
 _tui_go_binary() {
     if [[ -n "${MILOG_TUI_BIN:-}" && -x "$MILOG_TUI_BIN" ]]; then
         printf '%s' "$MILOG_TUI_BIN"; return 0
@@ -5961,9 +5372,6 @@ _tui_go_binary() {
     return 1
 }
 
-# `milog tui` — run the Go Charm Bubble Tea TUI. Separate subcommand from
-# `milog monitor` so both coexist and users pick. Clear install hint
-# when the binary is missing.
 mode_tui() {
     local go_bin
     if ! go_bin=$(_tui_go_binary); then
@@ -5974,7 +5382,6 @@ mode_tui() {
         echo -e "${D}  gives the same data with a simpler render loop.${NC}" >&2
         return 1
     fi
-    # Pass the MILOG_* surface through so config stays single-source.
     export MILOG_LOG_DIR="$LOG_DIR" \
            MILOG_APPS="${LOGS[*]}" \
            MILOG_REFRESH="${REFRESH:-5}" \
@@ -5983,8 +5390,7 @@ mode_tui() {
 }
 
 mode_monitor() {
-    # Async CPU sampler — reads /proc/stat in a background loop, writes the
-    # latest % to a tmpfile. Keeps the render loop from blocking on sleep 0.2.
+    # Sample CPU in the background; cpu_usage sleeps 0.2s and would stall the render loop.
     local cpu_file cpu_pid
     cpu_file=$(mktemp 2>/dev/null || echo "/tmp/milog.cpu.$$")
     echo 0 > "$cpu_file"
@@ -5997,11 +5403,9 @@ mode_monitor() {
         done
     ) & cpu_pid=$!
 
-    # Enable sparkline history for nginx_row
     MILOG_HIST_ENABLED=1
     declare -gA HIST
 
-    # Hide cursor and quiet input echo so keystrokes don't litter the TUI.
     tput civis 2>/dev/null || true
     stty -echo 2>/dev/null || true
 
@@ -6020,7 +5424,6 @@ mode_monitor() {
 
     local first=1 paused=0
     while true; do
-        # Reflow for terminal size — runs per tick so SIGWINCH just works.
         milog_update_geometry
         if (( first )); then
             clear
@@ -6057,18 +5460,14 @@ mode_monitor() {
         mem_bar=$(ascii_bar $BW "$mem_pct"  100)
         disk_bar=$(ascii_bar $BW "$disk_pct" 100)
 
-        # --- Single unified box starts here ---
         bdr_top
 
-        # Title row
         local t_p=" MiLog   ${TIMESTAMP}   ${net_iface}"
         local t_c=" ${W}MiLog${NC}   ${D}${TIMESTAMP}${NC}   ${D}${net_iface}${NC}"
         draw_row "$t_p" "$t_c"
 
         bdr_mid
 
-        # System metrics row 1 — bars
-        # Plain: " CPU  xx% [bar18]  MEM  xx% [bar18]  DISK  xx% [bar18]"
         local r1_p
         r1_p=$(printf " CPU %3d%% [%-${BW}s]  MEM %3d%% [%-${BW}s]  DISK %3d%% [%-${BW}s]" \
             "$cpu" "$cpu_bar" "$mem_pct" "$mem_bar" "$disk_pct" "$disk_bar")
@@ -6079,15 +5478,13 @@ mode_monitor() {
             "$disk_col" "$disk_pct" "$NC" "$disk_col" "$disk_bar" "$NC")
         draw_row "$r1_p" "$r1_c"
 
-        # System metrics row 2 — detail + net
-        # Max visible: ' MEM 99999/99999MB  DISK 999.9/999.9GB  dn:999.9MB/s up:999.9MB/s' = 72
+        # Widest case is 72 visible chars.
         local r2_p=" MEM ${mem_used}/${mem_total}MB  DISK ${disk_used}/${disk_total}GB  dn:${rx_s}/s up:${tx_s}/s"
         local r2_c=" ${D}MEM${NC} ${mem_used}/${mem_total}MB  ${D}DISK${NC} ${disk_used}/${disk_total}GB  ${C}dn:${rx_s}/s${NC} ${G}up:${tx_s}/s${NC}"
         draw_row "$r2_p" "$r2_c"
 
         bdr_mid
 
-        # Nginx workers
         draw_row " NGINX WORKERS" " ${W}NGINX WORKERS${NC}"
         local workers worker_count
         workers=$(ps aux 2>/dev/null | awk '/nginx: worker/{printf "  pid:%-8s  cpu:%5s%%  mem:%5s%%\n",$2,$3,$4}' | head -6)
@@ -6106,7 +5503,6 @@ mode_monitor() {
 
         bdr_mid
 
-        # Nginx per-app table (no nested box — continues same box with col separators)
         bdr_hdr
         hdr_row
         bdr_hdr
@@ -6117,7 +5513,6 @@ mode_monitor() {
 
         bdr_sep
 
-        # Footer
         local upstr; upstr=$(uptime -p 2>/dev/null | sed 's/up //' || echo 'n/a')
         local f_p=" TOTAL: ${TOTAL} req/min   UP: ${upstr}"
         local f_c=" ${W}TOTAL:${NC} ${TOTAL} req/min   ${D}UP: ${upstr}${NC}"
@@ -6126,9 +5521,8 @@ mode_monitor() {
         bdr_bot
         local ptag=""
         (( paused )) && ptag="  ${R}[PAUSED]${NC}"
-        # Clear-to-EOL so shorter footer over a longer one doesn't leave junk.
+        # \033[K and \033[J clear leftovers from a longer or taller previous frame.
         printf "${D} q:quit  p:pause  r:refresh  +/-:rate (${REFRESH}s)  |  5xx>=${THRESH_5XX_WARN} blinks${NC}${ptag}\033[K\n"
-        # Also clear from cursor down in case previous frame was taller.
         printf '\033[J'
 
         MILOG_HIST_PAUSED=$paused
@@ -6144,20 +5538,10 @@ mode_monitor() {
         esac
     done
 }
-# ==============================================================================
-# MODE: patterns — generic app-error detection across all LOGS source types
-# Watches every configured source through `_log_reader_cmd`, runs each line
-# against a built-in catalog of universal app-error signatures plus any
-# user-defined extras (APP_PATTERN_<name>=regex), and fires alerts keyed
-# `app:<source>:<pattern>` through the existing alert infra.
-# Source-agnostic by design — works on nginx, journal, docker, and text logs.
-# Parallel indexed arrays (not associative) keep the module bash-3.2-friendly
-# for dev boxes; the catalog is small enough that O(N) lookups are free.
-# ==============================================================================
+# milog patterns: app-error signatures over every LOGS source, firing `app:<source>:<pattern>`.
+# Parallel indexed arrays instead of associative ones keep it working on bash 3.2.
 
-# Built-in pattern catalog. Names + regexes paired by index. ERE, matched
-# case-insensitively. Each entry is anchored to a phrase narrow enough that
-# a false positive justifies waking someone — broaden only with care.
+# EREs matched case-insensitively; APP_PATTERN_<name>=regex adds or overrides one.
 _PATTERNS_BUILTIN_NAMES=(
     panic_go
     traceback_python
@@ -6179,7 +5563,7 @@ _PATTERNS_BUILTIN_REGEX=(
     'out of memory'
 )
 
-# Look up a built-in regex by name. Empty stdout = not a built-in.
+# Empty output means not a built-in.
 _patterns_builtin_get() {
     local want="$1" i
     for i in "${!_PATTERNS_BUILTIN_NAMES[@]}"; do
@@ -6191,10 +5575,7 @@ _patterns_builtin_get() {
     return 1
 }
 
-# Walk env for `APP_PATTERN_<name>=<regex>` overrides + extras, merge with
-# built-ins, emit one `<name>\t<regex>\n` line per active entry. An empty
-# user value disables a same-named built-in (mute panic_go etc. without
-# touching the source). Stable sorted output for deterministic listings.
+# Built-ins merged with APP_PATTERN_* env, as sorted `<name>\t<regex>` lines; an empty value disables a built-in.
 _patterns_collect() {
     local i name regex
     local -a out_names=() out_regex=()
@@ -6202,7 +5583,6 @@ _patterns_collect() {
         out_names+=("${_PATTERNS_BUILTIN_NAMES[$i]}")
         out_regex+=("${_PATTERNS_BUILTIN_REGEX[$i]}")
     done
-    # Apply user overrides + additions from env.
     local k v idx found
     while IFS='=' read -r k v; do
         [[ "$k" == APP_PATTERN_* ]] || continue
@@ -6226,15 +5606,12 @@ _patterns_collect() {
             out_regex+=("$v")
         fi
     done < <(env)
-    # Pair-emit and sort by name.
     for i in "${!out_names[@]}"; do
         printf '%s\t%s\n' "${out_names[$i]}" "${out_regex[$i]}"
     done | sort
 }
 
-# Build a single union ERE from the collected patterns — one tail+grep pipe
-# per source instead of N. The classifier below re-tests each pattern in
-# bash to attribute matches by name (rare path; only on actual matches).
+# All patterns as one ERE, a cheap pre-filter before per-name classification.
 _patterns_union_ere() {
     local first=1 out="" name re
     while IFS=$'\t' read -r name re; do
@@ -6245,10 +5622,7 @@ _patterns_union_ere() {
     printf '%s' "$out"
 }
 
-# Classify which named pattern(s) a line matched. Multiple matches per line
-# are possible (e.g. an OOM line trips both `oom_kill` and `out_of_memory`);
-# we fire one alert per classified pattern so silence rules can target each
-# independently. Stdout: pattern names, space-separated.
+# Space-separated names of every pattern the line matches; each fires separately so silences can target one.
 _patterns_classify() {
     local line="$1"
     local name re hits=""
@@ -6286,13 +5660,7 @@ mode_patterns() {
         echo -e "${D}Patterns: ${names[*]}${NC}\n"
     fi
 
-    # Single sequential consumer — multiple parallel watchers race on
-    # alerts.state's read-modify-write (concurrent renames clobber each
-    # other, leading to lost cooldown entries and double-fires). All sources
-    # funnel into one merged stream tagged `<source>\t<line>` and a single
-    # consumer processes lines one at a time, so cooldown is rock-solid.
-    # awk handles the per-line tagging + fflush so output is line-buffered
-    # on both Linux (gawk) and macOS (BSD awk) without GNU-only flags.
+    # One sequential consumer: parallel watchers would race on alerts.state and lose cooldowns.
     local colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
 
     {
@@ -6301,9 +5669,7 @@ mode_patterns() {
             local source_name; source_name=$(_log_name_for "$entry")
             local cmd;         cmd=$(_log_reader_cmd "$entry") || continue
             [[ -z "$cmd" ]] && continue
-            # Strip diagnostic lines (`#journal unavailable: …`) BEFORE
-            # tagging so they never match `(ERROR|FATAL|CRITICAL)\s` and
-            # self-page. awk fflush() forces line-buffering portably.
+            # Drop `#...unavailable` diagnostics first so they can't match generic_critical.
             ( bash -c "$cmd" 2>/dev/null \
                 | grep --line-buffered -v '^#' \
                 | awk -v src="$source_name" '{print src "\t" $0; fflush()}' ) &
@@ -6311,10 +5677,7 @@ mode_patterns() {
         wait
     } | while IFS=$'\t' read -r src line; do
             [[ -z "$line" ]] && continue
-            # Union pre-filter via bash =~ — avoids the cost of forking grep
-            # per line, and (critically) anchors patterns like `^panic:`
-            # against the actual line content, not against the post-tag
-            # stream where `^` would match nothing.
+            # Match the untagged line so `^` anchors like `^panic:` work.
             shopt -s nocasematch
             [[ "$line" =~ $union ]] || { shopt -u nocasematch; continue; }
             shopt -u nocasematch
@@ -6340,9 +5703,7 @@ mode_patterns() {
         done
 }
 
-# Inspect mode — `milog patterns list` shows the merged catalog including any
-# user overrides, with a `builtin` / `override` / `custom` tag. Useful for
-# debugging why a given pattern isn't firing.
+# `milog patterns list`: the merged catalog, each entry tagged builtin, override or custom.
 mode_patterns_list() {
     local name re origin builtin_re
     printf '%-28s %-10s %s\n' "NAME" "ORIGIN" "REGEX"
@@ -6358,35 +5719,12 @@ mode_patterns_list() {
         printf '%-28s %-10s %s\n' "$name" "$origin" "$re"
     done < <(_patterns_collect)
 }
-# ==============================================================================
-# MODE: probe — manage the eBPF probe sidecar (milog-probe) via systemd
-#
-# Counterpart to `milog web install-service`. The probe is Linux-only and
-# privileged (eBPF needs root or CAP_BPF + CAP_PERFMON), so its unit lives
-# in /etc/systemd/system/ rather than the user-mode location web uses.
-#
-# Subcommands:
-#   milog probe status                run state + journal pointer
-#   sudo milog probe install-service  write + enable + start the unit
-#   sudo milog probe uninstall-service stop + disable + remove the unit
-#
-# Why HOME is baked into the unit:
-#   The probe shells out to `milog _internal_alert` for every rule hit.
-#   Since the probe runs as root, milog inherits root's $HOME and resolves
-#   ALERT_STATE_DIR to /root/.cache/milog — invisible to the regular user
-#   running `milog alerts` from their shell. Capturing the invoking user's
-#   $HOME at install time and pinning it via Environment= keeps alerts +
-#   silences in the user's cache where they belong.
-# ==============================================================================
+# milog probe status|install-service|uninstall-service: the root-run eBPF sidecar's systemd unit.
+# The unit pins the invoking user's HOME, so alerts the probe fires via `milog _internal_alert` land in that user's cache, not root's.
 
-# Path to the systemd system unit. Kept in sync with _probe_service_install.
 _PROBE_SYSTEMD_UNIT="/etc/systemd/system/milog-probe.service"
 
-# Default file allowlist baked into the unit at install-service time.
-# Conservative system-tools list plus comm names observed as benign noise
-# in real deployments (Docker runc init stages, Tencent Cloud agents,
-# udev). Operators tune at install time via MILOG_PROBE_FILE_ALLOWLIST or
-# by editing the Environment= line in the unit afterward.
+# File-probe comm allowlist written into the unit; override with MILOG_PROBE_FILE_ALLOWLIST at install time.
 _PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,milog,milog-probe,ps,runc,runc:[2:INIT],watchtower,whoami"
 
 _probe_service_active() {
@@ -6411,9 +5749,7 @@ _probe_status() {
     fi
 }
 
-# Locate milog-probe, the Go companion binary. Same preference order as
-# _web_go_binary — explicit override, libexec/, /usr/local/bin, then a
-# clone-relative dev path.
+# Same lookup order as _web_go_binary.
 _probe_binary() {
     if [[ -n "${MILOG_PROBE_BIN:-}" && -x "$MILOG_PROBE_BIN" ]]; then
         printf '%s' "$MILOG_PROBE_BIN"; return 0
@@ -6470,10 +5806,7 @@ _probe_service_install() {
     local probe_bin
     probe_bin=$(_probe_binary) || { _probe_no_binary_error; return 1; }
 
-    # Capture the user who invoked sudo so the probe-spawned milog can
-    # write alerts + read silences from THAT user's $HOME, not root's.
-    # SUDO_USER is set by sudo; logname falls back for direct-root login.
-    # If everything fails (boot-time root shell), default to root + warn.
+    # SUDO_USER, else logname, else root.
     local target_user="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
     local target_home
     target_home=$(getent passwd "$target_user" 2>/dev/null | cut -d: -f6)
@@ -6594,17 +5927,12 @@ ${W}milog probe${NC} — manage the eBPF probe sidecar (Linux only)
             return 1 ;;
     esac
 }
-# ==============================================================================
-# MODE: probes — scanner / bot traffic by user-agent + protocol-level probes
-# Wide UA database covering security tools, mass scanners, SEO bots,
-# generic HTTP libs, AI crawlers, and non-HTTP protocol smuggling attempts.
-# ==============================================================================
+# milog probes: scanner, bot and crawler traffic by user-agent, plus non-HTTP protocol probes.
 mode_probes() {
     echo -e "${D}Watching scanner/bot traffic across all apps... (Ctrl+C)${NC}\n"
     local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
 
-    # Protocol-level: SSH banner, TLS ClientHello sent to plain HTTP (nginx logs
-    # the bytes as literal \xNN — double backslash so grep sees one).
+    # SSH banners and TLS ClientHellos sent to plain HTTP; nginx logs the bytes as literal \xNN.
     local pat='SSH-2\.0|\\x16\\x03|\\x00\\x00'
     # Security / pentest tools
     pat+='|masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster'
@@ -6644,8 +5972,7 @@ mode_probes() {
                     grep --line-buffered -Ei "$pat" | \
                 while IFS= read -r line; do
                     printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$line"
-                    # Fingerprint gate runs AFTER cooldown — see exploits.sh
-                    # for rationale. Scanner hits commonly match both rules.
+                    # Dedup with exploits, which often matches the same scanner line.
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \
                        && alert_fingerprint_fresh "$fp"; then
@@ -6661,9 +5988,7 @@ mode_probes() {
     wait
 }
 
-# ==============================================================================
-# MODE: rate — nginx-only
-# ==============================================================================
+# milog rate: nginx-only refresh dashboard.
 mode_rate() {
     while true; do
         milog_update_geometry
@@ -6691,13 +6016,7 @@ mode_rate() {
     done
 }
 
-# ==============================================================================
-# MODE: replay — postmortem summary of one archived log file
-# Read-only: never writes history. Handles .gz / .bz2 transparently.
-# Three passes of the file: counts + date range, timings (sort + percentile),
-# top source IPs. Each pass is single-awk-per-metric — same discipline as
-# the live dashboard helpers.
-# ==============================================================================
+# milog replay <file>: read-only postmortem summary of one log file, plain, .gz or .bz2.
 mode_replay() {
     local file="${1:-}"
     if [[ -z "$file" ]]; then
@@ -6706,8 +6025,6 @@ mode_replay() {
     fi
     [[ -f "$file" ]] || { echo -e "${R}Not found: $file${NC}" >&2; return 1; }
 
-    # Pick reader based on extension. Array form so no word-splitting risks
-    # when $file contains spaces.
     local -a reader=(cat --)
     case "$file" in
         *.gz)
@@ -6725,7 +6042,6 @@ mode_replay() {
 
     echo -e "\n${W}── MiLog: Replay — ${file} ──${NC}\n"
 
-    # Pass 1: lines, first/last timestamp, status-class tallies.
     local summary n first last e2 e3 e4 e5
     summary=$("${reader[@]}" "$file" 2>/dev/null | awk '
         {
@@ -6756,7 +6072,7 @@ mode_replay() {
     printf "  %-10s  2xx=%s  3xx=%s  ${Y}4xx=%s${NC}  ${R}5xx=%s${NC}\n" \
            "status"  "$e2" "$e3" "$e4" "$e5"
 
-    # Pass 2: percentiles, only if any line has a numeric final field.
+    # Percentiles only when some line ends in a number.
     local sorted
     sorted=$("${reader[@]}" "$file" 2>/dev/null \
         | awk '$NF ~ /^[0-9]+(\.[0-9]+)?$/ { print int($NF * 1000 + 0.5) }' \
@@ -6775,7 +6091,6 @@ mode_replay() {
         printf "  %-10s  p50=%dms  p95=%dms  p99=%dms\n" "response" "$p50" "$p95" "$p99"
     fi
 
-    # Pass 3: top 10 source IPs.
     echo
     echo -e "  ${W}Top source IPs:${NC}"
     "${reader[@]}" "$file" 2>/dev/null \
@@ -6789,31 +6104,11 @@ mode_replay() {
     echo
 }
 
-# ==============================================================================
-# MODE: search <pattern> [flags] — grep across all app logs + archives
-#
-# Tier-1 log search: a polite wrapper around `grep -F` (or `grep -E` with
-# --regex) across every configured app's access.log. Optional filters:
-#
-#   --since <spec>   : drop lines older than spec (today/Nh/Nd/Nw/all).
-#                      Reuses _alerts_window_to_epoch — same grammar.
-#   --app <name>     : scope to one app's logs.
-#   --path <sub>     : substring filter on URL path (post-grep).
-#   --regex          : pattern is ERE (grep -E) instead of fixed-string.
-#   --archives       : also search rotated logs (.log.1, .log.2.gz, ...).
-#   --limit N        : cap output to N lines (default 200; 0 = unlimited).
-#
-# Output: one prefixed line per match — `[app       ] <logline>` with per-app
-# coloring. Final tally shows total + per-app counts.
-#
-# Scaling: grep is linear; fine up to ~10 GB total log volume. Beyond that,
-# see the plan's "Full-text search, tier 2 (SQLite FTS5)" item.
-# ==============================================================================
+# milog search <pattern> [flags]: fixed-string (or --regex) grep across app logs and, with --archives, rotated ones.
 mode_search() {
     local pattern="" since="" app_filter="" path_filter=""
     local use_regex=0 include_archives=0 limit=200
 
-    # First positional (if not a flag) is the pattern.
     if [[ $# -gt 0 && "$1" != --* ]]; then
         pattern="$1"; shift
     fi
@@ -6847,13 +6142,10 @@ ${NC}"
     [[ "$limit" =~ ^[0-9]+$ ]] \
         || { echo -e "${R}--limit must be numeric${NC}" >&2; return 1; }
 
-    # Resolve --since to a cutoff epoch up-front (one fork, not per-line).
     local cutoff_epoch=""
     if [[ -n "$since" ]]; then
         cutoff_epoch=$(_alerts_window_to_epoch "$since") || return 1
-        # --since relies on awk's mktime() — gawk/mawk have it, BSD awk
-        # doesn't. Warn + disable gracefully on BSD-awk hosts so the search
-        # still runs (users get all matches instead of a hard failure).
+        # mktime() exists in gawk and mawk but not BSD awk; without it, skip the time filter rather than fail.
         if ! command -v gawk >/dev/null 2>&1 \
              && ! awk 'BEGIN { if (mktime("2020 1 1 0 0 0") <= 0) exit 1 }' 2>/dev/null; then
             echo -e "${Y}--since requires gawk or mawk (this awk lacks mktime); time filter skipped${NC}" >&2
@@ -6861,13 +6153,9 @@ ${NC}"
         fi
     fi
 
-    # Prefer gawk for the filtering awk — mawk/gawk have mktime, BSD awk
-    # doesn't. Falls back to plain `awk` when neither is explicit (works
-    # on Ubuntu where /usr/bin/awk is typically mawk).
     local awk_bin="awk"
     command -v gawk >/dev/null 2>&1 && awk_bin="gawk"
 
-    # Apps: explicit --app filter, else every configured LOGS entry.
     local apps_to_scan=()
     if [[ -n "$app_filter" ]]; then
         if [[ ! " ${LOGS[*]} " =~ " $app_filter " ]]; then
@@ -6879,13 +6167,10 @@ ${NC}"
         apps_to_scan=("${LOGS[@]}")
     fi
 
-    # grep -F by default (safe for user-pasted strings like "session_id=abc+xyz");
-    # --regex opts into grep -E so callers can use alternation.
     local grep_flag="-F"
     (( use_regex )) && grep_flag="-E"
 
-    # Stream all matches into a tmp file so we can tally + apply --limit
-    # after the fact without second-pass scanning the source logs.
+    # Collect matches in a temp file so --limit and the tally don't rescan the logs.
     local tmp; tmp=$(mktemp -t milog_search.XXXXXX) || return 1
     # shellcheck disable=SC2064
     trap "rm -f '$tmp'" RETURN
@@ -6897,8 +6182,6 @@ ${NC}"
         local label; label=$(printf "%-10s" "$app")
         idx=$(( idx + 1 ))
 
-        # Build the file list (current + optional archives). Expanded
-        # globs are sorted so rotated logs come after the current one.
         local files=()
         [[ -f "$LOG_DIR/$app.access.log" ]] && files+=("$LOG_DIR/$app.access.log")
         if (( include_archives )); then
@@ -6909,9 +6192,6 @@ ${NC}"
             shopt -u nullglob
         fi
 
-        # For each file, decompress if needed then grep. Piped through
-        # awk for --path / --since filtering and final prefixing. One
-        # awk instance per file keeps the per-app coloring cheap.
         local f
         for f in "${files[@]}"; do
             _search_one_file "$f" "$pattern" "$grep_flag" "$app" "$col" "$label" \
@@ -6936,9 +6216,7 @@ ${NC}"
         cat "$tmp"
     fi
 
-    # Per-app counts — strip the colored prefix to find the app name.
-    # The prefix shape is "[<app padded to 10>]" so we pull field-2 of
-    # the raw `[label ] rest...` pattern.
+    # Per-app counts from the `[label]` prefix.
     echo -e "\n  ${W}by app${NC}"
     awk '
         {
@@ -6960,15 +6238,12 @@ ${NC}"
     echo -e "\n  ${D}total: $total match(es)${NC}\n"
 }
 
-# Scan one log file for pattern, applying post-filters, prefix each
-# surviving line with `[<colored app label>]`. Handles .gz / .bz2 / plain.
-# Emits to stdout; caller appends to the tmp file.
+# Prints matching lines of one plain/.gz/.bz2/.xz file, filtered and prefixed with `[label]`.
 _search_one_file() {
     local f="$1" pattern="$2" grep_flag="$3" app="$4" col="$5" label="$6"
     local path_filter="$7" cutoff_epoch="$8" awk_bin="${9:-awk}"
 
-    # Decompression path — prefer `gzip -dc` over `zcat` because BSD zcat
-    # only handles .Z (compress), not .gz. Same for `bzip2 -dc` / `xz -dc`.
+    # gzip -dc rather than zcat: BSD zcat only reads .Z.
     local reader_cmd=""
     case "$f" in
         *.gz)   reader_cmd="gzip -dc"  ;;
@@ -6976,15 +6251,11 @@ _search_one_file() {
         *.xz)   reader_cmd="xz -dc"    ;;
         *)      reader_cmd="cat"       ;;
     esac
-    # Check the first word of reader_cmd is on PATH.
     local probe="${reader_cmd%% *}"
     command -v "$probe" >/dev/null 2>&1 \
         || { echo -e "${D}  (skipping $f — $probe not installed)${NC}" >&2; return 0; }
 
-    # The || true swallows grep's "no matches" exit=1 so `set -euo pipefail`
-    # doesn't abort the whole search when one file happens to not contain
-    # the pattern (very common on rotated archives). Each stage's other
-    # failure modes are intentionally swallowed too — search is best-effort.
+    # `|| true` keeps grep's no-match exit from aborting under pipefail; search is best-effort.
     $reader_cmd "$f" 2>/dev/null \
         | { grep "$grep_flag" -- "$pattern" || true; } \
         | "$awk_bin" -v app="$app" -v col="$col" -v nc="$NC" -v label="$label" \
@@ -7016,33 +6287,10 @@ _search_one_file() {
                 printf "[%s%s%s] %s\n", col, label, nc, $0
             }'
 }
-# ==============================================================================
-# MODE: silence — mute a rule (or glob of rules) while on-call works the fix
-#
-# Counterpart to the fire path: when a MiLog rule keeps pinging Discord every
-# ALERT_COOLDOWN seconds and you're already fixing the cause, mute it. The
-# silence outranks cooldown + dedup and even blocks the alerts.log record so
-# history stays signal-only.
-#
-# Subcommands:
-#   milog silence <rule_or_glob> <duration> [message]   add or extend
-#   milog silence list                                  show active silences
-#   milog silence clear <rule_or_glob>                  remove early
-#
-# Duration grammar: <N><s|m|h|d>  — `30s`, `5m`, `2h`, `1d`. A bare integer is
-# treated as seconds.
-#
-# Glob matching: bash glob syntax. `exploits:*` matches every `exploits:<cat>`
-# key fired by the exploits classifier. Be careful with overly broad globs —
-# `*` would silence literally every rule.
-#
-# Attribution: $USER (or `id -un` fallback) is recorded alongside each silence
-# so `milog silence list` shows WHO muted what. Useful even on single-user
-# hosts — the daemon writes as its own user; manual silences show as yours.
-# ==============================================================================
+# milog silence <rule_or_glob> <duration> [message] | list | clear <rule_or_glob>.
+# A silence outranks cooldown and dedup and also skips the alerts.log record; globs use bash syntax, so `*` mutes everything.
 
-# Human-readable "time remaining" from a future epoch. 0+ only (caller
-# guarantees unexpired rows).
+# Remaining time until a future epoch.
 _silence_fmt_remaining() {
     local now target delta
     now=$(date +%s)
@@ -7059,7 +6307,6 @@ _silence_fmt_remaining() {
     fi
 }
 
-# Human-readable absolute time, GNU/BSD portable (same trick as alerts.sh).
 _silence_fmt_epoch() {
     date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
     || date -r  "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
@@ -7187,24 +6434,15 @@ mode_silence() {
             _silence_help
             ;;
         *)
-            # Otherwise treat the first arg as the rule key and the rest as
-            # `<duration> [message]` — the most-used path.
             _silence_add "$@"
             ;;
     esac
 }
-# ==============================================================================
-# MODE: slow — top N endpoints by p95 response time
-# Requires the extended (combined_timed) log format — see README.
-# Pipeline: tail -> extract (path, ms) -> sort by path -> per-path p95
-#           -> sort by p95 desc -> head N. All portable POSIX awk; no
-#           gawk-only features (asort / PROCINFO) required.
-# ==============================================================================
+# milog slow [N]: endpoints ranked by p95 $request_time, in portable awk (no asort/PROCINFO).
 mode_slow() {
     local n="${1:-10}"
     local window="${SLOW_WINDOW:-1000}"
 
-    # Basic arg validation — integers only, otherwise later arithmetic trips.
     [[ "$n"      =~ ^[0-9]+$ ]] || { echo -e "${R}slow: N must be numeric${NC}" >&2; return 1; }
     [[ "$window" =~ ^[0-9]+$ ]] || { echo -e "${R}slow: SLOW_WINDOW must be numeric${NC}" >&2; return 1; }
 
@@ -7221,8 +6459,7 @@ mode_slow() {
         return 1
     fi
 
-    # Stream through two awk stages with sort in between so per-path p95 can
-    # be computed without multi-dim arrays.
+    # Sorting between the two awk passes gives per-path p95 without multi-dim arrays.
     local top_rows
     top_rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
         | awk -v EXCLUDE_LIST="${SLOW_EXCLUDE_PATHS:-}" '
@@ -7292,8 +6529,7 @@ mode_slow() {
     local i=1 path p95 count col
     while IFS=$'\t' read -r path p95 count; do
         col=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
-        # Truncate absurdly long paths so the table stays aligned. URL paths
-        # are ASCII, so ${#path} is safe for width math.
+        # URL paths are ASCII, so ${#path} is the display width.
         local display="$path"
         if (( ${#display} > 80 )); then
             display="${display:0:77}..."
@@ -7304,9 +6540,7 @@ mode_slow() {
     echo
 }
 
-# ==============================================================================
-# MODE: stats
-# ==============================================================================
+# milog stats <app>: requests per hour for one app.
 mode_stats() {
     local name="${1:-}"
     [[ -z "$name" || ! " ${LOGS[*]} " =~ " $name " ]] && {
@@ -7327,16 +6561,8 @@ mode_stats() {
     echo ""
 }
 
-# ==============================================================================
-# MODE: suspects — heuristic IP ranking (behavioral, not just UA)
-# Scores each IP in the last N log lines across all apps, using:
-#   4xx hits      × 2   (probing non-existent paths)
-#   5xx hits      × 3   (causing errors)
-#   missing UA    × 1   (scripted requests often send "-")
-#   scanner UA    + 10  (flat bonus if UA matches known tool)
-#   unique paths  / 5   (scanning behavior — many endpoints from one IP)
-# Prints top N with flags explaining why.
-# ==============================================================================
+# milog suspects [N] [lines]: ranks IPs over the last <lines> per app.
+# Score = 4xx×2 + 5xx×3 + missing-UA hits + 10 for a scanner UA + unique requests/5.
 mode_suspects() {
     local topn="${1:-20}"
     local window="${2:-2000}"
@@ -7365,9 +6591,7 @@ mode_suspects() {
         [[ -f "$file" ]] && tail -n "$window" "$file" >> "$tmp"
     done
 
-    # Score + top-N in one awk+sort pipeline. Post-aggregation, we pretty-
-    # print in bash so we can slot in an optional per-IP country lookup
-    # (mmdblookup runs at most $topn times — never per-line).
+    # Country lookups happen after ranking, so mmdblookup runs at most $topn times.
     local ranked
     ranked=$(awk '
         BEGIN { FS = "\"" }
@@ -7426,18 +6650,7 @@ mode_suspects() {
     echo
 }
 
-# ==============================================================================
-# MODE: top-paths — aggregate URLs across all app logs, show per-path stats
-#
-# The single most useful incident question ("what URL is eating traffic?" or
-# "what URL is spiking 5xx?") isn't well served by `top` (IPs) or `slow`
-# (p95). This surfaces REQ + 4xx + 5xx + p95 per path. Query string is
-# stripped so /search?q=x and /search?q=y collapse into one row.
-#
-# Pipeline mirrors mode_slow: awk emit → external sort by path → group awk
-# → sort by count → head N. p95 requires the extended log format; shows
-# "—" when $request_time is absent.
-# ==============================================================================
+# milog top-paths [N]: requests, 4xx, 5xx and p95 per path (query strings stripped); p95 shows n/a without $request_time.
 mode_top_paths() {
     local n="${1:-20}"
     local window="${SLOW_WINDOW:-2000}"
@@ -7457,17 +6670,7 @@ mode_top_paths() {
         return 1
     fi
 
-    # awk pass 1: extract (path, status, ms-or-"-") per line.
-    #   $7  = request URI  (nginx combined: `"GET /path HTTP/1.1"` is fields 6-8)
-    #   $9  = status code
-    #   $NF = $request_time when combined_timed is in use (plain number)
-    # Query string is stripped so /x?a=1 + /x?a=2 collapse to /x.
-    #
-    # awk pass 2: sort by path + ms-numeric, group, emit count/4xx/5xx/p95.
-    # Numeric sort with "-" present: gawk/sort put "-" first (treated as 0),
-    # numeric values follow in ascending order — our group-awk only counts
-    # numerics into v[], so the p95 position is computed against just the
-    # timed samples for each path.
+    # Rows of path, status, ms (or "-"); sorting by ms within each path lets the group pass index p95 over the timed samples only.
     local rows
     rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
         | awk -v EXCLUDE_LIST="${SLOW_EXCLUDE_PATHS:-}" '
@@ -7548,13 +6751,11 @@ mode_top_paths() {
         (( c5 > 0 )) && col_err="$R"
         col_err+=""    # no-op but keeps the colour local
         if [[ "$p95" == "-" ]]; then
-            # ASCII placeholder so printf byte-width == visual width. Unicode
-            # em-dash is 3 bytes / 1 column → throws off alignment.
+            # ASCII, because the 3-byte em-dash breaks printf width alignment.
             p95_disp=$(printf "%b%9s%b" "$D" "n/a" "$NC")
             col_p95=""
         else
             col_p95=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
-            # 7-wide number + "ms" = 9 visible chars (matches %9s header)
             p95_disp=$(printf "%b%7sms%b" "$col_p95" "$p95" "$NC")
         fi
         display="$path"
@@ -7571,9 +6772,7 @@ mode_top_paths() {
     echo
 }
 
-# ==============================================================================
-# MODE: top
-# ==============================================================================
+# milog top [N]: busiest IPs across all apps.
 mode_top() {
     local n="${1:-10}"
     echo -e "\n${W}── MiLog: Top ${n} IPs ──${NC}\n"
@@ -7596,8 +6795,7 @@ mode_top() {
             && awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
     done
 
-    # Geo lookup happens here — after uniq has already collapsed the IP set
-    # to at most $n rows, so we fork mmdblookup $n times, not once per line.
+    # Geo lookup after uniq, so mmdblookup forks at most $n times.
     local i=1 count ip col country
     while read -r count ip; do
         col=""
@@ -7618,13 +6816,7 @@ mode_top() {
     echo
 }
 
-# ==============================================================================
-# MODE: top-ip-by-app
-# Per-app top IPs in one report. Complements `milog top`, which collapses
-# the IP set across every app — that view hides "this IP only hits the
-# api app" patterns. Useful for forensics ("who's hammering /finance?")
-# and for spotting per-app scrapers.
-# ==============================================================================
+# milog top-ip-by-app [N]: top IPs per app, which `milog top` hides by merging apps.
 mode_top_ip_by_app() {
     local n="${1:-5}"
 
@@ -7651,10 +6843,7 @@ mode_top_ip_by_app() {
         path="$LOG_DIR/$name.access.log"
         [[ -f "$path" ]] || continue
 
-        # Empty-app guard: an empty file produces no rows from sort|uniq, so
-        # we'd silently skip the app. Print a placeholder so the operator
-        # sees "yes the app exists, no it has no traffic" rather than
-        # wondering whether the report dropped it.
+        # Show apps with no traffic instead of silently dropping them.
         if [[ ! -s "$path" ]]; then
             if (( show_geo )); then
                 printf "%-14s  %-5s  %-18s  %-7s  %10s\n" "$name" "-" "(no traffic)" "-" "0"
@@ -7666,8 +6855,6 @@ mode_top_ip_by_app() {
         fi
 
         i=1
-        # The geo lookup forks mmdblookup once per surfaced IP — at most
-        # `n` per app, so cost is bounded by `n × len(LOGS)`.
         while read -r count ip; do
             col=""
             (( i == 1 ))            && col="$R"
@@ -7684,8 +6871,6 @@ mode_top_ip_by_app() {
         done < <(awk '{print $1}' "$path" | sort | uniq -c | sort -rn | head -n "$n")
 
         printed_anything=1
-        # Blank separator between apps so the output reads as discrete
-        # blocks rather than one long flat table.
         echo
     done
 
@@ -7693,18 +6878,11 @@ mode_top_ip_by_app() {
         echo -e "${D}no readable access logs under $LOG_DIR${NC}"
     fi
 }
-# ==============================================================================
-# MODE: trend — ASCII sparkline chart from metrics_minute history
-# Requires HISTORY_ENABLED daemon to have written the DB. Renders two rows
-# per app: req/min (green) and 4xx+5xx errors (red). Bucket-aggregates so
-# the sparkline fits the fixed 60-char width.
-# ==============================================================================
+# milog trend [app] [hours]: req/min and 4xx+5xx sparklines per app from metrics_minute.
 _render_trend_one() {
     local app="$1" since="$2" window_sec="$3" width="$4"
 
-    # SQL buckets row timestamps into exactly `width` columns across the
-    # window. Empty columns (no samples) won't appear in output — we fill
-    # them in with zeros on the shell side below.
+    # Buckets with no rows are missing from the SQL output and filled with zeros below.
     local rows
     rows=$(sqlite3 -separator $'\t' "$HISTORY_DB" <<SQL 2>/dev/null
 SELECT CAST((ts - $since) * $width / $window_sec AS INTEGER) AS col,
@@ -7755,8 +6933,7 @@ mode_trend() {
 
     _history_precheck || return 1
 
-    # Sparkline width scales with terminal: 40-char floor so short terms
-    # still show something useful; each bucket maps to window_sec/width seconds.
+    # Terminal-width sparkline, at least 40 columns.
     milog_update_geometry
     local now since width window_sec
     width=$(( INNER - 40 ))
@@ -7767,8 +6944,6 @@ mode_trend() {
 
     local -a apps
     if [[ -n "$app_arg" ]]; then
-        # Reject app names that can't appear in LOGS, so a typo doesn't
-        # render "no data" forever.
         local ok=0 name
         for name in "${LOGS[@]}"; do
             [[ "$name" == "$app_arg" ]] && { ok=1; break; }
@@ -7790,18 +6965,15 @@ mode_trend() {
     done
 }
 
-# Path to the systemd user unit. Kept in sync with _web_service_install.
+# milog web: start/stop/status and the systemd user unit for the milog-web binary.
 _WEB_SYSTEMD_UNIT="${HOME}/.config/systemd/user/milog-web.service"
 
-# Is the unit currently active?
 _web_service_active() {
     command -v systemctl >/dev/null 2>&1 || return 1
     systemctl --user is-active --quiet milog-web.service 2>/dev/null
 }
 
-# Write the systemd user unit. Idempotent — repeated install just rewrites
-# the file with whatever config values are active NOW (so re-running picks
-# up `milog config set WEB_PORT 9000` without a second step).
+# Rewrites the unit from the current config, so re-running picks up a changed WEB_PORT.
 _web_service_install() {
     if ! command -v systemctl >/dev/null 2>&1; then
         echo -e "${R}systemctl not found — this host doesn't use systemd${NC}" >&2
@@ -7809,7 +6981,6 @@ _web_service_install() {
         echo -e "${D}    nohup milog web > ~/.cache/milog/web.out 2>&1 &${NC}" >&2
         return 1
     fi
-    # User services only — no root, no /etc/, no privileged ports.
     if [[ $(id -u) -eq 0 ]]; then
         echo -e "${R}run milog web install-service as your regular user, not root${NC}" >&2
         echo -e "${D}  the web dashboard binds to loopback on a high port — no root needed${NC}" >&2
@@ -7818,17 +6989,14 @@ _web_service_install() {
 
     local self="${BASH_SOURCE[0]}"
     [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
-    # If we're running from a repo clone, prefer the installed binary at
-    # /usr/local/bin/milog — more stable across clone renames / deletes.
+    # Prefer the installed copy over a repo clone that may move.
     [[ -x /usr/local/bin/milog ]] && self="/usr/local/bin/milog"
 
     local unit_dir; unit_dir=$(dirname "$_WEB_SYSTEMD_UNIT")
     mkdir -p "$unit_dir" 2>/dev/null \
         || { echo -e "${R}cannot create $unit_dir${NC}" >&2; return 1; }
 
-    # Write the unit. Environment= lines pin the current port/bind so a
-    # later `systemctl --user restart` uses the same surface — matches the
-    # URL `install-service` prints below.
+    # Pin the current port/bind so restarts serve the URL printed below.
     cat > "$_WEB_SYSTEMD_UNIT" <<EOF
 [Unit]
 Description=MiLog web dashboard (read-only, loopback)
@@ -7851,9 +7019,7 @@ EOF
 
     echo -e "${G}✓${NC} wrote $_WEB_SYSTEMD_UNIT"
 
-    # If a foreground milog web is already running, it would collide with
-    # the about-to-be-started systemd unit on the same port. Warn and stop
-    # it first — cleaner than a port-already-in-use failure on socket bind.
+    # A foreground instance would hold the port the unit is about to bind.
     if [[ -f "$(_web_pid_file)" ]]; then
         local old_pid; old_pid=$(< "$(_web_pid_file)" 2>/dev/null)
         if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
@@ -7913,12 +7079,7 @@ _web_service_uninstall() {
     fi
 }
 
-# Locate milog-web, the Go companion binary. Preference order:
-#   1. $MILOG_WEB_BIN (explicit override)
-#   2. /usr/local/libexec/milog/milog-web (package install location)
-#   3. /usr/local/bin/milog-web
-#   4. <dir of this script>/../../go/bin/milog-web (clone / dev)
-# Echoes the path on success, empty + non-zero on miss.
+# Path to milog-web: $MILOG_WEB_BIN, the package locations, then go/bin next to or above this script.
 _web_go_binary() {
     if [[ -n "${MILOG_WEB_BIN:-}" && -x "$MILOG_WEB_BIN" ]]; then
         printf '%s' "$MILOG_WEB_BIN"; return 0
@@ -7929,21 +7090,16 @@ _web_go_binary() {
         /usr/local/bin/milog-web; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
-    # Dev/clone path — relative to this script's bundled/unbundled location.
     local self="${BASH_SOURCE[0]}"
     [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
     local self_dir; self_dir=$(cd "$(dirname "$self")" && pwd)
-    # milog bundle is at repo root; go binary at repo/go/bin/milog-web.
     for candidate in "$self_dir/go/bin/milog-web" "$self_dir/../go/bin/milog-web"; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
     return 1
 }
 
-# Print actionable instructions when milog-web isn't on disk. install.sh
-# fetches it from a GitHub Release as part of curl-pipe install; the most
-# common reason to land here is a manual `git clone && bash milog.sh web`
-# without running install. Errors out non-zero so service starts fail loudly.
+# Usually reached from a git clone that never ran install.sh.
 _web_no_binary_error() {
     printf '%b' "
 ${R}milog-web binary not found.${NC}
@@ -7973,9 +7129,7 @@ Search path checked (in order):
 " >&2
 }
 
-# Exec milog-web with the bash-env MiLog vars mapped through. The Go
-# binary reads the same MILOG_* env set bash exposes, so configuration
-# stays single-source. Prints the URL + token once, then hands off.
+# Execs milog-web with the MILOG_* env it reads through config.Load().
 _web_start_go() {
     local go_bin="$1"
     local token; token=$(_web_token_read)
@@ -7993,13 +7147,10 @@ ${W}MiLog web${NC}  starting milog-web  ${D}${go_bin}${NC}
   ${D}stop:${NC}   milog web stop    (or Ctrl+C)
 
 "
-    # Track the exec'd Go binary's pid for `milog web stop`. Written
-    # before exec so foreground `Ctrl+C` works without an intermediate
-    # supervisor process.
+    # exec keeps this pid, so it is milog-web's pid for `milog web stop`.
     echo $$ > "$(_web_pid_file)"
     trap 'rm -f "$(_web_pid_file)"' EXIT
 
-    # Export the full MILOG_* surface — Go reads these via config.Load().
     export MILOG_WEB_BIND="$WEB_BIND" \
            MILOG_WEB_PORT="$WEB_PORT" \
            MILOG_LOG_DIR="$LOG_DIR" \
@@ -8012,8 +7163,7 @@ ${W}MiLog web${NC}  starting milog-web  ${D}${go_bin}${NC}
 }
 
 mode_web() {
-    # Subcommand dispatch — treats a leading --flag as implicit 'start' so
-    # `milog web --port 9000` works without the redundant literal 'start'.
+    # A leading --flag means implicit `start`.
     case "${1:-}" in
         stop)     _web_stop;   return ;;
         status)   _web_status; return ;;
@@ -8039,7 +7189,6 @@ mode_web() {
     [[ "$WEB_PORT" =~ ^[0-9]+$ ]] \
         || { echo -e "${R}--port must be numeric${NC}" >&2; return 1; }
 
-    # Expose-to-network guard — forces explicit consent.
     if [[ "$WEB_BIND" != "127.0.0.1" && "$WEB_BIND" != "localhost" && "$WEB_BIND" != "::1" ]] && (( ! trust )); then
         printf '%b' "
 ${R}refusing --bind $WEB_BIND without --trust${NC}
@@ -8052,7 +7201,6 @@ ${D}  If you really mean it:  milog web --bind $WEB_BIND --port $WEB_PORT --trus
         return 1
     fi
 
-    # Already running? Covers both the systemd unit and a foreground pidfile.
     if _web_systemd_active; then
         echo -e "${Y}milog-web.service is already running (systemd). Check: milog web status${NC}"
         return 1
@@ -8062,43 +7210,19 @@ ${D}  If you really mean it:  milog web --bind $WEB_BIND --port $WEB_PORT --trus
         return 1
     fi
 
-    # Token + state dirs.
     _web_token_ensure || return 1
     mkdir -p "$WEB_STATE_DIR" 2>/dev/null
 
-    # The Go binary is the dashboard server. No bash fallback — keeping
-    # two implementations in sync was the whole reason the bash router
-    # got deleted.
+    # No bash fallback server.
     local go_bin
     go_bin=$(_web_go_binary) || { _web_no_binary_error; return 1; }
     _web_start_go "$go_bin"
 }
 
-# ==============================================================================
-# ==============================================================================
-# MODE: ws — WebSocket session metrics (complementary to `slow`)
-#
-# nginx's `$request_time` for a WebSocket-upgraded connection is the full
-# session lifetime (start-of-HTTP-request to socket-close), not request
-# latency. `milog slow` / `top-paths` filter WS paths out so they don't
-# top the "slowest" table with healthy long-lived sessions. This mode is
-# the other side: shows WS sessions on their own terms — count, duration
-# distribution, longest, per-path breakdown.
-#
-# "Which paths are WebSocket?" comes from SLOW_EXCLUDE_PATHS (default:
-# "/ws/* /socket.io/*"). One source of truth — customising the exclude
-# list moves paths in/out of `ws` at the same time.
-#
-# Requires the combined_timed log format (with $request_time). Skipping
-# silently if no WS samples match in the window.
-# ==============================================================================
+# milog ws: WebSocket session metrics. $request_time is the whole session for these, which is why slow/top-paths exclude them.
+# WS paths are SLOW_EXCLUDE_PATHS, so both views always agree; needs $request_time in the log format.
 
-# Format a duration given in seconds into a short human string.
-#   < 1 s          → "<1s"
-#   < 60 s         → "Ns"
-#   < 3600 s       → "MmSSs"
-#   < 86400 s      → "HhMMm"
-#   >= 86400 s     → "DdHHh"
+# Seconds -> "<1s", "Ns", "MmSSs", "HhMMm" or "DdHHh".
 _ws_fmt_duration() {
     local s="$1"
     if ! [[ "$s" =~ ^[0-9]+$ ]]; then printf -- '—'; return; fi
@@ -8137,9 +7261,7 @@ mode_ws() {
         return 1
     fi
 
-    # Per-file extraction: emit `app \t path \t ms` for WS-prefixed paths
-    # only. Done in a loop rather than `tail -q` so we can tag each line
-    # with its source app.
+    # `app \t path \t ms` for WS paths, one file at a time so lines keep their app.
     local raw
     raw=$(
         for entry in "${files[@]}"; do
@@ -8178,8 +7300,6 @@ mode_ws() {
         return 0
     fi
 
-    # --- Summary across all apps --------------------------------------------
-    # Single awk pass: total count, sum, max, p50/p95, long-session count.
     local long_threshold_s=3600   # sessions > this are "long"
     local summary
     summary=$(printf '%s\n' "$raw" \
@@ -8219,9 +7339,7 @@ mode_ws() {
     fi
     echo
 
-    # --- Per-(app, path) breakdown -------------------------------------------
-    # Group by app+path, emit: sessions, p50, p95, max per group. Sort by
-    # session count desc.
+    # Per (app, path): sessions, p50, p95, max, busiest first.
     local rows
     rows=$(printf '%s\n' "$raw" \
         | sort -t $'\t' -k1,1 -k2,2 -k3,3n \

@@ -1,17 +1,7 @@
-# ==============================================================================
-# MODE: patterns — generic app-error detection across all LOGS source types
-# Watches every configured source through `_log_reader_cmd`, runs each line
-# against a built-in catalog of universal app-error signatures plus any
-# user-defined extras (APP_PATTERN_<name>=regex), and fires alerts keyed
-# `app:<source>:<pattern>` through the existing alert infra.
-# Source-agnostic by design — works on nginx, journal, docker, and text logs.
-# Parallel indexed arrays (not associative) keep the module bash-3.2-friendly
-# for dev boxes; the catalog is small enough that O(N) lookups are free.
-# ==============================================================================
+# milog patterns: app-error signatures over every LOGS source, firing `app:<source>:<pattern>`.
+# Parallel indexed arrays instead of associative ones keep it working on bash 3.2.
 
-# Built-in pattern catalog. Names + regexes paired by index. ERE, matched
-# case-insensitively. Each entry is anchored to a phrase narrow enough that
-# a false positive justifies waking someone — broaden only with care.
+# EREs matched case-insensitively; APP_PATTERN_<name>=regex adds or overrides one.
 _PATTERNS_BUILTIN_NAMES=(
     panic_go
     traceback_python
@@ -33,7 +23,7 @@ _PATTERNS_BUILTIN_REGEX=(
     'out of memory'
 )
 
-# Look up a built-in regex by name. Empty stdout = not a built-in.
+# Empty output means not a built-in.
 _patterns_builtin_get() {
     local want="$1" i
     for i in "${!_PATTERNS_BUILTIN_NAMES[@]}"; do
@@ -45,10 +35,7 @@ _patterns_builtin_get() {
     return 1
 }
 
-# Walk env for `APP_PATTERN_<name>=<regex>` overrides + extras, merge with
-# built-ins, emit one `<name>\t<regex>\n` line per active entry. An empty
-# user value disables a same-named built-in (mute panic_go etc. without
-# touching the source). Stable sorted output for deterministic listings.
+# Built-ins merged with APP_PATTERN_* env, as sorted `<name>\t<regex>` lines; an empty value disables a built-in.
 _patterns_collect() {
     local i name regex
     local -a out_names=() out_regex=()
@@ -56,7 +43,6 @@ _patterns_collect() {
         out_names+=("${_PATTERNS_BUILTIN_NAMES[$i]}")
         out_regex+=("${_PATTERNS_BUILTIN_REGEX[$i]}")
     done
-    # Apply user overrides + additions from env.
     local k v idx found
     while IFS='=' read -r k v; do
         [[ "$k" == APP_PATTERN_* ]] || continue
@@ -80,15 +66,12 @@ _patterns_collect() {
             out_regex+=("$v")
         fi
     done < <(env)
-    # Pair-emit and sort by name.
     for i in "${!out_names[@]}"; do
         printf '%s\t%s\n' "${out_names[$i]}" "${out_regex[$i]}"
     done | sort
 }
 
-# Build a single union ERE from the collected patterns — one tail+grep pipe
-# per source instead of N. The classifier below re-tests each pattern in
-# bash to attribute matches by name (rare path; only on actual matches).
+# All patterns as one ERE, a cheap pre-filter before per-name classification.
 _patterns_union_ere() {
     local first=1 out="" name re
     while IFS=$'\t' read -r name re; do
@@ -99,10 +82,7 @@ _patterns_union_ere() {
     printf '%s' "$out"
 }
 
-# Classify which named pattern(s) a line matched. Multiple matches per line
-# are possible (e.g. an OOM line trips both `oom_kill` and `out_of_memory`);
-# we fire one alert per classified pattern so silence rules can target each
-# independently. Stdout: pattern names, space-separated.
+# Space-separated names of every pattern the line matches; each fires separately so silences can target one.
 _patterns_classify() {
     local line="$1"
     local name re hits=""
@@ -140,13 +120,7 @@ mode_patterns() {
         echo -e "${D}Patterns: ${names[*]}${NC}\n"
     fi
 
-    # Single sequential consumer — multiple parallel watchers race on
-    # alerts.state's read-modify-write (concurrent renames clobber each
-    # other, leading to lost cooldown entries and double-fires). All sources
-    # funnel into one merged stream tagged `<source>\t<line>` and a single
-    # consumer processes lines one at a time, so cooldown is rock-solid.
-    # awk handles the per-line tagging + fflush so output is line-buffered
-    # on both Linux (gawk) and macOS (BSD awk) without GNU-only flags.
+    # One sequential consumer: parallel watchers would race on alerts.state and lose cooldowns.
     local colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
 
     {
@@ -155,9 +129,7 @@ mode_patterns() {
             local source_name; source_name=$(_log_name_for "$entry")
             local cmd;         cmd=$(_log_reader_cmd "$entry") || continue
             [[ -z "$cmd" ]] && continue
-            # Strip diagnostic lines (`#journal unavailable: …`) BEFORE
-            # tagging so they never match `(ERROR|FATAL|CRITICAL)\s` and
-            # self-page. awk fflush() forces line-buffering portably.
+            # Drop `#...unavailable` diagnostics first so they can't match generic_critical.
             ( bash -c "$cmd" 2>/dev/null \
                 | grep --line-buffered -v '^#' \
                 | awk -v src="$source_name" '{print src "\t" $0; fflush()}' ) &
@@ -165,10 +137,7 @@ mode_patterns() {
         wait
     } | while IFS=$'\t' read -r src line; do
             [[ -z "$line" ]] && continue
-            # Union pre-filter via bash =~ — avoids the cost of forking grep
-            # per line, and (critically) anchors patterns like `^panic:`
-            # against the actual line content, not against the post-tag
-            # stream where `^` would match nothing.
+            # Match the untagged line so `^` anchors like `^panic:` work.
             shopt -s nocasematch
             [[ "$line" =~ $union ]] || { shopt -u nocasematch; continue; }
             shopt -u nocasematch
@@ -194,9 +163,7 @@ mode_patterns() {
         done
 }
 
-# Inspect mode — `milog patterns list` shows the merged catalog including any
-# user overrides, with a `builtin` / `override` / `custom` tag. Useful for
-# debugging why a given pattern isn't firing.
+# `milog patterns list`: the merged catalog, each entry tagged builtin, override or custom.
 mode_patterns_list() {
     local name re origin builtin_re
     printf '%-28s %-10s %s\n' "NAME" "ORIGIN" "REGEX"

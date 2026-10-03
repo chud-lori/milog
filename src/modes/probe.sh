@@ -1,32 +1,9 @@
-# ==============================================================================
-# MODE: probe — manage the eBPF probe sidecar (milog-probe) via systemd
-#
-# Counterpart to `milog web install-service`. The probe is Linux-only and
-# privileged (eBPF needs root or CAP_BPF + CAP_PERFMON), so its unit lives
-# in /etc/systemd/system/ rather than the user-mode location web uses.
-#
-# Subcommands:
-#   milog probe status                run state + journal pointer
-#   sudo milog probe install-service  write + enable + start the unit
-#   sudo milog probe uninstall-service stop + disable + remove the unit
-#
-# Why HOME is baked into the unit:
-#   The probe shells out to `milog _internal_alert` for every rule hit.
-#   Since the probe runs as root, milog inherits root's $HOME and resolves
-#   ALERT_STATE_DIR to /root/.cache/milog — invisible to the regular user
-#   running `milog alerts` from their shell. Capturing the invoking user's
-#   $HOME at install time and pinning it via Environment= keeps alerts +
-#   silences in the user's cache where they belong.
-# ==============================================================================
+# milog probe status|install-service|uninstall-service: the root-run eBPF sidecar's systemd unit.
+# The unit pins the invoking user's HOME, so alerts the probe fires via `milog _internal_alert` land in that user's cache, not root's.
 
-# Path to the systemd system unit. Kept in sync with _probe_service_install.
 _PROBE_SYSTEMD_UNIT="/etc/systemd/system/milog-probe.service"
 
-# Default file allowlist baked into the unit at install-service time.
-# Conservative system-tools list plus comm names observed as benign noise
-# in real deployments (Docker runc init stages, Tencent Cloud agents,
-# udev). Operators tune at install time via MILOG_PROBE_FILE_ALLOWLIST or
-# by editing the Environment= line in the unit afterward.
+# File-probe comm allowlist written into the unit; override with MILOG_PROBE_FILE_ALLOWLIST at install time.
 _PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,milog,milog-probe,ps,runc,runc:[2:INIT],watchtower,whoami"
 
 _probe_service_active() {
@@ -51,9 +28,7 @@ _probe_status() {
     fi
 }
 
-# Locate milog-probe, the Go companion binary. Same preference order as
-# _web_go_binary — explicit override, libexec/, /usr/local/bin, then a
-# clone-relative dev path.
+# Same lookup order as _web_go_binary.
 _probe_binary() {
     if [[ -n "${MILOG_PROBE_BIN:-}" && -x "$MILOG_PROBE_BIN" ]]; then
         printf '%s' "$MILOG_PROBE_BIN"; return 0
@@ -110,10 +85,7 @@ _probe_service_install() {
     local probe_bin
     probe_bin=$(_probe_binary) || { _probe_no_binary_error; return 1; }
 
-    # Capture the user who invoked sudo so the probe-spawned milog can
-    # write alerts + read silences from THAT user's $HOME, not root's.
-    # SUDO_USER is set by sudo; logname falls back for direct-root login.
-    # If everything fails (boot-time root shell), default to root + warn.
+    # SUDO_USER, else logname, else root.
     local target_user="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
     local target_home
     target_home=$(getent passwd "$target_user" 2>/dev/null | cut -d: -f6)

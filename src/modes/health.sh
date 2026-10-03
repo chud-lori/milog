@@ -1,6 +1,4 @@
-# ==============================================================================
-# MODE: health
-# ==============================================================================
+# milog health: status-class totals per app.
 mode_health() {
     echo -e "\n${W}── MiLog: Status Code Health ──${NC}\n"
     printf "%-12s  %8s  %8s  %8s  %8s  %8s\n" "APP" "TOTAL" "2xx" "3xx" "4xx" "5xx"
