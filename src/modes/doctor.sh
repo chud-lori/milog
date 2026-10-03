@@ -186,6 +186,18 @@ mode_doctor() {
         _doc_ok "alerts.log: ${total_count} total, ${today_count} today" \
                 "view with: milog alerts [today|Nh|Nd|all]"
     fi
+    local flog="$ALERT_STATE_DIR/send_failures.log"
+    if [[ -s "$flog" ]]; then
+        local fail_cutoff fail_count fail_dests
+        fail_cutoff=$(( $(date +%s) - 86400 ))
+        fail_count=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c' "$flog" | wc -l | tr -d ' ')
+        fail_dests=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c {print $2}' "$flog" | sort -u | tr '\n' ' ')
+        if (( fail_count > 0 )); then
+            _doc_warn "${fail_count} alert deliveries failed in the last 24h  (${fail_dests% })" \
+                      "see $flog; test with 'milog alert test'"
+            warn=$(( warn + 1 ))
+        fi
+    fi
 
     # ---- history DB ---------------------------------------------------------
     _doc_head "history (SQLite)"

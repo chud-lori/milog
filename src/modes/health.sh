@@ -10,10 +10,15 @@ mode_health() {
         [[ -f "$file" ]] || { printf "%-12s  %8s\n" "$name" "(not found)"; continue; }
         local total s2=0 s3=0 s4=0 s5=0
         total=$(wc -l < "$file")
-        s2=$(grep -c ' 2[0-9][0-9] ' "$file" 2>/dev/null || true)
-        s3=$(grep -c ' 3[0-9][0-9] ' "$file" 2>/dev/null || true)
-        s4=$(grep -c ' 4[0-9][0-9] ' "$file" 2>/dev/null || true)
-        s5=$(grep -c ' 5[0-9][0-9] ' "$file" 2>/dev/null || true)
+        # Status from its field after the quoted request, as in nginx_minute_counts.
+        read -r s2 s3 s4 s5 < <(awk '
+            {
+                split($0, q, "\"")
+                split(q[3], f, " ")
+                if (f[1] ~ /^[2-5][0-9][0-9]$/) c[substr(f[1], 1, 1)]++
+            }
+            END { printf "%d %d %d %d\n", c[2], c[3], c[4], c[5] }
+        ' "$file" 2>/dev/null)
         local c4=$NC c5=$NC t4 t5
         t4=$(_thresh THRESH_4XX_WARN "$name")
         t5=$(_thresh THRESH_5XX_WARN "$name")

@@ -11,7 +11,25 @@ json_escape() {
     s="${s//$'\n'/\\n}"
     s="${s//$'\r'/\\r}"
     s="${s//$'\t'/\\t}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
+    # Remaining C0 controls as \u00XX; NUL can't occur in a bash string.
+    if [[ "$s" == *[[:cntrl:]]* ]]; then
+        local i h c u
+        for (( i=1; i<32; i++ )); do
+            printf -v h '%02x' "$i"
+            printf -v c "\\x$h"
+            printf -v u '\\u00%s' "$h"
+            s="${s//"$c"/"$u"}"
+        done
+    fi
     printf '"%s"' "$s"
+}
+
+# Code-fence text; backticks become ' so a log line can't close the fence.
+_alert_fence() {
+    local s="${1-}"
+    printf '```%s```' "${s//\`/\'}"
 }
 
 # Escape a string for safe embedding inside HTML text content. Emits the
@@ -92,11 +110,19 @@ _alert_record() {
     _alert_rotate_if_big "$log_file"
 }
 
+# Log a failed delivery (network or HTTP >= 400) for `milog doctor`.
+_alert_send_failed() {
+    local log_file="$ALERT_STATE_DIR/send_failures.log"
+    mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
+    printf '%s\t%s\n' "$(date +%s)" "${1:-unknown}" >> "$log_file" 2>/dev/null || true
+    _alert_rotate_if_big "$log_file"
+}
+
 # --- Per-destination senders --------------------------------------------------
 #
 # Each `_alert_send_*` is a private sender for one destination. Contract:
 #   - silently return 0 when its config is absent (opt-in)
-#   - never propagate errors back to the caller (always `|| true` the curl)
+#   - never propagate errors; record them with `_alert_send_failed`
 #   - apply the right encoding for its wire format (JSON / HTML / URL)
 #
 # Attacker-controlled inputs to watch for:
@@ -114,8 +140,8 @@ _alert_send_discord() {
     local payload
     payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")
-    curl -sS -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
+    curl -sS -f -m 5 -H "Content-Type: application/json" \
+         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed discord
 }
 
 # Slack incoming-webhook message. Uses mrkdwn with the body wrapped in a
@@ -132,8 +158,8 @@ _alert_send_slack() {
     local payload
     payload=$(printf '{"text":%s,"mrkdwn":true,"link_names":0}' \
         "$(json_escape "$text")")
-    curl -sS -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || true
+    curl -sS -f -m 5 -H "Content-Type: application/json" \
+         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed slack
 }
 
 # Telegram Bot API sendMessage. parse_mode=HTML + html_escape on every
@@ -152,9 +178,9 @@ _alert_send_telegram() {
     local payload
     payload=$(printf '{"chat_id":%s,"text":%s,"parse_mode":"HTML","disable_web_page_preview":true,"disable_notification":false}' \
         "$(json_escape "$TELEGRAM_CHAT_ID")" "$(json_escape "$text")")
-    curl -sS -m 5 -H "Content-Type: application/json" \
+    curl -sS -f -m 5 -H "Content-Type: application/json" \
          -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-         >/dev/null 2>&1 || true
+         >/dev/null 2>&1 || _alert_send_failed telegram
 }
 
 # Generic webhook — POST any JSON (or text) template to an arbitrary URL.
@@ -177,14 +203,23 @@ _alert_send_webhook() {
     # Template substitution. json_escape returns the value wrapped in
     # surrounding double-quotes, so the default template's `%TITLE%` etc.
     # expand to valid JSON string literals without additional quoting.
-    local payload="${WEBHOOK_TEMPLATE:-\"%TITLE%\"}"
-    payload="${payload//%TITLE%/$(json_escape "$title")}"
-    payload="${payload//%BODY%/$(json_escape "$body")}"
-    payload="${payload//%SEV%/$(json_escape "$sev")}"
-    payload="${payload//%RULE%/$(json_escape "$rule_key")}"
+    # Single pass, so a placeholder inside a substituted value stays literal.
+    local rest="${WEBHOOK_TEMPLATE:-\"%TITLE%\"}" payload=""
+    while [[ "$rest" == *%* ]]; do
+        payload+="${rest%%\%*}"
+        rest="${rest#*\%}"
+        case "$rest" in
+            TITLE%*) payload+=$(json_escape "$title");    rest="${rest#TITLE%}" ;;
+            BODY%*)  payload+=$(json_escape "$body");     rest="${rest#BODY%}" ;;
+            SEV%*)   payload+=$(json_escape "$sev");      rest="${rest#SEV%}" ;;
+            RULE%*)  payload+=$(json_escape "$rule_key"); rest="${rest#RULE%}" ;;
+            *)       payload+='%' ;;
+        esac
+    done
+    payload+="$rest"
     local ctype="${WEBHOOK_CONTENT_TYPE:-application/json}"
-    curl -sS -m 5 -H "Content-Type: ${ctype}" \
-         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || true
+    curl -sS -f -m 5 -H "Content-Type: ${ctype}" \
+         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || _alert_send_failed webhook
 }
 
 # Matrix m.room.message (m.text + custom.html). PUT to
@@ -210,12 +245,12 @@ ${body}"
     txn_id="milog-$(date +%s)-$RANDOM"
     # Strip a possible trailing slash from homeserver so the join is clean.
     local hs="${MATRIX_HOMESERVER%/}"
-    curl -sS -m 5 -X PUT \
+    curl -sS -f -m 5 -X PUT \
          -H "Authorization: Bearer ${MATRIX_TOKEN}" \
          -H "Content-Type: application/json" \
          -d "$payload" \
          "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}" \
-         >/dev/null 2>&1 || true
+         >/dev/null 2>&1 || _alert_send_failed matrix
 }
 
 # --- Silence / ack ------------------------------------------------------------
@@ -751,7 +786,8 @@ alert_fingerprint_fresh() {
     local now last tmp
     mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
     now=$(date +%s)
-    last=$(awk -v k="$fp" -F'\t' '$1==k {print $2; exit}' "$state_file" 2>/dev/null)
+    # ENVIRON, not -v: -v would expand the \xHH escapes nginx writes for quotes.
+    last=$(MILOG_FP="$fp" awk -F'\t' '$1==ENVIRON["MILOG_FP"] {print $2; exit}' "$state_file" 2>/dev/null)
     if [[ -n "$last" ]] && (( now - last < ALERT_DEDUP_WINDOW )); then
         return 1
     fi
@@ -760,8 +796,8 @@ alert_fingerprint_fresh() {
         # Drop the old entry for this fingerprint AND any whose last-seen has
         # already expired — keeps the file from growing unbounded on long
         # uptimes. 2×TTL gives a small safety margin.
-        awk -v k="$fp" -v cutoff=$(( now - ALERT_DEDUP_WINDOW * 2 )) \
-            -F'\t' 'BEGIN{OFS="\t"} $1!=k && $2>cutoff' "$state_file" 2>/dev/null
+        MILOG_FP="$fp" awk -v cutoff=$(( now - ALERT_DEDUP_WINDOW * 2 )) \
+            -F'\t' 'BEGIN{OFS="\t"} $1!=ENVIRON["MILOG_FP"] && $2>cutoff' "$state_file" 2>/dev/null
         printf '%s\t%s\n' "$fp" "$now"
     } > "$tmp" && mv "$tmp" "$state_file" 2>/dev/null
     [[ -f "$tmp" ]] && rm -f "$tmp"

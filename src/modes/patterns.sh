@@ -187,7 +187,7 @@ mode_patterns() {
                 if alert_should_fire "$key"; then
                     alert_fire \
                         "App pattern: $src / $pat" \
-                        "\`\`\`${line:0:1800}\`\`\`" \
+                        "$(_alert_fence "${line:0:1800}")" \
                         15158332 "$key" &
                 fi
             done
