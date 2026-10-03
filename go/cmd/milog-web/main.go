@@ -1,7 +1,8 @@
 // milog-web — optional Go implementation of `milog web`.
 //
-// `/healthz` is public; everything under `/api/*` and `/` is token-gated
-// by the same web.token file the bash handler uses.
+// `/healthz` and the `/static/*` app shell are public; everything under
+// `/api/*` and `/` is token-gated by the same web.token file the bash
+// handler uses.
 //
 // Intentionally scoped to the Go standard library — no third-party deps —
 // to keep the binary buildable from any Go 1.22+ toolchain with no module
@@ -54,35 +55,13 @@ func main() {
 	}
 
 	tokenPath := token.Resolve()
-	auth := token.Middleware(tokenPath)
 
 	staticFS, err := fs.Sub(webFS, "web")
 	if err != nil {
 		log.Fatalf("milog-web: embed: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthz)                        // public
-	mux.Handle("/api/meta.json", auth(metaHandler(cfg)))       // token-gated
-	mux.Handle("/api/summary.json", auth(summaryHandler(cfg))) // token-gated
-	mux.Handle("/api/alerts.json", auth(alertsHandler(cfg)))   // token-gated
-	mux.Handle("/api/logs.json", auth(logsHandler(cfg)))       // token-gated
-	mux.Handle("/api/logs/histogram.json", auth(logsHistogramHandler(cfg)))
-	mux.Handle("/api/stream", auth(streamHandler(cfg)))
-	mux.Handle("/api/logs/stream", auth(logsStreamHandler(cfg)))
-	mux.Handle("/metrics", auth(metricsHandler(cfg)))
-	mux.Handle("/api/latency.json", auth(latencyHandler(cfg)))
-	mux.Handle("/debug", auth(debugHandler(cfg)))
-	// Static dashboard assets (CSS / JS) live under /static/* and are
-	// served from the embed FS. http.FileServer sets Last-Modified so the
-	// browser revalidates with If-Modified-Since on each load — that's
-	// correct for our case (assets only change between binary upgrades).
-	mux.Handle("/static/", auth(http.StripPrefix("/static/", http.FileServer(http.FS(staticFS)))))
-	mux.Handle("/", auth(rootHandler(staticFS)))
-
-	// Security headers on every response — see securityHeaders below for
-	// the policy (CSP, no-sniff, frame-deny, no-referrer).
-	handler := securityHeaders(mux)
+	handler := newHandler(cfg, tokenPath, staticFS)
 
 	addr := net.JoinHostPort(cfg.Bind, cfg.Port)
 	srv := &http.Server{
@@ -108,6 +87,35 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+}
+
+// newHandler wires every route; only /healthz and /static/* skip auth.
+func newHandler(cfg *config.Config, tokenPath string, staticFS fs.FS) http.Handler {
+	auth := token.Middleware(tokenPath)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthz)                        // public
+	mux.Handle("/api/meta.json", auth(metaHandler(cfg)))       // token-gated
+	mux.Handle("/api/summary.json", auth(summaryHandler(cfg))) // token-gated
+	mux.Handle("/api/alerts.json", auth(alertsHandler(cfg)))   // token-gated
+	mux.Handle("/api/logs.json", auth(logsHandler(cfg)))       // token-gated
+	mux.Handle("/api/logs/histogram.json", auth(logsHistogramHandler(cfg)))
+	mux.Handle("/api/stream", auth(streamHandler(cfg)))
+	mux.Handle("/api/logs/stream", auth(logsStreamHandler(cfg)))
+	mux.Handle("/metrics", auth(metricsHandler(cfg)))
+	mux.Handle("/api/latency.json", auth(latencyHandler(cfg)))
+	mux.Handle("/debug", auth(debugHandler(cfg)))
+	// Static dashboard assets (CSS / JS) live under /static/* and are
+	// served from the embed FS. http.FileServer sets Last-Modified so the
+	// browser revalidates with If-Modified-Since on each load — that's
+	// correct for our case (assets only change between binary upgrades).
+	// Public: the page loads them before app.js can attach the token.
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	mux.Handle("/", auth(rootHandler(staticFS)))
+
+	// Security headers on every response — see securityHeaders below for
+	// the policy (CSP, no-sniff, frame-deny, no-referrer).
+	return securityHeaders(mux)
 }
 
 // healthz is the liveness probe — kept public so systemd WatchdogSec and
