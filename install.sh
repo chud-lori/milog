@@ -50,8 +50,7 @@ MILOG_RELEASE_TAG="${MILOG_RELEASE_TAG:-latest}"
 
 # Cache-bust GitHub's raw-content CDN by default. Appends `?t=<epoch>` to
 # the fetch URL (respecting any existing query string). Disable by setting
-# MILOG_NO_CACHE_BUST=1 — primarily for reproducibility in CI, where an
-# undetermined URL defeats artifact signing.
+# MILOG_NO_CACHE_BUST=1 — primarily for reproducibility in CI.
 MILOG_NO_CACHE_BUST="${MILOG_NO_CACHE_BUST:-0}"
 
 # ---- tiny logging -----------------------------------------------------------
@@ -243,14 +242,25 @@ _release_resolve_tag() {
     printf '%s' "${BASH_REMATCH[1]}"
 }
 
+# SHA-256 of one file via sha256sum (GNU) or shasum (macOS). Empty when
+# neither tool exists.
+_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
 # Download one companion binary from the Release matching the resolved
-# OS + arch. Writes to <dir>/<name> atomically. Silent return on any
-# failure — prebuilt install is best-effort, bash milog.sh is the
-# primary install path.
+# OS + arch. Writes to <dir>/<name> atomically. Silent return when the
+# archive isn't published; dies when it can't be verified against the
+# release's checksums.txt.
 _release_download_binary() {
     local name="$1" dst_dir="$2" tag="$3" os="$4" arch="$5"
     local archive="milog_${tag#v}_${os}_${arch}.tar.gz"
-    local url="https://github.com/${MILOG_RELEASE_REPO}/releases/download/${tag}/${archive}"
+    local base="https://github.com/${MILOG_RELEASE_REPO}/releases/download/${tag}"
+    local url="${base}/${archive}"
     local tmp
     tmp=$(mktemp -d) || return 1
     # shellcheck disable=SC2064
@@ -259,6 +269,27 @@ _release_download_binary() {
     if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/a.tar.gz" "$url" 2>/dev/null; then
         return 1
     fi
+
+    local want got
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/checksums.txt" "${base}/checksums.txt" 2>/dev/null; then
+        rm -rf "$tmp"
+        die "${name}: could not fetch checksums.txt for ${tag}; refusing to install an unverified binary"
+    fi
+    want=$(awk -v f="$archive" '$2 == f {print $1; exit}' "$tmp/checksums.txt")
+    if [[ -z "$want" ]]; then
+        rm -rf "$tmp"
+        die "${name}: ${archive} is not listed in checksums.txt for ${tag}; refusing to install"
+    fi
+    got=$(_sha256 "$tmp/a.tar.gz")
+    if [[ -z "$got" ]]; then
+        rm -rf "$tmp"
+        die "${name}: need sha256sum or shasum to verify ${archive}; refusing to install"
+    fi
+    if [[ "$got" != "$want" ]]; then
+        rm -rf "$tmp"
+        die "${name}: checksum mismatch for ${archive} (expected ${want}, got ${got}); refusing to install"
+    fi
+
     tar -xzf "$tmp/a.tar.gz" -C "$tmp" "$name" 2>/dev/null || return 1
     [[ -f "$tmp/$name" ]] || return 1
 
@@ -272,9 +303,9 @@ _release_download_binary() {
 
 # Top-level entry: try to fetch milog-web + milog-tui (+ milog-probe on
 # Linux) from the latest release. Prints one line per binary; silent
-# when a binary isn't published for this arch. Never fails hard — bash
-# milog.sh already installed, and a missing Go binary just means
-# `milog tui` will print its install hint.
+# when a binary isn't published for this arch. A missing binary is not
+# fatal — bash milog.sh already installed, and `milog tui` will print
+# its install hint — but a failed checksum aborts the install.
 _release_install_companions() {
     local dst_dir="$1"
     local os arch tag

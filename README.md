@@ -102,6 +102,10 @@ curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
 The web dashboard ships as the `milog-web` Go binary — `install.sh`
 fetches it from the latest GitHub release alongside `milog` itself, so
 no separate flag and no system listener (socat / ncat) is needed.
+Each downloaded archive is checked against the release's `checksums.txt`
+(SHA-256); a mismatch or a missing checksum aborts the install. The
+checksums are not signed, so they catch a corrupted or swapped asset but
+not a compromised release.
 
 ### From a clone (contributors)
 

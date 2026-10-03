@@ -64,6 +64,7 @@ jobs:
         run: |
           bash tests/smoke_exploits.sh
           bash tests/smoke_audit_tempfiles.sh
+          bash tests/smoke_installer_checksums.sh
 
       - name: Go vet
         working-directory: go
