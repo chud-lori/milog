@@ -230,3 +230,7 @@ Commit both the source change and the regenerated `milog.sh`.
 
 See [`src/README.md`](src/README.md) for the source layout and
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for design internals.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
