@@ -272,6 +272,24 @@ mode_doctor() {
             _doc_warn "milog.service installed but inactive" "start: sudo systemctl start milog.service"
             warn=$(( warn + 1 ))
         fi
+        # milog-probe.service runs as root: anything it executes or sources must be root-controlled.
+        if [[ -f "$_PROBE_SYSTEMD_UNIT" ]]; then
+            local probe_exec probe_cfg
+            probe_exec=$(sed -n 's/^ExecStart=//p' "$_PROBE_SYSTEMD_UNIT" | head -1)
+            probe_cfg=$(sed -n 's/^Environment=MILOG_CONFIG=//p' "$_PROBE_SYSTEMD_UNIT" | head -1)
+            if ! grep -q '^Environment=MILOG_PROBE_ALERT_USER=' "$_PROBE_SYSTEMD_UNIT" \
+                && [[ -n "$probe_cfg" && -e "$probe_cfg" ]] && ! _root_trusted_path "$probe_cfg"; then
+                _doc_fail "milog-probe.service sources $probe_cfg as root" \
+                          "it is user-writable — reinstall: sudo milog probe install-service"
+                fail=$(( fail + 1 ))
+            elif [[ -n "$probe_exec" ]] && ! _root_trusted_path "$probe_exec"; then
+                _doc_fail "milog-probe binary writable by non-root  ($probe_exec)" \
+                          "make it and its directory root-owned and not group/other-writable"
+                fail=$(( fail + 1 ))
+            else
+                _doc_ok "milog-probe.service config + binary are root-controlled"
+            fi
+        fi
         # milog-web.service (user unit) — optional dashboard. Only report if
         # something has attempted to install it; absent-by-choice is fine.
         local web_unit="${HOME}/.config/systemd/user/milog-web.service"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-40-gd861b11-dirty
-# MILOG_BUILT=2026-10-03T14:56:11Z
+# MILOG_VERSION=v0.3.0-41-gbabfd28-dirty
+# MILOG_BUILT=2026-10-03T15:49:06Z
 # ==============================================================================
 # MiLog — Nginx + System Monitor (V5.0)
 # ==============================================================================
@@ -258,8 +258,24 @@ WEB_TOKEN_FILE="$HOME/.config/milog/web.token"
 #     LOGS=(myapp api web)          # or leave unset to auto-discover
 #     REFRESH=3
 MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
-# shellcheck disable=SC1090
-[[ -f "$MILOG_CONFIG" ]] && . "$MILOG_CONFIG"
+
+# True when root owns the path and its directory and neither is group/other-writable.
+_root_trusted_path() {
+    local p meta
+    for p in "$1" "$(dirname "$1")"; do
+        meta=$(stat -c '%u %a' "$p" 2>/dev/null || stat -f '%u %Lp' "$p" 2>/dev/null) || return 1
+        [[ "${meta%% *}" == 0 ]] && (( (8#${meta#* } & 8#022) == 0 )) || return 1
+    done
+}
+
+if [[ -f "$MILOG_CONFIG" ]]; then
+    if [[ $EUID -ne 0 ]] || _root_trusted_path "$MILOG_CONFIG"; then
+        # shellcheck disable=SC1090
+        . "$MILOG_CONFIG"
+    else
+        echo "milog: running as root, refusing to source $MILOG_CONFIG (not root-owned or group/other-writable)" >&2
+    fi
+fi
 
 # Env var overrides win over the config file. MILOG_* prefix keeps them
 # from colliding with generic shell env. Add new knobs here when you want
@@ -5976,6 +5992,24 @@ mode_doctor() {
             _doc_warn "milog.service installed but inactive" "start: sudo systemctl start milog.service"
             warn=$(( warn + 1 ))
         fi
+        # milog-probe.service runs as root: anything it executes or sources must be root-controlled.
+        if [[ -f "$_PROBE_SYSTEMD_UNIT" ]]; then
+            local probe_exec probe_cfg
+            probe_exec=$(sed -n 's/^ExecStart=//p' "$_PROBE_SYSTEMD_UNIT" | head -1)
+            probe_cfg=$(sed -n 's/^Environment=MILOG_CONFIG=//p' "$_PROBE_SYSTEMD_UNIT" | head -1)
+            if ! grep -q '^Environment=MILOG_PROBE_ALERT_USER=' "$_PROBE_SYSTEMD_UNIT" \
+                && [[ -n "$probe_cfg" && -e "$probe_cfg" ]] && ! _root_trusted_path "$probe_cfg"; then
+                _doc_fail "milog-probe.service sources $probe_cfg as root" \
+                          "it is user-writable — reinstall: sudo milog probe install-service"
+                fail=$(( fail + 1 ))
+            elif [[ -n "$probe_exec" ]] && ! _root_trusted_path "$probe_exec"; then
+                _doc_fail "milog-probe binary writable by non-root  ($probe_exec)" \
+                          "make it and its directory root-owned and not group/other-writable"
+                fail=$(( fail + 1 ))
+            else
+                _doc_ok "milog-probe.service config + binary are root-controlled"
+            fi
+        fi
         # milog-web.service (user unit) — optional dashboard. Only report if
         # something has attempted to install it; absent-by-choice is fine.
         local web_unit="${HOME}/.config/systemd/user/milog-web.service"
@@ -6971,7 +7005,8 @@ mode_patterns_list() {
 #   ALERT_STATE_DIR to /root/.cache/milog — invisible to the regular user
 #   running `milog alerts` from their shell. Capturing the invoking user's
 #   $HOME at install time and pinning it via Environment= keeps alerts +
-#   silences in the user's cache where they belong.
+#   silences in the user's cache where they belong. The alert child runs
+#   as that user too (MILOG_PROBE_ALERT_USER), never as root.
 # ==============================================================================
 
 # Path to the systemd system unit. Kept in sync with _probe_service_install.
@@ -7046,6 +7081,48 @@ disk for the systemd unit to start. Pick one:
 " >&2
 }
 
+# Args: probe_bin target_user target_home target_config allowlist caps
+_probe_unit() {
+    cat <<EOF
+[Unit]
+Description=MiLog eBPF probe (exec / file / net / ptrace / kmod / retrans / syscall-rate / bpf-load)
+Documentation=https://github.com/chud-lori/milog
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=${1}
+Restart=on-failure
+RestartSec=5s
+# HOME + MILOG_CONFIG point at the invoking user's home so probe-fired
+# alerts route through that user's bash config (DISCORD_WEBHOOK, silences,
+# alerts.log) rather than root's. Edit + daemon-reload + restart to retune.
+Environment=HOME=${3}
+Environment=MILOG_CONFIG=${4}
+Environment=MILOG_PROBE_FILE_ALLOWLIST=${5}
+# Alerts run as this user so their config and hooks never execute as root.
+Environment=MILOG_PROBE_ALERT_USER=${2}
+
+# ProtectHome / ProtectSystem=strict stay off: the alert child writes the user's ~/.cache/milog.
+CapabilityBoundingSet=${6}
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 _probe_service_install() {
     local kernel; kernel=$(uname -s 2>/dev/null)
     if [[ "$kernel" != "Linux" ]]; then
@@ -7064,6 +7141,12 @@ _probe_service_install() {
     fi
     local probe_bin
     probe_bin=$(_probe_binary) || { _probe_no_binary_error; return 1; }
+    probe_bin=$(readlink -f "$probe_bin")
+    if ! _root_trusted_path "$probe_bin"; then
+        echo -e "${R}refusing to run ${probe_bin} as root: it or its directory is not root-owned or is group/other-writable${NC}" >&2
+        echo -e "${D}  fix:  sudo install -o root -g root -m 0755 ${probe_bin} /usr/local/bin/milog-probe${NC}" >&2
+        return 1
+    fi
 
     # Capture the user who invoked sudo so the probe-spawned milog can
     # write alerts + read silences from THAT user's $HOME, not root's.
@@ -7085,28 +7168,16 @@ _probe_service_install() {
 
     local allowlist="${MILOG_PROBE_FILE_ALLOWLIST:-$_PROBE_DEFAULT_FILE_ALLOWLIST}"
 
-    cat > "$_PROBE_SYSTEMD_UNIT" <<EOF
-[Unit]
-Description=MiLog eBPF probe (exec / file / net / ptrace / kmod / retrans / syscall-rate / bpf-load)
-Documentation=https://github.com/chud-lori/milog
-After=network.target
-Wants=network.target
+    # CAP_BPF / CAP_PERFMON only exist from 5.8; older kernels gate eBPF on CAP_SYS_ADMIN.
+    local caps="CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID"
+    local kver; kver=$(uname -r 2>/dev/null)
+    local kmaj="${kver%%.*}" kmin; kmin="${kver#*.}"; kmin="${kmin%%[!0-9]*}"
+    if [[ "$kmaj" =~ ^[0-9]+$ && "$kmin" =~ ^[0-9]+$ ]] && (( kmaj < 5 || (kmaj == 5 && kmin < 8) )); then
+        caps="$caps CAP_SYS_ADMIN"
+    fi
 
-[Service]
-Type=simple
-ExecStart=${probe_bin}
-Restart=on-failure
-RestartSec=5s
-# HOME + MILOG_CONFIG point at the invoking user's home so probe-fired
-# alerts route through that user's bash config (DISCORD_WEBHOOK, silences,
-# alerts.log) rather than root's. Edit + daemon-reload + restart to retune.
-Environment=HOME=${target_home}
-Environment=MILOG_CONFIG=${target_config}
-Environment=MILOG_PROBE_FILE_ALLOWLIST=${allowlist}
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    _probe_unit "$probe_bin" "$target_user" "$target_home" "$target_config" "$allowlist" "$caps" \
+        > "$_PROBE_SYSTEMD_UNIT"
 
     echo -e "${G}✓${NC} wrote $_PROBE_SYSTEMD_UNIT"
 
@@ -7175,8 +7246,8 @@ ${W}milog probe${NC} — manage the eBPF probe sidecar (Linux only)
 
   ${D}The probe runs as a system service (root) and shells out to milog
   for every rule hit. HOME + MILOG_CONFIG in the unit pin to the user
-  who ran install-service so alerts route through that user's webhook
-  config + silences, not root's.${NC}
+  who ran install-service so alerts run as that user and route through
+  their webhook config + silences, not root's.${NC}
 
   ${W}covers:${NC}
     exec  ·  tcp connect  ·  file open  ·  ptrace  ·  kmod load
