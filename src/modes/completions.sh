@@ -83,10 +83,20 @@ _completions_install() {
     _write_completion() {
         local shell="$1" dst="$2"
         mkdir -p "$(dirname "$dst")" 2>/dev/null || return 1
+        local tmp; tmp=$(mktemp "$dst.XXXXXX" 2>/dev/null) || return 1
         if [[ -n "$src" && -f "$src/$(_completions_filename "$shell")" ]]; then
-            cp "$src/$(_completions_filename "$shell")" "$dst"
+            cp "$src/$(_completions_filename "$shell")" "$tmp"
         else
-            _completions_emit "$shell" > "$dst"
+            _completions_emit "$shell" > "$tmp"
+        fi
+        if [[ ! -s "$tmp" ]]; then
+            rm -f "$tmp"
+            echo -e "${R}✗${NC} $shell: empty completion script, not writing $dst" >&2
+            return 1
+        fi
+        if ! chmod 0644 "$tmp" || ! mv "$tmp" "$dst"; then
+            rm -f "$tmp"
+            return 1
         fi
         echo -e "${G}✓${NC} $shell → $dst"
         installed=$((installed+1))

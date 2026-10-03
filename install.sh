@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# MiLog installer — Linux (Debian/Ubuntu, RHEL/Fedora/Rocky, Arch).
+# MiLog installer — Linux (Debian/Ubuntu, RHEL/Fedora/Rocky, Arch, Alpine).
 #
 # Works two ways:
 #
@@ -19,14 +19,15 @@
 #
 # Flags:
 #   --with-geoip           install mmdblookup for GeoIP enrichment
-#   --with-systemd         write + enable /etc/systemd/system/milog.service
-#                          so `milog daemon` survives reboots + ssh disconnect
-#   --webhook URL          pre-configure DISCORD_WEBHOOK + ALERTS_ENABLED=1
-#                          in the target user's config file
 #   --with-history         (deprecated — sqlite3 is installed by default)
+#   --with-web             (deprecated — the dashboard is a Go binary now)
 #   --bin PATH             install destination (default: /usr/local/bin/milog)
 #   --script-url URL       override milog.sh source URL (pipe mode)
-#   --uninstall            remove binary + systemd unit (configs preserved)
+#   --uninstall            remove binaries + systemd units (configs preserved)
+#   -h, --help             show usage
+#
+# Alerts + the systemd unit are set up after install with:
+#   sudo milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'
 # ==============================================================================
 set -euo pipefail
 
@@ -116,7 +117,7 @@ _print_recent_commits_hint() {
 # ---- package manager detection ----------------------------------------------
 detect_pkg_manager() {
     local pm
-    for pm in apt-get dnf yum pacman; do
+    for pm in apt-get dnf yum pacman apk; do
         if command -v "$pm" >/dev/null 2>&1; then
             echo "$pm"
             return 0
@@ -132,10 +133,10 @@ pkg_name_for() {
     case "${tool}:${pm}" in
         sqlite3:apt-get)                echo sqlite3 ;;
         sqlite3:dnf|sqlite3:yum)        echo sqlite ;;
-        sqlite3:pacman)                 echo sqlite ;;
+        sqlite3:pacman|sqlite3:apk)     echo sqlite ;;
         mmdblookup:apt-get)             echo mmdb-bin ;;
         mmdblookup:dnf|mmdblookup:yum)  echo libmaxminddb ;;
-        mmdblookup:pacman)              echo libmaxminddb ;;
+        mmdblookup:pacman|mmdblookup:apk) echo libmaxminddb ;;
         *)                              echo "$tool" ;;
     esac
 }
@@ -150,6 +151,7 @@ pkg_install() {
         dnf)    dnf    install -y "$@" ;;
         yum)    yum    install -y "$@" ;;
         pacman) pacman -S --noconfirm "$@" ;;
+        apk)    apk add --no-cache "$@" ;;
         none)   die "no supported package manager found — install manually: $*" ;;
     esac
 }
@@ -327,17 +329,37 @@ check_bash_version() {
 uninstall() {
     need_root
 
-    # Stop + remove the systemd unit if it's there (installed via
-    # `milog alert on`). Silent on any failure — we're going to delete the
-    # unit file anyway.
+    # Stop + remove the system units if they're there (installed via
+    # `milog alert on` and `milog probe install-service`). Silent on any
+    # failure — we're going to delete the unit files anyway.
     if command -v systemctl >/dev/null 2>&1; then
-        if [[ -f /etc/systemd/system/milog.service ]]; then
-            info "Stopping + removing milog.service"
-            systemctl stop    milog.service 2>/dev/null || true
-            systemctl disable milog.service 2>/dev/null || true
-            rm -f /etc/systemd/system/milog.service
+        local unit removed_units=0
+        for unit in milog.service milog-probe.service; do
+            if [[ -f "/etc/systemd/system/$unit" ]]; then
+                info "Stopping + removing $unit"
+                systemctl stop    "$unit" 2>/dev/null || true
+                systemctl disable "$unit" 2>/dev/null || true
+                rm -f "/etc/systemd/system/$unit"
+                removed_units=1
+            fi
+        done
+        if (( removed_units )); then
             systemctl daemon-reload 2>/dev/null || true
         fi
+    fi
+
+    # `milog web install-service` writes a user unit into the invoking
+    # user's home; stop it through that user's manager when reachable.
+    local web_user="${SUDO_USER:-root}" web_home web_unit
+    web_home=$(getent passwd "$web_user" 2>/dev/null | cut -d: -f6) || web_home=""
+    [[ -n "$web_home" ]] || web_home="${HOME:-/root}"
+    web_unit="$web_home/.config/systemd/user/milog-web.service"
+    if [[ -f "$web_unit" ]]; then
+        info "Stopping + removing $web_unit"
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --user -M "${web_user}@" disable --now milog-web.service 2>/dev/null || true
+        fi
+        rm -f "$web_unit" "$web_home/.config/systemd/user/default.target.wants/milog-web.service"
     fi
 
     if [[ -e "$BIN_DST" ]]; then
@@ -363,7 +385,7 @@ uninstall() {
 
     cat <<EOF
 
-Uninstalled MiLog binary + systemd unit. Left in place (delete manually if desired):
+Uninstalled MiLog binaries + systemd units. Left in place (delete manually if desired):
   ~/.config/milog/        user config (webhook + thresholds)
   ~/.cache/milog/         alert cooldown state
   ~/.local/share/milog/   history database (if you enabled it)
@@ -464,6 +486,8 @@ main() {
             --script-url)   SCRIPT_URL="${2:?--script-url needs a URL}"; shift 2 ;;
             --uninstall)    do_uninstall=1; shift ;;
             -h|--help)      usage; exit 0 ;;
+            --with-systemd|--webhook)
+                die "$1 is not supported — after install run: sudo milog alert on 'WEBHOOK_URL'" ;;
             *)              die "unknown option: $1" ;;
         esac
     done
@@ -472,9 +496,12 @@ main() {
 
     need_root
 
+    [[ "$(uname -s)" == "Linux" ]] \
+        || die "unsupported platform: $(uname -s) — install.sh supports Linux only (apt-get/dnf/yum/pacman/apk)"
+
     local pm
     pm=$(detect_pkg_manager)
-    [[ "$pm" == "none" ]] && die "no supported package manager (apt-get/dnf/yum/pacman) found"
+    [[ "$pm" == "none" ]] && die "no supported package manager (apt-get/dnf/yum/pacman/apk) found"
     info "Package manager: $pm"
 
     # Abstract-name dependency list. gawk is preferred over busybox/mawk

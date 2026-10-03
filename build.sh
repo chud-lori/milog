@@ -77,6 +77,22 @@ MILOG_BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u 2>/dev/null || 
     for f in src/modes/*.sh; do
         cat "$f"
     done
+    # completions/* baked in as _completions_payload_<shell> for installs
+    # that have no completions/ dir next to the binary.
+    for shell in bash zsh fish; do
+        case "$shell" in
+            bash) f=completions/milog.bash ;;
+            zsh)  f=completions/_milog ;;
+            fish) f=completions/milog.fish ;;
+        esac
+        [[ -s "$f" ]] || { echo "build.sh: missing $f" >&2; exit 1; }
+        if grep -qx 'MILOG_COMPLETION_EOF' "$f"; then
+            echo "build.sh: $f contains the heredoc delimiter" >&2; exit 1
+        fi
+        printf "_completions_payload_%s() {\n    cat <<'MILOG_COMPLETION_EOF'\n" "$shell"
+        cat "$f"
+        printf 'MILOG_COMPLETION_EOF\n}\n'
+    done
     cat src/dispatch.sh
 } > "$OUT"
 
