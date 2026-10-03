@@ -1,24 +1,13 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# MiLog — Nginx + System Monitor (V5.0)
-# ==============================================================================
+# MiLog — nginx + system monitor.
 set -euo pipefail
 
-# --- Configuration (defaults; overridable via config file or env) ---
+# Defaults; the config file and MILOG_* env vars override them.
 LOG_DIR="/var/log/nginx"
 LOGS=()
 REFRESH=5
 
-# Alerts — configure ONE or MORE destinations; alert_fire() fans out to
-# everything that's set. ALERTS_ENABLED=1 is the master switch. Each
-# destination silently no-ops when its config is missing, so adding a
-# second one doesn't require touching anything else.
-#
-#   Discord:  DISCORD_WEBHOOK
-#   Slack:    SLACK_WEBHOOK
-#   Telegram: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
-#   Matrix:   MATRIX_HOMESERVER + MATRIX_TOKEN + MATRIX_ROOM
-#   Webhook:  WEBHOOK_URL (+ optional WEBHOOK_TEMPLATE / WEBHOOK_CONTENT_TYPE)
+# Alert destinations: every configured one fires; each no-ops when its settings are empty.
 DISCORD_WEBHOOK=""
 SLACK_WEBHOOK=""
 TELEGRAM_BOT_TOKEN=""
@@ -27,33 +16,16 @@ MATRIX_HOMESERVER=""
 MATRIX_TOKEN=""
 MATRIX_ROOM=""
 
-# Generic webhook destination — any POST-accepting endpoint (ntfy.sh,
-# Mattermost, Rocket.Chat, custom ingest). Distinct from the discord/slack
-# adapters which know each API's specific payload shape; this is free-form.
-#
-# Template placeholders (all json_escape'd → quoted JSON string literals,
-# so the default template below is valid JSON after substitution):
-#   %TITLE%  alert title      %SEV%   severity word (crit / warn / info)
-#   %BODY%   alert body       %RULE%  rule key     (e.g. `5xx:api`)
-#
-# For `text/plain` ingest, override the template to a bare string and set
-# WEBHOOK_CONTENT_TYPE accordingly — the placeholder values will still be
-# quoted, but that's acceptable for most plain-text receivers.
+# Generic webhook. %TITLE% %BODY% %SEV% %RULE% are substituted as quoted JSON strings.
 WEBHOOK_URL=""
 WEBHOOK_TEMPLATE='{"title":%TITLE%,"body":%BODY%,"severity":%SEV%,"rule":%RULE%}'
 WEBHOOK_CONTENT_TYPE="application/json"
 ALERTS_ENABLED=0
 PATTERNS_ENABLED=1
-# File integrity monitor (audit). Off by default — opting in means
-# `milog daemon` rehashes the watchlist every AUDIT_FIM_INTERVAL seconds
-# and fires `audit:fim:<path>` on drift. Read perms on /etc/shadow etc.
-# are the user's deployment problem; we never `sudo` ourselves.
+# FIM: the daemon rehashes AUDIT_FIM_PATHS every AUDIT_FIM_INTERVAL seconds; milog never sudoes for read access.
 AUDIT_ENABLED=0
 AUDIT_FIM_INTERVAL=3600
-# Default watchlist — the classic post-compromise re-entry surface.
-# Glob patterns expanded with `nullglob`; missing files / dirs are
-# tolerated silently (auto-baseline records "absent" and alerts on
-# next-time-it-appears, which IS the signal we want).
+# Missing paths are baselined as absent, so a file that later appears alerts.
 AUDIT_FIM_PATHS=(
     /etc/passwd
     /etc/shadow
@@ -64,16 +36,8 @@ AUDIT_FIM_PATHS=(
     /root/.ssh/authorized_keys
     /home/*/.ssh/authorized_keys
 )
-# Persistence diff — track file-existence drift across the classic
-# attacker re-entry directories. NEW files in any of these → alert;
-# removed files are logged but don't page (a sysadmin pruning unused
-# units is normal noise).
-#
-# Glob patterns are *quoted* so the array stores the patterns themselves,
-# not their expansion at config-source time. The expander re-globs every
-# tick so a `cron.d/sneaky.cron` dropped after daemon start is detected.
-# (Unquoted globs would expand once at startup and miss new files
-# entirely — exactly what the watcher exists to catch.)
+# New files in these paths alert; removed ones are only logged.
+# Keep the globs quoted so they re-expand each tick instead of once at config-source time.
 AUDIT_PERSISTENCE_INTERVAL=3600
 AUDIT_PERSISTENCE_PATHS=(
     '/etc/cron.d/*'
@@ -94,34 +58,13 @@ AUDIT_PERSISTENCE_PATHS=(
     '/etc/rc.local'
     '/etc/ld.so.preload'
 )
-# Listening-port baseline — snapshot of every TCP/UDP listener at first
-# daemon tick, then diff each subsequent tick. NEW listeners alert; gone
-# listeners are silent (services restart routinely and the brief gap
-# shouldn't page anyone). Tracks `<proto>\t<bind>\t<port>` as the key so
-# a service moving from 127.0.0.1 to 0.0.0.0 also fires — bind-address
-# expansion onto a new interface is itself the signal.
+# New listeners alert, vanished ones don't; the key includes the bind address, so 127.0.0.1 -> 0.0.0.0 fires too.
 AUDIT_PORTS_INTERVAL=3600
-# YARA scan over webroot — opt-in via AUDIT_YARA_PATHS. Daily by default;
-# YARA is heavier than the other audit scans (full filesystem walk +
-# regex per file), so the rate is intentionally lower than FIM.
-#
-# AUDIT_YARA_PATHS is empty by default — we do NOT pick a webroot for
-# you. Configure it explicitly in milog.conf, e.g.
-#   AUDIT_YARA_PATHS=(/var/www /usr/share/nginx/html)
-# A daemon with no AUDIT_YARA_PATHS silently skips the scan. The yara
-# binary itself is also optional — the module logs once on missing
-# `yara` and degrades to no-op.
+# YARA is opt-in: no scan until AUDIT_YARA_PATHS is set, and it no-ops without the yara binary.
 AUDIT_YARA_INTERVAL=86400
 AUDIT_YARA_RULES_DIR="$HOME/.config/milog/yara"
 AUDIT_YARA_PATHS=()
-# Account / SSH-key audit — line-level diff (not file-hash like FIM) over
-# the files where new privileges materialise. New lines (added user, new
-# sudo grant, new SSH pubkey) fire alerts; removed lines are informational
-# only (admins clean up old keys).
-#
-# Same quoted-glob pattern as AUDIT_PERSISTENCE_PATHS — patterns expand
-# at tick-time so a newly-created /home/<user>/.ssh/authorized_keys is
-# picked up without a daemon restart.
+# Line-level diff: added users, sudo grants and SSH keys alert; removed lines don't. Globs stay quoted like the persistence list.
 AUDIT_ACCOUNTS_INTERVAL=3600
 AUDIT_ACCOUNTS_PATHS=(
     '/etc/passwd'
@@ -132,106 +75,51 @@ AUDIT_ACCOUNTS_PATHS=(
     '/home/*/.ssh/authorized_keys'
     '/home/*/.ssh/authorized_keys2'
 )
-# Rootkit hint scanner — point-in-time heuristics, no baseline. Fires
-# on the heuristic itself: hidden processes (ps vs /proc count mismatch),
-# /etc/ld.so.preload existence, binaries executing from /tmp / /dev/shm
-# / /var/tmp, processes whose /proc/PID/exe points to a deleted path
-# (memory-resident malware). Linux-only; macOS / BSD lack /proc and the
-# module no-ops.
+# Rootkit heuristics need no baseline and no-op where /proc is missing.
 AUDIT_ROOTKIT_INTERVAL=3600
 ALERT_COOLDOWN=300
-# Cross-rule dedup window: when multiple rules (e.g. exploits + probes) match
-# the same logline, only the first to fire records the (ip, path) fingerprint;
-# the second sees it fresh and suppresses. Tunes how long one event remains
-# "already reported" across distinct rules. Kept separate from ALERT_COOLDOWN
-# so rule-level and event-level suppression can evolve independently.
+# How long one (ip, path) event stays "already reported" across different rules.
 ALERT_DEDUP_WINDOW=300
 ALERT_STATE_DIR="$HOME/.cache/milog"
-# alerts.log rotation — when the file exceeds this many bytes, truncate it
-# in place to roughly the most recent 50%. No `.1` backup is kept: alerts
-# beyond the window are forensic noise (the state file + fingerprints already
-# carry the recent-fire state the rest of MiLog cares about). Set to 0 to
-# disable rotation entirely.
+# alerts.log is truncated in place to about its newest half past this size; 0 disables rotation.
 ALERT_LOG_MAX_BYTES=10485760  # 10 MB
 
-# Hook scripts — user escape hatch. Every executable under HOOKS_DIR/on_alert.d/
-# runs once per fire, with MILOG_RULE_KEY / MILOG_TITLE / MILOG_BODY /
-# MILOG_SEV / MILOG_COLOR / MILOG_TS in its env. Runs AFTER the silence
-# gate (so silenced fires skip hooks too) and in parallel with delivery.
-# Errors are logged to $ALERT_STATE_DIR/hooks.log and NEVER propagate —
-# a broken hook can't wedge the daemon. Individual hook run time is
-# capped by ALERT_HOOK_TIMEOUT so a hanging script doesn't leak forever.
+# Every executable in HOOKS_DIR/on_alert.d/ runs per fire (after the silence gate) with MILOG_* env;
+# failures go to hooks.log and each run is capped at ALERT_HOOK_TIMEOUT seconds.
 HOOKS_DIR="$HOME/.config/milog/hooks"
 ALERT_HOOK_TIMEOUT=10
 
-# --- Alert routing ------------------------------------------------------------
-# Per-rule destination mapping. Default (empty) = fan out to every configured
-# destination — exactly today's behavior, so existing users see no change.
-#
-# Format: one `key: destinations` pair per line. Whitespace-tolerant, `#`
-# begins a comment. Keys:
-#   - exact rule (`cpu`, `mem`, `workers`, `5xx:api`, `exploits:log4shell`)
-#   - prefix before the first `:` (`5xx`, `exploits`, `probes`)
-#   - `default`     — fallback when no other key matches
-# Resolution order: exact → prefix → default → empty. Leftmost wins.
-#
-# Destinations are space-separated types from: discord slack telegram matrix
-# (plus `skip` meaning "silently drop — no fire at all" for noise classes).
-# Unknown destinations are silently ignored for forward-compatibility.
-#
-# Example — route exploits to security, system alerts to ops, rest to discord:
+# Per-rule destinations, one `key: dest ...` per line; lookup is exact rule, then prefix before `:`, then `default`.
+# Destinations: discord slack telegram matrix webhook, or `skip`; empty fans out to everything.
 #   ALERT_ROUTES="
 #     exploits: slack telegram
-#     audit:    slack
-#     cpu:      discord
-#     mem:      discord
-#     disk:/:   discord
-#     5xx:      slack discord
 #     probes:   skip
 #     default:  discord
 #   "
 ALERT_ROUTES=""
 
-# Response-time percentile thresholds (milliseconds) — used to colour the p95
-# tag in the monitor dashboard. Requires nginx to log $request_time; see
-# README → "Response-time percentiles".
+# p95 colour thresholds in ms; needs $request_time in the nginx log format.
 P95_WARN_MS=500
 P95_CRIT_MS=1500
 
-# `milog slow` window (lines/app scanned from tail). Larger = wider history
-# but slower reads. Hour-of-traffic is a reasonable default on most sites.
+# Lines per app that `milog slow` reads from the tail.
 SLOW_WINDOW=1000
 
-# Path globs to EXCLUDE from `slow` + `top-paths`. Nginx's `$request_time`
-# for a WebSocket-upgraded connection is the full session lifetime, not
-# request latency — a healthy 22-minute chat session otherwise tops the
-# "slowest endpoints" list. Space-separated glob list; matched against the
-# leading path segment. `milog ws` presents WS session metrics separately.
-# Set to empty string ("") to include WS paths again.
+# WebSocket $request_time is the whole session, so these paths would top `slow` and `top-paths`; "" includes them.
 SLOW_EXCLUDE_PATHS="/ws/* /socket.io/*"
 
-# GeoIP enrichment (off by default). Requires `mmdblookup` and a MaxMind
-# GeoLite2-Country MMDB file. Enable both flags only after the MMDB is in
-# place — `milog top` and `milog suspects` add a COUNTRY column when on.
-# See README → "GeoIP enrichment".
+# GeoIP needs mmdblookup and a GeoLite2-Country MMDB.
 GEOIP_ENABLED=0
 MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
-# Historical metrics (off by default; requires sqlite3). When enabled in a
-# `milog daemon` context, one minute-aligned row per app lands in a local
-# SQLite database. Enables `milog trend` / `milog diff` read modes and
-# hour-bucket top-IP rollups. See README → "Historical metrics".
+# History needs sqlite3; the daemon writes one row per app per minute.
 HISTORY_ENABLED=0
 HISTORY_DB="$HOME/.local/share/milog/metrics.db"
 HISTORY_RETAIN_DAYS=30
 HISTORY_TOP_IP_N=50
 
-# Daily-pattern anomaly detection (off by default; piggybacks on history).
-# When enabled, every minute write triggers a same-minute-of-day baseline
-# check: if req / c5xx / p95 exceed mean + ANOMALY_SIGMA*stddev over the
-# last ANOMALY_MIN_DAYS days AND clear the per-metric floor, an alert
-# fires with rule key anomaly:<app>:<metric>. Hard-gated: needs
-# ANOMALY_MIN_DAYS distinct days of data before the first fire.
+# Fires anomaly:<app>:<metric> when a metric exceeds mean + ANOMALY_SIGMA*stddev for that minute of day
+# and its floor, but only after ANOMALY_MIN_DAYS days of history.
 ANOMALY_ENABLED=0
 ANOMALY_SIGMA=3
 ANOMALY_MIN_DAYS=14
@@ -239,30 +127,17 @@ ANOMALY_FLOOR_REQ=10
 ANOMALY_FLOOR_C5XX=2
 ANOMALY_FLOOR_P95=100
 
-# Web dashboard. Off by default; `milog web` execs the milog-web Go
-# binary, which serves a read-only JSON + HTML view on loopback. Expose
-# via SSH tunnel, Tailscale, or Cloudflare Tunnel (see README → "milog
-# web"). Non-loopback bind requires --trust. 8765 is unassigned by IANA
-# and rarely used (unlike 8080, which collides with Jenkins / Tomcat /
-# "my random dev server"). Override via --port.
+# milog-web binds loopback; non-loopback needs --trust. 8765 avoids the usual 8080 collisions.
 WEB_PORT=8765
 WEB_BIND="127.0.0.1"
 WEB_STATE_DIR="$HOME/.cache/milog"
 WEB_TOKEN_FILE="$HOME/.config/milog/web.token"
 
-# Optional user config — sourced if present. Can override any variable above.
-# Example:
-#     LOG_DIR="/var/log/nginx"
-#     LOGS=(myapp api web)          # or leave unset to auto-discover
-#     REFRESH=3
 MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 # shellcheck disable=SC1090
 [[ -f "$MILOG_CONFIG" ]] && . "$MILOG_CONFIG"
 
-# Env var overrides win over the config file. MILOG_* prefix keeps them
-# from colliding with generic shell env. Add new knobs here when you want
-# one-shot / systemd-unit overrides; full tuning still goes through the
-# config file.
+# MILOG_* env vars win over the config file.
 [[ -n "${MILOG_LOG_DIR:-}"         ]] && LOG_DIR="$MILOG_LOG_DIR"
 [[ -n "${MILOG_APPS:-}"            ]] && read -r -a LOGS <<< "$MILOG_APPS"
 [[ -n "${MILOG_REFRESH:-}"         ]] && REFRESH="$MILOG_REFRESH"
@@ -308,7 +183,6 @@ MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 [[ -n "${MILOG_WEB_BIND:-}"        ]] && WEB_BIND="$MILOG_WEB_BIND"
 [[ -n "${MILOG_SLOW_EXCLUDE_PATHS+x}" ]] && SLOW_EXCLUDE_PATHS="$MILOG_SLOW_EXCLUDE_PATHS"
 
-# Auto-discover: if no apps ended up configured, glob *.access.log in LOG_DIR
 if [[ ${#LOGS[@]} -eq 0 ]]; then
     shopt -s nullglob
     for f in "$LOG_DIR"/*.access.log; do
@@ -324,31 +198,11 @@ if [[ ${#LOGS[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# --- Typed log sources -------------------------------------------------------
-# LOGS entries are bare names by default (`LOGS=(api web)`) and resolve to
-# nginx-format files at `$LOG_DIR/<name>.access.log`. A typed prefix makes
-# MiLog usable on non-nginx logs too:
-#
-#   LOGS=(api web text:myapp:/var/log/myapp/error.log)
-#   LOGS=(api journal:mybot.service docker:postgres-prod)
-#   LOGS=(api text:rails:/var/log/rails/production.log nginx:gateway)
-#
-# Resolution:
-#   bare `api`                          → nginx type, $LOG_DIR/api.access.log
-#   `nginx:api`                         → same (explicit)
-#   `text:<name>:<absolute path>`       → any text file
-#   `journal:<unit>`                    → systemd journal for <unit>
-#   `docker:<container>`                → docker JSON-log for <container>
-#
-# Parser-free modes (logs, grep, search, <name> tail) work for every source
-# type via `_log_reader_cmd` below. Parsing modes (monitor, top, slow,
-# top-paths, etc.) skip non-nginx sources gracefully — they need the
-# combined log format to work.
+# LOGS entries: bare `api` or `nginx:api` read $LOG_DIR/api.access.log; `text:<name>:<path>`,
+# `journal:<unit>` and `docker:<container>` are also accepted.
+# Only parser-free modes (logs, grep, search, tail) handle every type; digest is the only parsing mode that skips non-nginx entries.
 
-# Return the file path for a LOGS entry — bare name or typed prefix.
-# `journal:` and `docker:` entries have no stable path (journal is a
-# streaming command, docker's path is looked up dynamically); prefer
-# `_log_reader_cmd` for anything that reads lines.
+# `journal:` and `docker:` have no fixed path; read through _log_reader_cmd instead.
 _log_path_for() {
     local entry="${1-}"
     case "$entry" in
@@ -360,7 +214,6 @@ _log_path_for() {
     esac
 }
 
-# Return the type for a LOGS entry.
 _log_type_for() {
     case "${1-}" in
         text:*)     printf 'text' ;;
@@ -371,7 +224,6 @@ _log_type_for() {
     esac
 }
 
-# Return the display name (strip type prefix and path).
 _log_name_for() {
     local entry="${1-}"
     case "$entry" in
@@ -383,9 +235,6 @@ _log_name_for() {
     esac
 }
 
-# Find the LOGS entry that matches a display name, or empty if no match.
-# Callers use this to map `milog <app>` / `milog grep <app> <pat>` / etc.
-# back to the typed source entry they came from.
 _log_entry_by_name() {
     local target="${1-}" entry
     for entry in "${LOGS[@]}"; do
@@ -397,31 +246,22 @@ _log_entry_by_name() {
     return 1
 }
 
-# Resolve a docker container name to the local path of its JSON log.
-# Fast path: `docker inspect` if the CLI is available. Fallback: glob
-# /var/lib/docker/containers/*/config.v2.json and grep for the name —
-# works even when the docker socket isn't accessible to this user.
-#
-# Returns empty on no-match; callers treat that as "container not
-# running right now" and skip.
+# Empty output means the container isn't running or can't be found.
 _log_docker_path() {
     local name="${1:-}"
     [[ -z "$name" ]] && return 0
-    # Preferred: `docker inspect` gives us the exact LogPath.
     if command -v docker >/dev/null 2>&1; then
         local path
         path=$(docker inspect --format '{{.LogPath}}' "$name" 2>/dev/null)
         [[ -n "$path" && -r "$path" ]] && { printf '%s' "$path"; return 0; }
     fi
-    # Fallback: scan container config files for the matching Name. Needs
-    # read perm on /var/lib/docker; silently no-ops if we can't see it.
+# Reading /var/lib/docker directly works when the docker socket isn't accessible.
     local default_root="${MILOG_DOCKER_ROOT:-/var/lib/docker}"
     [[ -d "$default_root/containers" ]] || return 0
     local cfg cid
     # shellcheck disable=SC2044
     for cfg in "$default_root"/containers/*/config.v2.json; do
         [[ -r "$cfg" ]] || continue
-        # Matches both `"/name"` and `"name"`. Cheap — no JSON parser.
         if grep -q "\"Name\":\"/$name\"" "$cfg" 2>/dev/null \
            || grep -q "\"Name\":\"$name\"" "$cfg" 2>/dev/null; then
             cid=$(basename "$(dirname "$cfg")")
@@ -432,22 +272,8 @@ _log_docker_path() {
     return 0
 }
 
-# Return a shell command (suitable for `eval` / process substitution)
-# that streams RAW log lines from the source entry on stdout. This is
-# the abstraction that lets `color_prefix`, `mode_grep`, and `milog
-# <name>` tail work uniformly across source types without each mode
-# reinventing "how do I read this".
-#
-#   nginx:/bare   → tail -F <file>
-#   text:         → tail -F <file>
-#   journal:      → journalctl -u <unit> -f --no-pager --since now
-#                   (on non-Linux / no journalctl: emits a `#` diag
-#                   line and exits, so callers don't hang)
-#   docker:       → tail -F <container-log> | python3 json-unwrap
-#
-# Prints the command on stdout; caller wraps in `bash -c "$cmd"` or
-# equivalent. On unresolvable entries (docker name not running, etc.)
-# prints empty and returns 1 so callers can skip.
+# Prints a shell command that streams raw lines for the entry; returns 1 when it can't be resolved.
+# Unavailable journal/docker sources print a `#` diagnostic line instead of hanging the caller.
 _log_reader_cmd() {
     local entry="${1:-}"
     local type; type=$(_log_type_for "$entry")
@@ -460,8 +286,6 @@ _log_reader_cmd() {
         journal)
             local unit; unit=$(_log_name_for "$entry")
             if ! command -v journalctl >/dev/null 2>&1; then
-                # Emit a diagnostic and exit so callers' stdout consumers
-                # still see something (preferable to a silent hang).
                 printf "printf '#journal unavailable: journalctl not on PATH\\n'"
                 return 0
             fi
@@ -474,10 +298,7 @@ _log_reader_cmd() {
                     "$(_log_name_for "$entry")"
                 return 0
             fi
-            # Unwrap docker's JSON-per-line format. jq is the robust
-            # option (proper JSON parser). Sed fallback handles typical
-            # plaintext payloads; pathological lines with embedded
-            # quotes/backslashes may render imperfectly.
+# The sed fallback mangles payloads with embedded quotes or backslashes.
             if command -v jq >/dev/null 2>&1; then
                 printf 'tail -F -n 0 %q 2>/dev/null | jq -rj .log 2>/dev/null' "$path"
             else
@@ -491,7 +312,6 @@ _log_reader_cmd() {
     esac
 }
 
-# Alert thresholds
 THRESH_REQ_WARN=15
 THRESH_REQ_CRIT=40
 THRESH_CPU_WARN=70
@@ -506,21 +326,7 @@ THRESH_5XX_WARN=5
 # Sparkline history depth (samples kept per app in monitor mode)
 SPARK_LEN=30
 
-# Per-app threshold override resolver. Looks up `<var>_<safe_app>` first,
-# falls back to the global `<var>`. Bash var names only allow [A-Za-z0-9_],
-# so `-` and `.` in an app name are mapped to `_` before the lookup.
-#
-#   _thresh THRESH_REQ_CRIT api       → $THRESH_REQ_CRIT_api  or  $THRESH_REQ_CRIT
-#   _thresh P95_WARN_MS    my-app     → $P95_WARN_MS_my_app   or  $P95_WARN_MS
-#
-# Overrides live in the config file the same way global thresholds do:
-#   THRESH_REQ_CRIT=40
-#   THRESH_REQ_CRIT_finance=80    # finance is louder; use its own limit
-#   P95_WARN_MS_api=200
-#
-# Kept in core.sh so every subsystem (nginx.sh, history.sh, daemon) reaches
-# the same resolver — threshold divergence between render-path and
-# alert-path has bitten us before.
+# Looks up `<var>_<app>` (non [A-Za-z0-9_] chars become `_`) before the global, e.g. THRESH_REQ_CRIT_api.
 _thresh() {
     local var="$1" app="${2:-}"
     if [[ -n "$app" ]]; then
@@ -534,7 +340,6 @@ _thresh() {
     printf '%s' "${!var:-0}"
 }
 
-# --- ANSI ---
 R="\033[0;31m"  G="\033[0;32m"  Y="\033[0;33m"  B="\033[0;34m"
 M="\033[0;35m"  C="\033[0;36m"  W="\033[1;37m"  D="\033[0;90m"
 RBLINK="\033[0;31;5m"
