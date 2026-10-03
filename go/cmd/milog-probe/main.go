@@ -1,33 +1,11 @@
-// milog-probe — eBPF-backed exec watcher.
+// milog-probe is the root-run eBPF sidecar for milog. It runs the rule
+// engine over exec, connect, file, ptrace, kmod, retransmit, syscall-rate
+// and bpf-load events and sends each hit through `milog _internal_alert`,
+// so cooldown, silence, dedup, routing and hooks all apply. It is a
+// separate binary so the bash daemon never needs root.
 //
-// Runs as a root systemd sidecar to milog daemon. Loads the
-// sched_process_exec tracepoint, runs the rule engine over each event,
-// and shells out to `milog _internal_alert` for matching hits — which
-// reuses the bash daemon's full alert pipeline (cooldown, silence,
-// dedup, routing, hooks). No parallel state in the probe.
-//
-// Why a separate binary
-//   - eBPF needs CAP_BPF + CAP_PERFMON (kernel 5.8+) or CAP_SYS_ADMIN
-//     (older kernels). The bash daemon should NOT run as root in v1;
-//     splitting the privileged pieces into milog-probe keeps that
-//     boundary clean.
-//   - The probe can crash, exit, or be temporarily disabled (verifier
-//     reject on exotic kernels) without affecting the rest of milog —
-//     systemd `Restart=on-failure` papers over transient failures.
-//
-// Privileges
-//   - Requires CAP_BPF + CAP_PERFMON in the systemd unit (preferred)
-//     or root via `User=root`. The unit ships in
-//     `milog probe install-service` — coming in a follow-up branch
-//     once the binary itself is field-tested.
-//
-// Output / IPC
-//   - Default: shell out to `milog _internal_alert <key> <title> <body> <color>`
-//     for each rule hit. milog (bash) does the actual delivery.
-//   - With --json: print one event per line as JSON to stdout. Useful
-//     for `milog-probe --json | jq` debugging on a fresh box.
-//   - With --dry-run: process events but don't fire — diagnostic mode
-//     to gauge rate / false-positive surface before enabling alerts.
+//	--json     print every event with its hits instead of alerting
+//	--dry-run  log hits without alerting
 package main
 
 import (
@@ -45,8 +23,7 @@ import (
 	"github.com/chud-lori/milog/internal/probe"
 )
 
-// buildVersion is link-time stamped via `-ldflags -X main.buildVersion`
-// matching the bash MILOG_VERSION embedding. Unstamped → "dev".
+// buildVersion is set at link time with -ldflags -X.
 var buildVersion = "dev"
 
 func main() {
@@ -71,10 +48,7 @@ func main() {
 		return
 	}
 
-	// Pre-flight: bail early on non-Linux with a useful message rather
-	// than letting probe.Run return ErrUnsupported anonymously deep in
-	// the goroutine. Operators running this on macOS for testing get
-	// a clear "you need Linux" instead of silent stall.
+	// Fail clearly on non-Linux instead of stalling inside probe.Run.
 	if runtime.GOOS != "linux" {
 		log.Fatalf("milog-probe needs Linux for eBPF; running on %s", runtime.GOOS)
 	}
@@ -82,18 +56,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Eight independent event streams: exec (sched_process_exec),
-	// tcp connect (sock:inet_sock_set_state), file open
-	// (syscalls:sys_enter_openat), ptrace (syscalls:sys_enter_ptrace),
-	// kernel module load (module:module_load), TCP retransmit
-	// observability (tcp:tcp_retransmit_skb, sampled), per-PID
-	// syscall rate (raw_tracepoint:sys_enter, sampled, Welford σ),
-	// and BPF program load (syscalls:sys_enter_bpf filtered to
-	// PROG_LOAD). Each runs in its own goroutine with its own BPF
-	// collection so a verifier reject on one doesn't take down the
-	// others — operators still get the remaining probes' coverage
-	// with a logged warning for the failed one. Only when ALL die
-	// do we exit non-zero so systemd Restart=on-failure can recover.
+	// One goroutine and BPF collection per probe, so a verifier reject
+	// only loses that probe; exit non-zero once all of them have died.
 	events := make(chan probe.Event, 256)
 	netEvents := make(chan probe.NetEvent, 256)
 	fileEvents := make(chan probe.FileEvent, 256)
@@ -123,9 +87,6 @@ func main() {
 	log.Printf("milog-probe %s — watching exec + tcp connect + file open + ptrace + kmod load + tcp retransmit + syscall rate + bpf prog-load (json=%v dry-run=%v)",
 		buildVersion, *flagJSON, *flagDryRun)
 
-	// allDead reports whether every probe has surfaced its terminal
-	// error. Once true, we exit non-zero so systemd Restart=on-failure
-	// papers over transient kernel-side issues.
 	allDead := func() bool {
 		return execErrCh == nil && netErrCh == nil && fileErrCh == nil &&
 			ptraceErrCh == nil && kmodErrCh == nil && retransErrCh == nil &&
@@ -221,11 +182,7 @@ func main() {
 	}
 }
 
-// drainErrors picks up any pending non-nil errors from each probe
-// after ctx cancellation. Logs anything that wasn't `nil` — useful
-// signal in the journal when a clean shutdown still had a failing
-// load on one side. Variadic so adding a fourth probe later doesn't
-// touch this signature.
+// drainErrors logs any errors still pending after shutdown.
 func drainErrors(chs ...chan error) {
 	for _, ch := range chs {
 		if ch == nil {
@@ -241,13 +198,11 @@ func drainErrors(chs ...chan error) {
 	}
 }
 
-// handleEvent runs the rule engine over one exec Event and dispatches
-// the configured side effect (json, dry-run, or shell-out to milog).
+// handleEvent runs the exec rules and prints, logs or fires each hit.
 func handleEvent(ev probe.Event, asJSON, dryRun bool, milogBin string) {
 	hits := probe.Match(ev)
 	if asJSON {
-		// Even when no rule matched, emit the event so debugging
-		// "why didn't it fire?" is straightforward.
+		// Print events without hits too, to debug "why didn't it fire?".
 		emitJSON(ev, hits)
 		return
 	}
@@ -263,9 +218,7 @@ func handleEvent(ev probe.Event, asJSON, dryRun bool, milogBin string) {
 	}
 }
 
-// handleNetEvent runs the network rule engine over one NetEvent —
-// same dispatch shape as handleEvent. Kept separate so future net
-// rules can grow independently.
+// handleNetEvent is handleEvent for connect events.
 func handleNetEvent(ev probe.NetEvent, asJSON, dryRun bool, milogBin string) {
 	hits := probe.MatchNet(ev)
 	if asJSON {
@@ -284,10 +237,7 @@ func handleNetEvent(ev probe.NetEvent, asJSON, dryRun bool, milogBin string) {
 	}
 }
 
-// handleFileEvent runs the file-audit rule engine over one FileEvent.
-// Same dispatch shape as the other handle* helpers — separated so the
-// emitFileJSON wire shape can carry the openat flags field that the
-// other event types don't have.
+// handleFileEvent is handleEvent for file opens.
 func handleFileEvent(ev probe.FileEvent, asJSON, dryRun bool, milogBin string) {
 	hits := probe.MatchFile(ev)
 	if asJSON {
@@ -306,9 +256,7 @@ func handleFileEvent(ev probe.FileEvent, asJSON, dryRun bool, milogBin string) {
 	}
 }
 
-// handlePtraceEvent dispatches one PtraceEvent through MatchPtrace.
-// Anti-injection is per-attach so the volume here is low — debug
-// sessions emit a handful of events, attacker activity emits ones.
+// handlePtraceEvent is handleEvent for ptrace attaches.
 func handlePtraceEvent(ev probe.PtraceEvent, asJSON, dryRun bool, milogBin string) {
 	hits := probe.MatchPtrace(ev)
 	if asJSON {
@@ -327,10 +275,7 @@ func handlePtraceEvent(ev probe.PtraceEvent, asJSON, dryRun bool, milogBin strin
 	}
 }
 
-// handleKmodEvent dispatches one KmodEvent through MatchKmod. Module
-// load is rare on production hosts, so most calls here see zero
-// hits (no allowlist match means alert, allowlist match means
-// silence). Either way the overhead is trivial.
+// handleKmodEvent is handleEvent for module loads.
 func handleKmodEvent(ev probe.KmodEvent, asJSON, dryRun bool, milogBin string) {
 	hits := probe.MatchKmod(ev)
 	if asJSON {
@@ -349,11 +294,7 @@ func handleKmodEvent(ev probe.KmodEvent, asJSON, dryRun bool, milogBin string) {
 	}
 }
 
-// handleRetransEvent dispatches one RetransEvent through MatchRetrans.
-// Volume is bounded by destination cardinality (LRU map cap is 4096)
-// rather than by per-packet retransmit count, so even a flaky link
-// produces at most a few hundred events per tick — most of which
-// won't cross the rule threshold.
+// handleRetransEvent is handleEvent for retransmit samples.
 func handleRetransEvent(ev probe.RetransEvent, asJSON, dryRun bool, milogBin string) {
 	hits := probe.MatchRetrans(ev)
 	if asJSON {
@@ -372,10 +313,7 @@ func handleRetransEvent(ev probe.RetransEvent, asJSON, dryRun bool, milogBin str
 	}
 }
 
-// handleRateAnomalyEvent dispatches one RateAnomalyEvent through
-// MatchRateAnomaly. Volume is bounded by tracked-PID cardinality
-// (LRU cap 16K); per-tick burst is at most that, but most events
-// land below the burn-in or floor gates and produce zero hits.
+// handleRateAnomalyEvent is handleEvent for syscall-rate samples.
 func handleRateAnomalyEvent(ev probe.RateAnomalyEvent, asJSON, dryRun bool, milogBin string) {
 	hits := probe.MatchRateAnomaly(ev)
 	if asJSON {
@@ -394,10 +332,7 @@ func handleRateAnomalyEvent(ev probe.RateAnomalyEvent, asJSON, dryRun bool, milo
 	}
 }
 
-// handleBpfLoadEvent dispatches one BpfLoadEvent. Load events are
-// rare on a healthy host (most legitimate loaders happen at boot);
-// per-event delivery is cheap and the rule's allowlist eliminates
-// the steady-state noise.
+// handleBpfLoadEvent is handleEvent for BPF program loads.
 func handleBpfLoadEvent(ev probe.BpfLoadEvent, asJSON, dryRun bool, milogBin string) {
 	hits := probe.MatchBpfLoad(ev)
 	if asJSON {
@@ -488,23 +423,17 @@ func emitBpfLoadJSON(ev probe.BpfLoadEvent, hits []probe.Hit) {
 	_ = enc.Encode(wire{BpfLoadEvent: ev, Hits: hits})
 }
 
-// fireAlert shells out to `milog _internal_alert <key> <title> <body> <color>`.
-// Color = 15158332 (Discord red) — same value the audit modules pass.
-// We don't wait for delivery to complete; alert_fire backgrounds the
-// webhook calls anyway, and a slow milog process shouldn't block the
-// next event in the ring.
+// fireAlert runs `milog _internal_alert` with Discord red and doesn't wait,
+// so a slow milog can't stall the event loop.
 func fireAlert(h probe.Hit, milogBin string) {
 	const color = "15158332"
 	cmd := exec.Command(milogBin, "_internal_alert", h.RuleKey, h.Title, h.Body, color)
-	// Inherit env so MILOG_CONFIG / DISCORD_WEBHOOK / etc. propagate
-	// to the bash daemon's resolution path.
+	// Pass the env through so MILOG_CONFIG reaches milog.
 	cmd.Env = os.Environ()
 	if err := cmd.Start(); err != nil {
 		log.Printf("milog-probe: failed to invoke %s: %v", milogBin, err)
 		return
 	}
-	// Reap async — don't wait for the bash process to finish, but
-	// release its zombie when it does. exec.Cmd.Wait only works
-	// once; calling in a goroutine is the standard pattern.
+	// Reap in the background so the child doesn't linger as a zombie.
 	go func() { _ = cmd.Wait() }()
 }

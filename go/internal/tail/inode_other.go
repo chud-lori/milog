@@ -4,10 +4,8 @@ package tail
 
 import "os"
 
-// inode falls back to mtime on platforms without syscall.Stat_t
-// (Windows primarily). Rotation detection degrades from "exact" to
-// "best-effort" — if the mtime happens to repeat, a rotation event
-// may be missed for one poll interval. Acceptable trade.
+// inode falls back to mtime where syscall.Stat_t is unavailable; a rotation
+// that keeps the mtime can go unnoticed for one poll.
 func inode(fi os.FileInfo) uint64 {
 	return uint64(fi.ModTime().UnixNano())
 }

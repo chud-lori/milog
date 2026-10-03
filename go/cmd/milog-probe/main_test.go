@@ -11,8 +11,7 @@ import (
 	"github.com/chud-lori/milog/internal/probe"
 )
 
-// captureStdout swaps os.Stdout for a pipe so we can assert on what
-// emitJSON writes without hitting the real terminal.
+// captureStdout returns what fn writes to os.Stdout.
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -59,20 +58,16 @@ func TestEmitJSON_includesEventAndHits(t *testing.T) {
 }
 
 func TestHandleEvent_dryRunFiresNothing(t *testing.T) {
-	// dry-run should NOT exec milog. We can't easily assert "didn't
-	// exec" without process introspection, so use a milogBin path that
-	// would fail if invoked — and rely on dry-run to skip it.
+	// A milogBin that would fail if run; dry-run must not run it.
 	ev := probe.Event{
 		Comm: "bash", ParentComm: "nginx", Filename: "/bin/bash",
 		PID: 100, UID: 0,
 	}
-	// No panic, no exec attempt → test passes by completion.
 	handleEvent(ev, false, true, "/nonexistent/milog")
 }
 
 func TestHandleEvent_jsonModeAlwaysEmits(t *testing.T) {
-	// Even a "no rule matched" event prints in JSON mode (debugging
-	// affordance). Verifies we don't shortcut on len(hits)==0.
+	// JSON mode prints events with no hits too.
 	ev := probe.Event{
 		Comm: "ls", ParentComm: "bash", Filename: "/bin/ls",
 		PID: 100, UID: 1000,
