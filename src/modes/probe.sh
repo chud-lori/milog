@@ -55,7 +55,8 @@ _probe_binary() {
     local candidate
     for candidate in \
         /usr/local/libexec/milog/milog-probe \
-        /usr/local/bin/milog-probe; do
+        /usr/local/bin/milog-probe \
+        /usr/bin/milog-probe; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
     local self="${BASH_SOURCE[0]}"
