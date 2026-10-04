@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-38-gaac50f5
-# MILOG_BUILT=2026-10-04T03:37:53Z
+# MILOG_VERSION=v0.6.0-47-g6a4d878
+# MILOG_BUILT=2026-10-04T04:00:19Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -7710,6 +7710,305 @@ mode_trend() {
     done
 }
 
+# milog update: replaces milog and its installed companion binaries with the latest GitHub release.
+# checksums.txt comes from the same release, so it catches corruption, not a compromised release.
+
+# Latest release tag of repo $1, empty when none; fails when GitHub is unreachable.
+_release_latest_tag() {
+    local loc rc=0
+    # /releases/latest redirects to /releases/tag/<tag> and answers 404 (curl exit 22) when there is no release.
+    loc=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$1/releases/latest" 2>/dev/null) || rc=$?
+    (( rc == 0 || rc == 22 )) || return 1
+    [[ "$loc" =~ /tag/([^/?#]+) ]] && printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+}
+
+# Commit SHA that tag $2 of repo $1 points at, empty when it cannot be resolved.
+_release_tag_sha() {
+    curl -fsSL --max-time 15 -H 'Accept: application/vnd.github.sha' \
+        "https://api.github.com/repos/$1/commits/$2" 2>/dev/null || true
+}
+
+_release_os_slug() {
+    case "$(uname -s)" in
+        Linux)  echo linux ;;
+        Darwin) echo darwin ;;
+        *)      echo unsupported ;;
+    esac
+}
+
+_release_arch_slug() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo amd64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *)             echo unsupported ;;
+    esac
+}
+
+# Downloads asset $3 of repo $1 release $2 into dir $4, verified against that release's checksums.txt.
+_release_fetch_verified() {
+    local repo="$1" tag="$2" asset="$3" dir="$4" base want got
+    base="https://github.com/${repo}/releases/download/${tag}"
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$dir/$asset" "$base/$asset" 2>/dev/null; then
+        echo -e "${R}could not download ${asset} from ${tag}${NC}" >&2
+        return 1
+    fi
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$dir/checksums.txt" "$base/checksums.txt" 2>/dev/null; then
+        echo -e "${R}could not fetch checksums.txt for ${tag}; refusing an unverified download${NC}" >&2
+        return 1
+    fi
+    want=$(awk -v f="$asset" '$2 == f {print $1; exit}' "$dir/checksums.txt")
+    if [[ -z "$want" ]]; then
+        echo -e "${R}${asset} is not listed in checksums.txt for ${tag}${NC}" >&2
+        return 1
+    fi
+    got=$(_audit_sha256 "$dir/$asset")
+    if [[ -z "$got" ]]; then
+        echo -e "${R}need sha256sum or shasum to verify ${asset}${NC}" >&2
+        return 1
+    fi
+    if [[ "$got" != "$want" ]]; then
+        echo -e "${R}checksum mismatch for ${asset} (expected ${want}, got ${got})${NC}" >&2
+        return 1
+    fi
+}
+
+# True when stamp $1 is older than tag $2; a stamp without a vX.Y.Z prefix counts as older.
+_version_older() {
+    local re='^v?([0-9]+)\.([0-9]+)\.([0-9]+)' i
+    local -a a b
+    if [[ ! "$2" =~ $re ]]; then
+        [[ "$1" != "$2" ]]; return
+    fi
+    b=("${BASH_REMATCH[@]:1}")
+    [[ "$1" =~ $re ]] || return 0
+    a=("${BASH_REMATCH[@]:1}")
+    for i in 0 1 2; do
+        if (( 10#${a[i]} < 10#${b[i]} )); then return 0; fi
+        if (( 10#${a[i]} > 10#${b[i]} )); then return 1; fi
+    done
+    return 1
+}
+
+# Prints how to update $1 through the package manager that owns it; non-zero when none does.
+_update_pkg_hint() {
+    local path="$1" tag="$2" file pkg
+    file="milog_${tag#v}_linux_$(_release_arch_slug)"
+    local url="https://github.com/${MILOG_RELEASE_REPO:-chud-lori/milog}/releases/download/${tag}"
+    if command -v dpkg >/dev/null 2>&1 && dpkg -S "$path" >/dev/null 2>&1; then
+        echo "  curl -fLO ${url}/${file}.deb && sudo apt install ./${file}.deb"
+    elif command -v rpm >/dev/null 2>&1 && rpm -qf "$path" >/dev/null 2>&1; then
+        echo "  curl -fLO ${url}/${file}.rpm && sudo rpm -U ./${file}.rpm"
+    elif command -v apk >/dev/null 2>&1 && apk info --who-owns "$path" >/dev/null 2>&1; then
+        echo "  curl -fLO ${url}/${file}.apk && sudo apk add --allow-untrusted ./${file}.apk"
+    elif command -v pacman >/dev/null 2>&1 && pkg=$(pacman -Qqo "$path" 2>/dev/null); then
+        echo "  upgrade the ${pkg} package the way you installed it (AUR helper or makepkg)"
+    else
+        return 1
+    fi
+}
+
+mode_update() {
+    local check=0
+    case "${1:-}" in
+        "")      ;;
+        --check) check=1 ;;
+        *) echo -e "${R}update: unknown option '$1'${NC} (usage: milog update [--check])" >&2; return 1 ;;
+    esac
+
+    local repo="${MILOG_RELEASE_REPO:-chud-lori/milog}" self cur tag cur_sha tag_sha up_to_date=0
+    self=$(_milog_self)
+    cur=$(_milog_stamp VERSION)
+    if ! tag=$(_release_latest_tag "$repo"); then
+        echo -e "${R}update: could not reach github.com to look up the latest release of ${repo}${NC}" >&2
+        return 1
+    fi
+    if [[ -z "$tag" ]]; then
+        echo -e "${R}update: no release found for ${repo}${NC}" >&2
+        return 1
+    fi
+    if ! _version_older "$cur" "$tag"; then
+        up_to_date=1
+    elif [[ "$cur" =~ -g([0-9a-f]{7,40})(-dirty)?$ ]]; then
+        # Bundles built before build.sh used --tags name an old tag but carry the release commit's SHA.
+        cur_sha="${BASH_REMATCH[1]}"
+        tag_sha=$(_release_tag_sha "$repo" "$tag")
+        [[ -n "$tag_sha" && "$tag_sha" == "$cur_sha"* ]] && up_to_date=1
+    fi
+    if (( up_to_date )); then
+        echo "milog ${cur} is up to date (latest release: ${tag})"
+        return 0
+    fi
+    if (( check )); then
+        echo "update available: ${cur} → ${tag}  (run: milog update)"
+        return 10
+    fi
+
+    if [[ -e "$(dirname "$self")/.git" ]]; then
+        echo -e "${R}update: ${self} is in a git checkout; update it with git pull && bash build.sh${NC}" >&2
+        return 1
+    fi
+    local -a names=() paths=()
+    local name path hint
+    while IFS=$'\t' read -r name path; do
+        names+=("$name")
+        paths+=("$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")")
+    done < <(_milog_companions)
+    # milog goes last: its stamp is what the next run compares, so a partial update still reads as outdated.
+    names+=(milog)
+    paths+=("$self")
+    for path in "${paths[@]}"; do
+        if hint=$(_update_pkg_hint "$path" "$tag"); then
+            echo -e "${R}update: ${path} belongs to a system package; update it through the package manager:${NC}" >&2
+            echo "$hint" >&2
+            return 1
+        fi
+    done
+    for path in "${paths[@]}"; do
+        if [[ ! -w "$(dirname "$path")" ]]; then
+            echo -e "${R}update: $(dirname "$path") is not writable; run: sudo milog update${NC}" >&2
+            return 1
+        fi
+    done
+
+    local os arch archive tmp
+    os=$(_release_os_slug)
+    arch=$(_release_arch_slug)
+    if [[ "$os" == unsupported || "$arch" == unsupported ]]; then
+        echo -e "${R}update: releases have no build for $(uname -s)/$(uname -m)${NC}" >&2
+        return 1
+    fi
+    archive="milog_${tag#v}_${os}_${arch}.tar.gz"
+    tmp=$(mktemp -d) || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" RETURN
+    if ! _release_fetch_verified "$repo" "$tag" "$archive" "$tmp"; then
+        echo -e "${R}update: aborted; nothing was changed${NC}" >&2
+        return 1
+    fi
+    mkdir "$tmp/x"
+    if ! tar -xzf "$tmp/$archive" -C "$tmp/x" || ! bash -n "$tmp/x/milog.sh" 2>/dev/null; then
+        echo -e "${R}update: ${archive} has no usable milog.sh; nothing was changed${NC}" >&2
+        return 1
+    fi
+
+    # Stage every file before the first mv so a failure leaves the old install whole.
+    local -a staged=()
+    local i src t
+    for i in "${!names[@]}"; do
+        staged+=("")
+        t=""
+        src="$tmp/x/${names[i]}"
+        [[ "${names[i]}" == milog ]] && src="$tmp/x/milog.sh"
+        if [[ ! -f "$src" ]]; then
+            echo -e "${Y}update: ${tag} ships no ${names[i]} for ${os}/${arch}; keeping ${paths[i]}${NC}" >&2
+            continue
+        fi
+        cmp -s "$src" "${paths[i]}" && continue
+        # cp -p carries the installed file's mode over before the new bytes land.
+        if ! t=$(mktemp "$(dirname "${paths[i]}")/.${names[i]}.update.XXXXXX") \
+            || ! cp -p "${paths[i]}" "$t" || ! cat "$src" > "$t"; then
+            [[ -n "$t" ]] && rm -f "$t"
+            for t in "${staged[@]}"; do [[ -n "$t" ]] && rm -f "$t"; done
+            echo -e "${R}update: could not stage ${paths[i]}; nothing was changed${NC}" >&2
+            return 1
+        fi
+        staged[i]="$t"
+    done
+
+    local changed=0 j
+    local -a left=()
+    for i in "${!staged[@]}"; do
+        [[ -n "${staged[i]}" ]] || continue
+        # A rename leaves the running script's open inode intact.
+        if ! mv -f "${staged[i]}" "${paths[i]}"; then
+            for j in "${!staged[@]}"; do
+                (( j >= i )) && [[ -n "${staged[j]}" ]] || continue
+                rm -f "${staged[j]}"
+                left+=("${paths[j]}")
+            done
+            echo -e "${R}update: could not replace ${paths[i]}; these were not updated:${NC}" >&2
+            printf '  %s\n' "${left[@]}" >&2
+            (( changed == 0 )) || echo -e "${Y}update: files listed as updated above are already ${tag}; rerun milog update once the error is fixed${NC}" >&2
+            return 1
+        fi
+        echo "updated ${paths[i]}"
+        changed=$((changed + 1))
+    done
+    if (( changed == 0 )); then
+        echo "milog already matches ${tag}; nothing to replace"
+        return 0
+    fi
+    echo -e "${G}✓${NC} milog ${cur} → ${tag}"
+
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl is-active --quiet milog.service 2>/dev/null; then
+        echo "  restart the daemon:  sudo systemctl restart milog"
+    fi
+    if systemctl is-active --quiet milog-probe.service 2>/dev/null; then
+        echo "  restart the probe:   sudo systemctl restart milog-probe"
+    fi
+    if [[ -f "$_PROBE_SYSTEMD_UNIT" ]]; then
+        echo "  refresh the probe unit for this version:  sudo milog probe install-service"
+    fi
+}
+# milog version: the bundle's build stamp plus the version of each companion binary found.
+
+# Path of the running milog with symlinks resolved.
+_milog_self() {
+    local self="${BASH_SOURCE[0]}"
+    [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+    readlink -f "$self" 2>/dev/null || printf '%s' "$self"
+}
+
+# Value of the `# MILOG_<KEY>=` header line build.sh writes, or "unknown".
+_milog_stamp() {
+    local v
+    v=$(head -5 "$(_milog_self)" 2>/dev/null | awk -F= -v k="# MILOG_$1" '$1 == k {print $2; exit}')
+    printf '%s' "${v:-unknown}"
+}
+
+# name<TAB>path for each companion binary the mode lookups find.
+_milog_companions() {
+    local p
+    if p=$(_web_go_binary);   then printf 'milog-web\t%s\n' "$p"; fi
+    if p=$(_tui_go_binary);   then printf 'milog-tui\t%s\n' "$p"; fi
+    if p=$(_probe_binary);    then printf 'milog-probe\t%s\n' "$p"; fi
+}
+
+# Version a companion reports for --version; the 3s cap covers milog-web builds that predate the flag and start serving instead.
+_companion_version() {
+    local name="$1" bin="$2" out f pid
+    f=$(mktemp) || { printf 'unknown'; return; }
+    # set -m gives the job its own process group, so one kill also reaches its children.
+    set -m
+    "$bin" --version >"$f" 2>/dev/null &
+    pid=$!
+    set +m
+    for _ in $(seq 30); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -- "-$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    out=$(head -1 "$f")
+    rm -f "$f"
+    if [[ "$out" != "$name "* ]]; then
+        printf 'unknown'; return
+    fi
+    out=${out#"$name "}
+    out=${out#v=}
+    printf '%s' "${out%% *}"
+}
+
+mode_version() {
+    printf '%-12s %s (built %s)  %s\n' milog "$(_milog_stamp VERSION)" "$(_milog_stamp BUILT)" "$(_milog_self)"
+    local name path
+    while IFS=$'\t' read -r name path; do
+        printf '%-12s %s  %s\n' "$name" "$(_companion_version "$name" "$path")" "$path"
+    done < <(_milog_companions)
+}
 # milog web: start/stop/status and the systemd user unit for the milog-web binary.
 _WEB_SYSTEMD_UNIT="${HOME}/.config/systemd/user/milog-web.service"
 
@@ -8147,7 +8446,7 @@ _milog_complete() {
         cword=$COMP_CWORD
     }
 
-    local cmds="monitor tui daemon rate health top top-ip-by-app top-paths attacker slow ws stats trend replay search diff auto-tune logs grep errors exploits probes patterns suspects config alert alerts silence digest report doctor web install audit probe bench completions help"
+    local cmds="monitor tui daemon rate health top top-ip-by-app top-paths attacker slow ws stats trend replay search diff auto-tune logs grep errors exploits probes patterns suspects config alert alerts silence digest report doctor version update web install audit probe bench completions help"
     local config_subs="show path init edit add rm dir set validate"
     local config_keys="LOG_DIR LOGS REFRESH SPARK_LEN DISCORD_WEBHOOK SLACK_WEBHOOK TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR ALERT_LOG_MAX_BYTES ALERT_ROUTES HOOKS_DIR ALERT_HOOK_TIMEOUT P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS GEOIP_ENABLED MMDB_PATH HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS WEB_PORT WEB_BIND THRESH_REQ_WARN THRESH_REQ_CRIT THRESH_CPU_WARN THRESH_CPU_CRIT THRESH_MEM_WARN THRESH_MEM_CRIT THRESH_DISK_WARN THRESH_DISK_CRIT THRESH_4XX_WARN THRESH_5XX_WARN"
     local alert_subs="on off status test"
@@ -8201,6 +8500,11 @@ _milog_complete() {
                 2) COMPREPLY=($(compgen -W "$digest_window_vals" -- "$cur")) ;;
             esac
             ;;
+        update)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "--check" -- "$cur")) ;;
+            esac
+            ;;
     esac
     return 0
 }
@@ -8249,6 +8553,8 @@ _milog() {
         'digest:exec-summary view over last day / week'
         'report:static markdown / HTML report'
         'doctor:diagnostic checklist'
+        'version:milog and companion binary versions'
+        'update:install the latest release'
         'web:start/stop/status web UI'
         'install:add optional features: geoip / web / history'
         'audit:host integrity scans (fim / persistence / ports / yara / accounts / rootkit)'
@@ -8303,6 +8609,7 @@ _milog() {
         web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
         alerts)   (( CURRENT == 3 )) && _describe 'window' window_vals ;;
         digest|report) (( CURRENT == 3 )) && _describe 'window' digest_window_vals ;;
+        update)   (( CURRENT == 3 )) && compadd -- --check ;;
     esac
 }
 
@@ -8354,6 +8661,8 @@ set -l cmds \
     "digest:exec-summary view last day / week" \
     "report:static markdown / HTML report" \
     "doctor:diagnostic checklist" \
+    "version:milog and companion binary versions" \
+    "update:install the latest release" \
     "web:start/stop/status web UI" \
     "install:add optional features" \
     "audit:host integrity scans" \
@@ -8397,6 +8706,8 @@ set -l digest_window_vals day week 1h 6h 12h 24h 7d 30d
 for v in $digest_window_vals
     complete -c milog -n "__milog_seen_cmd digest; or __milog_seen_cmd report" -a "$v"
 end
+
+complete -c milog -n "__milog_seen_cmd update" -l check -d "report only; exit 10 when an update exists"
 MILOG_COMPLETION_EOF
 }
 show_help() {
@@ -8440,6 +8751,8 @@ ${W}ALERTING${NC}
 
 ${W}DIAGNOSTICS${NC}
   ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
+  ${C}version${NC}            milog and companion binary versions
+  ${C}update [--check]${NC}   install the latest GitHub release over this milog
 
 ${W}WEB UI${NC} ${D}(read-only, token-gated, loopback-only by default)${NC}
   ${C}web${NC}                start the local HTTP dashboard (foreground)
@@ -8589,6 +8902,13 @@ _cmd_help() {
             echo -e "  Markdown by default; ${C}--html${NC} writes one self-contained page. Windows as digest (default 7d)."
             ;;
         doctor)   echo -e "${W}milog doctor${NC} — diagnostic checklist" ;;
+        version|--version|-V) echo -e "${W}milog version${NC} — build stamp of milog and the version of each companion binary found" ;;
+        update)
+            echo -e "${W}milog update [--check]${NC} — replace milog and its installed companion binaries with the latest release"
+            echo -e "  Verifies the tarball against the release's checksums.txt. Refuses package-managed installs."
+            echo -e "  ${C}--check${NC}  report only; exit 0 when up to date, 10 when an update exists"
+            echo -e "  ${D}Release repo: MILOG_RELEASE_REPO (default chud-lori/milog)${NC}"
+            ;;
         web)
             echo -e "${W}milog web${NC} — read-only local HTTP dashboard"
             echo -e "  Subs: start stop status install-service uninstall-service rotate-token"
@@ -8634,7 +8954,7 @@ fi
 # Setup and host-level commands must work before any app is configured.
 if [[ ${#LOGS[@]} -eq 0 ]]; then
     case "${1:-}" in
-        -h|--help|help|config|doctor|completions|install|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
+        -h|--help|help|config|doctor|version|--version|-V|update|completions|install|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
         *)
             echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
             echo "  Run 'milog config init', set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
@@ -8681,6 +9001,8 @@ case "${1:-}" in
     install)  shift; mode_install "$@" ;;
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
+    version|--version|-V) mode_version ;;
+    update)   shift; mode_update "$@" ;;
     web)      shift; mode_web "$@" ;;
     probe)    shift; mode_probe "$@" ;;
     # Hidden: milog-probe calls this per rule hit with <rule_key> <title> <body> [color] so the full alert path applies.
