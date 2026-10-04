@@ -15,6 +15,8 @@ fail() {
     exit 1
 }
 
+command -v timeout >/dev/null || timeout() { shift; "$@"; }
+
 mkdir -p "$tmp/home" "$tmp/logs" "$tmp/target"
 export HOME="$tmp/home"
 export MILOG_CONFIG="$tmp/home/.config/milog/config.sh"
@@ -114,16 +116,22 @@ if grep -qF 'rule:x' "$state/alerts.silences" 2>/dev/null; then
 fi
 
 # `alert on` accepts any configured destination, not only Discord.
+# Runs `alert on` against <home>/.config/milog/config.sh, set up as <config> copied or (with "link") symlinked.
 alert_on_with() {
+    mkdir -p "$1/.config/milog"
+    if [[ "${3:-}" == link ]]; then
+        ln -s "$2" "$1/.config/milog/config.sh"
+    else
+        cp "$2" "$1/.config/milog/config.sh"
+    fi
     bash -c '
         . "$1" help >/dev/null
         unset SUDO_USER
         home="$2"
         _alert_target_home() { printf "%s" "$home"; }
         _alert_install_service() { :; }
-        mkdir -p "$home/.config/milog" && cp "$3" "$home/.config/milog/config.sh"
         alert_on
-    ' _ "$MILOG" "$1" "$2" >/dev/null 2>&1
+    ' _ "$MILOG" "$1" > "$tmp/alert_on.out" 2>&1
 }
 printf 'TELEGRAM_BOT_TOKEN="t"\n' > "$tmp/target/partial.sh"
 printf 'SLACK_WEBHOOK="https://hooks.slack.invalid/x"\n' > "$tmp/target/slack.sh"
@@ -133,6 +141,19 @@ fi
 alert_on_with "$tmp/alerthome" "$tmp/target/slack.sh" || fail "alert on refused a Slack-only config"
 grep -qx 'ALERTS_ENABLED=1' "$tmp/alerthome/.config/milog/config.sh" \
     || fail "alert on did not enable alerts for a Slack-only config"
+
+# A config the readers would skip is refused up front instead of written to.
+cp "$tmp/target/slack.sh" "$tmp/target/slack.orig"
+alert_on_with "$tmp/bighome" "$tmp/target/big.sh" && fail "alert on accepted an oversized config"
+grep -qF 'refusing to use' "$tmp/alert_on.out" || fail "alert on gave no reason for skipping an oversized config"
+if (( EUID == 0 )); then
+    alert_on_with "$tmp/linkhome" "$tmp/target/slack.sh" link && fail "alert on as root accepted a symlinked config"
+    grep -qF 'refusing to use' "$tmp/alert_on.out" || fail "alert on as root gave no reason for skipping a symlink"
+    cmp -s "$tmp/target/slack.sh" "$tmp/target/slack.orig" || fail "alert on as root wrote through a symlink"
+else
+    alert_on_with "$tmp/linkhome" "$tmp/target/slack.sh" link || fail "alert on refused a symlinked config"
+fi
+grep -qF 'ALERTS_ENABLED' "$tmp/bighome/.config/milog/config.sh" && fail "alert on wrote to an oversized config"
 
 # The daemon counts a Slack-only config as alerting, not as "no webhooks".
 bash -c '

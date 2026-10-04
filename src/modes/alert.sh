@@ -45,6 +45,15 @@ _alert_config_readable() {
     (( size <= 1048576 ))
 }
 
+# Stops before any read or write when the target config exists but the readers would skip it.
+_alert_check_config() {
+    local file="$1"
+    [[ -e "$file" || -L "$file" ]] || return 0
+    _alert_config_readable "$file" && return 0
+    echo -e "${R}refusing to use $file:${NC} needs a regular file under 1 MiB (not a symlink when run as root)" >&2
+    return 1
+}
+
 # Always returns 0, printing nothing when the file or key is missing, to stay safe under `set -e`.
 _alert_read_webhook() {
     local file="$1"
@@ -128,6 +137,7 @@ alert_on() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     if [[ -n "$webhook_arg" ]]; then
         case "$webhook_arg" in
@@ -180,6 +190,7 @@ alert_off() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=0" \
         && echo -e "${G}✓${NC} ALERTS_ENABLED=0 in $target_config"
@@ -204,6 +215,7 @@ alert_status() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     # Read from the target config, not env, so `sudo milog alert status` shows the user's settings rather than root's.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url
@@ -289,6 +301,7 @@ alert_test() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     # Target user's config, not this process's env, for the same sudo reason as alert_status.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url wh_template wh_ctype
