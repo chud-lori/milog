@@ -208,12 +208,6 @@ if [[ ${#LOGS[@]} -eq 0 ]]; then
     shopt -u nullglob
 fi
 
-if [[ ${#LOGS[@]} -eq 0 ]]; then
-    echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
-    echo "  Set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
-    exit 1
-fi
-
 # LOGS entries: bare `api` or `nginx:api` read $LOG_DIR/api.access.log; `text:<name>:<path>`,
 # `journal:<unit>` and `docker:<container>` are also accepted.
 # Only parser-free modes (logs, grep, search, tail) handle every type; digest is the only parsing mode that skips non-nginx entries.

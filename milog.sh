@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-80-g0bf216c
-# MILOG_BUILT=2026-10-04T02:01:03Z
+# MILOG_VERSION=v0.3.0-90-g8cef3dd
+# MILOG_BUILT=2026-10-04T02:02:46Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -208,12 +208,6 @@ if [[ ${#LOGS[@]} -eq 0 ]]; then
         LOGS+=("$name")
     done
     shopt -u nullglob
-fi
-
-if [[ ${#LOGS[@]} -eq 0 ]]; then
-    echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
-    echo "  Set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
-    exit 1
 fi
 
 # LOGS entries: bare `api` or `nginx:api` read $LOG_DIR/api.access.log; `text:<name>:<path>`,
@@ -7906,6 +7900,17 @@ _cmd_help() {
 if [[ "${2:-}" == "--help" || "${2:-}" == "-h" ]]; then
     _cmd_help "${1:-}"
     exit $?
+fi
+
+# Setup and host-level commands must work before any app is configured.
+if [[ ${#LOGS[@]} -eq 0 ]]; then
+    case "${1:-}" in
+        -h|--help|help|config|doctor|completions|install|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
+        *)
+            echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
+            echo "  Run 'milog config init', set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
+            exit 1 ;;
+    esac
 fi
 
 case "${1:-}" in
