@@ -63,7 +63,7 @@ _silence_add() {
     local seconds
     seconds=$(alert_silence_parse_duration "$duration") || {
         echo -e "${R}invalid duration:${NC} $duration" >&2
-        echo -e "${D}  use N<s|m|h|d> — e.g. 30s, 5m, 2h, 1d${NC}" >&2
+        echo -e "${D}  use N<s|m|h|d> up to 3650d — e.g. 30s, 5m, 2h, 1d${NC}" >&2
         return 1
     }
     if (( seconds < 1 )); then

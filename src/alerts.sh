@@ -194,34 +194,22 @@ ${body}"
 # Silences: explicit mutes that outrank cooldown and dedup.
 # alerts.silences rows: key-or-glob, until, added, added_by, message. Expired rows are pruned lazily.
 
-# 30s / 5m / 2h / 1d (or bare seconds) -> seconds; returns 1 on bad input.
+# 30s / 5m / 2h / 1d (or bare seconds) -> seconds, up to 3650d; returns 1 on bad input.
 alert_silence_parse_duration() {
-    local s="${1:-}"
-    [[ -n "$s" ]] || return 1
-    local n="${s%[smhdSMHD]}" unit="${s: -1}"
-    if [[ "$s" =~ ^[0-9]+$ ]]; then
-        printf '%s' "$s"
-        return 0
-    fi
-    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    local s="${1:-}" n unit=1
     # `${unit,,}` is bash 4+ only.
-    case "$unit" in
-        s|S) printf '%s' "$n" ;;
-        m|M) printf '%s' $(( n * 60 )) ;;
-        h|H) printf '%s' $(( n * 3600 )) ;;
-        d|D) printf '%s' $(( n * 86400 )) ;;
-        *) return 1 ;;
+    case "$s" in
+        *[sS]) n="${s%?}" ;;
+        *[mM]) n="${s%?}" unit=60 ;;
+        *[hH]) n="${s%?}" unit=3600 ;;
+        *[dD]) n="${s%?}" unit=86400 ;;
+        *)     n="$s" ;;
     esac
-}
-
-alert_silence_prune() {
-    local f="$ALERT_STATE_DIR/alerts.silences"
-    [[ -f "$f" ]] || return 0
-    local now; now=$(date +%s)
-    local tmp
-    tmp=$(mktemp "$f.prune.XXXXXX" 2>/dev/null) || return 0
-    awk -F'\t' -v now="$now" 'BEGIN{OFS="\t"} $2+0 > now' "$f" 2>/dev/null > "$tmp"
-    mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+    # At most nine significant digits, so the multiply can't overflow.
+    [[ "$n" =~ ^0*([0-9]{1,9})$ ]] || return 1
+    n=$(( 10#${BASH_REMATCH[1]} * unit ))
+    (( n <= 3650 * 86400 )) || return 1
+    printf '%s' "$n"
 }
 
 # Prints the matching row; `[[ == $key ]]` is a glob match, so `exploit:*` covers every exploit rule.

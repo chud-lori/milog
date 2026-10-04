@@ -49,8 +49,11 @@ _alert_read_webhook() {
 }
 
 _alert_read_routes() {
-    local file="$1"
-    [[ -r "$file" ]] || return 0
+    local file="$1" size
+    # Root may be the reader, so skip symlinks, FIFOs and anything over 1 MiB.
+    [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 0
+    size=$(stat -c '%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null) || return 0
+    (( size <= 1048576 )) || return 0
     # Parsed, never sourced: under sudo this is another user's file and we're root.
     awk '
         !on && /^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/ {
@@ -131,11 +134,21 @@ alert_on() {
     fi
     _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=1" || return 1
 
-    local current_webhook
-    current_webhook=$(_alert_read_webhook "$target_config")
-    if [[ -z "$current_webhook" ]]; then
-        echo -e "${R}no DISCORD_WEBHOOK configured in $target_config${NC}" >&2
-        echo "  pass one:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+    local d_url s_url wh_url tg_token tg_chat mx_hs mx_token mx_room
+    d_url=$(_alert_read_webhook "$target_config")
+    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    wh_url=$(  _alert_read_key "$target_config" "WEBHOOK_URL")
+    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+    if [[ -z "$d_url$s_url$wh_url" ]] \
+        && [[ -z "$tg_token" || -z "$tg_chat" ]] \
+        && [[ -z "$mx_hs" || -z "$mx_token" || -z "$mx_room" ]]; then
+        echo -e "${R}no alert destination configured in $target_config${NC}" >&2
+        echo "  pass a Discord webhook:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+        echo "  or set SLACK_WEBHOOK, TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID, MATRIX_* or WEBHOOK_URL there" >&2
         return 1
     fi
 

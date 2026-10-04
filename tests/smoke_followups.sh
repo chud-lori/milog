@@ -79,6 +79,51 @@ expected=$'\n    exploit:  slack\n    default:  discord\n'
 [[ "$(cat "$tmp/routes.out"; printf .)" == "${expected}." ]] \
     || fail "_alert_read_routes returned the wrong value: $(cat "$tmp/routes.out")"
 
+# ...and skips a symlink, a FIFO and an oversized file instead of following, blocking or slurping.
+ln -s "$tmp/target/config.sh" "$tmp/target/link.sh"
+mkfifo "$tmp/target/fifo.sh"
+{ printf 'ALERT_ROUTES="default: slack"\n'; head -c 1100000 /dev/zero | tr '\0' '#'; } > "$tmp/target/big.sh"
+for f in link.sh fifo.sh big.sh; do
+    out=$(timeout 5 bash -c '
+        . "$1" help >/dev/null
+        _alert_read_routes "$2"
+    ' _ "$MILOG" "$tmp/target/$f") || fail "_alert_read_routes hung or failed on $f"
+    [[ -z "$out" ]] || fail "_alert_read_routes read $f"
+done
+
+# Silence durations are capped at 3650d, so a huge value can't overflow into the past.
+"$MILOG" silence 'rule:x' 3650d note >/dev/null 2>&1 || fail "silence rejected 3650d"
+"$MILOG" silence clear 'rule:x' >/dev/null 2>&1
+for d in 3651d 999999999999999d 99999999999999999999; do
+    if "$MILOG" silence 'rule:x' "$d" note >/dev/null 2>&1; then
+        fail "silence accepted $d"
+    fi
+done
+if grep -qF 'rule:x' "$state/alerts.silences" 2>/dev/null; then
+    fail "a rejected silence still wrote a row"
+fi
+
+# `alert on` accepts any configured destination, not only Discord.
+alert_on_with() {
+    bash -c '
+        . "$1" help >/dev/null
+        unset SUDO_USER
+        home="$2"
+        _alert_target_home() { printf "%s" "$home"; }
+        _alert_install_service() { :; }
+        mkdir -p "$home/.config/milog" && cp "$3" "$home/.config/milog/config.sh"
+        alert_on
+    ' _ "$MILOG" "$1" "$2" >/dev/null 2>&1
+}
+printf 'TELEGRAM_BOT_TOKEN="t"\n' > "$tmp/target/partial.sh"
+printf 'SLACK_WEBHOOK="https://hooks.slack.invalid/x"\n' > "$tmp/target/slack.sh"
+if alert_on_with "$tmp/partialhome" "$tmp/target/partial.sh"; then
+    fail "alert on accepted a config with only half a Telegram destination"
+fi
+alert_on_with "$tmp/alerthome" "$tmp/target/slack.sh" || fail "alert on refused a Slack-only config"
+grep -qx 'ALERTS_ENABLED=1' "$tmp/alerthome/.config/milog/config.sh" \
+    || fail "alert on did not enable alerts for a Slack-only config"
+
 # Log-derived text must reach the terminal with its control bytes neutralised.
 # shellcheck disable=SC2016
 printf '%s\tapp:app:panic_go\t15158332\tpanic\t```panic %s```\n' "$now" "$evil" >> "$state/alerts.log"
