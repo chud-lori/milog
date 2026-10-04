@@ -57,7 +57,8 @@ audit_event (
 `audit_event` gets a row when an audit scanner in the daemon reports a
 finding (`AUDIT_ENABLED=1`). A finding that keeps showing up on later
 checks is not stored again (details in [audit.md](audit.md#drift-history)). Read it with
-`milog audit history [days]` or the TUI integrity view (`i`).
+`milog audit history [days]`, the TUI integrity view (`i`), or the
+"Audit drift" section of `milog report`.
 
 The daemon writes to `metrics_minute` once per minute and rolls up
 `top_ip_hour` once per hour (keeping the top N IPs per app per hour —
