@@ -1,7 +1,8 @@
 # History: SQLite per-minute metrics and hourly top-IP rollups, one sqlite3 process per write.
 
 # Doubles single quotes and wraps the value in ''.
-_sql_quote() { local s="${1//\'/\'\'}"; printf "'%s'" "$s"; }
+# The quote goes through a variable because bash < 4.3 keeps the backslashes in "${1//\'/\'\'}".
+_sql_quote() { local q="'"; printf "'%s'" "${1//$q/$q$q}"; }
 
 # Epoch -> log timestamp prefix (dd/Mon/yyyy:HH:MM); tries GNU `date -d @` then BSD `date -r`.
 _cur_time_at() {
@@ -51,6 +52,13 @@ CREATE TABLE IF NOT EXISTS top_ip_hour (
     PRIMARY KEY (ts_hour, app, ip)
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_app_ts ON metrics_minute(app, ts);
+CREATE TABLE IF NOT EXISTS audit_event (
+    ts      INTEGER NOT NULL,
+    scanner TEXT    NOT NULL,
+    kind    TEXT    NOT NULL,
+    subject TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_event_ts ON audit_event(ts);
 SQL
     then
         _dlog "WARNING: sqlite3 init failed — disabling history"
@@ -115,6 +123,28 @@ history_write_hour() {
     fi
 }
 
+# rows are "<kind>\t<subject>" lines; a finding already stored at or after `since` is skipped, so drift that persists across ticks stays one row.
+history_write_audit() {
+    [[ "$HISTORY_ENABLED" != "1" ]] && return 0
+    local scanner="$1" since="${2:-0}" rows="$3"
+    [[ "$since" =~ ^[0-9]+$ ]] || since=0
+    local now; now=$(date +%s)
+    local sql="" kind subject k j q="'" s
+    s=$(_sql_quote "$scanner")
+    # Quoted inline, not via _sql_quote: a subshell per row stalls the daemon tick when thousands of findings persist.
+    while IFS=$'\t' read -r kind subject; do
+        [[ -n "$kind" && -n "$subject" ]] || continue
+        k="lower('${kind//$q/$q$q}')"; j="'${subject//$q/$q$q}'"
+        sql+="INSERT INTO audit_event SELECT $now, $s, $k, $j WHERE NOT EXISTS"
+        sql+=" (SELECT 1 FROM audit_event WHERE scanner = $s AND kind = $k AND subject = $j AND ts >= $since);"$'\n'
+    done <<< "$rows"
+
+    [[ -n "$sql" ]] || return 0
+    if ! { printf 'BEGIN;\n%sCOMMIT;\n' "$sql"; } | sqlite3 "$HISTORY_DB" 2>/dev/null; then
+        _dlog "history: audit write failed for $scanner"
+    fi
+}
+
 history_prune() {
     [[ "$HISTORY_ENABLED" != "1" ]] && return 0
     [[ -f "$HISTORY_DB" ]] || return 0
@@ -125,6 +155,7 @@ history_prune() {
 BEGIN;
 DELETE FROM metrics_minute WHERE ts      < $cutoff;
 DELETE FROM top_ip_hour    WHERE ts_hour < $cutoff;
+DELETE FROM audit_event    WHERE ts      < $cutoff;
 COMMIT;
 SQL
     then
