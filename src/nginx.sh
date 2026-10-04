@@ -7,8 +7,11 @@ nginx_minute_counts() {
     awk -v t="$2" '
         index($0, t) {
             n++
-            if (match($0, / [1-5][0-9][0-9] /)) {
-                cls = substr($0, RSTART+1, 1)
+            # Status follows the quoted request; nginx escapes quotes inside it.
+            split($0, q, "\"")
+            split(q[3], f, " ")
+            if (f[1] ~ /^[1-5][0-9][0-9]$/) {
+                cls = substr(f[1], 1, 1)
                 if      (cls == "2") e2++
                 else if (cls == "3") e3++
                 else if (cls == "4") e4++

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-56-g4721382
-# MILOG_BUILT=2026-10-03T16:27:57Z
+# MILOG_VERSION=v0.3.0-72-ge79cc6d
+# MILOG_BUILT=2026-10-04T01:59:12Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -372,7 +372,25 @@ json_escape() {
     s="${s//$'\n'/\\n}"
     s="${s//$'\r'/\\r}"
     s="${s//$'\t'/\\t}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
+    # Remaining C0 controls as \u00XX; NUL can't occur in a bash string.
+    if [[ "$s" == *[[:cntrl:]]* ]]; then
+        local i h c u
+        for (( i=1; i<32; i++ )); do
+            printf -v h '%02x' "$i"
+            printf -v c "\\x$h"
+            printf -v u '\\u00%s' "$h"
+            s="${s//"$c"/"$u"}"
+        done
+    fi
     printf '"%s"' "$s"
+}
+
+# Code-fence text; backticks become ' so a log line can't close the fence.
+_alert_fence() {
+    local s="${1-}"
+    printf '```%s```' "${s//\`/\'}"
 }
 
 # No surrounding quotes. Keeps log text from injecting tags into Telegram/Matrix HTML.
@@ -430,7 +448,15 @@ _alert_record() {
     _alert_rotate_if_big "$log_file"
 }
 
-# Senders return 0 when unconfigured and never propagate curl failures.
+# Log a failed delivery (network or HTTP >= 400) for `milog doctor`.
+_alert_send_failed() {
+    local log_file="$ALERT_STATE_DIR/send_failures.log"
+    mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
+    printf '%s\t%s\n' "$(date +%s)" "${1:-unknown}" >> "$log_file" 2>/dev/null || true
+    _alert_rotate_if_big "$log_file"
+}
+
+# Senders return 0 when unconfigured and record failures with _alert_send_failed.
 # The body carries attacker-controlled log text, so each sender escapes it and disables mentions where the API allows.
 
 # allowed_mentions.parse=[] stops @everyone / role pings.
@@ -440,8 +466,8 @@ _alert_send_discord() {
     local payload
     payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")
-    curl -sS -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
+    curl -sS -f -m 5 -H "Content-Type: application/json" \
+         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed discord
 }
 
 # link_names=0 keeps `<@channel>` literal; the body goes in a code block with backticks swapped for single quotes.
@@ -453,8 +479,8 @@ _alert_send_slack() {
     local payload
     payload=$(printf '{"text":%s,"mrkdwn":true,"link_names":0}' \
         "$(json_escape "$text")")
-    curl -sS -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || true
+    curl -sS -f -m 5 -H "Content-Type: application/json" \
+         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed slack
 }
 
 # parse_mode=HTML, so every value goes through html_escape.
@@ -469,9 +495,9 @@ _alert_send_telegram() {
     local payload
     payload=$(printf '{"chat_id":%s,"text":%s,"parse_mode":"HTML","disable_web_page_preview":true,"disable_notification":false}' \
         "$(json_escape "$TELEGRAM_CHAT_ID")" "$(json_escape "$text")")
-    curl -sS -m 5 -H "Content-Type: application/json" \
+    curl -sS -f -m 5 -H "Content-Type: application/json" \
          -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-         >/dev/null 2>&1 || true
+         >/dev/null 2>&1 || _alert_send_failed telegram
 }
 
 # Free-form POST driven by WEBHOOK_TEMPLATE; the color-to-severity mapping matches alerts.log.
@@ -484,14 +510,23 @@ _alert_send_webhook() {
         16753920|15844367)  sev=warn ;;
         *)                  sev=info ;;
     esac
-    local payload="${WEBHOOK_TEMPLATE:-\"%TITLE%\"}"
-    payload="${payload//%TITLE%/$(json_escape "$title")}"
-    payload="${payload//%BODY%/$(json_escape "$body")}"
-    payload="${payload//%SEV%/$(json_escape "$sev")}"
-    payload="${payload//%RULE%/$(json_escape "$rule_key")}"
+    # Single pass, so a placeholder inside a substituted value stays literal.
+    local rest="${WEBHOOK_TEMPLATE:-\"%TITLE%\"}" payload=""
+    while [[ "$rest" == *%* ]]; do
+        payload+="${rest%%\%*}"
+        rest="${rest#*\%}"
+        case "$rest" in
+            TITLE%*) payload+=$(json_escape "$title");    rest="${rest#TITLE%}" ;;
+            BODY%*)  payload+=$(json_escape "$body");     rest="${rest#BODY%}" ;;
+            SEV%*)   payload+=$(json_escape "$sev");      rest="${rest#SEV%}" ;;
+            RULE%*)  payload+=$(json_escape "$rule_key"); rest="${rest#RULE%}" ;;
+            *)       payload+='%' ;;
+        esac
+    done
+    payload+="$rest"
     local ctype="${WEBHOOK_CONTENT_TYPE:-application/json}"
-    curl -sS -m 5 -H "Content-Type: ${ctype}" \
-         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || true
+    curl -sS -f -m 5 -H "Content-Type: ${ctype}" \
+         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || _alert_send_failed webhook
 }
 
 # Room IDs are percent-encoded; the txn id only needs to be unique within the server's dedup window.
@@ -512,12 +547,12 @@ ${body}"
     room_enc=$(_url_encode "$MATRIX_ROOM")
     txn_id="milog-$(date +%s)-$RANDOM"
     local hs="${MATRIX_HOMESERVER%/}"
-    curl -sS -m 5 -X PUT \
+    curl -sS -f -m 5 -X PUT \
          -H "Authorization: Bearer ${MATRIX_TOKEN}" \
          -H "Content-Type: application/json" \
          -d "$payload" \
          "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}" \
-         >/dev/null 2>&1 || true
+         >/dev/null 2>&1 || _alert_send_failed matrix
 }
 
 # Silences: explicit mutes that outrank cooldown and dedup.
@@ -902,15 +937,16 @@ alert_fingerprint_fresh() {
     local now last tmp
     mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
     now=$(date +%s)
-    last=$(awk -v k="$fp" -F'\t' '$1==k {print $2; exit}' "$state_file" 2>/dev/null)
+    # ENVIRON, not -v: -v would expand the \xHH escapes nginx writes for quotes.
+    last=$(MILOG_FP="$fp" awk -F'\t' '$1==ENVIRON["MILOG_FP"] {print $2; exit}' "$state_file" 2>/dev/null)
     if [[ -n "$last" ]] && (( now - last < ALERT_DEDUP_WINDOW )); then
         return 1
     fi
     tmp=$(mktemp "$ALERT_STATE_DIR/alerts.fingerprints.tmp.XXXXXX" 2>/dev/null) || return 0
     {
         # Also drop entries older than 2x the window so the file stays bounded.
-        awk -v k="$fp" -v cutoff=$(( now - ALERT_DEDUP_WINDOW * 2 )) \
-            -F'\t' 'BEGIN{OFS="\t"} $1!=k && $2>cutoff' "$state_file" 2>/dev/null
+        MILOG_FP="$fp" awk -v cutoff=$(( now - ALERT_DEDUP_WINDOW * 2 )) \
+            -F'\t' 'BEGIN{OFS="\t"} $1!=ENVIRON["MILOG_FP"] && $2>cutoff' "$state_file" 2>/dev/null
         printf '%s\t%s\n' "$fp" "$now"
     } > "$tmp" && mv "$tmp" "$state_file" 2>/dev/null
     [[ -f "$tmp" ]] && rm -f "$tmp"
@@ -1387,8 +1423,11 @@ nginx_minute_counts() {
     awk -v t="$2" '
         index($0, t) {
             n++
-            if (match($0, / [1-5][0-9][0-9] /)) {
-                cls = substr($0, RSTART+1, 1)
+            # Status follows the quoted request; nginx escapes quotes inside it.
+            split($0, q, "\"")
+            split(q[3], f, " ")
+            if (f[1] ~ /^[1-5][0-9][0-9]$/) {
+                cls = substr(f[1], 1, 1)
                 if      (cls == "2") e2++
                 else if (cls == "3") e3++
                 else if (cls == "4") e4++
@@ -4955,6 +4994,18 @@ mode_doctor() {
         _doc_ok "alerts.log: ${total_count} total, ${today_count} today" \
                 "view with: milog alerts [today|Nh|Nd|all]"
     fi
+    local flog="$ALERT_STATE_DIR/send_failures.log"
+    if [[ -s "$flog" ]]; then
+        local fail_cutoff fail_count fail_dests
+        fail_cutoff=$(( $(date +%s) - 86400 ))
+        fail_count=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c' "$flog" | wc -l | tr -d ' ')
+        fail_dests=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c {print $2}' "$flog" | sort -u | tr '\n' ' ')
+        if (( fail_count > 0 )); then
+            _doc_warn "${fail_count} alert deliveries failed in the last 24h  (${fail_dests% })" \
+                      "see $flog; test with 'milog alert test'"
+            warn=$(( warn + 1 ))
+        fi
+    fi
 
     # History DB.
     _doc_head "history (SQLite)"
@@ -5287,7 +5338,7 @@ mode_exploits() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "exploit:$app:$cat_slug" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_fire "Exploit attempt: $app / $cat_slug" "\`\`\`${line:0:1800}\`\`\`" 15158332 "exploit:$app:$cat_slug" &
+                        alert_fire "Exploit attempt: $app / $cat_slug" "$(_alert_fence "${line:0:1800}")" 15158332 "exploit:$app:$cat_slug" &
                     fi
                 done
             ) &
@@ -5328,10 +5379,15 @@ mode_health() {
         [[ -f "$file" ]] || { printf "%-12s  %8s\n" "$name" "(not found)"; continue; }
         local total s2=0 s3=0 s4=0 s5=0
         total=$(wc -l < "$file")
-        s2=$(grep -c ' 2[0-9][0-9] ' "$file" 2>/dev/null || true)
-        s3=$(grep -c ' 3[0-9][0-9] ' "$file" 2>/dev/null || true)
-        s4=$(grep -c ' 4[0-9][0-9] ' "$file" 2>/dev/null || true)
-        s5=$(grep -c ' 5[0-9][0-9] ' "$file" 2>/dev/null || true)
+        # Status from its field after the quoted request, as in nginx_minute_counts.
+        read -r s2 s3 s4 s5 < <(awk '
+            {
+                split($0, q, "\"")
+                split(q[3], f, " ")
+                if (f[1] ~ /^[2-5][0-9][0-9]$/) c[substr(f[1], 1, 1)]++
+            }
+            END { printf "%d %d %d %d\n", c[2], c[3], c[4], c[5] }
+        ' "$file" 2>/dev/null)
         local c4=$NC c5=$NC t4 t5
         t4=$(_thresh THRESH_4XX_WARN "$name")
         t5=$(_thresh THRESH_5XX_WARN "$name")
@@ -5882,7 +5938,7 @@ mode_patterns() {
                 if alert_should_fire "$key"; then
                     alert_fire \
                         "App pattern: $src / $pat" \
-                        "\`\`\`${line:0:1800}\`\`\`" \
+                        "$(_alert_fence "${line:0:1800}")" \
                         15158332 "$key" &
                 fi
             done
@@ -6217,7 +6273,7 @@ mode_probes() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_fire "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 "probe:$app" &
+                        alert_fire "Probe traffic: $app" "$(_alert_fence "${line:0:1800}")" 15844367 "probe:$app" &
                     fi
                 done
             ) &

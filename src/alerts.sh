@@ -8,7 +8,25 @@ json_escape() {
     s="${s//$'\n'/\\n}"
     s="${s//$'\r'/\\r}"
     s="${s//$'\t'/\\t}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
+    # Remaining C0 controls as \u00XX; NUL can't occur in a bash string.
+    if [[ "$s" == *[[:cntrl:]]* ]]; then
+        local i h c u
+        for (( i=1; i<32; i++ )); do
+            printf -v h '%02x' "$i"
+            printf -v c "\\x$h"
+            printf -v u '\\u00%s' "$h"
+            s="${s//"$c"/"$u"}"
+        done
+    fi
     printf '"%s"' "$s"
+}
+
+# Code-fence text; backticks become ' so a log line can't close the fence.
+_alert_fence() {
+    local s="${1-}"
+    printf '```%s```' "${s//\`/\'}"
 }
 
 # No surrounding quotes. Keeps log text from injecting tags into Telegram/Matrix HTML.
@@ -66,7 +84,15 @@ _alert_record() {
     _alert_rotate_if_big "$log_file"
 }
 
-# Senders return 0 when unconfigured and never propagate curl failures.
+# Log a failed delivery (network or HTTP >= 400) for `milog doctor`.
+_alert_send_failed() {
+    local log_file="$ALERT_STATE_DIR/send_failures.log"
+    mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
+    printf '%s\t%s\n' "$(date +%s)" "${1:-unknown}" >> "$log_file" 2>/dev/null || true
+    _alert_rotate_if_big "$log_file"
+}
+
+# Senders return 0 when unconfigured and record failures with _alert_send_failed.
 # The body carries attacker-controlled log text, so each sender escapes it and disables mentions where the API allows.
 
 # allowed_mentions.parse=[] stops @everyone / role pings.
@@ -76,8 +102,8 @@ _alert_send_discord() {
     local payload
     payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")
-    curl -sS -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
+    curl -sS -f -m 5 -H "Content-Type: application/json" \
+         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed discord
 }
 
 # link_names=0 keeps `<@channel>` literal; the body goes in a code block with backticks swapped for single quotes.
@@ -89,8 +115,8 @@ _alert_send_slack() {
     local payload
     payload=$(printf '{"text":%s,"mrkdwn":true,"link_names":0}' \
         "$(json_escape "$text")")
-    curl -sS -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || true
+    curl -sS -f -m 5 -H "Content-Type: application/json" \
+         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed slack
 }
 
 # parse_mode=HTML, so every value goes through html_escape.
@@ -105,9 +131,9 @@ _alert_send_telegram() {
     local payload
     payload=$(printf '{"chat_id":%s,"text":%s,"parse_mode":"HTML","disable_web_page_preview":true,"disable_notification":false}' \
         "$(json_escape "$TELEGRAM_CHAT_ID")" "$(json_escape "$text")")
-    curl -sS -m 5 -H "Content-Type: application/json" \
+    curl -sS -f -m 5 -H "Content-Type: application/json" \
          -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-         >/dev/null 2>&1 || true
+         >/dev/null 2>&1 || _alert_send_failed telegram
 }
 
 # Free-form POST driven by WEBHOOK_TEMPLATE; the color-to-severity mapping matches alerts.log.
@@ -120,14 +146,23 @@ _alert_send_webhook() {
         16753920|15844367)  sev=warn ;;
         *)                  sev=info ;;
     esac
-    local payload="${WEBHOOK_TEMPLATE:-\"%TITLE%\"}"
-    payload="${payload//%TITLE%/$(json_escape "$title")}"
-    payload="${payload//%BODY%/$(json_escape "$body")}"
-    payload="${payload//%SEV%/$(json_escape "$sev")}"
-    payload="${payload//%RULE%/$(json_escape "$rule_key")}"
+    # Single pass, so a placeholder inside a substituted value stays literal.
+    local rest="${WEBHOOK_TEMPLATE:-\"%TITLE%\"}" payload=""
+    while [[ "$rest" == *%* ]]; do
+        payload+="${rest%%\%*}"
+        rest="${rest#*\%}"
+        case "$rest" in
+            TITLE%*) payload+=$(json_escape "$title");    rest="${rest#TITLE%}" ;;
+            BODY%*)  payload+=$(json_escape "$body");     rest="${rest#BODY%}" ;;
+            SEV%*)   payload+=$(json_escape "$sev");      rest="${rest#SEV%}" ;;
+            RULE%*)  payload+=$(json_escape "$rule_key"); rest="${rest#RULE%}" ;;
+            *)       payload+='%' ;;
+        esac
+    done
+    payload+="$rest"
     local ctype="${WEBHOOK_CONTENT_TYPE:-application/json}"
-    curl -sS -m 5 -H "Content-Type: ${ctype}" \
-         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || true
+    curl -sS -f -m 5 -H "Content-Type: ${ctype}" \
+         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || _alert_send_failed webhook
 }
 
 # Room IDs are percent-encoded; the txn id only needs to be unique within the server's dedup window.
@@ -148,12 +183,12 @@ ${body}"
     room_enc=$(_url_encode "$MATRIX_ROOM")
     txn_id="milog-$(date +%s)-$RANDOM"
     local hs="${MATRIX_HOMESERVER%/}"
-    curl -sS -m 5 -X PUT \
+    curl -sS -f -m 5 -X PUT \
          -H "Authorization: Bearer ${MATRIX_TOKEN}" \
          -H "Content-Type: application/json" \
          -d "$payload" \
          "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}" \
-         >/dev/null 2>&1 || true
+         >/dev/null 2>&1 || _alert_send_failed matrix
 }
 
 # Silences: explicit mutes that outrank cooldown and dedup.
@@ -538,15 +573,16 @@ alert_fingerprint_fresh() {
     local now last tmp
     mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
     now=$(date +%s)
-    last=$(awk -v k="$fp" -F'\t' '$1==k {print $2; exit}' "$state_file" 2>/dev/null)
+    # ENVIRON, not -v: -v would expand the \xHH escapes nginx writes for quotes.
+    last=$(MILOG_FP="$fp" awk -F'\t' '$1==ENVIRON["MILOG_FP"] {print $2; exit}' "$state_file" 2>/dev/null)
     if [[ -n "$last" ]] && (( now - last < ALERT_DEDUP_WINDOW )); then
         return 1
     fi
     tmp=$(mktemp "$ALERT_STATE_DIR/alerts.fingerprints.tmp.XXXXXX" 2>/dev/null) || return 0
     {
         # Also drop entries older than 2x the window so the file stays bounded.
-        awk -v k="$fp" -v cutoff=$(( now - ALERT_DEDUP_WINDOW * 2 )) \
-            -F'\t' 'BEGIN{OFS="\t"} $1!=k && $2>cutoff' "$state_file" 2>/dev/null
+        MILOG_FP="$fp" awk -v cutoff=$(( now - ALERT_DEDUP_WINDOW * 2 )) \
+            -F'\t' 'BEGIN{OFS="\t"} $1!=ENVIRON["MILOG_FP"] && $2>cutoff' "$state_file" 2>/dev/null
         printf '%s\t%s\n' "$fp" "$now"
     } > "$tmp" && mv "$tmp" "$state_file" 2>/dev/null
     [[ -f "$tmp" ]] && rm -f "$tmp"
