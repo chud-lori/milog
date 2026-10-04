@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-1-g69f1a52
-# MILOG_BUILT=2026-10-04T02:23:13Z
+# MILOG_VERSION=v0.6.0-3-g7d137ee
+# MILOG_BUILT=2026-10-04T02:35:54Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -1215,7 +1215,7 @@ history_write_minute() {
     for app in "${LOGS[@]}"; do
         [[ "$(_log_type_for "$app")" == "nginx" ]] || continue
         name=$(_log_name_for "$app")
-        read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$cur_time")"
+        read -r count c2 c3 c4 c5 _ <<< "$(nginx_minute_counts "$name" "$cur_time")"
         count=${count:-0}; c2=${c2:-0}; c3=${c3:-0}; c4=${c4:-0}; c5=${c5:-0}
         read -r p50 p95 p99 <<< "$(percentiles "$name" "$cur_time")"
         [[ "$p50" =~ ^[0-9]+$ ]] || p50="NULL"
@@ -1421,11 +1421,11 @@ SQL
 # Lowercase UA tokens of AI crawlers and assistant fetchers; go/internal/nginxlog mirrors it and a test checks they match.
 AI_CRAWLER_UA_RE='gptbot|chatgpt-user|oai-searchbot|claudebot|claude-user|claude-searchbot|anthropic-ai|perplexitybot|perplexity-user|meta-externalagent|meta-externalfetcher|bytespider|amazonbot|ccbot|cohere-ai|duckassistbot|mistralai-user|youbot'
 
-# Prints "count c2 c3 c4 c5" for lines containing timestamp $2, or zeros when the log is missing.
+# Prints "count c2 c3 c4 c5 ai" for lines containing timestamp $2, or zeros when the log is missing; ai matches the UA field.
 nginx_minute_counts() {
     local file="$LOG_DIR/$1.access.log"
-    [[ -f "$file" ]] || { printf '0 0 0 0 0\n'; return; }
-    awk -v t="$2" '
+    [[ -f "$file" ]] || { printf '0 0 0 0 0 0\n'; return; }
+    awk -v t="$2" -v re="$AI_CRAWLER_UA_RE" '
         index($4, t) == 2 {
             n++
             # Status follows the quoted request; nginx escapes quotes inside it.
@@ -1438,8 +1438,9 @@ nginx_minute_counts() {
                 else if (cls == "4") e4++
                 else if (cls == "5") e5++
             }
+            if (tolower(q[6]) ~ re) ai++
         }
-        END { printf "%d %d %d %d %d\n", n+0, e2+0, e3+0, e4+0, e5+0 }
+        END { printf "%d %d %d %d %d %d\n", n+0, e2+0, e3+0, e4+0, e5+0, ai+0 }
     ' "$file" 2>/dev/null
 }
 
@@ -1526,12 +1527,12 @@ nginx_check_http_alerts() {
     fi
 }
 
-# Prints "ai total" for $1, counting only lines with timestamp $2 when given; matches the UA field, not the whole line.
+# Prints "ai total" over the whole log of $1; matches the UA field, not the whole line.
 nginx_ai_counts() {
     local file="$LOG_DIR/$1.access.log"
     [[ -f "$file" ]] || { printf '0 0\n'; return; }
-    awk -v t="${2:-}" -v re="$AI_CRAWLER_UA_RE" '
-        t == "" || index($4, t) == 2 {
+    awk -v re="$AI_CRAWLER_UA_RE" '
+        {
             n++
             split($0, q, "\"")
             if (tolower(q[6]) ~ re) ai++
@@ -1570,7 +1571,7 @@ nginx_row() {
     local name="$1" CUR_TIME="$2" TOTAL_ref="$3"
     local count=0 c2=0 c3=0 c4=0 c5=0
 
-    read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+    read -r count c2 c3 c4 c5 _ <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
     count=${count:-0}; c4=${c4:-0}; c5=${c5:-0}
     # shellcheck disable=SC2034
     eval "$TOTAL_ref=$(( ${!TOTAL_ref} + count ))"
@@ -4656,13 +4657,12 @@ mode_daemon() {
         sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
                          "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
 
-        local name cnt c2 c3 c4 c5 ai tot
+        local name cnt c2 c3 c4 c5 ai
         for name in "${LOGS[@]}"; do
-            read -r cnt c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+            read -r cnt c2 c3 c4 c5 ai <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
             cnt=${cnt:-0}; c4=${c4:-0}; c5=${c5:-0}
             nginx_check_http_alerts "$name" "$c4" "$c5"
-            read -r ai tot <<< "$(nginx_ai_counts "$name" "$CUR_TIME")"
-            nginx_check_ai_alert "$name" "${ai:-0}" "${tot:-0}"
+            nginx_check_ai_alert "$name" "${ai:-0}" "$cnt"
         done
 
         # Each scanner throttles itself by its AUDIT_*_INTERVAL and no-ops when disabled.
