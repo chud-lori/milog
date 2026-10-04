@@ -129,7 +129,9 @@ Sparkline from history (requires
 Per-app: now vs 1d ago vs 7d ago.
 .TP
 .BR auto-tune " [\fIDAYS\fR]"
-Suggest threshold values from history data.
+Suggest threshold values from history data, plus a threshold raise or a
+silence for each rule averaging more than 10 fires a day in alerts.log.
+Prints commands; applies nothing.
 .TP
 .B replay " \fIFILE\fR"
 Postmortem for one archived log file.
@@ -191,7 +193,8 @@ Subs: \fBshow\fR, \fBpath\fR, \fBinit\fR, \fBedit\fR, \fBadd\fR \fINAME\fR,
 .TP
 .B alert " \fISUB\fR"
 Toggle alerting + systemd service. Subs: \fBon\fR, \fBoff\fR, \fBstatus\fR,
-\fBtest\fR.
+\fBtest\fR, \fBstats\fR [\fIWINDOW\fR] (fires per rule from alerts.log,
+default \fB7d\fR).
 .TP
 .BR alerts " [\fIWINDOW\fR]"
 Fire history reader. Window grammar: \fBtoday\fR, \fByesterday\fR,

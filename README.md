@@ -183,6 +183,7 @@ milog diff                 # per-app: now vs 1d / 7d ago
 milog auto-tune [D]        # suggest thresholds from history
 milog replay <file>        # postmortem for one archived log
 milog alerts [window]      # local fire history
+milog alert stats [window] # fires per rule, busiest first
 
 milog errors               # live 4xx/5xx tail
 milog exploits             # LFI / RCE / SQLi / XSS / infra-probe live tail
@@ -192,7 +193,7 @@ milog <app>                # raw tail of one app
 
 milog web [install-service|stop|status]
 milog probe [status|install-service|uninstall-service]   # Linux only — eBPF sidecar
-milog alert [on|off|status|test]
+milog alert [on|off|status|test|stats]
 milog audit [fim|persistence|ports|yara|accounts|rootkit] [baseline|check|status]
 milog silence <rule_or_glob> <duration> [msg]
 milog config [init|add|rm|dir|set|edit]
