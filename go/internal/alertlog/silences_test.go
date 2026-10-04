@@ -84,14 +84,14 @@ func TestSilences_RejectsBadInput(t *testing.T) {
 func TestParseDuration(t *testing.T) {
 	ok := map[string]time.Duration{
 		"300": 300 * time.Second, "30s": 30 * time.Second, "5m": 5 * time.Minute,
-		"2H": 2 * time.Hour, "1d": 24 * time.Hour,
+		"2H": 2 * time.Hour, "1d": 24 * time.Hour, "3650d": 3650 * 24 * time.Hour,
 	}
 	for in, want := range ok {
 		if got, err := ParseDuration(in); err != nil || got != want {
 			t.Errorf("ParseDuration(%q) = %v, %v; want %v", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"", "h", "-5m", "1.5h", "2w", "abc"} {
+	for _, in := range []string{"", "h", "-5m", "1.5h", "2w", "abc", "3651d", "213504d", "4294967295d", "99999999999999999999"} {
 		if _, err := ParseDuration(in); err == nil {
 			t.Errorf("ParseDuration(%q): expected error", in)
 		}
@@ -102,6 +102,12 @@ func TestSilence_Matches(t *testing.T) {
 	s := Silence{Key: "exploit:*"}
 	if !s.Matches("exploit:api:sqli") || s.Matches("probe:api") {
 		t.Error("glob match wrong")
+	}
+	if !(Silence{Key: "audit:fim:*"}).Matches("audit:fim:MODIFIED:/etc/passwd") {
+		t.Error("* must cross / like a bash glob")
+	}
+	if !(Silence{Key: "audit:*:/etc/*"}).Matches("audit:fim:MODIFIED:/etc/ssh/sshd_config") {
+		t.Error("literal / in the pattern must still match")
 	}
 	if !(Silence{Key: "5xx:api"}).Matches("5xx:api") {
 		t.Error("exact match wrong")

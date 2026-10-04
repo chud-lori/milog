@@ -23,12 +23,12 @@ type Silence struct {
 	Message string
 }
 
-// Matches mirrors bash `[[ $rule == $key ]]`; path.Match differs only in that `*` stops at `/`.
+// Matches mirrors bash `[[ $rule == $key ]]`; `/` is swapped out because path.Match's `*` stops at it and audit keys hold paths.
 func (s Silence) Matches(rule string) bool {
 	if rule == s.Key {
 		return true
 	}
-	ok, _ := path.Match(s.Key, rule)
+	ok, _ := path.Match(strings.ReplaceAll(s.Key, "/", "\x00"), strings.ReplaceAll(rule, "/", "\x00"))
 	return ok
 }
 
@@ -99,21 +99,26 @@ func RemoveSilence(file, key string) (removed bool, err error) {
 	return true, writeSilences(file, kept)
 }
 
+const maxSilenceSec = 3650 * 86400
+
 // ParseDuration accepts what bash alert_silence_parse_duration does: bare
-// seconds or N followed by s, m, h or d.
+// seconds or N followed by s, m, h or d, up to 3650d.
 func ParseDuration(s string) (time.Duration, error) {
-	if n, err := strconv.ParseUint(s, 10, 32); err == nil {
-		return time.Duration(n) * time.Second, nil
-	}
-	units := map[string]time.Duration{"s": time.Second, "m": time.Minute, "h": time.Hour, "d": 24 * time.Hour}
+	num, unitSec := s, uint64(1)
+	units := map[string]uint64{"s": 1, "m": 60, "h": 3600, "d": 86400}
 	if len(s) >= 2 {
-		unit, ok := units[strings.ToLower(s[len(s)-1:])]
-		n, err := strconv.ParseUint(s[:len(s)-1], 10, 32)
-		if ok && err == nil {
-			return time.Duration(n) * unit, nil
+		if u, ok := units[strings.ToLower(s[len(s)-1:])]; ok {
+			num, unitSec = s[:len(s)-1], u
 		}
 	}
-	return 0, fmt.Errorf("invalid duration %q (use N<s|m|h|d>, e.g. 30m, 2h)", s)
+	n, err := strconv.ParseUint(num, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q (use N<s|m|h|d>, e.g. 30m, 2h)", s)
+	}
+	if n > maxSilenceSec/unitSec {
+		return 0, fmt.Errorf("duration %q is longer than 3650d", s)
+	}
+	return time.Duration(n*unitSec) * time.Second, nil
 }
 
 func readSilences(file string) ([]Silence, error) {

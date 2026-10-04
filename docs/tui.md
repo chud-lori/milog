@@ -106,7 +106,7 @@ one-off keys per pane.
 
 ## Alert history and silences
 
-`H` lists every fire in alerts.log, newest first. Rules covered by an
+`H` lists the latest 500 fires in alerts.log, newest first. Rules covered by an
 active silence are marked `silenced`. `enter` opens one alert with its
 full body and the other fires from the same client IP (the first IP in
 the body). `s` asks for a duration (`30m`, `2h`, `1d`; empty means 1h)
