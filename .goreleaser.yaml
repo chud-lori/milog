@@ -170,18 +170,21 @@ nfpms:
           - coreutils
           - curl
           - gawk | mawk
+          - sqlite3
       rpm:
         dependencies:
           - bash
           - coreutils
           - curl
           - gawk
+          - sqlite
       apk:
         dependencies:
           - bash
           - coreutils
           - curl
           - gawk
+          - sqlite
 
 checksum:
   name_template: checksums.txt

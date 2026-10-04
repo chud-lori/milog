@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-90-g8cef3dd
-# MILOG_BUILT=2026-10-04T02:02:46Z
+# MILOG_VERSION=v0.3.0-97-g949fa28
+# MILOG_BUILT=2026-10-04T02:03:50Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -4030,10 +4030,20 @@ _completions_install() {
     _write_completion() {
         local shell="$1" dst="$2"
         mkdir -p "$(dirname "$dst")" 2>/dev/null || return 1
+        local tmp; tmp=$(mktemp "$dst.XXXXXX" 2>/dev/null) || return 1
         if [[ -n "$src" && -f "$src/$(_completions_filename "$shell")" ]]; then
-            cp "$src/$(_completions_filename "$shell")" "$dst"
+            cp "$src/$(_completions_filename "$shell")" "$tmp"
         else
-            _completions_emit "$shell" > "$dst"
+            _completions_emit "$shell" > "$tmp"
+        fi
+        if [[ ! -s "$tmp" ]]; then
+            rm -f "$tmp"
+            echo -e "${R}✗${NC} $shell: empty completion script, not writing $dst" >&2
+            return 1
+        fi
+        if ! chmod 0644 "$tmp" || ! mv "$tmp" "$dst"; then
+            rm -f "$tmp"
+            return 1
         fi
         echo -e "${G}✓${NC} $shell → $dst"
         installed=$((installed+1))
@@ -7677,6 +7687,258 @@ mode_ws() {
         i=$(( i + 1 ))
     done <<< "$rows"
     echo
+}
+_completions_payload_bash() {
+    cat <<'MILOG_COMPLETION_EOF'
+# bash-completion for milog.
+# Install to /usr/share/bash-completion/completions/milog (system) or
+# source from ~/.bash_completion for a user install.
+
+_milog_complete() {
+    local cur prev words cword
+    _init_completion 2>/dev/null || {
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    }
+
+    local cmds="monitor tui daemon rate health top top-ip-by-app top-paths attacker slow ws stats trend replay search diff auto-tune logs grep errors exploits probes patterns suspects config alert alerts silence digest doctor web install audit probe bench completions help"
+    local config_subs="show path init edit add rm dir set validate"
+    local config_keys="LOG_DIR LOGS REFRESH SPARK_LEN DISCORD_WEBHOOK SLACK_WEBHOOK TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR ALERT_LOG_MAX_BYTES ALERT_ROUTES HOOKS_DIR ALERT_HOOK_TIMEOUT P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS GEOIP_ENABLED MMDB_PATH HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS WEB_PORT WEB_BIND THRESH_REQ_WARN THRESH_REQ_CRIT THRESH_CPU_WARN THRESH_CPU_CRIT THRESH_MEM_WARN THRESH_MEM_CRIT THRESH_DISK_WARN THRESH_DISK_CRIT THRESH_4XX_WARN THRESH_5XX_WARN"
+    local alert_subs="on off status test"
+    local silence_subs="list clear"
+    local web_subs="start stop status install-service uninstall-service rotate-token"
+    local window_vals="today yesterday 1h 6h 12h 24h 7d 30d all"
+
+    case $cword in
+        1)
+            COMPREPLY=($(compgen -W "$cmds" -- "$cur"))
+            return 0
+            ;;
+    esac
+
+    # Second-level: depend on the chosen command.
+    local cmd="${words[1]}"
+    case "$cmd" in
+        config)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "$config_subs" -- "$cur")) ;;
+                3)
+                    case "${words[2]}" in
+                        set) COMPREPLY=($(compgen -W "$config_keys" -- "$cur")) ;;
+                    esac
+                    ;;
+            esac
+            ;;
+        alert)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "$alert_subs" -- "$cur")) ;;
+            esac
+            ;;
+        silence)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "$silence_subs" -- "$cur")) ;;
+            esac
+            ;;
+        web)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "$web_subs" -- "$cur")) ;;
+            esac
+            ;;
+        alerts|digest)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "$window_vals" -- "$cur")) ;;
+            esac
+            ;;
+    esac
+    return 0
+}
+
+complete -F _milog_complete milog
+MILOG_COMPLETION_EOF
+}
+_completions_payload_zsh() {
+    cat <<'MILOG_COMPLETION_EOF'
+#compdef milog
+# zsh completion for milog.
+# Install to /usr/share/zsh/site-functions/_milog (system) or any dir in $fpath.
+
+_milog() {
+    local -a commands config_subs config_keys alert_subs silence_subs web_subs window_vals
+
+    commands=(
+        'monitor:bash dashboard (nginx + system)'
+        'tui:bubbletea TUI (Go binary)'
+        'daemon:headless alerter — no TUI'
+        'rate:nginx-only req/min dashboard'
+        'health:2xx/3xx/4xx/5xx per app'
+        'top:top N source IPs'
+        'top-ip-by-app:top N source IPs per app'
+        'top-paths:top N URLs by req/4xx/5xx/p95'
+        'attacker:forensic view of one IP'
+        'slow:top N slow endpoints by p95'
+        'ws:WebSocket session metrics'
+        'stats:hourly request histogram per app'
+        'trend:sparkline of req/min from history'
+        'replay:postmortem for one archived log'
+        'search:grep across current + archived logs'
+        'diff:per-app req now vs 1d/7d ago'
+        'auto-tune:suggest thresholds from history'
+        'logs:tail all logs, color prefixed'
+        'grep:filter-tail one app'
+        'errors:live 4xx/5xx tail'
+        'exploits:LFI/RCE/SQLi/XSS/infra-probe tail'
+        'probes:scanner/bot traffic tail'
+        'patterns:app-error signatures (panics, OOM, stacktraces)'
+        'suspects:heuristic bot ranking'
+        'config:show / edit / set / init / validate'
+        'alert:toggle alerting + systemd service'
+        'alerts:local fire history'
+        'silence:mute a rule while on-call fixes it'
+        'digest:exec-summary view over last day / week'
+        'doctor:diagnostic checklist'
+        'web:start/stop/status web UI'
+        'install:add optional features: geoip / web / history'
+        'audit:host integrity scans (fim / persistence / ports / yara / accounts / rootkit)'
+        'probe:eBPF probe sidecar service'
+        'bench:benchmark harness against synthetic fixtures'
+        'completions:install / print bash|zsh|fish completions'
+        'help:show help'
+    )
+
+    config_subs=(show path init edit add rm dir set validate)
+    config_keys=(
+        LOG_DIR LOGS REFRESH SPARK_LEN
+        DISCORD_WEBHOOK SLACK_WEBHOOK
+        TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+        MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM
+        WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE
+        ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW
+        ALERT_LOG_MAX_BYTES ALERT_ROUTES
+        HOOKS_DIR ALERT_HOOK_TIMEOUT
+        P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
+        GEOIP_ENABLED MMDB_PATH
+        HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS
+        WEB_PORT WEB_BIND
+        THRESH_REQ_WARN THRESH_REQ_CRIT
+        THRESH_CPU_WARN THRESH_CPU_CRIT
+        THRESH_MEM_WARN THRESH_MEM_CRIT
+        THRESH_DISK_WARN THRESH_DISK_CRIT
+        THRESH_4XX_WARN THRESH_5XX_WARN
+    )
+    alert_subs=(on off status test)
+    silence_subs=(list clear)
+    web_subs=(start stop status install-service uninstall-service rotate-token)
+    window_vals=(today yesterday 1h 6h 12h 24h 7d 30d all)
+
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'milog subcommand' commands
+        return
+    fi
+
+    case "${words[2]}" in
+        config)
+            if   (( CURRENT == 3 )); then _describe 'config subcommand' config_subs
+            elif (( CURRENT == 4 )); then
+                case "${words[3]}" in
+                    set) _describe 'config key' config_keys ;;
+                esac
+            fi
+            ;;
+        alert)    (( CURRENT == 3 )) && _describe 'alert subcommand' alert_subs ;;
+        silence)  (( CURRENT == 3 )) && _describe 'silence subcommand' silence_subs ;;
+        web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
+        alerts|digest) (( CURRENT == 3 )) && _describe 'window' window_vals ;;
+    esac
+}
+
+_milog "$@"
+MILOG_COMPLETION_EOF
+}
+_completions_payload_fish() {
+    cat <<'MILOG_COMPLETION_EOF'
+# fish completion for milog.
+# Install to /usr/share/fish/vendor_completions.d/milog.fish (system) or
+# ~/.config/fish/completions/milog.fish (user).
+
+function __milog_seen_cmd
+    set -l cmd $argv[1]
+    set -l tokens (commandline -opc)
+    test (count $tokens) -ge 2; and test $tokens[2] = $cmd
+end
+
+# Top-level commands
+set -l cmds \
+    "monitor:bash dashboard" \
+    "tui:bubbletea TUI (Go binary)" \
+    "daemon:headless alerter" \
+    "rate:nginx req/min dashboard" \
+    "health:2xx/3xx/4xx/5xx per app" \
+    "top:top N source IPs" \
+    "top-ip-by-app:top N source IPs per app" \
+    "top-paths:top N URLs by req/4xx/5xx/p95" \
+    "attacker:forensic view of one IP" \
+    "slow:top N slow endpoints" \
+    "ws:WebSocket session metrics" \
+    "stats:hourly request histogram" \
+    "trend:sparkline from history" \
+    "replay:postmortem for one log file" \
+    "search:grep across current + archived logs" \
+    "diff:per-app req now vs 1d/7d ago" \
+    "auto-tune:suggest thresholds" \
+    "logs:tail all logs, color prefixed" \
+    "grep:filter-tail one app" \
+    "errors:live 4xx/5xx tail" \
+    "exploits:LFI/RCE/SQLi/XSS/infra probe tail" \
+    "probes:scanner/bot traffic tail" \
+    "patterns:app-error signatures" \
+    "suspects:heuristic bot ranking" \
+    "config:show/edit/set/init/validate" \
+    "alert:toggle alerting + systemd" \
+    "alerts:local fire history" \
+    "silence:mute a rule while on-call fixes it" \
+    "digest:exec-summary view last day / week" \
+    "doctor:diagnostic checklist" \
+    "web:start/stop/status web UI" \
+    "install:add optional features" \
+    "audit:host integrity scans" \
+    "probe:eBPF probe sidecar service" \
+    "bench:benchmark harness" \
+    "completions:install / print shell completions" \
+    "help:show help"
+
+for entry in $cmds
+    set -l parts (string split ":" "$entry")
+    complete -c milog -n "__fish_is_first_token" -a "$parts[1]" -d "$parts[2]"
+end
+
+# Subcommands
+set -l config_subs show path init edit add rm dir set validate
+for s in $config_subs
+    complete -c milog -n "__milog_seen_cmd config" -a "$s"
+end
+
+set -l alert_subs on off status test
+for s in $alert_subs
+    complete -c milog -n "__milog_seen_cmd alert" -a "$s"
+end
+
+set -l silence_subs list clear
+for s in $silence_subs
+    complete -c milog -n "__milog_seen_cmd silence" -a "$s"
+end
+
+set -l web_subs start stop status install-service uninstall-service rotate-token
+for s in $web_subs
+    complete -c milog -n "__milog_seen_cmd web" -a "$s"
+end
+
+set -l window_vals today yesterday 1h 6h 12h 24h 7d 30d all
+for v in $window_vals
+    complete -c milog -n "__milog_seen_cmd alerts; or __milog_seen_cmd digest" -a "$v"
+end
+MILOG_COMPLETION_EOF
 }
 show_help() {
     echo -e "

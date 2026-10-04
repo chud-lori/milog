@@ -60,8 +60,8 @@ is handled by `install.sh`.
 ### Native package (preferred when available)
 
 GitHub Releases ship `.deb`, `.rpm`, and `.apk` packages alongside the
-tarballs. Pulls in `bash` + `coreutils` + `curl` + `gawk` automatically
-through your distro's package manager:
+tarballs. Pulls in `bash` + `coreutils` + `curl` + `gawk` + `sqlite3`
+automatically through your distro's package manager:
 
 ```bash
 # Debian / Ubuntu
@@ -82,7 +82,7 @@ Replace `<VER>` with the [latest release tag](https://github.com/chud-lori/milog
 The packages drop `milog`, `milog-web`, and `milog-tui` into `/usr/bin`,
 plus shell completions and docs under `/usr/share`.
 
-### Curl one-liner (any Linux/macOS)
+### Curl one-liner (Linux: apt / dnf / yum / pacman / apk)
 
 Drops `milog` + Go binaries into `/usr/local/bin`; uses your distro's
 package manager to ensure `gawk` / `curl` / `sqlite3` are present:

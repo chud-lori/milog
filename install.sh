@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# MiLog installer for apt, dnf, yum and pacman hosts. Uses the milog.sh next to this script, else downloads it:
+# MiLog installer for Linux (apt, dnf, yum, pacman, apk). Uses the milog.sh next to this script, else downloads it:
 #   curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh | sudo bash -s -- [--with-geoip]
 # Flags: --with-geoip, --bin PATH, --script-url URL, --uninstall (see usage below).
+# Alerts and the systemd unit come after install: sudo milog alert on URL
 set -euo pipefail
 
 # In pipe mode BASH_SOURCE[0] is not a real path, so the source is resolved later in resolve_script_src.
@@ -63,7 +64,7 @@ _print_recent_commits_hint() {
 
 detect_pkg_manager() {
     local pm
-    for pm in apt-get dnf yum pacman; do
+    for pm in apt-get dnf yum pacman apk; do
         if command -v "$pm" >/dev/null 2>&1; then
             echo "$pm"
             return 0
@@ -78,10 +79,10 @@ pkg_name_for() {
     case "${tool}:${pm}" in
         sqlite3:apt-get)                echo sqlite3 ;;
         sqlite3:dnf|sqlite3:yum)        echo sqlite ;;
-        sqlite3:pacman)                 echo sqlite ;;
+        sqlite3:pacman|sqlite3:apk)     echo sqlite ;;
         mmdblookup:apt-get)             echo mmdb-bin ;;
         mmdblookup:dnf|mmdblookup:yum)  echo libmaxminddb ;;
-        mmdblookup:pacman)              echo libmaxminddb ;;
+        mmdblookup:pacman|mmdblookup:apk) echo libmaxminddb ;;
         *)                              echo "$tool" ;;
     esac
 }
@@ -96,6 +97,7 @@ pkg_install() {
         dnf)    dnf    install -y "$@" ;;
         yum)    yum    install -y "$@" ;;
         pacman) pacman -S --noconfirm "$@" ;;
+        apk)    apk add --no-cache "$@" ;;
         none)   die "no supported package manager found — install manually: $*" ;;
     esac
 }
@@ -266,15 +268,35 @@ check_bash_version() {
 uninstall() {
     need_root
 
-    # Unit written by `milog alert on`.
+    # Units written by `milog alert on` and `milog probe install-service`.
     if command -v systemctl >/dev/null 2>&1; then
-        if [[ -f /etc/systemd/system/milog.service ]]; then
-            info "Stopping + removing milog.service"
-            systemctl stop    milog.service 2>/dev/null || true
-            systemctl disable milog.service 2>/dev/null || true
-            rm -f /etc/systemd/system/milog.service
+        local unit removed_units=0
+        for unit in milog.service milog-probe.service; do
+            if [[ -f "/etc/systemd/system/$unit" ]]; then
+                info "Stopping + removing $unit"
+                systemctl stop    "$unit" 2>/dev/null || true
+                systemctl disable "$unit" 2>/dev/null || true
+                rm -f "/etc/systemd/system/$unit"
+                removed_units=1
+            fi
+        done
+        if (( removed_units )); then
             systemctl daemon-reload 2>/dev/null || true
         fi
+    fi
+
+    # `milog web install-service` writes a user unit into the invoking
+    # user's home; stop it through that user's manager when reachable.
+    local web_user="${SUDO_USER:-root}" web_home web_unit
+    web_home=$(getent passwd "$web_user" 2>/dev/null | cut -d: -f6) || web_home=""
+    [[ -n "$web_home" ]] || web_home="${HOME:-/root}"
+    web_unit="$web_home/.config/systemd/user/milog-web.service"
+    if [[ -f "$web_unit" ]]; then
+        info "Stopping + removing $web_unit"
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --user -M "${web_user}@" disable --now milog-web.service 2>/dev/null || true
+        fi
+        rm -f "$web_unit" "$web_home/.config/systemd/user/default.target.wants/milog-web.service"
     fi
 
     if [[ -e "$BIN_DST" ]]; then
@@ -297,7 +319,7 @@ uninstall() {
 
     cat <<EOF
 
-Uninstalled MiLog binary + systemd unit. Left in place (delete manually if desired):
+Uninstalled MiLog binaries + systemd units. Left in place (delete manually if desired):
   ~/.config/milog/        user config (webhook + thresholds)
   ~/.cache/milog/         alert cooldown state
   ~/.local/share/milog/   history database (if you enabled it)
@@ -385,6 +407,8 @@ main() {
             --script-url)   SCRIPT_URL="${2:?--script-url needs a URL}"; shift 2 ;;
             --uninstall)    do_uninstall=1; shift ;;
             -h|--help)      usage; exit 0 ;;
+            --with-systemd|--webhook)
+                die "$1 is not supported — after install run: sudo milog alert on 'WEBHOOK_URL'" ;;
             *)              die "unknown option: $1" ;;
         esac
     done
@@ -393,9 +417,12 @@ main() {
 
     need_root
 
+    [[ "$(uname -s)" == "Linux" ]] \
+        || die "unsupported platform: $(uname -s) — install.sh supports Linux only (apt-get/dnf/yum/pacman/apk)"
+
     local pm
     pm=$(detect_pkg_manager)
-    [[ "$pm" == "none" ]] && die "no supported package manager (apt-get/dnf/yum/pacman) found"
+    [[ "$pm" == "none" ]] && die "no supported package manager (apt-get/dnf/yum/pacman/apk) found"
     info "Package manager: $pm"
 
     # mmdblookup stays opt-in because it needs a MaxMind account.
