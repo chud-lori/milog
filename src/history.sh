@@ -79,7 +79,7 @@ history_write_minute() {
     for app in "${LOGS[@]}"; do
         [[ "$(_log_type_for "$app")" == "nginx" ]] || continue
         name=$(_log_name_for "$app")
-        read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$cur_time")"
+        read -r count c2 c3 c4 c5 _ <<< "$(nginx_minute_counts "$name" "$cur_time")"
         count=${count:-0}; c2=${c2:-0}; c3=${c3:-0}; c4=${c4:-0}; c5=${c5:-0}
         read -r p50 p95 p99 <<< "$(percentiles "$name" "$cur_time")"
         [[ "$p50" =~ ^[0-9]+$ ]] || p50="NULL"

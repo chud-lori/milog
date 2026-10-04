@@ -1,7 +1,7 @@
 // milog-tui is the Bubble Tea TUI for MiLog. It shares internal/* with
 // milog-web, so both show the same numbers.
 //
-// Seven views:
+// Nine views:
 //
 //	overview    header + system bars + per-app table (default)
 //	drilldown   one app: top paths, top IPs, recent alerts
@@ -9,6 +9,8 @@
 //	paths       top paths summed across every configured app
 //	errors      pattern-fire aggregation (app:* rule keys) with per-source breakdown
 //	trend       per-app request-rate sparklines over the last hour from the SQLite history DB
+//	history     alerts.log newest first, with per-alert detail and silencing
+//	silences    active alerts.silences rows, shared with `milog silence`
 //	integrity   audit drift over the last 7 days from the SQLite history DB
 //
 // Key bindings:
@@ -24,8 +26,10 @@
 //	P           open the paths-cross-app view (capital P; lowercase p is pause)
 //	e           open the errors aggregation view
 //	t           open the trend view
+//	H / S       open alert history / active silences
+//	s / x       silence the selected alert's rule / clear the selected silence
 //	i           open the integrity view
-//	esc / h     leave drill-down / alerts / paths / errors / trend / integrity → overview
+//	esc / h     leave drill-down / alerts / paths / errors / trend / history / silences / integrity → overview
 package main
 
 import (
@@ -79,6 +83,8 @@ const (
 	viewPaths
 	viewErrors
 	viewTrend
+	viewHistory
+	viewSilences
 	viewIntegrity
 )
 
@@ -148,6 +154,7 @@ type drilldownData struct {
 	topPaths   []kv
 	topIPs     []kv
 	totalLines int
+	aiLines    int
 	alerts     []alertlog.Row
 	err        error
 }
@@ -309,6 +316,7 @@ type model struct {
 	paths       pathsData     // current paths-view payload (empty when not in viewPaths)
 	errors      errorsData    // current errors-view payload (empty when not in viewErrors)
 	trend       trendData     // current trend-view payload (empty when not in viewTrend)
+	hist        historyState  // history and silences views
 	integrity   integrityData // current integrity-view payload (empty when not in viewIntegrity)
 }
 
@@ -374,6 +382,9 @@ func drilldownSampleCmd(cfg *config.Config, app string) tea.Cmd {
 			}
 			if ln.IP != "" {
 				ips[ln.IP]++
+			}
+			if nginxlog.IsAICrawler(ln.UA) {
+				d.aiLines++
 			}
 		}
 		d.topPaths = topN(paths, drilldownTopN)
@@ -677,6 +688,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.hist.prompting {
+			return m.updateSilencePrompt(msg)
+		}
 		keys := m.controls()
 		// Keys that behave the same in every view.
 		switch {
@@ -714,11 +728,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, errorsSampleCmd(m.cfg)
 			case viewTrend:
 				return m, trendSampleCmd(m.cfg)
+			case viewHistory, viewSilences:
+				return m, historyLoadCmd(m.cfg)
 			case viewIntegrity:
 				return m, integritySampleCmd(m.cfg)
 			default:
 				return m, sampleCmd(m.cfg)
 			}
+		}
+		if next, cmd, handled := m.updateHistoryKey(msg); handled {
+			return next, cmd
 		}
 		switch m.view {
 		case viewOverview:
@@ -841,6 +860,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			batch = append(batch, errorsSampleCmd(m.cfg))
 		case viewTrend:
 			batch = append(batch, trendSampleCmd(m.cfg))
+		case viewHistory, viewSilences:
+			batch = append(batch, historyLoadCmd(m.cfg))
 		case viewIntegrity:
 			batch = append(batch, integritySampleCmd(m.cfg))
 		}
@@ -905,6 +926,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The trend view shows loadErr inline, so leave m.status alone.
 		m.syncViewportContent()
 
+	case historyMsg:
+		m.applyHistory(msg)
+		m.syncViewportContent()
+
+	case silenceDoneMsg:
+		return m.applySilenceDone(msg)
 	case integrityMsg:
 		m.integrity = msg.data
 		m.syncViewportContent()
@@ -983,6 +1010,10 @@ func (m model) renderBodyContent() string {
 		return m.renderErrorsView()
 	case viewTrend:
 		return m.renderTrendView()
+	case viewHistory:
+		return m.renderHistoryView()
+	case viewSilences:
+		return m.renderSilencesView()
 	case viewIntegrity:
 		return m.renderIntegrityView()
 	default:
@@ -1115,10 +1146,14 @@ func (m model) renderDrilldown() string {
 	}
 	var b strings.Builder
 
+	scanned := fmt.Sprintf("(scanned %d recent lines)", d.totalLines)
+	if d.totalLines > 0 {
+		scanned = fmt.Sprintf("(scanned %d recent lines, AI crawlers %d%%)", d.totalLines, d.aiLines*100/d.totalLines)
+	}
 	subhead := fmt.Sprintf("  %s %s   %s",
 		labelStyle.Render("APP"),
 		titleStyle.Render(d.app),
-		dimStyle.Render(fmt.Sprintf("(scanned %d recent lines)", d.totalLines)))
+		dimStyle.Render(scanned))
 	b.WriteString(subhead)
 	b.WriteString("\n\n")
 
@@ -1502,6 +1537,9 @@ func renderSparkline(buf []int, width int) string {
 }
 
 func (m model) renderFooter() string {
+	if m.hist.prompting {
+		return m.renderSilencePrompt()
+	}
 	status := ""
 	if m.status != "" {
 		status = " · " + critStyle.Render(m.status)
@@ -1523,6 +1561,8 @@ func (m model) renderFooter() string {
 			bindingHint(keys.Paths),
 			bindingHint(keys.Errors),
 			bindingHint(keys.Trend),
+			bindingHint(historyKeys.History),
+			bindingHint(historyKeys.Silences),
 			bindingHint(keys.Integrity),
 		)
 	case viewDrilldown:
@@ -1535,6 +1575,8 @@ func (m model) renderFooter() string {
 		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	case viewTrend:
 		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
+	case viewHistory, viewSilences:
+		parts = append(parts, historyFooterHints(m)...)
 	case viewIntegrity:
 		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	}
@@ -1569,7 +1611,7 @@ func (m model) ShortHelp() []key.Binding {
 	out := []key.Binding{keys.Quit, keys.Pause, keys.Refresh, keys.Faster, keys.Help}
 	switch m.view {
 	case viewOverview:
-		out = append(out, keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend, keys.Integrity)
+		out = append(out, keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend, historyKeys.History, historyKeys.Silences, keys.Integrity)
 	default:
 		out = append(out, keys.Up, keys.Down, keys.PageDown, keys.PageUp, keys.Back)
 	}
@@ -1584,7 +1626,8 @@ func (m model) FullHelp() [][]key.Binding {
 	switch m.view {
 	case viewOverview:
 		groups = append(groups, []key.Binding{
-			keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend, keys.Integrity,
+			keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend,
+			historyKeys.History, historyKeys.Silences, keys.Integrity,
 		})
 	default:
 		groups = append(groups, []key.Binding{
@@ -1625,9 +1668,11 @@ KEYS (inside the TUI)
   P            open paths-cross-app view (capital P; lowercase p is pause)
   e            open errors aggregation view
   t            open trend view (per-app sparklines, last hour)
+  H            open alert history (enter: detail, s: silence the rule)
+  S            open active silences (x: clear one)
   i            open integrity view (audit drift, last 7 days)
   ↑/k ↓/j      scroll focused views; f/pgdn and b/pgup page
-  esc / h      back from drill-down / alerts / paths / errors / trend / integrity`)
+  esc / h      back from any view to the overview`)
 			return
 		}
 	}

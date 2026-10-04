@@ -15,10 +15,12 @@ mode_top() {
     fi
 
     local tmp; tmp=$(mktemp)
-    local name
+    local name ai tot ai_sum=0 tot_sum=0
     for name in "${LOGS[@]}"; do
-        [[ -f "$LOG_DIR/$name.access.log" ]] \
-            && awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
+        [[ -f "$LOG_DIR/$name.access.log" ]] || continue
+        awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
+        read -r ai tot < <(nginx_ai_counts "$name")
+        ai_sum=$(( ai_sum + ai )); tot_sum=$(( tot_sum + tot ))
     done
 
     # Geo lookup after uniq, so mmdblookup forks at most $n times.
@@ -39,6 +41,9 @@ mode_top() {
     done < <(sort "$tmp" | uniq -c | sort -rn | head -n "$n")
 
     rm -f "$tmp"
+    if (( tot_sum > 0 )); then
+        echo -e "\n${D}AI crawlers: $(( ai_sum * 100 / tot_sum ))% of requests (${ai_sum} of ${tot_sum})${NC}"
+    fi
     echo
 }
 
