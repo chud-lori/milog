@@ -69,7 +69,7 @@ _tune_alert_noise() {
         fi
         # Attackers drive these counts, so muting them would mute attack detection.
         case "$key" in
-            exploit:*|audit:*)
+            exploit:*|audit:*|process:*|proc:*|net:*|file:*)
                 printf "  ${W}%s${NC}  ${D}%s fires, high volume: review the source, not silenced${NC}\n" "$key" "$count"
                 continue
                 ;;
