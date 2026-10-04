@@ -199,6 +199,7 @@ mode_report() {
     secs=$(_digest_window_to_secs "$window") || { echo -e "${R}report: invalid window: $window${NC}" >&2; return 1; }
     now=$(date +%s)
     cutoff=$(( now - secs ))
+    (( cutoff >= 0 )) || cutoff=0
 
     report=$(
         printf 'T\tMiLog report: last %s on %s\n' "$window" "$(hostname 2>/dev/null || echo host)"

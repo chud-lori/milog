@@ -129,6 +129,8 @@ second=$(grep -nF '0.0.0.0:4444/tcp' <<< "$md" | cut -d: -f1)
 html=$("$ROOT/milog.sh" report 7d --html)
 grep -qF '<td>/srv/&lt;script&gt;x&lt;/script&gt; a|b it&#39;s t</td>' <<< "$html" || fail "html audit subject not escaped: $html"
 grep -qi '<script' <<< "$html" && fail "html audit subject kept a script tag"
+md=$("$ROOT/milog.sh" report 99999d)
+grep -qF '| fim | modified | /etc/old-drift |' <<< "$md" || fail "window past the epoch dropped audit rows: $md"
 
 for i in $(seq 1 55); do printf "INSERT INTO audit_event VALUES ($recent, 'ports', 'appeared', 'p$i');\n"; done | sqlite3 "$db"
 md=$("$ROOT/milog.sh" report 7d)

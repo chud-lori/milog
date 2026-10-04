@@ -147,10 +147,12 @@ history_write_audit() {
 
 # audit_event rows with ts >= since, newest first: local time, scanner, kind, subject (tab-separated).
 _history_audit_rows() {
-    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    local since="$1"
+    [[ "$since" =~ ^-?[0-9]+$ ]] || return 1
+    (( since >= 0 )) || since=0
     sqlite3 -readonly -separator $'\t' "$HISTORY_DB" \
         "SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'), scanner, kind, subject
-         FROM audit_event WHERE ts >= $1 ORDER BY ts DESC;"
+         FROM audit_event WHERE ts >= $since ORDER BY ts DESC, rowid DESC;"
 }
 
 history_prune() {
