@@ -79,18 +79,27 @@ expected=$'\n    exploit:  slack\n    default:  discord\n'
 [[ "$(cat "$tmp/routes.out"; printf .)" == "${expected}." ]] \
     || fail "_alert_read_routes returned the wrong value: $(cat "$tmp/routes.out")"
 
-# ...and skips a symlink, a FIFO and an oversized file instead of following, blocking or slurping.
+# ...and skips a FIFO, an oversized file and (as root only) a symlink.
 ln -s "$tmp/target/config.sh" "$tmp/target/link.sh"
 mkfifo "$tmp/target/fifo.sh"
 { printf 'ALERT_ROUTES="default: slack"\n'; head -c 1100000 /dev/zero | tr '\0' '#'; } > "$tmp/target/big.sh"
-for f in link.sh fifo.sh big.sh; do
-    out=$(timeout 5 bash -c '
+read_alert_config() {
+    timeout 5 bash -c '
         . "$1" help >/dev/null
         _alert_read_routes "$2"
         _alert_read_key "$2" ALERT_ROUTES
-    ' _ "$MILOG" "$tmp/target/$f") || fail "alert config readers hung or failed on $f"
+    ' _ "$MILOG" "$1"
+}
+for f in fifo.sh big.sh; do
+    out=$(read_alert_config "$tmp/target/$f") || fail "alert config readers hung or failed on $f"
     [[ -z "$out" ]] || fail "alert config readers read $f"
 done
+out=$(read_alert_config "$tmp/target/link.sh") || fail "alert config readers failed on a symlink"
+if (( EUID == 0 )); then
+    [[ -z "$out" ]] || fail "alert config readers followed a symlink as root"
+else
+    [[ "$out" == *"exploit:  slack"* ]] || fail "alert config readers ignored a symlinked config"
+fi
 
 # Silence durations are capped at 3650d, so a huge value can't overflow into the past.
 "$MILOG" silence 'rule:x' 3650d >/dev/null 2>&1 || fail "silence rejected 3650d"

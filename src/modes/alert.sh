@@ -36,11 +36,12 @@ _alert_write_config() {
     fi
 }
 
-# Root may be the reader, so only a regular, non-symlink file up to 1 MiB counts.
+# Regular file up to 1 MiB; root also refuses symlinks, since it may be reading another user's file.
 _alert_config_readable() {
     local file="$1" size
-    [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 1
-    size=$(stat -c '%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null) || return 1
+    [[ -f "$file" && -r "$file" ]] || return 1
+    (( EUID != 0 )) || [[ ! -L "$file" ]] || return 1
+    size=$(stat -L -c '%s' "$file" 2>/dev/null || stat -L -f '%z' "$file" 2>/dev/null) || return 1
     (( size <= 1048576 ))
 }
 
