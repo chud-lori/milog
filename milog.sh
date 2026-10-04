@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-125-g63d63a2
-# MILOG_BUILT=2026-10-04T02:09:43Z
+# MILOG_VERSION=v0.6.0-3-g7d137ee
+# MILOG_BUILT=2026-10-04T02:35:54Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -334,6 +334,7 @@ THRESH_DISK_WARN=80
 THRESH_DISK_CRIT=95
 THRESH_4XX_WARN=20
 THRESH_5XX_WARN=5
+THRESH_AICRAWL_WARN=30
 
 # Sparkline history depth (samples kept per app in monitor mode)
 SPARK_LEN=30
@@ -1214,7 +1215,7 @@ history_write_minute() {
     for app in "${LOGS[@]}"; do
         [[ "$(_log_type_for "$app")" == "nginx" ]] || continue
         name=$(_log_name_for "$app")
-        read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$cur_time")"
+        read -r count c2 c3 c4 c5 _ <<< "$(nginx_minute_counts "$name" "$cur_time")"
         count=${count:-0}; c2=${c2:-0}; c3=${c3:-0}; c4=${c4:-0}; c5=${c5:-0}
         read -r p50 p95 p99 <<< "$(percentiles "$name" "$cur_time")"
         [[ "$p50" =~ ^[0-9]+$ ]] || p50="NULL"
@@ -1417,11 +1418,14 @@ SQL
 }
 # nginx access-log counters and monitor rows.
 
-# Prints "count c2 c3 c4 c5" for lines containing timestamp $2, or zeros when the log is missing.
+# Lowercase UA tokens of AI crawlers and assistant fetchers; go/internal/nginxlog mirrors it and a test checks they match.
+AI_CRAWLER_UA_RE='gptbot|chatgpt-user|oai-searchbot|claudebot|claude-user|claude-searchbot|anthropic-ai|perplexitybot|perplexity-user|meta-externalagent|meta-externalfetcher|bytespider|amazonbot|ccbot|cohere-ai|duckassistbot|mistralai-user|youbot'
+
+# Prints "count c2 c3 c4 c5 ai" for lines containing timestamp $2, or zeros when the log is missing; ai matches the UA field.
 nginx_minute_counts() {
     local file="$LOG_DIR/$1.access.log"
-    [[ -f "$file" ]] || { printf '0 0 0 0 0\n'; return; }
-    awk -v t="$2" '
+    [[ -f "$file" ]] || { printf '0 0 0 0 0 0\n'; return; }
+    awk -v t="$2" -v re="$AI_CRAWLER_UA_RE" '
         index($4, t) == 2 {
             n++
             # Status follows the quoted request; nginx escapes quotes inside it.
@@ -1434,8 +1438,9 @@ nginx_minute_counts() {
                 else if (cls == "4") e4++
                 else if (cls == "5") e5++
             }
+            if (tolower(q[6]) ~ re) ai++
         }
-        END { printf "%d %d %d %d %d\n", n+0, e2+0, e3+0, e4+0, e5+0 }
+        END { printf "%d %d %d %d %d %d\n", n+0, e2+0, e3+0, e4+0, e5+0, ai+0 }
     ' "$file" 2>/dev/null
 }
 
@@ -1522,6 +1527,28 @@ nginx_check_http_alerts() {
     fi
 }
 
+# Prints "ai total" over the whole log of $1; matches the UA field, not the whole line.
+nginx_ai_counts() {
+    local file="$LOG_DIR/$1.access.log"
+    [[ -f "$file" ]] || { printf '0 0\n'; return; }
+    awk -v re="$AI_CRAWLER_UA_RE" '
+        {
+            n++
+            split($0, q, "\"")
+            if (tolower(q[6]) ~ re) ai++
+        }
+        END { printf "%d %d\n", ai+0, n+0 }
+    ' "$file" 2>/dev/null
+}
+
+nginx_check_ai_alert() {
+    local name="$1" ai="$2" total="$3" t
+    t=$(_thresh THRESH_AICRAWL_WARN "$name")
+    if (( ai > 0 && ai >= t )) && alert_should_fire "aicrawl:$name"; then
+        alert_fire "AI crawler surge: $name" "${ai} AI-crawler requests in the last minute, $(( ai * 100 / total ))% of ${total} (threshold ${t})" 15844367 "aicrawl:$name" &
+    fi
+}
+
 # CPU/MEM/DISK/worker alerts, shared by monitor and daemon.
 sys_check_alerts() {
     local cpu="$1" mem_pct="$2" mem_used="$3" mem_total="$4"
@@ -1544,7 +1571,7 @@ nginx_row() {
     local name="$1" CUR_TIME="$2" TOTAL_ref="$3"
     local count=0 c2=0 c3=0 c4=0 c5=0
 
-    read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+    read -r count c2 c3 c4 c5 _ <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
     count=${count:-0}; c4=${c4:-0}; c5=${c5:-0}
     # shellcheck disable=SC2034
     eval "$TOTAL_ref=$(( ${!TOTAL_ref} + count ))"
@@ -4169,6 +4196,7 @@ config_show() {
     printf "  %-22s warn=%s crit=%s\n" "mem"      "$THRESH_MEM_WARN"  "$THRESH_MEM_CRIT"
     printf "  %-22s warn=%s crit=%s\n" "disk"     "$THRESH_DISK_WARN" "$THRESH_DISK_CRIT"
     printf "  %-22s 4xx=%s 5xx=%s\n"   "status thresholds" "$THRESH_4XX_WARN" "$THRESH_5XX_WARN"
+    printf "  %-22s %s/min\n" "AI crawler alert" "$THRESH_AICRAWL_WARN"
     printf "  %-22s warn=%sms crit=%sms\n" "p95 response time" "$P95_WARN_MS" "$P95_CRIT_MS"
     printf "  %-22s %s\n" "SLOW_WINDOW"   "$SLOW_WINDOW"
     printf "  %-22s enabled=%s mmdb=%s\n" "geoip" "$GEOIP_ENABLED" \
@@ -4219,6 +4247,7 @@ config_init() {
 # THRESH_DISK_CRIT=95
 # THRESH_4XX_WARN=20
 # THRESH_5XX_WARN=5
+# THRESH_AICRAWL_WARN=30   # AI-crawler requests/min per app before an aicrawl alert
 # P95_WARN_MS=500
 # P95_CRIT_MS=1500
 # SLOW_WINDOW=1000      # lines scanned per app by `milog slow`
@@ -4389,6 +4418,7 @@ config_validate() {
         THRESH_MEM_WARN THRESH_MEM_CRIT
         THRESH_DISK_WARN THRESH_DISK_CRIT
         THRESH_4XX_WARN THRESH_5XX_WARN
+        THRESH_AICRAWL_WARN
     )
     # Prefixes for per-app overrides like THRESH_REQ_CRIT_finance.
     local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ AUDIT_ )
@@ -4447,6 +4477,7 @@ config_validate() {
     _check_int THRESH_MEM_CRIT  0 100
     _check_int THRESH_DISK_WARN 0 100
     _check_int THRESH_DISK_CRIT 0 100
+    _check_int THRESH_AICRAWL_WARN 0
     _check_int P95_WARN_MS 0
     _check_int P95_CRIT_MS 0
     _check_int SLOW_WINDOW 1
@@ -4626,11 +4657,12 @@ mode_daemon() {
         sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
                          "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
 
-        local name cnt c2 c3 c4 c5
+        local name cnt c2 c3 c4 c5 ai
         for name in "${LOGS[@]}"; do
-            read -r cnt c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+            read -r cnt c2 c3 c4 c5 ai <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
             cnt=${cnt:-0}; c4=${c4:-0}; c5=${c5:-0}
             nginx_check_http_alerts "$name" "$c4" "$c5"
+            nginx_check_ai_alert "$name" "${ai:-0}" "$cnt"
         done
 
         # Each scanner throttles itself by its AUDIT_*_INTERVAL and no-ops when disabled.
@@ -5406,15 +5438,15 @@ mode_grep() {
     bash -c "$cmd" 2>/dev/null | grep --line-buffered -i "$pattern" | _tty_safe
 }
 
-# milog health: status-class totals per app.
+# milog health: status-class totals and AI-crawler share per app.
 mode_health() {
     echo -e "\n${W}── MiLog: Status Code Health ──${NC}\n"
-    printf "%-12s  %8s  %8s  %8s  %8s  %8s\n" "APP" "TOTAL" "2xx" "3xx" "4xx" "5xx"
-    printf "%-12s  %8s  %8s  %8s  %8s  %8s\n" "───────────" "───────" "───────" "───────" "───────" "───────"
+    printf "%-12s  %8s  %8s  %8s  %8s  %8s  %6s\n" "APP" "TOTAL" "2xx" "3xx" "4xx" "5xx" "AI"
+    printf "%-12s  %8s  %8s  %8s  %8s  %8s  %6s\n" "───────────" "───────" "───────" "───────" "───────" "───────" "─────"
     for name in "${LOGS[@]}"; do
         local file="$LOG_DIR/$name.access.log"
         [[ -f "$file" ]] || { printf "%-12s  %8s\n" "$name" "(not found)"; continue; }
-        local total s2=0 s3=0 s4=0 s5=0
+        local total s2=0 s3=0 s4=0 s5=0 ai=0 ai_pct="-"
         total=$(wc -l < "$file")
         # Status from its field after the quoted request, as in nginx_minute_counts.
         read -r s2 s3 s4 s5 < <(awk '
@@ -5425,13 +5457,15 @@ mode_health() {
             }
             END { printf "%d %d %d %d\n", c[2], c[3], c[4], c[5] }
         ' "$file" 2>/dev/null)
+        read -r ai _ < <(nginx_ai_counts "$name")
+        (( total > 0 )) && ai_pct="$(( ai * 100 / total ))%"
         local c4=$NC c5=$NC t4 t5
         t4=$(_thresh THRESH_4XX_WARN "$name")
         t5=$(_thresh THRESH_5XX_WARN "$name")
         [[ $s4 -gt $t4 ]] && c4=$Y
         [[ $s5 -gt $t5 ]] && c5=$R
-        printf "%-12s  %8s  %8s  %8s  ${c4}%8s${NC}  ${c5}%8s${NC}\n" \
-            "$name" "$total" "$s2" "$s3" "$s4" "$s5"
+        printf "%-12s  %8s  %8s  %8s  ${c4}%8s${NC}  ${c5}%8s${NC}  %6s\n" \
+            "$name" "$total" "$s2" "$s3" "$s4" "$s5" "$ai_pct"
     done
     echo ""
 }
@@ -6280,10 +6314,9 @@ mode_probes() {
     pat+='|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe'
     # SEO / advertising crawlers (often unwanted)
     pat+='|ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat'
-    pat+='|dataforseobot|bytespider|mauibot|megaindex|seznambot'
+    pat+='|dataforseobot|mauibot|megaindex|seznambot'
     # AI crawlers
-    pat+='|claudebot|gptbot|ccbot|anthropic-ai|perplexitybot|youbot'
-    pat+='|amazonbot|applebot-extended|cohere-ai|diffbot'
+    pat+="|$AI_CRAWLER_UA_RE|diffbot"
     # Generic HTTP libraries (legit use exists but often scripted)
     pat+='|python-requests|python-urllib|aiohttp|go-http-client|okhttp'
     pat+='|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2'
@@ -7126,10 +7159,12 @@ mode_top() {
     fi
 
     local tmp; tmp=$(mktemp)
-    local name
+    local name ai tot ai_sum=0 tot_sum=0
     for name in "${LOGS[@]}"; do
-        [[ -f "$LOG_DIR/$name.access.log" ]] \
-            && awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
+        [[ -f "$LOG_DIR/$name.access.log" ]] || continue
+        awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
+        read -r ai tot < <(nginx_ai_counts "$name")
+        ai_sum=$(( ai_sum + ai )); tot_sum=$(( tot_sum + tot ))
     done
 
     # Geo lookup after uniq, so mmdblookup forks at most $n times.
@@ -7150,6 +7185,9 @@ mode_top() {
     done < <(sort "$tmp" | uniq -c | sort -rn | head -n "$n")
 
     rm -f "$tmp"
+    if (( tot_sum > 0 )); then
+        echo -e "\n${D}AI crawlers: $(( ai_sum * 100 / tot_sum ))% of requests (${ai_sum} of ${tot_sum})${NC}"
+    fi
     echo
 }
 

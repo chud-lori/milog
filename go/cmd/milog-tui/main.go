@@ -151,6 +151,7 @@ type drilldownData struct {
 	topPaths   []kv
 	topIPs     []kv
 	totalLines int
+	aiLines    int
 	alerts     []alertlog.Row
 	err        error
 }
@@ -373,6 +374,9 @@ func drilldownSampleCmd(cfg *config.Config, app string) tea.Cmd {
 			}
 			if ln.IP != "" {
 				ips[ln.IP]++
+			}
+			if nginxlog.IsAICrawler(ln.UA) {
+				d.aiLines++
 			}
 		}
 		d.topPaths = topN(paths, drilldownTopN)
@@ -1113,10 +1117,14 @@ func (m model) renderDrilldown() string {
 	}
 	var b strings.Builder
 
+	scanned := fmt.Sprintf("(scanned %d recent lines)", d.totalLines)
+	if d.totalLines > 0 {
+		scanned = fmt.Sprintf("(scanned %d recent lines, AI crawlers %d%%)", d.totalLines, d.aiLines*100/d.totalLines)
+	}
 	subhead := fmt.Sprintf("  %s %s   %s",
 		labelStyle.Render("APP"),
 		titleStyle.Render(d.app),
-		dimStyle.Render(fmt.Sprintf("(scanned %d recent lines)", d.totalLines)))
+		dimStyle.Render(scanned))
 	b.WriteString(subhead)
 	b.WriteString("\n\n")
 
