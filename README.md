@@ -75,6 +75,9 @@ sudo dnf install ./milog.rpm
 # Alpine
 curl -fsSL -o milog.apk https://github.com/chud-lori/milog/releases/latest/download/milog_<VER>_linux_amd64.apk
 sudo apk add --allow-untrusted ./milog.apk
+
+# Arch Linux (builds packaging/aur/PKGBUILD from the release tarball)
+git clone https://github.com/chud-lori/milog && cd milog/packaging/aur && makepkg -si
 ```
 
 Replace `<VER>` with the [latest release tag](https://github.com/chud-lori/milog/releases/latest)

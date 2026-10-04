@@ -1,0 +1,37 @@
+# Maintainer: Lori <imlori000@gmail.com>
+pkgname=milog-bin
+pkgver=0.5.3
+pkgrel=1
+pkgdesc='Single-host nginx + system + app-error monitor with alerts'
+arch=('x86_64' 'aarch64')
+url='https://github.com/chud-lori/milog'
+license=('MIT')
+depends=('bash' 'coreutils' 'curl' 'gawk' 'sqlite')
+provides=('milog')
+conflicts=('milog')
+options=('!debug')
+_rel="$url/releases/download/v$pkgver"
+# The release tarball lacks completions and the man page; v0.5.3 predates the LICENSE file.
+source=("milog-$pkgver-src.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "LICENSE::https://raw.githubusercontent.com/chud-lori/milog/3201913e9e095403b3e525e8386b58718e6228d4/LICENSE")
+source_x86_64=("$_rel/milog_${pkgver}_linux_amd64.tar.gz")
+source_aarch64=("$_rel/milog_${pkgver}_linux_arm64.tar.gz")
+sha256sums=('4fbc0aefa33aa5108e030c10fcbe34370868366dc78802aa4b51b7467d27c3be'
+            'f0842c9374536b752e42495290d04ad197e2fe79790b93efd92f45799a1b27b7')
+sha256sums_x86_64=('23d8edb7a722a9363d3143edd6c1c892d544c208ade53d70888a8e4f93e00091')
+sha256sums_aarch64=('732c3e7fd37e617f4913aea103be42f4615474bd3843c384e6fa2c5ca9f611b5')
+
+package() {
+  install -Dm755 milog.sh "$pkgdir/usr/bin/milog"
+  install -Dm755 -t "$pkgdir/usr/bin" milog-web milog-tui milog-probe
+  install -Dm644 -t "$pkgdir/usr/share/doc/milog" README.md SERVER_HARDENING.md
+  install -Dm644 -t "$pkgdir/usr/share/doc/milog/docs" docs/*.md
+
+  cd "$srcdir/milog-$pkgver"
+  install -Dm644 completions/milog.bash "$pkgdir/usr/share/bash-completion/completions/milog"
+  install -Dm644 completions/_milog "$pkgdir/usr/share/zsh/site-functions/_milog"
+  install -Dm644 completions/milog.fish "$pkgdir/usr/share/fish/vendor_completions.d/milog.fish"
+  install -Dm644 man/milog.1 "$pkgdir/usr/share/man/man1/milog.1"
+
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
