@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-17-g9341c14
-# MILOG_BUILT=2026-10-04T02:44:23Z
+# MILOG_VERSION=v0.6.0-27-gf1a3e9a
+# MILOG_BUILT=2026-10-04T02:48:30Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -1781,7 +1781,7 @@ _web_stop() {
     fi
     rm -f "$pf"
 }
-# milog alert on|off|status|test: toggle alerting and the systemd service.
+# milog alert on|off|status|test|stats: toggle alerting and the systemd service.
 # Under sudo, config goes to SUDO_USER's home and the service runs as that user, not root.
 
 _alert_target_user() {
@@ -2129,6 +2129,7 @@ ${W}USAGE${NC}
   ${C}milog alert status${NC}             show destinations/service/recent-fire state
   ${C}milog alert test${NC}               fire one test alert to EVERY configured
                               destination (Discord + Slack + Telegram + Matrix)
+  ${C}milog alert stats [WINDOW]${NC}     fires per rule from alerts.log (default 7d)
 
 ${W}EXAMPLES${NC}
   ${D}# First-time setup in one command (Discord):${NC}
@@ -2154,6 +2155,7 @@ mode_alert() {
         off)            alert_off ;;
         status|'')      alert_status ;;
         test)           alert_test ;;
+        stats)          alert_stats "${1:-7d}" ;;
         -h|--help|help) alert_help ;;
         *) echo -e "${R}Unknown alert subcommand:${NC} $sub"; alert_help; exit 1 ;;
     esac
@@ -2161,7 +2163,7 @@ mode_alert() {
 
 # milog alerts [window]: what fired, read from alerts.log.
 
-# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; there is no upper bound, so `yesterday` includes today.
+# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; pair with _alerts_window_end_epoch for the upper bound.
 _alerts_window_to_epoch() {
     local w="$1"
     local now; now=$(date +%s)
@@ -2281,6 +2283,58 @@ mode_alerts() {
         | awk -F'\t' '{printf "    %5d  %s\n", $1, $2}'
 
     echo -e "\n  ${D}total: $total alert(s) in window — log at $log_file${NC}\n"
+}
+
+# TSV per rule key in alerts.log from epoch $1 to before $2 (0 = open): fires, key, last fire epoch; busiest first.
+_alerts_counts_since() {
+    awk -F'\t' -v cutoff="$1" -v end="${2:-0}" '
+        $1 >= cutoff && (end == 0 || $1 < end) && $2 != "" { c[$2]++; if ($1 > last[$2]) last[$2] = $1 }
+        END { for (k in c) printf "%d\t%s\t%d\n", c[k], k, last[k] }
+    ' "$ALERT_STATE_DIR/alerts.log" | sort -t "$(printf '\t')" -k1,1rn -k2,2
+}
+
+# milog alert stats [window]: fires per rule key over the window.
+alert_stats() {
+    local window="${1:-7d}"
+    local log_file="$ALERT_STATE_DIR/alerts.log"
+
+    if [[ ! -f "$log_file" ]]; then
+        echo -e "${D}No alerts logged yet at $log_file${NC}"
+        return 0
+    fi
+
+    local cutoff end rows
+    cutoff=$(_alerts_window_to_epoch "$window") || return 1
+    end=$(_alerts_window_end_epoch "$window")
+    rows=$(_alerts_counts_since "$cutoff" "$end")
+    (( end == 0 )) && end=$(date +%s)
+
+    echo -e "\n${W}── MiLog: alert stats since $(_alerts_fmt_epoch "$cutoff") (window=$window) ──${NC}\n"
+
+    if [[ -z "$rows" ]]; then
+        echo -e "  ${D}no alerts in window${NC}\n"
+        return 0
+    fi
+
+    # `all` has no window length, so the per-day rate runs from the oldest fire.
+    (( cutoff == 0 )) && cutoff=$(awk -F'\t' '{ print $1; exit }' "$log_file")
+    # Floor of one day so a short window like `today` just after midnight doesn't extrapolate.
+    local span=$(( end - cutoff ))
+    (( span >= 86400 )) || span=86400
+
+    printf "  %6s  %7s  %-16s  %s\n" "FIRES" "PER DAY" "LAST" "RULE"
+    printf "  %6s  %7s  %-16s  %s\n" "──────" "───────" "────────────────" "────"
+    local count key last per_day note total=0
+    while IFS=$'\t' read -r count key last; do
+        per_day=$(awk -v c="$count" -v s="$span" 'BEGIN { printf "%.1f", c * 86400 / s }')
+        note=""
+        alert_is_silenced "$key" >/dev/null && note="  ${D}(silenced)${NC}"
+        printf "  %6d  %7s  %-16s  %s%b\n" "$count" "$per_day" "$(_alerts_fmt_epoch "$last")" "$key" "$note"
+        total=$(( total + count ))
+    done < <(printf '%s\n' "$rows" | _tty_safe)
+
+    echo -e "\n  ${D}total: $total fire(s); silenced and deduped fires are never written to alerts.log, so they are not counted.${NC}"
+    echo -e "  ${D}milog auto-tune suggests fixes for rules firing more than 10 times a day.${NC}\n"
 }
 # milog attacker <IP>: everything one IP did across all apps' current access logs (rotated logs are not read).
 mode_attacker() {
@@ -3792,6 +3846,7 @@ _audit_rootkit_subcmd() {
     esac
 }
 # milog auto-tune [days]: suggests HTTP thresholds from percentiles of metrics_minute. CPU/MEM/DISK aren't in the DB.
+# Also suggests threshold raises or silences for rules that fire too often in alerts.log.
 
 # p-th percentile (1..100) of newline-separated numbers on stdin.
 _pct_from_stdin() {
@@ -3824,10 +3879,66 @@ _tune_row() {
         "$metric" "$current" "$suggested" "$delta"
 }
 
+# Rules averaging more than 10 fires a day in alerts.log get a printed fix; nothing is applied.
+_tune_alert_noise() {
+    local days="$1" log_file="$ALERT_STATE_DIR/alerts.log"
+    [[ -f "$log_file" ]] || return 0
+    local cutoff=$(( $(date +%s) - days * 86400 )) max=$(( days * 10 ))
+
+    echo -e "\n${W}── MiLog: auto-tune noisy alerts (window=${days}d, over 10 fires/day) ──${NC}\n"
+    local count key var app pct current kept suggested found=0
+    while IFS=$'\t' read -r count key _; do
+        (( count > max )) || break
+        alert_is_silenced "$key" >/dev/null && continue
+        found=1
+        var="" app="" pct=0
+        case "$key" in
+            5xx:*)  var=THRESH_5XX_WARN; app="${key#5xx:}" ;;
+            4xx:*)  var=THRESH_4XX_WARN; app="${key#4xx:}" ;;
+            aicrawl:*) var=THRESH_AICRAWL_WARN; app="${key#aicrawl:}" ;;
+            cpu)    var=THRESH_CPU_CRIT;  pct=1 ;;
+            mem)    var=THRESH_MEM_CRIT;  pct=1 ;;
+            disk:/) var=THRESH_DISK_CRIT; pct=1 ;;
+        esac
+        if [[ -n "$var" ]]; then
+            current=$(_thresh "$var" "$app")
+            # The body's first number is the value that tripped the rule; the new threshold lets only the top $max through.
+            kept=$(MILOG_KEY="$key" awk -F'\t' -v cutoff="$cutoff" '
+                $1 >= cutoff && $2 == ENVIRON["MILOG_KEY"] && match($5, /[0-9]+/) { print substr($5, RSTART, RLENGTH) }
+            ' "$log_file" | sort -rn | sed -n "$(( max + 1 ))p")
+            suggested=$(( kept + 1 ))
+            (( suggested > current )) || suggested=$(( current + 1 ))
+            if (( ! pct || suggested <= 100 )); then
+                [[ -n "$app" ]] && var="${var}_${app//[^A-Za-z0-9_]/_}"
+                printf "  ${W}%s${NC}  ${D}%s fires, threshold %s${NC}\n" "$key" "$count" "$current"
+                printf "    milog config set %s %s\n" "$var" "$suggested"
+                continue
+            fi
+        fi
+        # Attackers drive these counts, so muting them would mute attack detection.
+        case "$key" in
+            exploit:*|audit:*|process:*|proc:*|net:*|file:*)
+                printf "  ${W}%s${NC}  ${D}%s fires, high volume: review the source, not silenced${NC}\n" "$key" "$count"
+                continue
+                ;;
+        esac
+        printf "  ${W}%s${NC}  ${D}%s fires, a threshold raise can't quiet it${NC}\n" "$key" "$count"
+        printf "    milog silence %q 7d 'noisy rule'\n" "$key"
+    done < <(_alerts_counts_since "$cutoff" | _tty_safe)
+
+    if (( found == 0 )); then
+        echo -e "  ${D}no unsilenced rule fired more than 10 times a day${NC}"
+    else
+        echo -e "\n  ${D}nothing was applied; run the lines you agree with. Per-rule counts: milog alert stats ${days}d${NC}"
+    fi
+}
+
 mode_auto_tune() {
     local days="${1:-7}"
     [[ "$days" =~ ^[1-9][0-9]*$ ]] \
         || { echo -e "${R}auto-tune: days must be a positive integer${NC}" >&2; return 1; }
+
+    _tune_alert_noise "$days"
 
     _history_precheck || return 1
 
@@ -7965,7 +8076,7 @@ _milog_complete() {
     local cmds="monitor tui daemon rate health top top-ip-by-app top-paths attacker slow ws stats trend replay search diff auto-tune logs grep errors exploits probes patterns suspects config alert alerts silence digest report doctor web install audit probe bench completions help"
     local config_subs="show path init edit add rm dir set validate"
     local config_keys="LOG_DIR LOGS REFRESH SPARK_LEN DISCORD_WEBHOOK SLACK_WEBHOOK TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR ALERT_LOG_MAX_BYTES ALERT_ROUTES HOOKS_DIR ALERT_HOOK_TIMEOUT P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS GEOIP_ENABLED MMDB_PATH HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS WEB_PORT WEB_BIND THRESH_REQ_WARN THRESH_REQ_CRIT THRESH_CPU_WARN THRESH_CPU_CRIT THRESH_MEM_WARN THRESH_MEM_CRIT THRESH_DISK_WARN THRESH_DISK_CRIT THRESH_4XX_WARN THRESH_5XX_WARN"
-    local alert_subs="on off status test"
+    local alert_subs="on off status test stats"
     local silence_subs="list clear"
     local web_subs="start stop status install-service uninstall-service rotate-token"
     local window_vals="today yesterday 1h 6h 12h 24h 7d 30d all"
@@ -8093,7 +8204,7 @@ _milog() {
         THRESH_DISK_WARN THRESH_DISK_CRIT
         THRESH_4XX_WARN THRESH_5XX_WARN
     )
-    alert_subs=(on off status test)
+    alert_subs=(on off status test stats)
     silence_subs=(list clear)
     web_subs=(start stop status install-service uninstall-service rotate-token)
     window_vals=(today yesterday 1h 6h 12h 24h 7d 30d all)
@@ -8188,7 +8299,7 @@ for s in $config_subs
     complete -c milog -n "__milog_seen_cmd config" -a "$s"
 end
 
-set -l alert_subs on off status test
+set -l alert_subs on off status test stats
 for s in $alert_subs
     complete -c milog -n "__milog_seen_cmd alert" -a "$s"
 end
@@ -8239,7 +8350,7 @@ ${W}ANALYSIS${NC}
   ${C}suspects [N] [W]${NC}   heuristic bot ranking ${D}(top N=20, window=2000 lines/app)${NC}
   ${C}trend [app] [H]${NC}    sparkline of req/min from history ${D}(default: all apps, 24h)${NC}
   ${C}diff${NC}               per-app req: now vs 1d ago vs 7d ago
-  ${C}auto-tune [D]${NC}      suggest thresholds from history  ${D}(default: 7 days)${NC}
+  ${C}auto-tune [D]${NC}      suggest thresholds from history + alert noise  ${D}(default: 7 days)${NC}
   ${C}replay <file>${NC}      postmortem summary for one archived log file
   ${C}search <pat> ...${NC}   grep across all apps (flags: --since/--app/--path/--regex/--archives)
 
@@ -8248,6 +8359,7 @@ ${W}ALERTING${NC}
   ${C}alert off${NC}          disable alerts + stop service
   ${C}alert status${NC}       webhook / service / recent-fire state
   ${C}alert test${NC}         send a test Discord embed right now
+  ${C}alert stats [W]${NC}    fires per rule ${D}(default 7d)${NC}
   ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
   ${C}silence ...${NC}        mute a rule while on-call works the fix ${D}(milog silence --help)${NC}
   ${C}digest [window]${NC}     exec-summary (day / week / Nh / Nd)
@@ -8389,7 +8501,7 @@ _cmd_help() {
             ;;
         alert)
             echo -e "${W}milog alert <sub>${NC} — toggle alerting + systemd service"
-            echo -e "  Subs: on off status test"
+            echo -e "  Subs: on off status test stats"
             ;;
         alerts)   echo -e "${W}milog alerts [window]${NC} — fire history (today / Nh / Nd / Nw / all)" ;;
         silence)  echo -e "${W}milog silence <rule> <duration> [message]${NC} — mute a rule"; echo -e "  Also: ${C}milog silence list${NC} · ${C}milog silence clear <rule>${NC}" ;;
