@@ -495,7 +495,7 @@
           tail never sees.
         </p>
         <ul>
-          <li><code>exec</code> outside the allowlist, <code>tcp</code> to non-allowlisted CIDRs</li>
+          <li><code>exec</code> outside the allowlist, <code>tcp</code> to non-allowlisted CIDRs (milog's own alert sends excepted)</li>
           <li><code>file</code> writes to /etc and binaries</li>
           <li><code>ptrace</code>, <code>kmod</code>, <code>bpf-load</code></li>
           <li>Retransmits and syscall rate, Welford sigma</li>

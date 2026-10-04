@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strconv"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -121,6 +123,7 @@ func RunNet(ctx context.Context, out chan<- NetEvent) error {
 			continue
 		}
 		ev.PPID, ev.ParentComm = lookupParent(raw.PID)
+		ev.Exe, ev.Cgroup = lookupExeCgroup(raw.PID)
 
 		select {
 		case out <- ev:
@@ -128,4 +131,15 @@ func RunNet(ctx context.Context, out chan<- NetEvent) error {
 			return nil
 		}
 	}
+}
+
+// lookupExeCgroup returns ("", "") for whatever is gone, which
+// isMilogDelivery treats as not milog's.
+func lookupExeCgroup(pid uint32) (exe, cgroup string) {
+	dir := "/proc/" + strconv.FormatUint(uint64(pid), 10)
+	exe, _ = os.Readlink(dir + "/exe")
+	if data, err := os.ReadFile(dir + "/cgroup"); err == nil {
+		cgroup = cgroupPath(string(data))
+	}
+	return exe, cgroup
 }

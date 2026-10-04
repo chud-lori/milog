@@ -146,6 +146,14 @@ the default — paste the whole list and add to it. The same applies to
 `MILOG_PROBE_NET_ALLOWLIST` (CIDRs + bare ports) and the kmod /
 syscall / bpf-load allowlists.
 
+An entry in the file, ptrace, kmod or bpf-load allowlist matches either
+the thread name or its process name. Multi-threaded agents name their
+threads: Tencent's `YDService` reads files from a thread called
+`ParseLoop`, and the `YDService` entry covers it. When the two differ,
+the alert body shows both (`comm=ParseLoop proc=YDService`). Rule keys
+keep the thread name, so a silence still needs
+`file:sensitive_read:ParseLoop:…`.
+
 ## Net allowlist + per-comm silences
 
 Background daemons that legitimately call out (Docker watchtower
@@ -161,6 +169,23 @@ milog silence 'net:unexpected_outbound:node'       365d "node app outbound; revi
 
 `milog silence list` shows what's muted; `milog silence clear …`
 removes early.
+
+### milog's own alert delivery
+
+milog sends Discord / Slack / Telegram / Matrix / webhook alerts with
+`curl`. The probe skips `net:unexpected_outbound` for a connect only
+when both hold:
+
+- the process is in `milog.service` or `milog-probe.service` (cgroup
+  `/system.slice/<unit>`, which only root can place a process in)
+- its executable is `/usr/bin/curl`, `/bin/curl` or `/usr/local/bin/curl`
+
+Without this, every alert's delivery fired a new
+`net:unexpected_outbound:curl` alert, whose delivery fired another.
+`curl` anywhere else still alerts, and so does any other binary inside
+milog's units, such as a shell spawned from the daemon. A manual
+`milog alert test` from a login shell is not in either unit and still
+alerts once.
 
 ## Foreground / dry-run modes
 
@@ -243,7 +268,7 @@ silence as appropriate:
 | `whoami`                                 | one-shot UID lookup                                               | already in default file allowlist          |
 | `watchtower`                             | Docker image-update polling GHCR/Docker Hub                       | silence `net:unexpected_outbound:watchtower` |
 | App-level `node` / `python` / `curl`     | normal API calls to external services                             | silence `net:unexpected_outbound:<comm>` (lose attribution for that comm) or extend `MILOG_PROBE_NET_ALLOWLIST` with concrete CIDRs |
-| Tencent / AWS / GCP cloud agents (`barad_agent`, `YDService`) | shell-out + `/var/log/auth.log` read | allowlist comm if the agent isn't going to be removed |
+| Tencent / AWS / GCP cloud agents (`barad_agent`, `YDService`) | shell-out and file reads from threads such as `ParseLoop` | add the process name (`YDService`) to the allowlist if the agent stays; it covers the agent's threads |
 
 If you hit a recurring source not in this table, the easiest path is
 `milog silence <full-rule-key> 1d "investigating"` while you decide.
