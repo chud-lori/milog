@@ -1,7 +1,7 @@
 // milog-tui is the Bubble Tea TUI for MiLog. It shares internal/* with
 // milog-web, so both show the same numbers.
 //
-// Six views:
+// Seven views:
 //
 //	overview    header + system bars + per-app table (default)
 //	drilldown   one app: top paths, top IPs, recent alerts
@@ -9,6 +9,7 @@
 //	paths       top paths summed across every configured app
 //	errors      pattern-fire aggregation (app:* rule keys) with per-source breakdown
 //	trend       per-app request-rate sparklines over the last hour from the SQLite history DB
+//	integrity   audit drift over the last 7 days from the SQLite history DB
 //
 // Key bindings:
 //
@@ -23,7 +24,8 @@
 //	P           open the paths-cross-app view (capital P; lowercase p is pause)
 //	e           open the errors aggregation view
 //	t           open the trend view
-//	esc / h     leave drill-down / alerts / paths / errors / trend → overview
+//	i           open the integrity view
+//	esc / h     leave drill-down / alerts / paths / errors / trend / integrity → overview
 package main
 
 import (
@@ -77,6 +79,7 @@ const (
 	viewPaths
 	viewErrors
 	viewTrend
+	viewIntegrity
 )
 
 const (
@@ -245,6 +248,8 @@ type keyMap struct {
 	Trend  key.Binding
 	Back   key.Binding
 
+	Integrity key.Binding
+
 	PageDown key.Binding
 	PageUp   key.Binding
 	HalfDown key.Binding
@@ -269,6 +274,8 @@ func newKeyMap() keyMap {
 		Errors: key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "errors")),
 		Trend:  key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "trend")),
 		Back:   key.NewBinding(key.WithKeys("esc", "h", "left", "backspace"), key.WithHelp("esc", "back")),
+
+		Integrity: key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "integrity")),
 
 		PageDown: key.NewBinding(key.WithKeys("pgdown", " ", "f"), key.WithHelp("f/pgdn", "page down")),
 		PageUp:   key.NewBinding(key.WithKeys("pgup", "b"), key.WithHelp("b/pgup", "page up")),
@@ -302,6 +309,7 @@ type model struct {
 	paths       pathsData     // current paths-view payload (empty when not in viewPaths)
 	errors      errorsData    // current errors-view payload (empty when not in viewErrors)
 	trend       trendData     // current trend-view payload (empty when not in viewTrend)
+	integrity   integrityData // current integrity-view payload (empty when not in viewIntegrity)
 }
 
 // sampleCmd runs the blocking sampling off the UI goroutine.
@@ -706,6 +714,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, errorsSampleCmd(m.cfg)
 			case viewTrend:
 				return m, trendSampleCmd(m.cfg)
+			case viewIntegrity:
+				return m, integritySampleCmd(m.cfg)
 			default:
 				return m, sampleCmd(m.cfg)
 			}
@@ -750,6 +760,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = viewTrend
 				m.resetViewport()
 				return m, trendSampleCmd(m.cfg)
+			case key.Matches(msg, keys.Integrity):
+				m.view = viewIntegrity
+				m.resetViewport()
+				return m, integritySampleCmd(m.cfg)
 			}
 		case viewDrilldown:
 			switch {
@@ -791,6 +805,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resetViewport()
 				return m, nil
 			}
+		case viewIntegrity:
+			switch {
+			case key.Matches(msg, keys.Back):
+				m.view = viewOverview
+				m.integrity = integrityData{}
+				m.resetViewport()
+				return m, nil
+			}
 		}
 		if m.view != viewOverview {
 			m.syncViewportContent()
@@ -819,6 +841,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			batch = append(batch, errorsSampleCmd(m.cfg))
 		case viewTrend:
 			batch = append(batch, trendSampleCmd(m.cfg))
+		case viewIntegrity:
+			batch = append(batch, integritySampleCmd(m.cfg))
 		}
 		return m, tea.Batch(batch...)
 
@@ -879,6 +903,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case trendMsg:
 		m.trend = msg.data
 		// The trend view shows loadErr inline, so leave m.status alone.
+		m.syncViewportContent()
+
+	case integrityMsg:
+		m.integrity = msg.data
 		m.syncViewportContent()
 	}
 	return m, nil
@@ -955,6 +983,8 @@ func (m model) renderBodyContent() string {
 		return m.renderErrorsView()
 	case viewTrend:
 		return m.renderTrendView()
+	case viewIntegrity:
+		return m.renderIntegrityView()
 	default:
 		var overview strings.Builder
 		overview.WriteString(m.renderSystem())
@@ -1493,6 +1523,7 @@ func (m model) renderFooter() string {
 			bindingHint(keys.Paths),
 			bindingHint(keys.Errors),
 			bindingHint(keys.Trend),
+			bindingHint(keys.Integrity),
 		)
 	case viewDrilldown:
 		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
@@ -1503,6 +1534,8 @@ func (m model) renderFooter() string {
 	case viewErrors:
 		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	case viewTrend:
+		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
+	case viewIntegrity:
 		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	}
 	return dimStyle.Render("  " + strings.Join(parts, "  ") + status)
@@ -1536,7 +1569,7 @@ func (m model) ShortHelp() []key.Binding {
 	out := []key.Binding{keys.Quit, keys.Pause, keys.Refresh, keys.Faster, keys.Help}
 	switch m.view {
 	case viewOverview:
-		out = append(out, keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend)
+		out = append(out, keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend, keys.Integrity)
 	default:
 		out = append(out, keys.Up, keys.Down, keys.PageDown, keys.PageUp, keys.Back)
 	}
@@ -1551,7 +1584,7 @@ func (m model) FullHelp() [][]key.Binding {
 	switch m.view {
 	case viewOverview:
 		groups = append(groups, []key.Binding{
-			keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend,
+			keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend, keys.Integrity,
 		})
 	default:
 		groups = append(groups, []key.Binding{
@@ -1592,8 +1625,9 @@ KEYS (inside the TUI)
   P            open paths-cross-app view (capital P; lowercase p is pause)
   e            open errors aggregation view
   t            open trend view (per-app sparklines, last hour)
+  i            open integrity view (audit drift, last 7 days)
   ↑/k ↓/j      scroll focused views; f/pgdn and b/pgup page
-  esc / h      back from drill-down / alerts / paths / errors / trend`)
+  esc / h      back from drill-down / alerts / paths / errors / trend / integrity`)
 			return
 		}
 	}

@@ -92,6 +92,7 @@ Keys (inside the TUI):
 | `P`                      | paths-cross-app view (top 12 paths summed across apps + breakdown)    |
 | `e`                      | errors view (`app:*` rule fires aggregated by pattern → source)       |
 | `t`                      | trend view (per-app 60-minute request-rate sparklines from history DB) |
+| `i`                      | integrity view (audit drift from the last 7 days, newest first, from history DB) |
 
 Scrolling / long-view behavior is intentionally operator-oriented:
 the TUI keeps dense summaries on screen, caps the expensive top lists,
