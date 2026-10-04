@@ -1,14 +1,4 @@
-# ==============================================================================
-# MODE: doctor — checklist of what's installed/configured/reachable
-#
-# The tool no-ops gracefully when sqlite3, mmdblookup, a webhook, or the
-# extended log format are missing — which is friendly but can hide a
-# misconfigured install. `doctor` makes every degraded capability visible
-# with a one-line hint on how to enable it.
-#
-# Output: ✓ (ready) / ! (degraded, works-but-limited) / ✗ (broken/required).
-# Exit code: 0 if all required deps are present; 1 otherwise. CI-friendly.
-# ==============================================================================
+# milog doctor: shows every missing or degraded capability with a hint. Exits 1 only when a required dep is missing.
 _doc_line() {
     # $1=marker (colored glyph)  $2=headline  $3=optional hint
     printf "  %b %s\n" "$1" "$2"
@@ -24,7 +14,7 @@ mode_doctor() {
     local fail=0 warn=0
     echo -e "\n${W}── MiLog: doctor ──${NC}"
 
-    # ---- core tools (required) ----------------------------------------------
+    # Core tools (required).
     _doc_head "core tools"
     local tool
     for tool in bash gawk curl; do
@@ -43,7 +33,7 @@ mode_doctor() {
         warn=$(( warn + 1 ))
     fi
 
-    # ---- optional tools ------------------------------------------------------
+    # Optional tools.
     _doc_head "optional tools"
     if command -v sqlite3 >/dev/null 2>&1; then
         _doc_ok "sqlite3 present  ($(sqlite3 --version 2>/dev/null | awk '{print $1}'))"
@@ -57,8 +47,17 @@ mode_doctor() {
         _doc_warn "mmdblookup missing" "GeoIP column disabled — install 'mmdb-bin' / 'libmaxminddb'"
         warn=$(( warn + 1 ))
     fi
+    if _audit_have_sha256; then
+        _doc_ok "sha256 tool present" "audit fim can hash watched files"
+    elif [[ "${AUDIT_ENABLED:-0}" == "1" ]]; then
+        _doc_fail "no sha256sum or shasum on PATH" "AUDIT_ENABLED=1 but FIM refuses to baseline — install coreutils"
+        fail=$(( fail + 1 ))
+    else
+        _doc_warn "no sha256sum or shasum on PATH" "audit fim will refuse to baseline — install coreutils"
+        warn=$(( warn + 1 ))
+    fi
 
-    # ---- log dir + per-app logs ---------------------------------------------
+    # Log dir and per-app logs.
     _doc_head "log directory"
     if [[ -d "$LOG_DIR" && -r "$LOG_DIR" ]]; then
         _doc_ok "$LOG_DIR readable"
@@ -95,14 +94,7 @@ mode_doctor() {
         done
     fi
 
-    # ---- nginx log format — does it carry $request_time? --------------------
-    #
-    # Scan the tail of every configured app's log and look for any timed line
-    # (numeric last field, NF>=12). One app's tail might still be pre-reload
-    # old-format while others are already new-format — we report ✓ as long
-    # as at least one app has timed samples recently. Simultaneously tracks
-    # apps with only old-format lines so the hint can call them out for
-    # manual verification.
+    # $request_time check: ✓ if any app's latest line ends in a number with NF >= 12; others may predate a reload.
     _doc_head "nginx log format"
     if (( ${#LOGS[@]} == 0 )); then
         _doc_warn "no configured apps"
@@ -140,7 +132,7 @@ mode_doctor() {
         fi
     fi
 
-    # ---- Discord alerting ----------------------------------------------------
+    # Discord.
     _doc_head "alerting (Discord)"
     if [[ -z "${DISCORD_WEBHOOK:-}" ]]; then
         _doc_warn "DISCORD_WEBHOOK not configured" \
@@ -148,9 +140,7 @@ mode_doctor() {
         warn=$(( warn + 1 ))
     else
         _doc_ok "DISCORD_WEBHOOK configured  (${DISCORD_WEBHOOK:0:40}…)"
-        # Reachability — a POST with an empty content is ignored by Discord,
-        # so we GET the webhook metadata instead (returns 200 + JSON on valid
-        # webhooks, 404 on stale). 5s cap so doctor never hangs.
+        # GET the webhook: Discord ignores an empty POST, and GET returns 404 for stale webhooks.
         local http
         http=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 \
                "$DISCORD_WEBHOOK" 2>/dev/null || echo 000)
@@ -167,15 +157,13 @@ mode_doctor() {
         _doc_warn "ALERTS_ENABLED=0" "alerts are armed but disabled — 'milog alert on' to flip"
         warn=$(( warn + 1 ))
     fi
-    # Report other destinations when configured — each is opt-in, so
-    # "not configured" is informational (not a warning).
+    # Other destinations are opt-in, so "not configured" is informational.
     [[ -n "${SLACK_WEBHOOK:-}" ]] \
         && _doc_ok "Slack webhook configured  (${SLACK_WEBHOOK:0:40}…)"
     [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] \
         && _doc_ok "Telegram bot configured  (chat=$TELEGRAM_CHAT_ID)"
     [[ -n "${MATRIX_HOMESERVER:-}" && -n "${MATRIX_TOKEN:-}" && -n "${MATRIX_ROOM:-}" ]] \
         && _doc_ok "Matrix configured  (${MATRIX_HOMESERVER} room=$MATRIX_ROOM)"
-    # Alert history log — surface count since "today" so users know it works.
     local alog="$ALERT_STATE_DIR/alerts.log"
     if [[ -f "$alog" ]]; then
         local now_epoch today_cutoff today_count total_count
@@ -186,8 +174,20 @@ mode_doctor() {
         _doc_ok "alerts.log: ${total_count} total, ${today_count} today" \
                 "view with: milog alerts [today|Nh|Nd|all]"
     fi
+    local flog="$ALERT_STATE_DIR/send_failures.log"
+    if [[ -s "$flog" ]]; then
+        local fail_cutoff fail_count fail_dests
+        fail_cutoff=$(( $(date +%s) - 86400 ))
+        fail_count=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c' "$flog" | wc -l | tr -d ' ')
+        fail_dests=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c {print $2}' "$flog" | sort -u | tr '\n' ' ')
+        if (( fail_count > 0 )); then
+            _doc_warn "${fail_count} alert deliveries failed in the last 24h  (${fail_dests% })" \
+                      "see $flog; test with 'milog alert test'"
+            warn=$(( warn + 1 ))
+        fi
+    fi
 
-    # ---- history DB ---------------------------------------------------------
+    # History DB.
     _doc_head "history (SQLite)"
     if [[ "${HISTORY_ENABLED:-0}" != "1" ]]; then
         _doc_warn "HISTORY_ENABLED=0" "set to 1 to let 'milog daemon' persist metrics for trend/diff/auto-tune"
@@ -214,7 +214,7 @@ mode_doctor() {
         fi
     fi
 
-    # ---- GeoIP --------------------------------------------------------------
+    # GeoIP.
     _doc_head "geoip"
     if [[ "${GEOIP_ENABLED:-0}" != "1" ]]; then
         _doc_warn "GEOIP_ENABLED=0" "optional — set to 1 + install the MaxMind MMDB to enable country column"
@@ -236,11 +236,8 @@ mode_doctor() {
         fi
     fi
 
-    # ---- web dashboard ------------------------------------------------------
+    # Web dashboard.
     _doc_head "web dashboard"
-    # milog-web is the Go binary served by `milog web`. _web_go_binary
-    # checks the same path order the launcher uses, so the warning here
-    # mirrors what users will hit at start time.
     local web_bin
     if web_bin=$(_web_go_binary 2>/dev/null) && [[ -n "$web_bin" ]]; then
         _doc_ok "milog-web binary present  ($web_bin)"
@@ -259,10 +256,9 @@ mode_doctor() {
         fi
     fi
 
-    # ---- systemd units (only meaningful where systemd is installed) ---------
+    # systemd units.
     if command -v systemctl >/dev/null 2>&1; then
         _doc_head "systemd"
-        # milog.service (system unit) — the alert daemon.
         if [[ ! -f /etc/systemd/system/milog.service ]]; then
             _doc_warn "milog.service not installed" "run: sudo milog alert on (installs + enables the unit)"
             warn=$(( warn + 1 ))
@@ -272,8 +268,25 @@ mode_doctor() {
             _doc_warn "milog.service installed but inactive" "start: sudo systemctl start milog.service"
             warn=$(( warn + 1 ))
         fi
-        # milog-web.service (user unit) — optional dashboard. Only report if
-        # something has attempted to install it; absent-by-choice is fine.
+        # milog-probe.service runs as root: anything it executes or sources must be root-controlled.
+        if [[ -f "$_PROBE_SYSTEMD_UNIT" ]]; then
+            local probe_exec probe_cfg
+            probe_exec=$(sed -n 's/^ExecStart=//p' "$_PROBE_SYSTEMD_UNIT" | head -1)
+            probe_cfg=$(sed -n 's/^Environment=MILOG_CONFIG=//p' "$_PROBE_SYSTEMD_UNIT" | head -1)
+            if ! grep -q '^Environment=MILOG_PROBE_ALERT_USER=' "$_PROBE_SYSTEMD_UNIT" \
+                && [[ -n "$probe_cfg" && -e "$probe_cfg" ]] && ! _root_trusted_path "$probe_cfg"; then
+                _doc_fail "milog-probe.service sources $probe_cfg as root" \
+                          "it is user-writable — reinstall: sudo milog probe install-service"
+                fail=$(( fail + 1 ))
+            elif [[ -n "$probe_exec" ]] && ! _root_trusted_path "$probe_exec"; then
+                _doc_fail "milog-probe binary writable by non-root  ($probe_exec)" \
+                          "make it and its directory root-owned and not group/other-writable"
+                fail=$(( fail + 1 ))
+            else
+                _doc_ok "milog-probe.service config + binary are root-controlled"
+            fi
+        fi
+        # milog-web.service is reported only once someone has tried to install it.
         local web_unit="${HOME}/.config/systemd/user/milog-web.service"
         if [[ -f "$web_unit" ]]; then
             if systemctl --user is-active --quiet milog-web.service 2>/dev/null; then
@@ -286,7 +299,6 @@ mode_doctor() {
         fi
     fi
 
-    # ---- summary -------------------------------------------------------------
     echo
     if (( fail > 0 )); then
         echo -e "  ${R}${fail} failure(s)${NC}, ${Y}${warn} warning(s)${NC} — required functionality is missing."
@@ -300,4 +312,3 @@ mode_doctor() {
     fi
 }
 
-# ==============================================================================

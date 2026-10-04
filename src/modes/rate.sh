@@ -1,6 +1,4 @@
-# ==============================================================================
-# MODE: rate — nginx-only
-# ==============================================================================
+# milog rate: nginx-only refresh dashboard.
 mode_rate() {
     while true; do
         milog_update_geometry

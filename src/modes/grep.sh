@@ -1,6 +1,4 @@
-# ==============================================================================
-# MODE: grep — filter-tail one source (any type: nginx / text / journal / docker)
-# ==============================================================================
+# milog grep <app> <pattern>: filtered tail of one source of any type.
 mode_grep() {
     local name="${1:-}" pattern="${2:-.}"
     if [[ -z "$name" ]]; then
