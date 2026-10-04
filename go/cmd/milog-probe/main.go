@@ -18,9 +18,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/chud-lori/milog/internal/probe"
 )
@@ -30,6 +32,9 @@ var buildVersion = "dev"
 
 // alertCred is the identity `milog _internal_alert` runs as; nil keeps the probe's own.
 var alertCred *syscall.Credential
+
+// alertsLog is the bash side's alerts.log; the unit pins HOME to the milog user's.
+var alertsLog = filepath.Join(os.Getenv("HOME"), ".cache", "milog", "alerts.log")
 
 func main() {
 	var (
@@ -220,6 +225,20 @@ func handleEvent(ev probe.Event, asJSON, dryRun bool, milogBin string) {
 		// Print events without hits too, to debug "why didn't it fire?".
 		emitJSON(ev, hits)
 		return
+	}
+	if probe.FromWebWorker(ev) {
+		at := time.Now()
+		time.AfterFunc(probe.WebExecGrace, func() {
+			h, ok := probe.WebTriggeredExec(ev, alertsLog, at)
+			if !ok {
+				return
+			}
+			if dryRun {
+				log.Printf("DRY: %s :: %s", h.RuleKey, h.Title)
+				return
+			}
+			fireAlert(h, milogBin)
+		})
 	}
 	if len(hits) == 0 {
 		return
