@@ -1,11 +1,6 @@
-// Package promtext emits Prometheus text-format 0.0.4 payloads.
-//
-// Tiny hand-rolled encoder — MiLog's /metrics exposure is a dozen
-// series, not the thousands that justify pulling in the full
-// prometheus/client_golang module. Stays in stdlib.
-//
-// Format spec:
-//   https://github.com/prometheus/docs/blob/main/content/docs/instrumenting/exposition_formats.md
+// Package promtext writes Prometheus text format 0.0.4. Hand-rolled because
+// /metrics has a dozen series, not enough to justify client_golang.
+// Spec: https://github.com/prometheus/docs/blob/main/content/docs/instrumenting/exposition_formats.md
 package promtext
 
 import (
@@ -15,15 +10,14 @@ import (
 	"strings"
 )
 
-// Sample is one observation of a metric. Labels must be valid Prom label
-// names (letters, digits, underscores; first char non-digit). Values are
-// escaped by the encoder — callers pass raw strings.
+// Sample is one observation. Label names must be valid Prometheus names;
+// values are escaped by the encoder.
 type Sample struct {
 	Labels map[string]string
 	Value  float64
 }
 
-// Metric is a named metric with HELP + TYPE + samples.
+// Metric is a named metric with its HELP, TYPE and samples.
 type Metric struct {
 	Name    string   // e.g. "milog_cpu_percent"
 	Help    string   // one-line description
@@ -31,9 +25,7 @@ type Metric struct {
 	Samples []Sample // zero or more labelled observations
 }
 
-// Encode writes every metric in prom plaintext 0.0.4. Samples within a
-// metric are sorted by label-string so output is deterministic
-// (simplifies diffing, helps Prom's dedup).
+// Encode writes metrics with samples sorted by labels so output is deterministic.
 func Encode(w io.Writer, metrics []Metric) error {
 	for _, m := range metrics {
 		if m.Name == "" {
@@ -51,7 +43,6 @@ func Encode(w io.Writer, metrics []Metric) error {
 		if _, err := fmt.Fprintf(w, "# TYPE %s %s\n", m.Name, typ); err != nil {
 			return err
 		}
-		// Sort samples deterministically.
 		sort.Slice(m.Samples, func(i, j int) bool {
 			return labelString(m.Samples[i].Labels) < labelString(m.Samples[j].Labels)
 		})
@@ -64,8 +55,7 @@ func Encode(w io.Writer, metrics []Metric) error {
 	return nil
 }
 
-// labelString renders `{k1="v1",k2="v2"}` sorted by key. Empty labels →
-// empty string (not `{}`).
+// labelString renders `{k1="v1",k2="v2"}` sorted by key, or "" with no labels.
 func labelString(labels map[string]string) string {
 	if len(labels) == 0 {
 		return ""
@@ -90,14 +80,14 @@ func labelString(labels map[string]string) string {
 	return b.String()
 }
 
-// escapeHelp per spec: backslash and newline escape.
+// escapeHelp escapes backslash and newline.
 func escapeHelp(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, "\n", `\n`)
 	return s
 }
 
-// escapeLabelValue per spec: backslash, newline, double-quote.
+// escapeLabelValue escapes backslash, newline and double quote.
 func escapeLabelValue(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, "\n", `\n`)
@@ -105,8 +95,7 @@ func escapeLabelValue(s string) string {
 	return s
 }
 
-// formatValue renders a float per spec. Integers render without trailing
-// `.0`; NaN / ±Inf use their spec tokens.
+// formatValue drops `.0` from integers and uses the spec's NaN/+Inf/-Inf tokens.
 func formatValue(v float64) string {
 	switch {
 	case v != v: // NaN
@@ -116,7 +105,6 @@ func formatValue(v float64) string {
 	case v < -1e308:
 		return "-Inf"
 	}
-	// Integers as integers for readability.
 	if v == float64(int64(v)) {
 		return fmt.Sprintf("%d", int64(v))
 	}

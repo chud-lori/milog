@@ -1,19 +1,7 @@
 //go:build linux
 
-// Linux-only BPF loader for the exec probe. Compiled into the
-// `milog-probe` binary on linux/amd64 + linux/arm64; non-Linux builds
-// pick up the stub in exec_other.go.
-//
-// The compiled BPF object (bpf/exec.bpf.o) is embedded at build time
-// via go:embed. build.sh invokes clang to produce it from
-// bpf/exec.bpf.c — which means a Linux build host needs `clang` with
-// BPF target support (Debian/Ubuntu: `apt install clang llvm`,
-// Fedora/Rocky: `dnf install clang llvm`).
-//
-// On a clean clone before clang has run, exec.bpf.o doesn't exist
-// yet; embed will fail at compile time. build.sh handles that by
-// running clang first when it's available, and by SKIPPING the probe
-// build entirely when it isn't.
+// Linux loader for the exec probe. bpf/exec.bpf.o is embedded at build time;
+// build.sh compiles it with clang and skips milog-probe when clang is missing.
 
 package probe
 
@@ -37,19 +25,13 @@ import (
 //go:embed bpf/exec.bpf.o
 var execBpfObj []byte
 
-// commLen / filenameLen mirror the C-side struct exec_event. Keep in
-// sync with bpf/exec.bpf.c — a mismatch means we'd misread the ring
-// buffer payload and emit garbage filenames into alert bodies.
+// commLen and filenameLen must match struct exec_event in bpf/exec.bpf.c.
 const (
 	commLen     = 16
 	filenameLen = 256
 )
 
-// rawEvent is the binary layout written by the BPF program into the
-// ring buffer. Field order + packing matches struct exec_event in
-// bpf/exec.bpf.c byte-for-byte. binary.LittleEndian.Uint32 for the
-// pid/uid; the byte arrays come through as-is and we trim at the
-// first NUL.
+// rawEvent matches struct exec_event byte for byte; strings are cut at the first NUL.
 type rawEvent struct {
 	PID      uint32
 	UID      uint32
@@ -57,23 +39,13 @@ type rawEvent struct {
 	Filename [filenameLen]byte
 }
 
-// Run loads the BPF program, attaches the tracepoint, and streams
-// matched Hits into `out` until ctx is cancelled. Caller is expected
-// to consume the channel concurrently — a slow consumer will only
-// drop in-Go events; the kernel ring buffer auto-recycles when the
-// userspace side falls behind.
-//
-// Errors:
-//   - rlimit / map/program load failures (CAP_BPF / CAP_PERFMON missing)
-//   - tracepoint attachment failure (kernel without sched_process_exec)
-//
-// Both surface as "I can't do my job" — milog-probe exits non-zero,
-// systemd restarts it, the daemon notices and logs the gap.
+// Run attaches sched_process_exec and sends an Event per exec on out until
+// ctx is cancelled. Sends block, so a slow consumer backs up the ring buffer
+// and the kernel drops events once it is full. Load or attach failures
+// (missing CAP_BPF/CAP_PERFMON, no tracepoint) are returned.
 func Run(ctx context.Context, out chan<- Event) error {
 	if len(execBpfObj) == 0 {
-		// Build-time placeholder — clang didn't run before go build.
-		// Fail fast with an actionable message rather than emitting
-		// nothing forever.
+		// The object is empty when clang didn't run before go build.
 		return errors.New("probe: bpf/exec.bpf.o is empty — rebuild with clang available (apt install clang llvm)")
 	}
 
@@ -109,9 +81,7 @@ func Run(ctx context.Context, out chan<- Event) error {
 	}
 	defer rb.Close()
 
-	// Cancellation: ring buffer Read() blocks; closing the reader on
-	// ctx.Done unblocks it with ErrClosed. Single goroutine to keep
-	// shutdown ordering simple.
+	// Closing the reader on cancel unblocks Read with ErrClosed.
 	go func() {
 		<-ctx.Done()
 		_ = rb.Close()
@@ -126,9 +96,7 @@ func Run(ctx context.Context, out chan<- Event) error {
 			return fmt.Errorf("probe: ringbuf read: %w", err)
 		}
 		if len(rec.RawSample) < int(binary.Size(rawEvent{})) {
-			// Truncated — should never happen with our fixed-size
-			// struct, but sanity-check rather than panic on a
-			// kernel-side bug.
+			// Truncated record; skip rather than panic.
 			continue
 		}
 		var raw rawEvent
@@ -141,11 +109,8 @@ func Run(ctx context.Context, out chan<- Event) error {
 			Comm:     trimNul(raw.Comm[:]),
 			Filename: trimNul(raw.Filename[:]),
 		}
-		// PPID + parent comm are cheaper to read in userspace than
-		// to add CO-RE chain reads to the BPF program. /proc reads
-		// happen on the consumer goroutine, not the BPF hot path —
-		// a slow /proc read just delays this one event, doesn't
-		// block the kernel ringbuf producer.
+		// Parent info comes from /proc here instead of CO-RE reads in
+		// BPF; a slow read delays only this event.
 		ev.PPID, ev.ParentComm = lookupParent(raw.PID)
 		select {
 		case out <- ev:
@@ -155,9 +120,7 @@ func Run(ctx context.Context, out chan<- Event) error {
 	}
 }
 
-// trimNul slices off the trailing NUL bytes from a fixed-size kernel
-// string. bpf_get_current_comm + bpf_probe_read_kernel_str both
-// guarantee NUL termination; we trim everything from the first NUL on.
+// trimNul cuts a fixed-size kernel string at its first NUL.
 func trimNul(b []byte) string {
 	for i, c := range b {
 		if c == 0 {
@@ -167,16 +130,9 @@ func trimNul(b []byte) string {
 	return string(b)
 }
 
-// lookupParent reads /proc/<pid>/status for PPid + /proc/<ppid>/comm.
-// Returns (0, "") when the child has already exited or the parent
-// can't be read — both are fine, the rule engine treats unknown parent
-// as "not allowlisted, not a web worker" → matches no rules.
-//
-// We accept the inherent race: by the time the userspace consumer
-// sees the event, the parent might have died and PPID rolled to 1
-// (init). For our security-monitoring use case that just means the
-// alert occasionally lacks parent context — a worse failure mode would
-// be holding state in the BPF program for every running process.
+// lookupParent returns the PPid and parent comm from /proc, or (0, "") if
+// either is gone; parent-based rules then don't match. The parent may
+// already have exited, leaving ppid 1, which only costs alert context.
 func lookupParent(pid uint32) (uint32, string) {
 	statusPath := "/proc/" + strconv.FormatUint(uint64(pid), 10) + "/status"
 	data, err := os.ReadFile(statusPath)

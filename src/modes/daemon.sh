@@ -1,20 +1,13 @@
-# ==============================================================================
-# MODE: daemon — headless sampler + rule evaluator (no TUI)
-# Fires the same rules as the live modes. stderr decision log only;
-# webhook sends are backgrounded so a slow Discord never wedges the loop.
-# ==============================================================================
+# milog daemon: headless sampler and rule evaluator, logging to stderr.
 
 mode_daemon() {
-    # Config sanity gate — refuse to start with ERROR-level findings so a
-    # broken config doesn't silently degrade at 3am. Warnings don't block;
-    # they're printed via stderr alongside the normal _dlog output.
+    # Refuse to start on config errors; warnings only get printed.
     if ! config_validate >&2; then
         local rc=$?
         if (( rc == 1 )); then
             _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
             exit 1
         fi
-        # rc=2 means warnings only → continue, user's been told.
     fi
 
     local hook_state
@@ -26,9 +19,7 @@ mode_daemon() {
 
     history_init   # no-op when HISTORY_ENABLED=0; disables itself on error
 
-    # Live-tail watchers for exploit + probe + app-pattern rules. Their stdout
-    # is suppressed; the alert call sites inside each mode fire webhooks
-    # directly. `mode_patterns` self-suppresses when PATTERNS_ENABLED=0.
+    # Watcher stdout is discarded; their alerts fire from inside each mode.
     local watcher_pids=()
     ( mode_exploits > /dev/null ) & watcher_pids+=($!)
     ( mode_probes   > /dev/null ) & watcher_pids+=($!)
@@ -41,9 +32,7 @@ mode_daemon() {
     '
     trap "$_cleanup" INT TERM
 
-    # Init rollover state — start at "current" so the first write happens
-    # only once we've crossed a real minute/hour/day boundary, never mid-
-    # minute on start-up with partial counts.
+    # Start at the current period so the first write covers a complete minute, never a partial one.
     local last_min last_hour last_day now
     now=$(date +%s)
     last_min=$((  now / 60   ))
@@ -54,7 +43,6 @@ mode_daemon() {
         local CUR_TIME
         CUR_TIME=$(date '+%d/%b/%Y:%H:%M')
 
-        # System metrics — same helpers mode_monitor uses.
         local cpu mem_pct mem_used mem_total disk_pct disk_used disk_total
         cpu=$(cpu_usage)
         [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
@@ -67,7 +55,6 @@ mode_daemon() {
         sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
                          "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
 
-        # Per-app HTTP rules.
         local name cnt c2 c3 c4 c5
         for name in "${LOGS[@]}"; do
             read -r cnt c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
@@ -75,12 +62,7 @@ mode_daemon() {
             nginx_check_http_alerts "$name" "$c4" "$c5"
         done
 
-        # Audit scanners — file integrity, persistence surface, listening
-        # ports, YARA, account/SSH-key drift, rootkit hints. Self-throttled
-        # by their respective AUDIT_*_INTERVAL — cheap to call every tick
-        # (returns immediately when not due). No-op when AUDIT_ENABLED=0.
-        # YARA additionally no-ops when `yara` isn't installed or
-        # AUDIT_YARA_PATHS is empty; rootkit no-ops on macOS / BSD.
+        # Each scanner throttles itself by its AUDIT_*_INTERVAL and no-ops when disabled.
         _audit_fim_tick
         _audit_persistence_tick
         _audit_ports_tick
@@ -88,8 +70,7 @@ mode_daemon() {
         _audit_accounts_tick
         _audit_rootkit_tick
 
-        # History rollover. Write the *previous* complete minute so nothing
-        # lands partial. Hour rollup runs similarly on the hour edge.
+        # Write the previous minute and hour, which are complete.
         now=$(date +%s)
         local cur_min=$((  now / 60   ))
         local cur_hour=$(( now / 3600 ))

@@ -15,7 +15,7 @@ fail() {
 }
 
 # Every flag in install.sh's header must be parsed by main().
-documented=$(sed -n '/^# Flags:/,/^# =/p' "$ROOT/install.sh" | grep -oE '^#   -[-a-z]+(, --[a-z]+)?' | grep -oE -- '--?[a-z-]+')
+documented=$(grep -m1 '^# Flags:' "$ROOT/install.sh" | grep -oE -- '--[a-z-]+')
 parsed=$(sed -n '/^main() {/,/^}/p' "$ROOT/install.sh" | grep -oE '^ +(-[-a-z|]+)\)' | tr -d ' )' | tr '|' '\n')
 for flag in $documented; do
     grep -qxF -- "$flag" <<< "$parsed" || fail "install.sh documents $flag but main() does not parse it"

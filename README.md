@@ -102,6 +102,10 @@ curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh \
 The web dashboard ships as the `milog-web` Go binary — `install.sh`
 fetches it from the latest GitHub release alongside `milog` itself, so
 no separate flag and no system listener (socat / ncat) is needed.
+Each downloaded archive is checked against the release's `checksums.txt`
+(SHA-256); a mismatch or a missing checksum aborts the install. The
+checksums are not signed, so they catch a corrupted or swapped asset but
+not a compromised release.
 
 ### From a clone (contributors)
 
@@ -226,7 +230,13 @@ state dirs so re-installing preserves your settings).
 The shipping artifact `milog.sh` is generated from `src/*.sh` by
 `build.sh`. Don't edit `milog.sh` by hand — edit the file under `src/`
 that owns the code, then run `bash build.sh` to regenerate the bundle.
-Commit both the source change and the regenerated `milog.sh`.
+Commit the source change first, then run `bash build.sh` on the clean
+tree and commit the regenerated `milog.sh`. A bundle built from a tree
+with uncommitted changes is stamped `-dirty`, and CI rejects it.
 
 See [`src/README.md`](src/README.md) for the source layout and
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for design internals.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

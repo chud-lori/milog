@@ -1,35 +1,13 @@
-# ==============================================================================
-# MODE: completions — install shell completion files
-#
-# Static completion scripts live under completions/ in the repo, baked into
-# the milog bundle. This mode extracts them back out to the user's shell
-# lookup paths. Two flavours:
-#
-#   milog completions install      # drop to /usr/share or ~/.local
-#   milog completions <shell>      # print a single shell's completion to stdout
-#                                    (for curl-pipe-bash install paths)
-#
-# Supported: bash / zsh / fish.
-# ==============================================================================
+# milog completions install | bash | zsh | fish.
 
-# Embedded completion payloads live in the bundled milog.sh, written there
-# by build.sh from completions/*.  Here we extract them via heredocs — the
-# content is literally duplicated because bash can't do "read this file
-# from inside the bundle" without the source layout.
-#
-# To stay DRY, we ship a sentinel approach: each completion body lives in
-# its own helper below. If a user is on a clone (bundle built from src/),
-# we defer to completions/*. Otherwise we use the fallback bodies.
+# Bodies come from completions/ in a repo clone, else from _completions_payload_<shell>, which build.sh does not generate.
 
 _completions_src_dir() {
-    # Return the repo's completions/ dir if we're running from a clone and
-    # it exists; empty otherwise.
     local me self_dir
     me="${BASH_SOURCE[0]:-$0}"
     [[ -n "$me" && -f "$me" ]] || return 1
     self_dir=$(cd -P "$(dirname "$me")" 2>/dev/null && pwd) || return 1
-    # Walk up — src/modes/completions.sh → repo/completions; or
-    # /usr/local/bin/milog (bundle) → no src/ nearby.
+    # src/modes/ in a clone, or the repo root for a built milog.sh.
     local candidate
     for candidate in "$self_dir/../../completions" "$self_dir/../completions" "$self_dir/completions"; do
         [[ -d "$candidate" ]] && { printf '%s' "$(cd -P "$candidate" && pwd)"; return 0; }
@@ -68,7 +46,6 @@ _completions_install() {
     local src; src=$(_completions_src_dir) || src=""
     local installed=0
 
-    # Target paths (system when root, user otherwise).
     local bash_dst zsh_dst fish_dst
     if [[ $(id -u) -eq 0 ]]; then
         bash_dst="/usr/share/bash-completion/completions/milog"
@@ -132,8 +109,6 @@ _completions_emit() {
             return 0
         fi
     fi
-    # Fallback: the bundle ships a copy of each completion script inline
-    # via build.sh heredocs. If that's missing too, we truly can't emit.
     local fn="_completions_payload_${shell}"
     if declare -F "$fn" >/dev/null 2>&1; then
         "$fn"

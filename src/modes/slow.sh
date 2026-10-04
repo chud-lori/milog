@@ -1,15 +1,8 @@
-# ==============================================================================
-# MODE: slow — top N endpoints by p95 response time
-# Requires the extended (combined_timed) log format — see README.
-# Pipeline: tail -> extract (path, ms) -> sort by path -> per-path p95
-#           -> sort by p95 desc -> head N. All portable POSIX awk; no
-#           gawk-only features (asort / PROCINFO) required.
-# ==============================================================================
+# milog slow [N]: endpoints ranked by p95 $request_time, in portable awk (no asort/PROCINFO).
 mode_slow() {
     local n="${1:-10}"
     local window="${SLOW_WINDOW:-1000}"
 
-    # Basic arg validation — integers only, otherwise later arithmetic trips.
     [[ "$n"      =~ ^[0-9]+$ ]] || { echo -e "${R}slow: N must be numeric${NC}" >&2; return 1; }
     [[ "$window" =~ ^[0-9]+$ ]] || { echo -e "${R}slow: SLOW_WINDOW must be numeric${NC}" >&2; return 1; }
 
@@ -26,8 +19,7 @@ mode_slow() {
         return 1
     fi
 
-    # Stream through two awk stages with sort in between so per-path p95 can
-    # be computed without multi-dim arrays.
+    # Sorting between the two awk passes gives per-path p95 without multi-dim arrays.
     local top_rows
     top_rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
         | awk -v EXCLUDE_LIST="${SLOW_EXCLUDE_PATHS:-}" '
@@ -97,8 +89,7 @@ mode_slow() {
     local i=1 path p95 count col
     while IFS=$'\t' read -r path p95 count; do
         col=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
-        # Truncate absurdly long paths so the table stays aligned. URL paths
-        # are ASCII, so ${#path} is safe for width math.
+        # URL paths are ASCII, so ${#path} is the display width.
         local display="$path"
         if (( ${#display} > 80 )); then
             display="${display:0:77}..."

@@ -1,41 +1,12 @@
-# ==============================================================================
-# MODE: alerts — read the local alert history log
-#
-# The log itself is appended to by `_alert_record` (called from
-# `alert_discord`) — one TSV row per fired alert. This mode presents the
-# "what fired overnight? / this week?" view that was previously
-# unanswerable (the cooldown state file tracks last-fire per rule but
-# not history).
-#
-# Window grammar:
-#   today        since local midnight today
-#   yesterday    24h window ending at today's midnight
-#   all          no cutoff
-#   <N>m         last N minutes
-#   <N>h         last N hours
-#   <N>d         last N days
-#   <N>w         last N weeks
-# Default: today.
-#
-# Log file:       $ALERT_STATE_DIR/alerts.log
-# Rotation:       automatic, in-place, on each append. When the file
-#                 exceeds ALERT_LOG_MAX_BYTES (default 10 MB) it's truncated
-#                 to ~50% keeping the most recent records. No `.1` backup.
-#                 Set ALERT_LOG_MAX_BYTES=0 to disable.
-# ==============================================================================
+# milog alerts [window]: what fired, read from alerts.log.
 
-# Parse a window spec (today/yesterday/all/Nh/Nd/Nw) to a Unix epoch cutoff.
-# Echoes the cutoff on success; non-zero exit + stderr message on invalid
-# input. Separated from mode_alerts so tests can exercise it independently.
+# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; there is no upper bound, so `yesterday` includes today.
 _alerts_window_to_epoch() {
     local w="$1"
     local now; now=$(date +%s)
     case "$w" in
         today)
-            # Local midnight today — (now % 86400) is seconds since UTC
-            # midnight, not local, but on most servers localtime=UTC and it
-            # doesn't meaningfully drift. Precise-to-the-timezone is overkill
-            # for an "alerts today" view.
+            # UTC midnight, not local; close enough for this view.
             echo $(( now - (now % 86400) ))
             ;;
         yesterday)
@@ -71,8 +42,6 @@ _alerts_window_to_epoch() {
     esac
 }
 
-# Human-readable timestamp from epoch, portable across GNU/BSD date.
-# Used for the WHEN column in the table.
 _alerts_fmt_epoch() {
     date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
     || date -r  "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
@@ -95,7 +64,6 @@ mode_alerts() {
 
     echo -e "\n${W}── MiLog: Alerts since ${cutoff_fmt} (window=$window) ──${NC}\n"
 
-    # Filter once by epoch, feed the result to both the list and the summary.
     local filtered; filtered=$(mktemp -t milog_alerts.XXXXXX) || return 1
     # shellcheck disable=SC2064
     trap "rm -f '$filtered'" RETURN
@@ -110,9 +78,7 @@ mode_alerts() {
         return 0
     fi
 
-    # --- Timeline (last ~30 rows, chronological) ---------------------------
-    # Most recent is most relevant, but humans read top-down and expect
-    # chronological order. Cap at 30 so the table stays glanceable.
+    # Newest 30 rows, oldest first.
     local list_cap=30
     local shown=$total
     (( shown > list_cap )) && shown=$list_cap
@@ -120,9 +86,7 @@ mode_alerts() {
     printf "  %-16s  %-28s  %s\n" "WHEN" "RULE" "TITLE"
     printf "  %-16s  %-28s  %s\n" "────────────────" "────────────────────────────" "──────"
 
-    # Per-row format in bash — calling _alerts_fmt_epoch (which forks date)
-    # inside awk's strftime is gawk-only; BSD awk on macOS lacks strftime.
-    # 30 row cap keeps the fork count trivial.
+    # Format dates in bash: awk strftime is gawk-only.
     local epoch rule color title body when rule_disp title_disp col
     while IFS=$'\t' read -r epoch rule color title body; do
         [[ -z "$epoch" ]] && continue
@@ -131,10 +95,6 @@ mode_alerts() {
         (( ${#rule_disp} > 28 )) && rule_disp="${rule_disp:0:25}..."
         title_disp="$title"
         (( ${#title_disp} > 50 )) && title_disp="${title_disp:0:47}..."
-        # Color the rule column by severity (derived from Discord color int):
-        #   15158332 / 16711680 → crit  (red)    — exploits, 5xx, sys crit
-        #   16753920 / 15844367 → warn  (yellow) — 4xx spike, probes
-        #   other               → info  (green)  — test alert etc.
         case "$color" in
             15158332|16711680)    col="$R" ;;
             16753920|15844367)    col="$Y" ;;
@@ -143,7 +103,6 @@ mode_alerts() {
         printf "  %-16s  %b%-28s%b  %s\n" "$when" "$col" "$rule_disp" "$NC" "$title_disp"
     done < <(tail -n "$list_cap" "$filtered")
 
-    # --- Summary by rule ----------------------------------------------------
     echo -e "\n  ${W}by rule (top 10)${NC}"
     awk -F'\t' '{c[$2]++} END {for (r in c) printf "%d\t%s\n", c[r], r}' "$filtered" \
         | sort -rn | head -n 10 \

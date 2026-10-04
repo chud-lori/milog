@@ -1,26 +1,8 @@
-# ==============================================================================
-# MODE: audit — point-in-time host integrity scans
-#
-# Today: file integrity monitoring (FIM). SHA256 baseline of a configurable
-# watchlist (AUDIT_FIM_PATHS) re-checked on a timer. Drift fires
-# `audit:fim:<path>` through the existing alert path — silence + cooldown
-# + dedup all apply for free.
-#
-# Layout: `audit` is the umbrella subcommand. `fim` is the first scanner;
-# more land beside it (persistence diff, listening-port baseline, SSH key
-# audit, rootkit hints) without renaming anything.
-#
-# Storage: $ALERT_STATE_DIR/audit/fim.baseline (TSV, one row per path)
-#   <path>\t<sha256>\t<mtime_epoch>\t<size_bytes>\t<recorded_epoch>
-# Special sha256 value `MISSING` means the path was absent at baseline
-# time — alerts fire when an absent path subsequently appears.
-# ==============================================================================
+# milog audit: host integrity scanners (fim, persistence, ports, yara, accounts, rootkit).
+# Drift goes through alert_fire, so silence, cooldown and dedup apply.
+# fim.baseline rows: path, sha256, mtime, size, recorded; sha256 MISSING means absent at baseline time.
 
-# --- helpers ------------------------------------------------------------------
-
-# Portable sha256 of one file. Returns the hex digest on stdout, empty on
-# error (unreadable / nonexistent). Avoids forking the same binary
-# differently across distros.
+# Hex digest, or empty when unreadable.
 _audit_sha256() {
     local path="$1"
     [[ -r "$path" ]] || return 0
@@ -52,10 +34,7 @@ _audit_state_dir() {
     printf '%s' "$d"
 }
 
-# Expand AUDIT_FIM_PATHS with shell globbing into a deduped, sorted list of
-# concrete paths. Patterns that match nothing contribute the literal
-# pattern itself — so a watchlist entry pointing at a path that doesn't
-# exist yet is still tracked (and fires the moment it does appear).
+# Watchlist globs expanded to a sorted, deduped path list.
 _audit_fim_expand_paths() {
     local pat path
     local -a out=()
@@ -67,24 +46,15 @@ _audit_fim_expand_paths() {
                 out+=("$path")
             done
         else
-            # No match — keep the literal pattern so absence is auditable.
-            # (Globless paths fall through here too — `/etc/shadow` with no
-            # glob chars matches itself if present, lands in this branch
-            # otherwise.)
+            # nullglob only drops patterns with glob chars, so this branch is unmatched globs; literal paths never reach it.
             out+=("$pat")
         fi
     done
     shopt -u nullglob
-    # Dedupe + sort for stable diff output.
     printf '%s\n' "${out[@]}" | sort -u
 }
 
-# --- baseline / check ---------------------------------------------------------
-
-# (Re)build the FIM baseline from the current filesystem state. Overwrites
-# the previous baseline. No alerts fire — this is the "I trust the host
-# right now" moment. Use `milog audit fim check` to compare against the
-# baseline later.
+# Overwrites the baseline without alerting.
 _audit_fim_baseline() {
     if ! _audit_have_sha256; then
         echo "milog: no sha256sum or shasum on PATH — refusing to write a FIM baseline" >&2
@@ -114,20 +84,11 @@ _audit_fim_baseline() {
     done < <(_audit_fim_expand_paths)
 
     mv "$tmp" "$out"
-    # Stdout: `<count_present> <count_missing> <path>` — read with
-    # `read present missing path` in the caller. Three fields on one
-    # line dodges the subshell-scope problem that bites globals when
-    # this function is invoked via $().
+    # One "<present> <missing> <path>" line so callers can `read` it; globals don't survive $(...).
     printf '%d %d %s\n' "$count" "$missing" "$out"
 }
 
-# Compare current state against the baseline. Stdout: one line per
-# drifted path, format `<change>\t<path>\t<old>→<new>`. Change types:
-#   MODIFIED   sha256 differs
-#   APPEARED   was MISSING, now present
-#   REMOVED    was present, now MISSING
-#   UNREADABLE was readable, now denied (perm change is itself signal)
-# Empty stdout = no drift.
+# One `<change>\t<path>\t<old>→<new>` line per drifted path: MODIFIED, APPEARED, REMOVED or UNREADABLE.
 _audit_fim_diff() {
     local dir; dir=$(_audit_state_dir)
     local baseline="$dir/fim.baseline"
@@ -144,8 +105,7 @@ _audit_fim_diff() {
             if [[ "$old_sha" == "MISSING" ]]; then
                 printf 'APPEARED\t%s\t%s→%s\n' "$path" "$old_sha" "${new_sha:0:16}"
             elif [[ "$old_sha" == "UNREADABLE" && "$new_sha" != "UNREADABLE" ]]; then
-                # Was perm-blocked at baseline, now readable — record as
-                # APPEARED-equivalent so the operator sees the new content.
+                # Readable for the first time since baseline, so report it like a new file.
                 printf 'APPEARED\t%s\t%s→%s\n' "$path" "$old_sha" "${new_sha:0:16}"
             elif [[ "$old_sha" != "$new_sha" ]]; then
                 if [[ "$new_sha" == "UNREADABLE" ]]; then
@@ -162,9 +122,7 @@ _audit_fim_diff() {
     done < "$baseline"
 }
 
-# Daemon-side periodic check. Auto-baselines on first run (no alerts);
-# later runs alert on drift. Throttled by AUDIT_FIM_INTERVAL via an
-# epoch marker file so multiple daemon ticks per minute don't all hash.
+# Daemon check, at most once per AUDIT_FIM_INTERVAL; the first run baselines silently.
 _audit_fim_tick() {
     [[ "${AUDIT_ENABLED:-0}" == "1" ]] || return 0
     local dir; dir=$(_audit_state_dir)
@@ -185,16 +143,11 @@ _audit_fim_tick() {
     fi
 
     if [[ ! -f "$baseline" ]]; then
-        # First run: silently baseline. The user's own
-        # `milog audit fim check` is how to verify the watchlist —
-        # surprise-firing on the first daemon tick would be noise.
-        # We discard the count line; the daemon doesn't print it.
         _audit_fim_baseline >/dev/null 2>&1
         printf '%s' "$now" > "$marker"
         return 0
     fi
 
-    # Drift check; one alert per drifted path.
     local change path detail key body
     while IFS=$'\t' read -r change path detail; do
         [[ -z "$change" ]] && continue
@@ -207,8 +160,6 @@ _audit_fim_tick() {
 
     printf '%s' "$now" > "$marker"
 }
-
-# --- user-facing subcommands --------------------------------------------------
 
 mode_audit() {
     case "${1:-}" in
@@ -226,9 +177,7 @@ mode_audit() {
 }
 
 _audit_help() {
-    # printf '%b' interprets the \033 escape sequences in $W / $C / $NC.
-    # `cat <<EOF` would pass them through as the literal 4-char string
-    # \033[…m, which is what users on real terminals would actually see.
+    # printf '%b' renders the \033 escapes in $W/$C/$NC; a heredoc would print them literally.
     printf '%b' "
 ${W}milog audit${NC} — point-in-time host integrity scans
 
@@ -329,23 +278,8 @@ _audit_fim_subcmd() {
     esac
 }
 
-# ==============================================================================
-# Persistence diff — file-existence drift across the classic re-entry surface
-# (cron drops, systemd units, rc.local, ld.so.preload). Tracks "did a file
-# appear that wasn't there before?" — the high-signal half of post-compromise
-# scanning. Hash-drift on existing files is FIM's job; this scanner watches
-# directories where attackers DROP NEW FILES.
-#
-# Storage: $ALERT_STATE_DIR/audit/persistence.baseline (TSV)
-#   <path>\t<size>\t<mtime_epoch>\t<recorded_epoch>
-#
-# Drift policy:
-#   APPEARED  fires alert. Sysadmin adding a unit usually goes through
-#             config management; a new file in /etc/cron.d/ that wasn't
-#             planned is exactly what we want to know about.
-#   REMOVED   informational on `check` output but does NOT alert. Pruning
-#             stale units is normal sysadmin housekeeping.
-# ==============================================================================
+# Persistence: file-existence diff over cron, systemd and rc paths. Only APPEARED alerts; removals are housekeeping.
+# persistence.baseline rows: path, size, mtime, recorded.
 
 _audit_persistence_expand() {
     local pat path
@@ -359,17 +293,12 @@ _audit_persistence_expand() {
         fi
         if (( ${#matches[@]} > 0 )); then
             for path in "${matches[@]}"; do
-                # Skip directories — cron drops and systemd units are files.
-                # A bare directory entry from the glob would match every
-                # daemon tick and produce no useful baseline.
+                # Only files; a directory match would never change.
                 [[ -d "$path" ]] && continue
                 out+=("$path")
             done
         fi
-        # Globs that match nothing contribute zero entries — different from
-        # FIM where literal-tracked-as-absent is desirable. For persistence
-        # we only care about presence; a never-populated /etc/cron.d/ tree
-        # is the steady state, not signal.
+        # Unmatched globs add nothing, but nullglob leaves literal paths in place even when they don't exist.
     done
     shopt -u nullglob
     printf '%s\n' "${out[@]}" | sort -u
@@ -395,9 +324,7 @@ _audit_persistence_baseline() {
     printf '%d %s\n' "$count" "$out"
 }
 
-# Diff current vs baseline. Stdout: `<change>\t<path>` per line.
-# Changes: APPEARED, REMOVED. APPEARED fires alerts; REMOVED is shown
-# in `check` output but doesn't fire.
+# `<change>\t<path>` lines, APPEARED or REMOVED.
 _audit_persistence_diff() {
     local dir; dir=$(_audit_state_dir)
     local baseline="$dir/persistence.baseline"
@@ -410,7 +337,7 @@ _audit_persistence_diff() {
     trap "rm -f '$current' '$sorted_baseline'" RETURN
     _audit_persistence_expand > "$current"
 
-    # comm needs sorted inputs. Strip baseline to its path column first.
+    # comm needs sorted input.
     awk -F'\t' '{print $1}' "$baseline" | sort -u > "$sorted_baseline"
 
     # APPEARED: in current, not in baseline.
@@ -438,7 +365,6 @@ _audit_persistence_tick() {
         return 0
     fi
 
-    # Only APPEARED entries fire — REMOVED is intentional silent (housekeeping).
     local change path key body
     while IFS=$'\t' read -r change path; do
         [[ "$change" == "APPEARED" ]] || continue
@@ -523,27 +449,13 @@ _audit_persistence_subcmd() {
     esac
 }
 
-# ==============================================================================
-# Listening-port baseline — snapshot every TCP/UDP listener at first run,
-# diff each subsequent tick. NEW listener fires; gone listener is silent
-# (services restart routinely; the brief gap shouldn't page anyone).
-#
-# Storage: $ALERT_STATE_DIR/audit/ports.baseline (TSV)
-#   <proto>\t<bind>\t<port>\t<recorded>
-#
-# Capture: prefers `ss -tulnH` (iproute2). Falls back to `netstat -tunl`
-# on hosts where ss isn't available — same fields, slower. PID/process
-# columns intentionally NOT captured: `ss -p` requires CAP_NET_ADMIN /
-# root and we never escalate ourselves; the bind+port tuple is enough
-# to fire the alert and let the operator investigate with `lsof -i`.
-# ==============================================================================
+# Ports: new TCP/UDP listeners alert, vanished ones don't. ports.baseline rows: proto, bind, port, recorded.
+# PIDs aren't captured because `ss -p` needs root.
 
-# Capture current listeners as TSV `<proto>\t<bind>\t<port>` rows.
-# Output is sorted+deduped so set-diff against baseline is straight `comm`.
+# Sorted `<proto>\t<bind>\t<port>` rows, ready for comm.
 _audit_ports_capture() {
     if command -v ss >/dev/null 2>&1; then
-        # `-H` (no header) is iproute2-recent; older versions ignore it
-        # and emit a header row that the awk filter below drops anyway.
+        # Older iproute2 ignores -H and prints a header, which the awk skips.
         ss -tulnH 2>/dev/null | awk '
             # Columns: Netid State Recv-Q Send-Q Local-Addr:Port Peer-Addr:Port ...
             # State col absent for UDP (where it would be UNCONN, not LISTEN);
@@ -580,9 +492,7 @@ _audit_ports_capture() {
             }
         ' | sort -u
     fi
-    # Both missing → empty stdout. Caller treats that as "no listeners",
-    # which is not great signal — but not our problem to fix; install a
-    # tools layer.
+    # With neither ss nor netstat the output is empty.
 }
 
 _audit_ports_baseline() {
@@ -603,9 +513,7 @@ _audit_ports_baseline() {
     printf '%d %s\n' "$count" "$out"
 }
 
-# Diff current vs baseline. Stdout: `<change>\t<proto>\t<bind>\t<port>` per
-# line. Changes: NEW (in current, not baseline), GONE (in baseline, not
-# current). Only NEW fires alerts.
+# `<change>\t<proto>\t<bind>\t<port>` lines, NEW or GONE.
 _audit_ports_diff() {
     local dir; dir=$(_audit_state_dir)
     local baseline="$dir/ports.baseline"
@@ -725,34 +633,10 @@ _audit_ports_subcmd() {
     esac
 }
 
-# ==============================================================================
-# YARA scan over webroot — pattern-match against a curated rule catalogue
-# every AUDIT_YARA_INTERVAL seconds. Daily default; webroots are large and
-# the regex pass is the heaviest of the audit scans.
-#
-# This module **shells out** to the system `yara` binary rather than
-# binding libyara directly. Two reasons:
-#   1. Curl-pipe install path stays single-file bash. Users on Debian
-#      run `apt install yara` once; daemon picks it up next tick.
-#   2. We don't yet need the live-fsnotify trigger that would justify
-#      the cgo cost — daily scans catch attacker-dropped webshells
-#      well before they're useful, and a missed window of < 24h is
-#      acceptable signal-vs-effort.
-#
-# Off until both of these are true:
-#   - `yara` binary is on PATH (logged-once warning otherwise)
-#   - AUDIT_YARA_PATHS contains at least one directory
-#
-# Match dedup: TSV at $ALERT_STATE_DIR/audit/yara.matches stores
-# `<rule>\t<file>\t<sha256>\t<first_seen>`. A second tick that finds
-# the same (rule, file, sha) tuple is silent — only NEW matches alert.
-# A modified file with the same rule firing alerts again (sha changed).
-# ==============================================================================
+# YARA over AUDIT_YARA_PATHS via the system yara binary; idle until the binary exists and a path is set.
+# yara.matches records rule, file, sha256, first_seen, so only new (rule, file, sha) combinations alert.
 
-# Embedded starter ruleset. Three conservative rules — high signal,
-# minimal false-positive risk on legit PHP webroots. User extends by
-# dropping more `.yar` files into AUDIT_YARA_RULES_DIR; we never
-# overwrite user files.
+# Starter rules, written once by `milog audit yara init` and never overwritten.
 _audit_yara_default_rules() {
     cat <<'YARA_RULES'
 /*
@@ -812,8 +696,6 @@ rule milog_webshell_families
 YARA_RULES
 }
 
-# Init the rules dir if missing. Returns 0 on success (dir exists with at
-# least one .yar file), 1 on failure to create.
 _audit_yara_init_rules() {
     local dir="${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}"
     mkdir -p "$dir" 2>/dev/null || return 1
@@ -824,8 +706,7 @@ _audit_yara_init_rules() {
     return 0
 }
 
-# `yara` binary present?  Caches the answer in a marker file so we don't
-# log the "missing" warning more than once per daemon lifetime.
+# The marker keeps the missing-binary warning to once.
 _audit_yara_have_binary() {
     if command -v yara >/dev/null 2>&1; then
         return 0
@@ -839,29 +720,18 @@ _audit_yara_have_binary() {
     return 1
 }
 
-# Scan one path with all .yar files in the rules dir. Stdout: one match
-# per line, format `<rule>\t<file>` (yara's `-s` for full match details
-# is too noisy for the alert body — we record the rule name + path and
-# leave deeper triage to the operator).
+# `<rule>\t<file>` per match.
 _audit_yara_scan_path() {
     local target="$1"
     local rules_dir="${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}"
     [[ -d "$target" || -f "$target" ]] || return 0
     [[ -d "$rules_dir" ]] || return 0
 
-    # `yara -r` recursive; per-file invocation per rule file lets us
-    # recover gracefully from one bad rule file without aborting the
-    # whole scan.
+    # One yara run per rule file so a broken file doesn't abort the scan.
     local yar
     for yar in "$rules_dir"/*.yar; do
         [[ -f "$yar" ]] || continue
-        # `yara` exit codes: 0 = no match, 1 = match, >1 = error.
-        # Output format `<rule_name> <file_path>` (space-separated).
-        # Convert to TSV for downstream parsing.
-        # NB: no `--` separator — `yara` 4.x treats `--` as a literal
-        # filename, not an end-of-options sentinel. Path arguments come
-        # from AUDIT_YARA_PATHS / AUDIT_YARA_RULES_DIR (operator config),
-        # so a leading-dash filename isn't a realistic attack surface.
+        # yara exits 1 on match. No `--`: yara 4.x treats it as a filename.
         yara -r -w "$yar" "$target" 2>/dev/null | awk '{
             # Split on the first space only; the path keeps its exact bytes.
             i = index($0, " ")
@@ -935,8 +805,6 @@ _audit_yara_tick() {
         return 0
     fi
 
-    # Bootstrap rules dir on first tick (also handles the case where
-    # the user wiped it). Failure is logged, not fatal.
     if ! _audit_yara_init_rules; then
         echo "milog: failed to init yara rules dir at ${AUDIT_YARA_RULES_DIR:-$HOME/.config/milog/yara}" >&2
         printf '%s' "$now" > "$marker"
@@ -1114,9 +982,7 @@ _audit_accounts_expand() {
     printf '%s\n' "${out[@]}" | sort -u
 }
 
-# Capture each tracked file's contents into the baseline dir. Returns
-# `<count> <baseline_dir>` so the caller can `read` it without subshell-
-# scope variable leakage.
+# Prints `<count> <dir>`.
 _audit_accounts_baseline() {
     local dir; dir=$(_audit_accounts_state_dir)
     local count=0 path safe tmp f kept="/"
@@ -1142,11 +1008,7 @@ _audit_accounts_baseline() {
     printf '%d %s\n' "$count" "$dir"
 }
 
-# Diff every currently-tracked file against its baseline. Stdout per
-# line: `<change>\t<file>\t<line>` where change ∈ {ADDED, REMOVED}.
-# A missing baseline file is treated as if every line in the current
-# file is ADDED — which is exactly the signal we want when an attacker
-# creates a new authorized_keys for an existing or freshly-added user.
+# `<change>\t<file>\t<line>`, ADDED or REMOVED; a file with no baseline reports every line as ADDED.
 _audit_accounts_diff() {
     local dir; dir=$(_audit_accounts_state_dir)
     local path safe baseline
@@ -1158,13 +1020,9 @@ _audit_accounts_diff() {
             baseline="$dir/$(_audit_accounts_legacy_name "$path").baseline"
         fi
         if [[ ! -f "$baseline" ]]; then
-            # File appeared since last baseline — every line is ADDED.
             awk -v p="$path" 'NF { printf "ADDED\t%s\t%s\n", p, $0 }' "$path" 2>/dev/null
             continue
         fi
-        # comm wants sorted inputs; account files are small enough that
-        # sorting per tick is cheap (passwd ≈ 50 lines, authorized_keys
-        # rarely beyond ~20 keys).
         comm -23 <(sort -u "$path" 2>/dev/null) <(sort -u "$baseline") \
             | awk -v p="$path" 'NF { printf "ADDED\t%s\t%s\n", p, $0 }'
         comm -13 <(sort -u "$path" 2>/dev/null) <(sort -u "$baseline") \
@@ -1184,19 +1042,14 @@ _audit_accounts_tick() {
         return 0
     fi
 
-    # First-run silent baseline. Marker file used to detect bootstrap
-    # state because the per-file baselines may legitimately be missing
-    # (file glob matches zero entries on a freshly-installed host).
+    # The marker, not the per-file baselines, marks bootstrap: the globs can match nothing on a fresh host.
     if [[ ! -f "$marker" ]]; then
         _audit_accounts_baseline >/dev/null 2>&1
         printf '%s' "$now" > "$marker"
         return 0
     fi
 
-    # Group ADDED lines by file so we fire one alert per file rather
-    # than one per added key — critical when an attacker drops 5 new
-    # keys at once into authorized_keys. Body is capped at 5 lines plus
-    # an "… and N more" tail to stay under Discord's 4000-char limit.
+    # One alert per file, listing at most 5 new lines.
     local prev_file="" body="" capped=""
     local change file line lines_count=0 key b
     while IFS=$'\t' read -r change file line; do
@@ -1322,10 +1175,7 @@ _audit_rootkit_supported() {
     [[ -d /proc ]] && [[ -d /proc/1 ]]
 }
 
-# Hidden-process check. Returns one line `hidden_process\t<detail>` if the
-# /proc directory count exceeds `ps -e` count by more than the slack.
-# The slack accommodates the race window between the two enumerations
-# (a process can spawn or die in the microseconds between them).
+# The slack covers processes that start or exit between the two counts.
 _audit_rootkit_check_hidden() {
     local ps_count proc_count slack=5
     ps_count=$(ps -eo pid 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
@@ -1382,16 +1232,10 @@ _audit_rootkit_check_preload() {
     fi
 }
 
-# Walk /proc/<pid>/exe symlinks. Two heuristics share the walk so we
-# don't pay for it twice per tick:
-#   - exec_from_tmp:    exe path resolves under /tmp / /dev/shm / /var/tmp
-#   - deleted_exe:      exe symlink target ends with " (deleted)"
-# kernel-thread exe links are unreadable (-EPERM) — silently skipped.
+# One /proc walk for both exec_from_tmp and deleted_exe; unreadable kernel-thread exe links are skipped.
 _audit_rootkit_walk_proc() {
     local pid exe comm
     for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-        # readlink on /proc/<pid>/exe returns either the absolute path or
-        # `<path> (deleted)` for unlinked-but-still-running binaries.
         exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
         [[ -z "$exe" ]] && continue
         comm=$(cat "/proc/$pid/comm" 2>/dev/null | tr -d '\n')
@@ -1409,9 +1253,7 @@ _audit_rootkit_walk_proc() {
     done
 }
 
-# Run every heuristic; emit one line per finding, format
-# `<heuristic_key>\t<detail>`. heuristic_key may be suffixed with the
-# process comm for per-process keys (so cooldown groups correctly).
+# `<heuristic>\t<detail>` per finding; per-process keys carry the comm so cooldown groups by process.
 _audit_rootkit_run_all() {
     _audit_rootkit_supported || return 0
     _audit_rootkit_check_hidden

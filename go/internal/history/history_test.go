@@ -10,8 +10,7 @@ import (
 	"testing"
 )
 
-// requireSqlite skips the test when the system has no sqlite3 binary —
-// CI runners without it just see a SKIP, not a noisy failure.
+// requireSqlite skips when sqlite3 is not installed.
 func requireSqlite(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
@@ -19,9 +18,7 @@ func requireSqlite(t *testing.T) {
 	}
 }
 
-// makeDB creates a temp DB at `dir/metrics.db` with the bash-side
-// metrics_minute schema and the rows passed in. Reuses the same
-// schema the bash daemon uses so the test exercises the real shape.
+// makeDB creates dir/metrics.db with the daemon's metrics_minute schema and rows.
 func makeDB(t *testing.T, dir string, rows []MinuteRow, app string) string {
 	t.Helper()
 	dbPath := filepath.Join(dir, "metrics.db")
@@ -124,8 +121,7 @@ func TestLoadMinutes_EmptyResultMapNotNil(t *testing.T) {
 	requireSqlite(t)
 	dir := t.TempDir()
 	db := makeDB(t, dir, []MinuteRow{{TS: 1700000000, Req: 1}}, "api")
-	// since-cutoff after every row → empty result, but we still want
-	// a non-nil map so the caller can range over it without nil-check.
+	// No rows still returns a non-nil map.
 	got, err := LoadMinutes(db, 9999999999)
 	if err != nil {
 		t.Fatalf("LoadMinutes: %v", err)

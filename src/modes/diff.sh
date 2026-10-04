@@ -1,8 +1,4 @@
-# ==============================================================================
-# MODE: diff — hour-level comparison: now vs 1d ago vs 7d ago, per app
-# Same-hour windows against metrics_minute. Percent deltas computed in the
-# shell because bash arithmetic handles the small integer math cleanly.
-# ==============================================================================
+# milog diff: this hour vs the same hour 1 and 7 days ago, per app, from metrics_minute.
 mode_diff() {
     _history_precheck || return 1
 
@@ -39,9 +35,7 @@ SQL
         return 0
     fi
 
-    # ASCII header labels — Δ is a 2-byte 1-column char that confuses
-    # printf byte-width formatting. Divider em-dashes are counted to match
-    # each column's VISUAL width (12/10/10/10/8/8) so rows line up.
+    # ASCII labels and dividers sized to visual width; Δ is multi-byte and breaks printf padding.
     printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \
            "APP" "NOW" "1d ago" "7d ago" "d1 %" "d7 %"
     printf "  %-12s  %10s  %10s  %10s  %8s  %8s\n" \

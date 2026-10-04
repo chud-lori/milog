@@ -1,15 +1,12 @@
-# Path to the systemd user unit. Kept in sync with _web_service_install.
+# milog web: start/stop/status and the systemd user unit for the milog-web binary.
 _WEB_SYSTEMD_UNIT="${HOME}/.config/systemd/user/milog-web.service"
 
-# Is the unit currently active?
 _web_service_active() {
     command -v systemctl >/dev/null 2>&1 || return 1
     systemctl --user is-active --quiet milog-web.service 2>/dev/null
 }
 
-# Write the systemd user unit. Idempotent — repeated install just rewrites
-# the file with whatever config values are active NOW (so re-running picks
-# up `milog config set WEB_PORT 9000` without a second step).
+# Rewrites the unit from the current config, so re-running picks up a changed WEB_PORT.
 _web_service_install() {
     if ! command -v systemctl >/dev/null 2>&1; then
         echo -e "${R}systemctl not found — this host doesn't use systemd${NC}" >&2
@@ -17,7 +14,6 @@ _web_service_install() {
         echo -e "${D}    nohup milog web > ~/.cache/milog/web.out 2>&1 &${NC}" >&2
         return 1
     fi
-    # User services only — no root, no /etc/, no privileged ports.
     if [[ $(id -u) -eq 0 ]]; then
         echo -e "${R}run milog web install-service as your regular user, not root${NC}" >&2
         echo -e "${D}  the web dashboard binds to loopback on a high port — no root needed${NC}" >&2
@@ -26,17 +22,14 @@ _web_service_install() {
 
     local self="${BASH_SOURCE[0]}"
     [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
-    # If we're running from a repo clone, prefer the installed binary at
-    # /usr/local/bin/milog — more stable across clone renames / deletes.
+    # Prefer the installed copy over a repo clone that may move.
     [[ -x /usr/local/bin/milog ]] && self="/usr/local/bin/milog"
 
     local unit_dir; unit_dir=$(dirname "$_WEB_SYSTEMD_UNIT")
     mkdir -p "$unit_dir" 2>/dev/null \
         || { echo -e "${R}cannot create $unit_dir${NC}" >&2; return 1; }
 
-    # Write the unit. Environment= lines pin the current port/bind so a
-    # later `systemctl --user restart` uses the same surface — matches the
-    # URL `install-service` prints below.
+    # Pin the current port/bind so restarts serve the URL printed below.
     cat > "$_WEB_SYSTEMD_UNIT" <<EOF
 [Unit]
 Description=MiLog web dashboard (read-only, loopback)
@@ -59,9 +52,7 @@ EOF
 
     echo -e "${G}✓${NC} wrote $_WEB_SYSTEMD_UNIT"
 
-    # If a foreground milog web is already running, it would collide with
-    # the about-to-be-started systemd unit on the same port. Warn and stop
-    # it first — cleaner than a port-already-in-use failure on socket bind.
+    # A foreground instance would hold the port the unit is about to bind.
     if [[ -f "$(_web_pid_file)" ]]; then
         local old_pid; old_pid=$(< "$(_web_pid_file)" 2>/dev/null)
         if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
@@ -121,12 +112,7 @@ _web_service_uninstall() {
     fi
 }
 
-# Locate milog-web, the Go companion binary. Preference order:
-#   1. $MILOG_WEB_BIN (explicit override)
-#   2. /usr/local/libexec/milog/milog-web (package install location)
-#   3. /usr/local/bin/milog-web
-#   4. <dir of this script>/../../go/bin/milog-web (clone / dev)
-# Echoes the path on success, empty + non-zero on miss.
+# Path to milog-web: $MILOG_WEB_BIN, the package locations, then go/bin next to or above this script.
 _web_go_binary() {
     if [[ -n "${MILOG_WEB_BIN:-}" && -x "$MILOG_WEB_BIN" ]]; then
         printf '%s' "$MILOG_WEB_BIN"; return 0
@@ -137,21 +123,16 @@ _web_go_binary() {
         /usr/local/bin/milog-web; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
-    # Dev/clone path — relative to this script's bundled/unbundled location.
     local self="${BASH_SOURCE[0]}"
     [[ "$self" != /* ]] && self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
     local self_dir; self_dir=$(cd "$(dirname "$self")" && pwd)
-    # milog bundle is at repo root; go binary at repo/go/bin/milog-web.
     for candidate in "$self_dir/go/bin/milog-web" "$self_dir/../go/bin/milog-web"; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
     return 1
 }
 
-# Print actionable instructions when milog-web isn't on disk. install.sh
-# fetches it from a GitHub Release as part of curl-pipe install; the most
-# common reason to land here is a manual `git clone && bash milog.sh web`
-# without running install. Errors out non-zero so service starts fail loudly.
+# Usually reached from a git clone that never ran install.sh.
 _web_no_binary_error() {
     printf '%b' "
 ${R}milog-web binary not found.${NC}
@@ -181,9 +162,7 @@ Search path checked (in order):
 " >&2
 }
 
-# Exec milog-web with the bash-env MiLog vars mapped through. The Go
-# binary reads the same MILOG_* env set bash exposes, so configuration
-# stays single-source. Prints the URL + token once, then hands off.
+# Execs milog-web with the MILOG_* env it reads through config.Load().
 _web_start_go() {
     local go_bin="$1"
     local token; token=$(_web_token_read)
@@ -201,13 +180,10 @@ ${W}MiLog web${NC}  starting milog-web  ${D}${go_bin}${NC}
   ${D}stop:${NC}   milog web stop    (or Ctrl+C)
 
 "
-    # Track the exec'd Go binary's pid for `milog web stop`. Written
-    # before exec so foreground `Ctrl+C` works without an intermediate
-    # supervisor process.
+    # exec keeps this pid, so it is milog-web's pid for `milog web stop`.
     echo $$ > "$(_web_pid_file)"
     trap 'rm -f "$(_web_pid_file)"' EXIT
 
-    # Export the full MILOG_* surface — Go reads these via config.Load().
     export MILOG_WEB_BIND="$WEB_BIND" \
            MILOG_WEB_PORT="$WEB_PORT" \
            MILOG_LOG_DIR="$LOG_DIR" \
@@ -220,8 +196,7 @@ ${W}MiLog web${NC}  starting milog-web  ${D}${go_bin}${NC}
 }
 
 mode_web() {
-    # Subcommand dispatch — treats a leading --flag as implicit 'start' so
-    # `milog web --port 9000` works without the redundant literal 'start'.
+    # A leading --flag means implicit `start`.
     case "${1:-}" in
         stop)     _web_stop;   return ;;
         status)   _web_status; return ;;
@@ -247,7 +222,6 @@ mode_web() {
     [[ "$WEB_PORT" =~ ^[0-9]+$ ]] \
         || { echo -e "${R}--port must be numeric${NC}" >&2; return 1; }
 
-    # Expose-to-network guard — forces explicit consent.
     if [[ "$WEB_BIND" != "127.0.0.1" && "$WEB_BIND" != "localhost" && "$WEB_BIND" != "::1" ]] && (( ! trust )); then
         printf '%b' "
 ${R}refusing --bind $WEB_BIND without --trust${NC}
@@ -260,7 +234,6 @@ ${D}  If you really mean it:  milog web --bind $WEB_BIND --port $WEB_PORT --trus
         return 1
     fi
 
-    # Already running? Covers both the systemd unit and a foreground pidfile.
     if _web_systemd_active; then
         echo -e "${Y}milog-web.service is already running (systemd). Check: milog web status${NC}"
         return 1
@@ -270,16 +243,12 @@ ${D}  If you really mean it:  milog web --bind $WEB_BIND --port $WEB_PORT --trus
         return 1
     fi
 
-    # Token + state dirs.
     _web_token_ensure || return 1
     mkdir -p "$WEB_STATE_DIR" 2>/dev/null
 
-    # The Go binary is the dashboard server. No bash fallback — keeping
-    # two implementations in sync was the whole reason the bash router
-    # got deleted.
+    # No bash fallback server.
     local go_bin
     go_bin=$(_web_go_binary) || { _web_no_binary_error; return 1; }
     _web_start_go "$go_bin"
 }
 
-# ==============================================================================

@@ -5,11 +5,10 @@
 .\" Or:
 .\"   nroff -man man/milog.1 | less
 .\"
-.\" Source-of-truth note: when adding a new mode to src/dispatch.sh's per-cmd
-.\" help registry, mirror it under COMMANDS below. CI does not yet enforce
-.\" sync; reviewers should eyeball it.
+.\" Every command in src/dispatch.sh needs an entry under COMMANDS;
+.\" tests/smoke_docs_drift.sh fails CI when one is missing.
 .\"
-.TH MILOG 1 "2026-05-01" "milog" "User Commands"
+.TH MILOG 1 "2026-10-03" "milog" "User Commands"
 .SH NAME
 milog \- single-host nginx + system + app-error monitor with alerts
 .SH SYNOPSIS
@@ -90,6 +89,10 @@ and
 is on
 .BR PATH .
 .TP
+.BR top-ip-by-app " [\fIN\fR]"
+Top \fIN\fR source IPs per app (default 5). Alias:
+.BR top-by-app .
+.TP
 .BR top-paths " [\fIN\fR]"
 Top \fIN\fR URLs by req / 4xx / 5xx / p95. Excludes
 .B SLOW_EXCLUDE_PATHS
@@ -126,6 +129,12 @@ Suggest threshold values from history data.
 .B replay " \fIFILE\fR"
 Postmortem for one archived log file.
 .SS Search and filter
+.TP
+.B logs
+Tail every configured source with a coloured prefix per source. Same as
+running
+.B milog
+with no command.
 .TP
 .B search " \fIPATTERN\fR [\fIFLAGS\fR]"
 Grep across current + archived log files.
@@ -191,6 +200,121 @@ Exec-summary for the period.
 .B doctor
 Diagnostic checklist \(em flags every degraded optional capability with a
 one-line fix.
+.SS Host audit
+.B audit
+runs point-in-time integrity scans. It reads no log files. Baselines and
+scan state live under
+.IR ~/.cache/milog/audit/
+(\fBALERT_STATE_DIR\fR/audit). With no subcommand, prints help. Each
+scanner defaults to \fBstatus\fR when its subcommand is omitted.
+\fBcheck\fR and \fBscan\fR exit 1 when they find drift or new matches,
+and when they cannot run (no baseline yet, \fByara\fR missing).
+.TP
+.B audit fim " \fBbaseline\fR | \fBcheck\fR | \fBstatus\fR"
+SHA256, mtime, and size of each path in
+.BR AUDIT_FIM_PATHS .
+.B check
+reports paths that were modified, removed, appeared, or became unreadable
+since the baseline.
+.TP
+.B audit persistence " \fBbaseline\fR | \fBcheck\fR | \fBstatus\fR"
+New files under
+.B AUDIT_PERSISTENCE_PATHS
+(default: cron directories and spools, systemd units and timers,
+.IR /etc/rc.local ,
+.IR /etc/ld.so.preload ).
+.B check
+lists removed files too but exits 1 only for new ones.
+.TP
+.B audit ports " \fBbaseline\fR | \fBcheck\fR | \fBstatus\fR"
+TCP and UDP listeners read from
+.BR ss (8),
+or
+.BR netstat (8)
+when
+.B ss
+is missing.
+.B check
+exits 1 only for new listeners.
+.TP
+.B audit yara " \fBinit\fR | \fBscan\fR | \fBstatus\fR"
+.B init
+writes default rules to
+.B milog-default.yar
+in
+.B AUDIT_YARA_RULES_DIR
+(default
+.IR ~/.config/milog/yara ).
+.B scan
+runs
+.BR yara (1)
+over
+.B AUDIT_YARA_PATHS
+and prints matches not reported before. Needs the
+.B yara
+binary and a non-empty
+.BR AUDIT_YARA_PATHS .
+.TP
+.B audit accounts " \fBbaseline\fR | \fBcheck\fR | \fBstatus\fR"
+Line-level diff of the files in
+.B AUDIT_ACCOUNTS_PATHS
+(default:
+.IR /etc/passwd ,
+sudoers, and root and
+.I /home/*
+authorized_keys files).
+.B check
+exits 1 only for added lines.
+.TP
+.B audit rootkit " \fBcheck\fR | \fBstatus\fR"
+Heuristics: more PIDs in
+.I /proc
+than
+.BR ps (1)
+lists (by more than 5), an
+.I /etc/ld.so.preload
+file, processes running from
+.IR /tmp ,
+.IR /var/tmp ,
+or
+.IR /dev/shm ,
+and processes whose executable was deleted. Linux only;
+.B check
+exits 1 on other systems.
+.PP
+When
+.B AUDIT_ENABLED=1
+and
+.B milog daemon
+is running, each scanner runs on its
+.B AUDIT_*_INTERVAL
+timer and fires an
+.B audit:<scanner>:...
+alert on drift. The fim, persistence, ports, and accounts scanners
+record a baseline on their first run instead of alerting.
+.SS Kernel observability
+.TP
+.B probe " \fBstatus\fR | \fBinstall-service\fR | \fBuninstall-service\fR"
+Manages the
+.B milog-probe
+eBPF sidecar (Linux only) as the systemd unit
+.IR /etc/systemd/system/milog-probe.service .
+.B status
+shows whether the unit is active.
+.B install-service
+needs root: it writes the unit, sets
+.B HOME
+and
+.B MILOG_CONFIG
+to the invoking user's so alerts use that user's config, and runs
+.BR "systemctl enable --now" .
+.B MILOG_PROBE_FILE_ALLOWLIST
+overrides the default file-event allowlist written into the unit.
+.B MILOG_PROBE_BIN
+overrides the binary path.
+.B uninstall-service
+needs root and stops, disables, and removes the unit.
+With no subcommand, prints help.
 .SS Distribution
 .TP
 .B install " \fIFEATURE\fR"
@@ -208,7 +332,7 @@ Install / print shell completion script.
 Synthetic-fixture timing harness for CI baseline comparison.
 .SH GLOBAL HELP
 .TP
-.B milog --help
+.BR "milog help" ", " "milog --help"
 List all commands (slim main help).
 .TP
 .B milog \fICOMMAND\fR --help

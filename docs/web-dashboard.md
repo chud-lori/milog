@@ -71,10 +71,11 @@ Read this before ever pointing `--bind` at anything other than loopback.
 
 - **Binds to `127.0.0.1` by default.** Non-loopback binds require
   `--trust` to force explicit consent — refuses otherwise.
-- **Every request is token-gated.** The token is 32 bytes of
+- **Every data route is token-gated.** The token is 32 bytes of
   `/dev/urandom` at `~/.config/milog/web.token` (mode 600). Accepted
   via `?t=TOKEN` query (first page load) or
-  `Authorization: Bearer TOKEN` header (API calls).
+  `Authorization: Bearer TOKEN` header (API calls). Only `/healthz`
+  and the `/static/*` CSS, JS, and icon are public; they carry no log data.
 - **All routes are read-only.** No endpoint mutates config, webhook,
   history, systemd state, or the alerts log. The worst an attacker
   with the token can do is read what `milog monitor` already shows.
