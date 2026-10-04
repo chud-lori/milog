@@ -22,14 +22,23 @@ _milog_companions() {
     if p=$(_probe_binary);    then printf 'milog-probe\t%s\n' "$p"; fi
 }
 
-# Version a companion reports for --version; the timeout covers milog-web builds that predate the flag and start serving instead.
+# Version a companion reports for --version; the 3s cap covers milog-web builds that predate the flag and start serving instead.
 _companion_version() {
-    local name="$1" bin="$2" out=""
-    if command -v timeout >/dev/null 2>&1; then
-        out=$(timeout 3 "$bin" --version 2>/dev/null | head -1) || true
-    else
-        out=$("$bin" --version 2>/dev/null | head -1) || true
-    fi
+    local name="$1" bin="$2" out f pid
+    f=$(mktemp) || { printf 'unknown'; return; }
+    # set -m gives the job its own process group, so one kill also reaches its children.
+    set -m
+    "$bin" --version >"$f" 2>/dev/null &
+    pid=$!
+    set +m
+    for _ in $(seq 30); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -- "-$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    out=$(head -1 "$f")
+    rm -f "$f"
     if [[ "$out" != "$name "* ]]; then
         printf 'unknown'; return
     fi

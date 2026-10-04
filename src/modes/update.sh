@@ -1,13 +1,21 @@
 # milog update: replaces milog and its installed companion binaries with the latest GitHub release.
 # checksums.txt comes from the same release, so it catches corruption, not a compromised release.
 
-# Latest release tag of repo $1, empty when none; /releases/latest redirects to /releases/tag/<tag>.
+# Latest release tag of repo $1, empty when none; fails when GitHub is unreachable.
 _release_latest_tag() {
-    local loc
+    local loc rc=0
+    # /releases/latest redirects to /releases/tag/<tag> and answers 404 (curl exit 22) when there is no release.
     loc=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
-        "https://github.com/$1/releases/latest" 2>/dev/null) || return 0
+        "https://github.com/$1/releases/latest" 2>/dev/null) || rc=$?
+    (( rc == 0 || rc == 22 )) || return 1
     [[ "$loc" =~ /tag/([^/?#]+) ]] && printf '%s' "${BASH_REMATCH[1]}"
     return 0
+}
+
+# Commit SHA that tag $2 of repo $1 points at, empty when it cannot be resolved.
+_release_tag_sha() {
+    curl -fsSL --max-time 15 -H 'Accept: application/vnd.github.sha' \
+        "https://api.github.com/repos/$1/commits/$2" 2>/dev/null || true
 }
 
 _release_os_slug() {
@@ -97,15 +105,26 @@ mode_update() {
         *) echo -e "${R}update: unknown option '$1'${NC} (usage: milog update [--check])" >&2; return 1 ;;
     esac
 
-    local repo="${MILOG_RELEASE_REPO:-chud-lori/milog}" self cur tag
+    local repo="${MILOG_RELEASE_REPO:-chud-lori/milog}" self cur tag cur_sha tag_sha up_to_date=0
     self=$(_milog_self)
     cur=$(_milog_stamp VERSION)
-    tag=$(_release_latest_tag "$repo")
+    if ! tag=$(_release_latest_tag "$repo"); then
+        echo -e "${R}update: could not reach github.com to look up the latest release of ${repo}${NC}" >&2
+        return 1
+    fi
     if [[ -z "$tag" ]]; then
         echo -e "${R}update: no release found for ${repo}${NC}" >&2
         return 1
     fi
     if ! _version_older "$cur" "$tag"; then
+        up_to_date=1
+    elif [[ "$cur" =~ -g([0-9a-f]{7,40})(-dirty)?$ ]]; then
+        # Bundles built before build.sh used --tags name an old tag but carry the release commit's SHA.
+        cur_sha="${BASH_REMATCH[1]}"
+        tag_sha=$(_release_tag_sha "$repo" "$tag")
+        [[ -n "$tag_sha" && "$tag_sha" == "$cur_sha"* ]] && up_to_date=1
+    fi
+    if (( up_to_date )); then
         echo "milog ${cur} is up to date (latest release: ${tag})"
         return 0
     fi
@@ -118,19 +137,22 @@ mode_update() {
         echo -e "${R}update: ${self} is in a git checkout; update it with git pull && bash build.sh${NC}" >&2
         return 1
     fi
-    local hint
-    if hint=$(_update_pkg_hint "$self" "$tag"); then
-        echo -e "${R}update: ${self} belongs to a system package; update it through the package manager:${NC}" >&2
-        echo "$hint" >&2
-        return 1
-    fi
-
-    local -a names=(milog) paths=("$self")
-    local name path
+    local -a names=() paths=()
+    local name path hint
     while IFS=$'\t' read -r name path; do
         names+=("$name")
         paths+=("$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")")
     done < <(_milog_companions)
+    # milog goes last: its stamp is what the next run compares, so a partial update still reads as outdated.
+    names+=(milog)
+    paths+=("$self")
+    for path in "${paths[@]}"; do
+        if hint=$(_update_pkg_hint "$path" "$tag"); then
+            echo -e "${R}update: ${path} belongs to a system package; update it through the package manager:${NC}" >&2
+            echo "$hint" >&2
+            return 1
+        fi
+    done
     for path in "${paths[@]}"; do
         if [[ ! -w "$(dirname "$path")" ]]; then
             echo -e "${R}update: $(dirname "$path") is not writable; run: sudo milog update${NC}" >&2
@@ -183,11 +205,22 @@ mode_update() {
         staged[i]="$t"
     done
 
-    local changed=0
+    local changed=0 j
+    local -a left=()
     for i in "${!staged[@]}"; do
         [[ -n "${staged[i]}" ]] || continue
         # A rename leaves the running script's open inode intact.
-        mv -f "${staged[i]}" "${paths[i]}"
+        if ! mv -f "${staged[i]}" "${paths[i]}"; then
+            for j in "${!staged[@]}"; do
+                (( j >= i )) && [[ -n "${staged[j]}" ]] || continue
+                rm -f "${staged[j]}"
+                left+=("${paths[j]}")
+            done
+            echo -e "${R}update: could not replace ${paths[i]}; these were not updated:${NC}" >&2
+            printf '  %s\n' "${left[@]}" >&2
+            (( changed == 0 )) || echo -e "${Y}update: files listed as updated above are already ${tag}; rerun milog update once the error is fixed${NC}" >&2
+            return 1
+        fi
         echo "updated ${paths[i]}"
         changed=$((changed + 1))
     done

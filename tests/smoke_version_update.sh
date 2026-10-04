@@ -48,23 +48,30 @@ out="" url=""
 while (( $# )); do
     case "$1" in
         -o) out="$2"; shift 2 ;;
-        -w|--retry|--retry-delay|--max-time) shift 2 ;;
+        -w|-H|--retry|--retry-delay|--max-time) shift 2 ;;
         -*) shift ;;
         *)  url="$1"; shift ;;
     esac
 done
 echo "$url" >> "$CURL_LOG"
+[[ "${FAKE_OFFLINE:-0}" == 1 ]] && exit 6
 if [[ "$url" == https://github.com/test/milog/releases/latest ]]; then
     printf 'https://github.com/test/milog/releases/tag/v9.9.9'; exit 0
+fi
+if [[ "$url" == https://api.github.com/repos/test/milog/commits/v9.9.9 ]]; then
+    printf 'fcec8451111111111111111111111111111111111'; exit 0
 fi
 [[ "$url" == https://github.com/test/milog/releases/download/v9.9.9/* ]] || exit 22
 [[ -f "$FAKE_RELEASE/${url##*/}" ]] || exit 22
 cp "$FAKE_RELEASE/${url##*/}" "$out"
 EOF
 for pm in rpm apk pacman; do printf '#!/bin/sh\nexit 1\n' > "$tmp/stub/$pm"; done
-printf '#!/bin/sh\n[ "${FAKE_DPKG_OWNS:-0}" = 1 ]\n' > "$tmp/stub/dpkg"
+printf '#!/bin/sh\n[ "$2" = "$FAKE_DPKG_OWNS" ]\n' > "$tmp/stub/dpkg"
 printf '#!/bin/sh\n[ "$1 $3" = "is-active milog.service" ]\n' > "$tmp/stub/systemctl"
+real_mv=$(command -v mv)
+printf '#!/bin/sh\ncase "$3" in "$FAKE_MV_FAIL") exit 1 ;; esac\nexec %s "$@"\n' "$real_mv" > "$tmp/stub/mv"
 chmod 0755 "$tmp/stub"/*
+export FAKE_DPKG_OWNS="" FAKE_MV_FAIL=""
 export PATH="$tmp/stub:$PATH"
 
 # Installed milog stamped $1 plus milog-web and milog-tui (no milog-probe), reached through a symlink.
@@ -89,8 +96,15 @@ out=$("$tmp/link/milog" version) || fail "version exited non-zero"
 [[ "$out" != *milog-probe* ]] || fail "version listed a probe that is not installed: $out"
 [[ "$("$tmp/link/milog" --version)" == "$out" ]] || fail "--version differs from version"
 
-# Up to date, and a dev build ahead of the release, change nothing.
-for v in v9.9.9 v9.9.9-3-gabc1234; do
+# A companion that ignores --version and keeps running is cut off and reported as unknown.
+printf '#!/bin/sh\nsleep 30\n' > "$tmp/bin/milog-web"
+start=$(date +%s)
+out=$("$tmp/link/milog" version) || fail "version exited non-zero with a hanging companion"
+(( $(date +%s) - start < 10 )) || fail "version waited on a hanging companion"
+[[ "$out" == *"milog-web    unknown"* ]] || fail "hanging companion not reported unknown: $out"
+
+# Up to date, a dev build ahead of the release, and an old-tag stamp on the release commit change nothing.
+for v in v9.9.9 v9.9.9-3-gabc1234 v0.3.0-127-gfcec845; do
     install_old "$v"
     before=$(snap)
     out=$("$tmp/link/milog" update) || fail "update on $v exited non-zero"
@@ -99,8 +113,8 @@ for v in v9.9.9 v9.9.9-3-gabc1234; do
     [[ "$(snap)" == "$before" ]] || fail "update on $v changed files"
 done
 
-# --check exits 10 for an older stamp, including mis-stamped and unparseable ones, and changes nothing.
-for v in v0.1.0 v0.3.0-127-gfcec845 abc1234 unknown; do
+# --check exits 10 for an older stamp, another commit's SHA, or an unparseable stamp, and changes nothing.
+for v in v0.1.0 v0.3.0-127-gdeadbee abc1234 unknown; do
     install_old "$v"
     before=$(snap)
     rc=0; "$tmp/link/milog" update --check >/dev/null || rc=$?
@@ -111,15 +125,32 @@ done
 install_old v0.1.0
 before=$(snap)
 
+if out=$(FAKE_OFFLINE=1 "$tmp/link/milog" update --check 2>&1); then fail "offline check succeeded"; fi
+[[ "$out" == *"could not reach github.com"* ]] || fail "offline: $out"
+
 printf 'x' >> "$tmp/release/$archive"
 if out=$("$tmp/link/milog" update 2>&1); then fail "tampered tarball did not abort"; fi
 [[ "$out" == *"checksum mismatch"* ]] || fail "tampered tarball: $out"
 [[ "$(snap)" == "$before" ]] || fail "tampered tarball changed files"
 cp "$tmp/good.tar.gz" "$tmp/release/$archive"
 
-if out=$(FAKE_DPKG_OWNS=1 "$tmp/link/milog" update 2>&1); then fail "package-owned milog was updated"; fi
-[[ "$out" == *"sudo apt install ./milog_9.9.9_linux_"*.deb* ]] || fail "package-owned: $out"
-[[ "$(snap)" == "$before" ]] || fail "package-owned refusal changed files"
+for owned in milog milog-tui; do
+    if out=$(FAKE_DPKG_OWNS="$tmp/bin/$owned" "$tmp/link/milog" update 2>&1); then fail "package-owned $owned was updated"; fi
+    [[ "$out" == *"sudo apt install ./milog_9.9.9_linux_"*.deb* ]] || fail "package-owned $owned: $out"
+    [[ "$(snap)" == "$before" ]] || fail "package-owned $owned refusal changed files"
+done
+
+# A failed rename stops the update, names what was not replaced, and leaves no staged files.
+if out=$(FAKE_MV_FAIL="$tmp/bin/milog-tui" "$tmp/link/milog" update 2>&1); then fail "failed rename reported success"; fi
+[[ "$out" == *"could not replace $tmp/bin/milog-tui"* ]] || fail "failed rename: $out"
+[[ "$out" == *"updated $tmp/bin/milog-web"* ]] || fail "failed rename did not list the updated file: $out"
+[[ "$out" == *"  $tmp/bin/milog"$'\n'* || "$out" == *"  $tmp/bin/milog" ]] || fail "failed rename did not list milog as not updated: $out"
+cmp -s "$tmp/bin/milog-web" "$tmp/pkg/milog-web" || fail "milog-web should have been replaced before the failure"
+[[ "$(ls -A "$tmp/bin")" == "$(printf 'milog\nmilog-tui\nmilog-web')" ]] || fail "staged files left behind: $(ls -A "$tmp/bin")"
+rc=0; "$tmp/link/milog" update --check >/dev/null || rc=$?
+[[ "$rc" == 10 ]] || fail "after a partial update --check exited $rc, want 10"
+install_old v0.1.0
+before=$(snap)
 
 # Root writes anywhere, so the unwritable case drops to nobody when the test runs as root.
 chmod 0555 "$tmp/bin"
@@ -129,7 +160,7 @@ if [[ "$(id -u)" == 0 ]]; then
     chmod -R a+rX "$tmp"
     chmod a+w "$tmp/home"
 fi
-if out=$("${as_user[@]}" "$tmp/link/milog" update 2>&1); then fail "unwritable install was updated"; fi
+if out=$(${as_user[@]+"${as_user[@]}"} "$tmp/link/milog" update 2>&1); then fail "unwritable install was updated"; fi
 [[ "$out" == *"run: sudo milog update"* ]] || fail "unwritable: $out"
 chmod 0755 "$tmp/bin"
 [[ "$(snap)" == "$before" ]] || fail "unwritable refusal changed files"
