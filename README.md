@@ -36,12 +36,14 @@ Everything in-depth lives under [`docs/`](docs/) — skim the
 
 - [**Configuration**](docs/configuration.md) — variables, env overrides, nginx `log_format`
 - [**Alerts**](docs/alerts.md) — Discord / Slack / Telegram / Matrix setup, rule catalog, history
+- [**Ban hooks**](docs/ban-hooks.md) — pass exploit source IPs to fail2ban or an nftables set
 - [**Host integrity audits**](docs/audit.md) — `milog audit` (fim / rootkit / persistence / ports / accounts / yara), provocations to verify detection
 - [**Web dashboard**](docs/web-dashboard.md) — `milog web`, systemd user service, SSH / Tailscale / Cloudflare Tunnel exposure patterns
 - [**Historical metrics**](docs/historical-metrics.md) — SQLite time series, `trend` / `diff` / `auto-tune`
 - [**`milog daemon`**](docs/daemon.md) — headless mode, systemd service, permissions
 - [**Kernel observability (`milog probe`)**](docs/probe.md) — eBPF sidecar, the 8 probes, `install-service`, allowlist tuning
 - [**GeoIP enrichment**](docs/geoip.md) — MaxMind license + weekly auto-refresh
+- [**CrowdSec CTI enrichment**](docs/crowdsec-cti.md) — opt-in IP reputation in `attacker`, `suspects` and exploit/probe alerts
 - [**Troubleshooting**](docs/troubleshooting.md) — `milog doctor` + common failure modes
 
 Plus: [ARCHITECTURE.md](ARCHITECTURE.md) for contributors and
@@ -150,6 +152,11 @@ milog alerts 24h
 sudo milog probe install-service
 sudo journalctl -u milog-probe.service -f
 ```
+
+The probe does not alert on milog's own webhook sends (`curl` inside
+`milog.service` or `milog-probe.service`). Its comm allowlists also
+match a thread's process name, so `YDService` covers that agent's
+`ParseLoop` thread. Tuning: [docs/probe.md](docs/probe.md).
 
 Full command list: `milog help`.
 

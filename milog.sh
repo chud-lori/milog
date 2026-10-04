@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-43-g03b8420
-# MILOG_BUILT=2026-10-04T03:37:49Z
+# MILOG_VERSION=v0.6.0-44-g985f0f2-dirty
+# MILOG_BUILT=2026-10-04T04:18:25Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -114,6 +114,9 @@ SLOW_EXCLUDE_PATHS="/ws/* /socket.io/*"
 GEOIP_ENABLED=0
 MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
+# CrowdSec CTI reputation lookups; empty means milog never contacts the API.
+CROWDSEC_CTI_KEY=""
+
 # History needs sqlite3; the daemon writes one row per app per minute.
 HISTORY_ENABLED=0
 HISTORY_DB="$HOME/.local/share/milog/metrics.db"
@@ -189,6 +192,7 @@ fi
 [[ -n "${MILOG_MATRIX_ROOM:-}"        ]] && MATRIX_ROOM="$MILOG_MATRIX_ROOM"
 [[ -n "${MILOG_GEOIP_ENABLED:-}"   ]] && GEOIP_ENABLED="$MILOG_GEOIP_ENABLED"
 [[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
+[[ -n "${MILOG_CROWDSEC_CTI_KEY:-}" ]] && CROWDSEC_CTI_KEY="$MILOG_CROWDSEC_CTI_KEY"
 [[ -n "${MILOG_HISTORY_ENABLED:-}" ]] && HISTORY_ENABLED="$MILOG_HISTORY_ENABLED"
 [[ -n "${MILOG_HISTORY_DB:-}"      ]] && HISTORY_DB="$MILOG_HISTORY_DB"
 [[ -n "${MILOG_ANOMALY_ENABLED:-}"   ]] && ANOMALY_ENABLED="$MILOG_ANOMALY_ENABLED"
@@ -706,12 +710,12 @@ _alert_route_for() {
 }
 
 # Runs every executable in HOOKS_DIR/on_alert.d/ in the background with MILOG_RULE_KEY, MILOG_TITLE, MILOG_BODY,
-# MILOG_SEV, MILOG_COLOR and MILOG_TS set. Non-zero exits are logged to hooks.log, never propagated.
+# MILOG_SEV, MILOG_COLOR, MILOG_TS and MILOG_IP set. Non-zero exits are logged to hooks.log, never propagated.
 _alert_run_hooks() {
     local hook_dir="${HOOKS_DIR:-$HOME/.config/milog/hooks}/on_alert.d"
     [[ -d "$hook_dir" ]] || return 0
 
-    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}" ip="${5:-}"
     local sev
     case "$color" in
         15158332|16711680)  sev=crit ;;
@@ -739,6 +743,7 @@ _alert_run_hooks() {
                       MILOG_SEV="$sev"           \
                       MILOG_COLOR="$color"       \
                       MILOG_TS="$ts"             \
+                      MILOG_IP="$ip"             \
                       timeout "$timeout_s" "$hook" 2>&1)
                 rc=$?
             else
@@ -748,6 +753,7 @@ _alert_run_hooks() {
                       MILOG_SEV="$sev"           \
                       MILOG_COLOR="$color"       \
                       MILOG_TS="$ts"             \
+                      MILOG_IP="$ip"             \
                       "$hook" 2>&1)
                 rc=$?
             fi
@@ -762,10 +768,10 @@ _alert_run_hooks() {
     done
 }
 
-# alert_fire <title> <body> [color] [rule_key]. Each destination is sent in the background.
+# alert_fire <title> <body> [color] [rule_key] [ip]. Each destination is sent in the background; ip only reaches hooks.
 alert_fire() {
     [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
-    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}" ip="${5:-}"
     # Silenced fires are not recorded either; the silence row is the audit trail.
     if [[ -n "$rule_key" ]] && alert_is_silenced "$rule_key" >/dev/null; then
         return 0
@@ -774,7 +780,7 @@ alert_fire() {
     _alert_record "$rule_key" "$title" "$body" "$color"
 
     # Hooks run before the curl check; they don't need it.
-    _alert_run_hooks "$title" "$body" "$color" "$rule_key"
+    _alert_run_hooks "$title" "$body" "$color" "$rule_key" "$ip"
 
     command -v curl >/dev/null 2>&1 || return 0
 
@@ -1510,6 +1516,86 @@ geoip_country() {
     out=$(mmdblookup --file "$MMDB_PATH" --ip "$1" country iso_code 2>/dev/null \
           | awk -F'"' 'NF>=3 {print $2; exit}')
     printf '%s' "${out:-—}"
+}
+
+# Prints "<reputation> (<behaviors>)", or "unknown" when CTI has no record; empty when off or failing.
+# Results are cached per IP for a day; pass `cached` to skip the network. Failures land in cti.err for doctor.
+cti_lookup() {
+    local ip="${1-}" dir="$ALERT_STATE_DIR/cti"
+    [[ -n "${CROWDSEC_CTI_KEY:-}" ]] || return 0
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || ( "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:.]*[0-9a-fA-F][0-9a-fA-F:.]*$ ) ]] || return 0
+    ip=$(printf '%s' "$ip" | tr A-F a-f)
+    local f="$dir/$ip" mtime
+    if [[ -f "$f" ]]; then
+        mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+        if (( $(date +%s) - mtime < 86400 )); then
+            cat "$f"
+            return 0
+        fi
+    fi
+    [[ "${2:-}" == cached ]] && return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    # After a 429 every request would fail too, so pause lookups for 15 minutes.
+    [[ -n "$(find "$dir/.backoff" -mmin -15 2>/dev/null)" ]] && return 0
+    local err="$ALERT_STATE_DIR/cti.err"
+    # The key goes into a curl config on stdin, so a quote or newline would break out of it.
+    if [[ "$CROWDSEC_CTI_KEY" == *[\"\\[:space:]]* ]]; then
+        printf '%s\tCROWDSEC_CTI_KEY contains quotes, backslashes or whitespace\n' "$(date +%s)" > "$err"
+        return 0
+    fi
+    local resp code="" summary="" body
+    resp=$(mktemp "$dir/.resp.XXXXXX" 2>/dev/null) || return 0
+    code=$(printf 'header = "x-api-key: %s"\n' "$CROWDSEC_CTI_KEY" \
+        | curl -s -m 3 --max-filesize 65536 -K - -o "$resp" -w '%{http_code}' \
+              "https://cti.api.crowdsec.net/v2/smoke/$ip" 2>/dev/null) || true
+    case "$code" in
+        200) summary=$(tr -d '\n' < "$resp" | _cti_summary) ;;
+        # Only a JSON error object counts as "no record"; a proxy or HTML 404 is a failure.
+        404) body=$(tr -d '[:space:]' < "$resp")
+             [[ "$body" == "{"* && "$body" != *'"ip"'* ]] && summary="unknown" ;;
+        429) touch "$dir/.backoff" ;;
+    esac
+    rm -f "$resp"
+    if [[ -z "$summary" ]]; then
+        printf '%s\tHTTP %s for %s\n' "$(date +%s)" "${code:-000}" "$ip" > "$err"
+        return 0
+    fi
+    rm -f "$err"
+    printf '%s\n' "$summary" > "$f"
+    printf '%s\n' "$summary"
+}
+
+# Reads one smoke-API JSON object on a single line; output is limited to [A-Za-z0-9 :._,()/-].
+_cti_summary() {
+    awk '
+        { s = s $0 }
+        END {
+            if (!match(s, /"reputation" *: *"[a-z_]*"/)) exit
+            rep = substr(s, RSTART, RLENGTH)
+            sub(/^"reputation" *: *"/, "", rep); sub(/"$/, "", rep)
+            labels = ""; n = 0
+            if (match(s, /"behaviors" *: *\[[^]]*\]/)) {
+                b = substr(s, RSTART, RLENGTH)
+                while (n < 3 && match(b, /"label" *: *"[^"]*"/)) {
+                    l = substr(b, RSTART, RLENGTH)
+                    b = substr(b, RSTART + RLENGTH)
+                    sub(/^"label" *: *"/, "", l); sub(/"$/, "", l)
+                    labels = labels (n++ ? ", " : "") l
+                }
+            }
+            out = rep (labels != "" ? " (" labels ")" : "")
+            gsub(/[^A-Za-z0-9 :._,()\/-]/, "", out)
+            print out
+        }'
+}
+
+# Alert-body suffix for exploit and probe alerts; looks up only when alerts are on.
+cti_alert_note() {
+    [[ "${ALERTS_ENABLED:-0}" == "1" ]] || return 0
+    local s; s=$(cti_lookup "${1-}")
+    [[ -n "$s" ]] && printf '\nCrowdSec: %s' "$s"
+    return 0
 }
 
 # p95 for the monitor row, cached per app per minute so a 5s refresh doesn't rescan the log.
@@ -2429,6 +2515,8 @@ mode_attacker() {
     printf "  %-14s %s\n"  "first seen:" "${first_seen:-?}"
     printf "  %-14s %s\n"  "last seen:"  "${last_seen:-?}"
     printf "  %-14s %d of %d\n" "apps touched:" "$apps_hit" "${#LOGS[@]}"
+    local cti; cti=$(cti_lookup "$ip")
+    [[ -n "$cti" ]] && printf "  %-14s %s\n" "crowdsec:" "$cti"
 
     echo -e "\n  ${W}per-app${NC}"
     awk -F'\t' '
@@ -4445,6 +4533,9 @@ config_init() {
 # GEOIP_ENABLED=0
 # MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
+# CrowdSec CTI reputation in attacker, suspects and exploit/probe alerts. Free key at app.crowdsec.net.
+# CROWDSEC_CTI_KEY=""
+
 # Historical metrics — requires sqlite3; writes from `milog daemon` only.
 # HISTORY_ENABLED=0
 # HISTORY_DB="$HOME/.local/share/milog/metrics.db"
@@ -4599,7 +4690,7 @@ config_validate() {
         ALERT_LOG_MAX_BYTES ALERT_ROUTES
         HOOKS_DIR ALERT_HOOK_TIMEOUT
         P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
-        GEOIP_ENABLED MMDB_PATH
+        GEOIP_ENABLED MMDB_PATH CROWDSEC_CTI_KEY
         HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS HISTORY_TOP_IP_N
         WEB_PORT WEB_BIND WEB_STATE_DIR WEB_TOKEN_FILE
         THRESH_REQ_WARN THRESH_REQ_CRIT
@@ -5309,6 +5400,21 @@ mode_doctor() {
         fi
     fi
 
+    _doc_head "crowdsec cti"
+    if [[ -z "${CROWDSEC_CTI_KEY:-}" ]]; then
+        _doc_ok "off  (CROWDSEC_CTI_KEY empty, no lookups)"
+    elif [[ -s "$ALERT_STATE_DIR/cti.err" ]]; then
+        local cti_paused=""
+        [[ -n "$(find "$ALERT_STATE_DIR/cti/.backoff" -mmin -15 2>/dev/null)" ]] && cti_paused="  (lookups paused for 15 min)"
+        _doc_warn "last lookup failed: $(cut -f2 "$ALERT_STATE_DIR/cti.err")${cti_paused}" \
+                  "401/403: key rejected; 429: rate limit hit; 000: no answer within 3s"
+        warn=$(( warn + 1 ))
+    else
+        local cti_cached
+        cti_cached=$(find "$ALERT_STATE_DIR/cti" -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+        _doc_ok "on  (${cti_cached} IPs cached in $ALERT_STATE_DIR/cti)"
+    fi
+
     # Web dashboard.
     _doc_head "web dashboard"
     local web_bin
@@ -5596,7 +5702,7 @@ mode_exploits() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "exploit:$app:$cat_slug" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_fire "Exploit attempt: $app / $cat_slug" "$(_alert_fence "${line:0:1800}")" 15158332 "exploit:$app:$cat_slug" &
+                        alert_fire "Exploit attempt: $app / $cat_slug" "$(_alert_fence "${line:0:1800}")$(cti_alert_note "${line%% *}")" 15158332 "exploit:$app:$cat_slug" "${line%% *}" &
                     fi
                 done
             ) &
@@ -6532,7 +6638,7 @@ mode_probes() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_fire "Probe traffic: $app" "$(_alert_fence "${line:0:1800}")" 15844367 "probe:$app" &
+                        alert_fire "Probe traffic: $app" "$(_alert_fence "${line:0:1800}")$(cti_alert_note "${line%% *}")" 15844367 "probe:$app" "${line%% *}" &
                     fi
                 done
             ) &
@@ -7375,8 +7481,11 @@ mode_suspects() {
 
     [[ -z "$ranked" ]] && { echo; return 0; }
 
-    local sc ip req e4 e5 p_count flags c country
+    local sc ip req e4 e5 p_count flags c country cti
     while IFS=$'\t' read -r sc ip req e4 e5 p_count flags; do
+        # Cache only: a network lookup per row would stall the table and burn the API quota.
+        cti=$(cti_lookup "$ip" cached)
+        [[ -n "$cti" && "$cti" != unknown ]] && flags="${flags:+$flags }CS:${cti%% *}"
         c=$G
         (( sc >= 10 )) && c=$Y
         (( sc >= 30 )) && c=$R
