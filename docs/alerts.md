@@ -166,7 +166,7 @@ the three Matrix vars — the alert would silently no-op otherwise.
 | Audit ports       | `audit:ports:<proto>:<port>`         | new TCP/UDP listener appeared                                                |
 | Audit YARA        | `audit:yara:<rule>:<path>`           | YARA rule hit on a webroot file                                              |
 | Audit rootkit     | `audit:rootkit:<heuristic>`          | hidden-process / `ld.so.preload` / tmp-exec heuristic                        |
-| Probe — process   | `process:shell_from_web_worker:…` `process:exec_from_tmp:<comm>` `process:suid_escalation:…` | eBPF sidecar — see [`docs/probe.md`](probe.md)        |
+| Probe — process   | `process:shell_from_web_worker:…` `process:exec_from_tmp:<comm>` `process:suid_escalation:…` `process:web_triggered_exec:…` | eBPF sidecar — see [`docs/probe.md`](probe.md)        |
 | Probe — file      | `file:sensitive_read:<comm>:<path>`  | non-allowlisted process opened a sensitive file                              |
 | Probe — net       | `net:unexpected_outbound:<comm>` `net:retrans_spike:<dst>:<port>` | outbound connect to non-allowlisted dest, or sustained TCP retransmits      |
 | Probe — kernel    | `proc:ptrace_inject:<comm>` `proc:kmod_load:<module>` `proc:bpf_load:<comm>` `process:syscall_burst:<comm>` | ptrace attach by non-debugger, kernel module load, BPF program load, per-PID syscall σ-anomaly |

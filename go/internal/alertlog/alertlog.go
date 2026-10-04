@@ -101,23 +101,11 @@ func LoadRange(path string, cutoff, until int64, maxRows int) ([]Row, error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
-		line := sc.Text()
-		parts := strings.SplitN(line, "\t", 5)
-		if len(parts) < 5 {
+		r, ok := ParseRow(sc.Text())
+		if !ok || r.TS < cutoff || (until > 0 && r.TS >= until) {
 			continue
 		}
-		ts, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil || ts < cutoff || (until > 0 && ts >= until) {
-			continue
-		}
-		color, _ := strconv.ParseInt(parts[2], 10, 64)
-		rows = append(rows, Row{
-			TS:    ts,
-			Rule:  parts[1],
-			Sev:   Severity(color),
-			Title: parts[3],
-			Body:  parts[4],
-		})
+		rows = append(rows, r)
 	}
 	if err := sc.Err(); err != nil {
 		return rows, err
@@ -127,4 +115,24 @@ func LoadRange(path string, cutoff, until int64, maxRows int) ([]Row, error) {
 		rows = rows[len(rows)-maxRows:]
 	}
 	return rows, nil
+}
+
+// ParseRow parses one alerts.log line; ok is false for malformed rows.
+func ParseRow(line string) (Row, bool) {
+	parts := strings.SplitN(line, "\t", 5)
+	if len(parts) < 5 {
+		return Row{}, false
+	}
+	ts, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return Row{}, false
+	}
+	color, _ := strconv.ParseInt(parts[2], 10, 64)
+	return Row{
+		TS:    ts,
+		Rule:  parts[1],
+		Sev:   Severity(color),
+		Title: parts[3],
+		Body:  parts[4],
+	}, true
 }
