@@ -54,8 +54,8 @@ _patterns_collect() {
         if [[ -z "$v" ]]; then
             if (( found >= 0 )); then
                 unset "out_names[$found]" "out_regex[$found]"
-                out_names=("${out_names[@]}")
-                out_regex=("${out_regex[@]}")
+                out_names=(${out_names[@]+"${out_names[@]}"})
+                out_regex=(${out_regex[@]+"${out_regex[@]}"})
             fi
             continue
         fi

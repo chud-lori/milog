@@ -51,7 +51,7 @@ _audit_fim_expand_paths() {
         fi
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    printf '%s\n' ${out[@]+"${out[@]}"} | sort -u
 }
 
 # Overwrites the baseline without alerting.
@@ -301,7 +301,7 @@ _audit_persistence_expand() {
         # Unmatched globs add nothing, but nullglob leaves literal paths in place even when they don't exist.
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    printf '%s\n' ${out[@]+"${out[@]}"} | sort -u
 }
 
 _audit_persistence_baseline() {
@@ -979,7 +979,7 @@ _audit_accounts_expand() {
         fi
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    printf '%s\n' ${out[@]+"${out[@]}"} | sort -u
 }
 
 # Prints `<count> <dir>`.
