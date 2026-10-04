@@ -8,7 +8,6 @@ mode_daemon() {
         _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
         exit 1
     fi
-    # rc=2 means warnings only → continue, user's been told.
 
     local hook_state
     hook_state="disabled"

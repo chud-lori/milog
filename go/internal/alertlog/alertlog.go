@@ -21,8 +21,7 @@ type Row struct {
 }
 
 // WindowToCutoff turns today | yesterday | all | Nh | Nd | Nw into the
-// oldest epoch to include; all is 0. There's no upper bound, so yesterday
-// includes today.
+// oldest epoch to include; all is 0. WindowToRange adds yesterday's end.
 func WindowToCutoff(w string, now time.Time) (int64, error) {
 	if w == "" {
 		w = "today"

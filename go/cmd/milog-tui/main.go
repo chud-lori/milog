@@ -27,7 +27,7 @@
 //	t           open the trend view
 //	H / S       open alert history / active silences
 //	s / x       silence the selected alert's rule / clear the selected silence
-//	esc / h     leave drill-down / alerts / paths / errors / trend → overview
+//	esc / h     leave any view → overview (closes the history detail first)
 package main
 
 import (
