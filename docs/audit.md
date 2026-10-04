@@ -50,6 +50,26 @@ These flow through the same `ALERT_ROUTES` / cooldown / silence /
 hooks plumbing as everything else (see [alerts.md](alerts.md)). You
 can route `audit:*` to a higher-severity channel, for instance.
 
+## Drift history
+
+With `HISTORY_ENABLED=1` as well, the daemon also stores each finding in
+the `audit_event` table of the history DB (see
+[historical-metrics.md](historical-metrics.md)). Silenced and
+cooled-down findings are stored too, and so are removals the scanners
+don't alert on (`ports`, `persistence` and `accounts` removed). A
+finding that persists across checks is stored once: per baseline for
+`fim`, `persistence`, `ports` and `accounts`, per retention window for
+`rootkit` (and for `accounts` baselines written before milog started
+recording a `.encoded` marker), and per new match for `yara`. `accounts` rows name the file, never the changed line.
+
+```bash
+milog audit history        # last 7 days, newest first
+milog audit history 30     # last 30 days
+```
+
+`milog tui` shows the same rows in its integrity view (`i`). Rows older
+than `HISTORY_RETAIN_DAYS` are pruned with the rest of the history DB.
+
 ## Verify it actually catches things
 
 Run these end-to-end at install time. Each one is a controlled
