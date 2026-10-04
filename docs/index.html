@@ -499,7 +499,7 @@
         </p>
         <ul>
           <li><code>exec</code>: a shell under a web worker, a binary run from /tmp</li>
-          <li><code>tcp</code> connects to destinations outside the allowlisted CIDRs</li>
+          <li><code>tcp</code> connects to destinations outside the allowlisted CIDRs, except milog's own alert sends</li>
           <li><code>file</code> opens of shadow, sudoers and SSH config by processes outside the allowlist</li>
           <li><code>ptrace</code>, <code>kmod</code>, <code>bpf-load</code></li>
           <li>Retransmits and syscall rate, Welford sigma</li>

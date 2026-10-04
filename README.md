@@ -151,6 +151,11 @@ sudo milog probe install-service
 sudo journalctl -u milog-probe.service -f
 ```
 
+The probe does not alert on milog's own webhook sends (`curl` inside
+`milog.service` or `milog-probe.service`). Its comm allowlists also
+match a thread's process name, so `YDService` covers that agent's
+`ParseLoop` thread. Tuning: [docs/probe.md](docs/probe.md).
+
 Full command list: `milog help`.
 
 ## Commands at a glance
