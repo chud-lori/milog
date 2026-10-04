@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-1-ged882df
-# MILOG_BUILT=2026-10-04T02:30:43Z
+# MILOG_VERSION=v0.6.0-3-gfd3bf76
+# MILOG_BUILT=2026-10-04T02:44:51Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -978,7 +978,7 @@ _rules_check() {
     for kind in exploit probe; do
         grep -q "^$kind"$'\t' "$f" || { echo "$f: no $kind rules" >&2; return 1; }
     done
-    while IFS=$'\t' read -r kind name re; do
+    while IFS=$'\t' read -r kind name re || [[ -n "$kind" ]]; do
         [[ -n "$kind" && "$kind" != \#* ]] || continue
         # Exit 2 is a bad regex; 0 means it matches an empty line and would flag every request.
         rc=0; grep -Eq -- "$re" <<< "" 2>/dev/null || rc=$?
@@ -5393,7 +5393,7 @@ mode_exploits() {
             (
                 app="$name"
                 tail -F "$file" 2>/dev/null | \
-                    grep --line-buffered -Ei "$RULES_EXPLOIT" | \
+                    grep --line-buffered -Ei -e "$RULES_EXPLOIT" | \
                 while IFS= read -r line; do
                     printf '%b[%s]%b %b[EXPLOIT]%b %s\n' "$col" "$label" "$NC" "$R" "$NC" "$(_tty_safe <<< "$line")"
                     cat_slug=$(_exploit_category "$line")
@@ -6302,7 +6302,7 @@ mode_probes() {
             (
                 app="$name"
                 tail -F "$file" 2>/dev/null | \
-                    grep --line-buffered -Ei "$RULES_PROBE" | \
+                    grep --line-buffered -Ei -e "$RULES_PROBE" | \
                 while IFS= read -r line; do
                     printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$(_tty_safe <<< "$line")"
                     # Dedup with exploits, which often matches the same scanner line.
@@ -7318,9 +7318,13 @@ mode_update_rules() {
     tmp=$(mktemp -d) || return 1
     # shellcheck disable=SC2064
     trap "rm -rf '$tmp'" RETURN
-    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/milog-rules.tsv" "${base}/milog-rules.tsv" 2>/dev/null \
-       || ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/checksums.txt" "${base}/checksums.txt" 2>/dev/null; then
-        echo -e "${R}update-rules: could not fetch milog-rules.tsv and checksums.txt from ${tag}${NC}" >&2
+    # Releases up to v0.6.0 predate the rules file, so a 404 here is expected.
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/milog-rules.tsv" "${base}/milog-rules.tsv" 2>/dev/null; then
+        echo -e "${R}update-rules: release ${tag} ships no rules file (or it could not be fetched)${NC}" >&2
+        return 1
+    fi
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/checksums.txt" "${base}/checksums.txt" 2>/dev/null; then
+        echo -e "${R}update-rules: could not fetch checksums.txt for ${tag}; refusing an unverified rules file${NC}" >&2
         return 1
     fi
 
