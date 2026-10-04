@@ -27,7 +27,6 @@ func TestFormatDuration(t *testing.T) {
 
 func TestHostname(t *testing.T) {
 	h := Hostname()
-	// Never panics, never returns "error" — empty is acceptable on weird
-	// kernels that fail os.Hostname().
+	// "" is acceptable when os.Hostname fails.
 	_ = h
 }

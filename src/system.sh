@@ -1,6 +1,4 @@
-# ==============================================================================
-# SYSTEM METRICS
-# ==============================================================================
+# System metrics from /proc.
 
 cpu_usage() {
     local s1 s2 t1 i1 t2 i2
@@ -40,8 +38,7 @@ fmt_bytes() {
     fi
 }
 
-# ASCII progress bar using only hyphen and equals — no wide-glyph block chars
-# $1=width  $2=value  $3=max → prints exactly $1 chars
+# Prints exactly $1 chars of `|` and `.`, scaled $2/$3; ASCII so wide glyphs can't break alignment.
 ascii_bar() {
     local width=$1 val=$2 max=${3:-100}
     [[ $max -le 0 ]] && max=1
@@ -60,8 +57,7 @@ tcol() {
     printf '%s' "$G"
 }
 
-# Unicode sparkline: reads space-separated ints on $1, prints sparkline chars.
-# Each sample scales to one of 8 block chars relative to the max in the series.
+# Scales each space-separated int in $1 to one of 8 block chars relative to the series max.
 sparkline_render() {
     local -a vals=( $1 )
     local -a blk=('▁' '▂' '▃' '▄' '▅' '▆' '▇' '█')
@@ -81,8 +77,7 @@ sparkline_render() {
     printf '%s' "$out"
 }
 
-# Wait up to $1 seconds for a single keypress. Prints the key if pressed, empty
-# on timeout. Needs an interactive tty; silent read so input doesn't echo.
+# Prints one keypress within $1 seconds, or nothing on timeout.
 wait_or_key() {
     local k
     if read -rsn1 -t "$1" k 2>/dev/null; then
@@ -90,7 +85,6 @@ wait_or_key() {
     fi
 }
 
-# Daemon/history stderr log — timestamped, never to stdout. Shared by any
-# code path that runs under mode_daemon (rule evaluator, history writers).
+# Daemon log to stderr; stdout stays clean.
 _dlog() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
 
