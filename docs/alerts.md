@@ -282,10 +282,11 @@ chmod +x ~/.config/milog/hooks/on_alert.d/10-log
 | ------------------ | ---------------------------------------------- |
 | `MILOG_RULE_KEY`   | `5xx:api`, `exploit:api:sqli`, `cpu`, ...      |
 | `MILOG_TITLE`      | alert title (`"5xx spike: api"`)               |
-| `MILOG_BODY`       | alert body (newlines stripped to spaces)       |
+| `MILOG_BODY`       | alert body, verbatim (may contain newlines and log text) |
 | `MILOG_SEV`        | `crit` / `warn` / `info`                       |
 | `MILOG_COLOR`      | raw Discord color int (for custom severity maps) |
 | `MILOG_TS`         | fire epoch seconds                             |
+| `MILOG_IP`         | client IP for `exploit:*` and `probe:*` fires, empty otherwise ([ban-hooks.md](ban-hooks.md)) |
 
 Run order is deterministic alphabetical, so name with a priority
 prefix (`10-log`, `20-notify`, `99-cleanup`) — classic
