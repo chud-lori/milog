@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-17-g9341c14
-# MILOG_BUILT=2026-10-04T02:44:23Z
+# MILOG_VERSION=v0.6.0-24-g3a0cae4
+# MILOG_BUILT=2026-10-04T02:51:09Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -90,6 +90,9 @@ ALERT_LOG_MAX_BYTES=10485760  # 10 MB
 # failures go to hooks.log and each run is capped at ALERT_HOOK_TIMEOUT seconds.
 HOOKS_DIR="$HOME/.config/milog/hooks"
 ALERT_HOOK_TIMEOUT=10
+
+# Detection regexes for exploits/probes; `milog update-rules` writes this file, and without it the built-in copy applies.
+RULES_FILE="$HOME/.config/milog/rules.tsv"
 
 # Per-rule destinations, one `key: dest ...` per line; lookup is exact rule, then prefix before `:`, then `default`.
 # Destinations: discord slack telegram matrix webhook, or `skip`; empty fans out to everything.
@@ -961,23 +964,63 @@ alert_fingerprint_from_line() {
     printf '%s:%s' "$ip" "$path"
 }
 
-# Rough substring classification, only used to group alerts by rule key.
+# Prints the `# version: N` from the first line of a rules file on stdin.
+_rules_version() {
+    sed -n '1s/^# version: \([0-9][0-9]*\)$/\1/p'
+}
+
+# Prints the version of a valid rules file; otherwise prints the reason to stderr and fails.
+_rules_check() {
+    local f="$1" version bad kind name re rc
+    version=$(_rules_version < "$f")
+    [[ -n "$version" ]] || { echo "$f: first line must be '# version: N'" >&2; return 1; }
+    bad=$(awk -F'\t' '!/^#/ && NF && !(NF == 3 && $1 ~ /^(exploit|probe|category)$/ && $2 != "" && $3 != "") { print NR; exit }' "$f")
+    [[ -z "$bad" ]] || { echo "$f:$bad: want <exploit|probe|category><TAB><name><TAB><regex>" >&2; return 1; }
+    for kind in exploit probe; do
+        grep -q "^$kind"$'\t' "$f" || { echo "$f: no $kind rules" >&2; return 1; }
+    done
+    while IFS=$'\t' read -r kind name re || [[ -n "$kind" ]]; do
+        [[ -n "$kind" && "$kind" != \#* ]] || continue
+        # Exit 2 is a bad regex; 0 means it matches an empty line and would flag every request.
+        rc=0; grep -Eq -- "$re" <<< "" 2>/dev/null || rc=$?
+        (( rc == 1 )) || { echo "$f: $kind/$name: regex does not compile or matches everything: $re" >&2; return 1; }
+    done < "$f"
+    printf '%s' "$version"
+}
+
+# RULES_FILE wins when it passes _rules_check; otherwise the rules baked in by build.sh apply.
+_rules_load() {
+    local text="" kind name re
+    if [[ -f "$RULES_FILE" ]]; then
+        if _rules_check "$RULES_FILE" >/dev/null; then
+            text=$(cat "$RULES_FILE")
+        else
+            echo "milog: ignoring $RULES_FILE, using the built-in rules" >&2
+        fi
+    fi
+    [[ -n "$text" ]] || text=$(_rules_default)
+    RULES_EXPLOIT="" RULES_PROBE="" RULES_CATEGORY_NAMES=() RULES_CATEGORY_RES=()
+    while IFS=$'\t' read -r kind name re; do
+        case "$kind" in
+            exploit)  RULES_EXPLOIT+="${RULES_EXPLOIT:+|}$re" ;;
+            probe)    RULES_PROBE+="${RULES_PROBE:+|}$re" ;;
+            category) RULES_CATEGORY_NAMES+=("$name"); RULES_CATEGORY_RES+=("$re") ;;
+        esac
+    done <<< "$text"
+    # The AI crawler list is shared with health/top, so it is not duplicated in the rules file.
+    RULES_PROBE+="|$AI_CRAWLER_UA_RE"
+}
+
+# First matching category row names the alert's rule key; needs _rules_load first.
 _exploit_category() {
-    local line="$1" cat="other"
+    local line="$1" cat="other" i
     shopt -s nocasematch
-    case "$line" in
-        *'${jndi'*|*'jndi:'*|*log4j*)                                            cat=log4shell ;;
-        *union*select*|*select*from*|*'sleep('*|*'benchmark('*|*' or 1=1'*|*%27*or*) cat=sqli ;;
-        *'<script'*|*%3cscript*|*'onerror='*|*'onload='*|*'javascript:'*)        cat=xss ;;
-        *base64_decode*|*'eval('*|*'system('*|*'passthru('*|*shell_exec*)         cat=rce ;;
-        *'../'*|*%2e%2e*|*/etc/passwd*|*/etc/shadow*|*/proc/self*)               cat=traversal ;;
-        */containers/*|*/actuator/*|*/server-status*|*/console*|*/druid/*)       cat=infra ;;
-        */SDK/web*|*/cgi-bin/*|*/boaform/*|*/HNAP1*)                             cat=device ;;
-        */wp-admin*|*/wp-login*|*/wp-content/plugins*|*/xmlrpc.php*)             cat=wordpress ;;
-        */phpmyadmin*|*/pma/*|*/mysql/admin*)                                    cat=phpmyadmin ;;
-        */.env*|*/.git/*|*/.aws/*|*/.ssh/*|*/.DS_Store*|*/config.php*|*/config.json*|*/config.yml*|*/config.yaml*|*/web.config*) cat=dotfile ;;
-        *libredtail*|*nikto*|*masscan*|*zgrab*|*sqlmap*|*nuclei*|*gobuster*|*dirbuster*|*wfuzz*|*l9explore*|*l9tcpid*|*'hello, world'*|*'hello,world'*) cat=scanner ;;
-    esac
+    for i in "${!RULES_CATEGORY_RES[@]}"; do
+        if [[ "$line" =~ ${RULES_CATEGORY_RES[$i]} ]]; then
+            cat="${RULES_CATEGORY_NAMES[$i]}"
+            break
+        fi
+    done
     shopt -u nocasematch
     printf '%s' "$cat"
 }
@@ -4408,7 +4451,7 @@ config_validate() {
         WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE
         ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR
         ALERT_LOG_MAX_BYTES ALERT_ROUTES
-        HOOKS_DIR ALERT_HOOK_TIMEOUT
+        HOOKS_DIR ALERT_HOOK_TIMEOUT RULES_FILE
         P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
         GEOIP_ENABLED MMDB_PATH
         HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS HISTORY_TOP_IP_N
@@ -5374,22 +5417,7 @@ mode_exploits() {
     echo -e "${D}Watching exploit attempts across all apps... (Ctrl+C)${NC}\n"
     local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
 
-    # ERE, matched case-insensitively.
-    local pat='\.\./|%2e%2e'                                                   # path traversal
-    pat+='|/etc/passwd|/etc/shadow|/proc/self/environ'                         # target files
-    pat+='|/containers/json|/actuator/|/server-status|/console(/|\?)|/druid/'  # infra probes
-    pat+='|/SDK/web|/cgi-bin/|/boaform/|/HNAP1'                                # embedded-device probes
-    pat+='|/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php'               # wordpress
-    pat+='|/phpmyadmin|/pma/|/mysql/admin'                                     # phpmyadmin
-    pat+='|/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store'                         # dotfiles / secrets
-    pat+='|/config\.(php|json|yml|yaml)|/web\.config'                          # config files
-    pat+='|jndi:|\$\{jndi|log4j'                                               # log4shell
-    pat+='|union[+% ]+select|select[+% ]+from|sleep\([0-9]|benchmark\('        # sqli
-    pat+='|or[+% ]+1=1|%27[+% ]*or|%27%20or'                                  # sqli
-    pat+='|<script|%3cscript|onerror=|onload=|javascript:'                     # xss
-    pat+='|base64_decode|eval\(|system\(|passthru\(|shell_exec'                # rce fn
-    pat+='|libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster'              # scanner UAs
-    pat+='|dirbuster|wfuzz|l9explore|l9tcpid|hello,\s?world'                   # scanner UAs
+    _rules_load
 
     for name in "${LOGS[@]}"; do
         local file="$LOG_DIR/$name.access.log"
@@ -5399,7 +5427,7 @@ mode_exploits() {
             (
                 app="$name"
                 tail -F "$file" 2>/dev/null | \
-                    grep --line-buffered -Ei "$pat" | \
+                    grep --line-buffered -Ei -e "$RULES_EXPLOIT" | \
                 while IFS= read -r line; do
                     printf '%b[%s]%b %b[EXPLOIT]%b %s\n' "$col" "$label" "$NC" "$R" "$NC" "$(_tty_safe <<< "$line")"
                     cat_slug=$(_exploit_category "$line")
@@ -6300,33 +6328,7 @@ mode_probes() {
     echo -e "${D}Watching scanner/bot traffic across all apps... (Ctrl+C)${NC}\n"
     local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
 
-    # SSH banners and TLS ClientHellos sent to plain HTTP; nginx logs the bytes as literal \xNN.
-    local pat='SSH-2\.0|\\x16\\x03|\\x00\\x00'
-    # Security / pentest tools
-    pat+='|masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster'
-    pat+='|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan'
-    pat+='|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag'
-    # Mass internet scanners / research crawlers
-    pat+='|l9explore|l9tcpid|l9retrieve|leakix'
-    pat+='|libredtail|httpx|naabu|katana|subfinder'
-    pat+='|expanseinc|censysinspect|shodan|stretchoid|internet-measurement'
-    pat+='|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey'
-    pat+='|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe'
-    # SEO / advertising crawlers (often unwanted)
-    pat+='|ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat'
-    pat+='|dataforseobot|mauibot|megaindex|seznambot'
-    # AI crawlers
-    pat+="|$AI_CRAWLER_UA_RE|diffbot"
-    # Generic HTTP libraries (legit use exists but often scripted)
-    pat+='|python-requests|python-urllib|aiohttp|go-http-client|okhttp'
-    pat+='|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2'
-    pat+='|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize'
-    # Headless / automation
-    pat+='|headlesschrome|phantomjs|puppeteer|playwright|selenium'
-    # Generic bot / crawler hints in UA
-    pat+='|[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester'
-    # Known payloads
-    pat+='|hello,\s*world'
+    _rules_load
 
     for name in "${LOGS[@]}"; do
         local file="$LOG_DIR/$name.access.log"
@@ -6336,7 +6338,7 @@ mode_probes() {
             (
                 app="$name"
                 tail -F "$file" 2>/dev/null | \
-                    grep --line-buffered -Ei "$pat" | \
+                    grep --line-buffered -Ei -e "$RULES_PROBE" | \
                 while IFS= read -r line; do
                     printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$(_tty_safe <<< "$line")"
                     # Dedup with exploits, which often matches the same scanner line.
@@ -7525,6 +7527,72 @@ mode_trend() {
     done
 }
 
+# milog update-rules: installs the detection rules from the latest release as RULES_FILE.
+# checksums.txt comes from the same release, so it catches corruption, not a compromised release.
+mode_update_rules() {
+    local repo="${MILOG_RELEASE_REPO:-chud-lori/milog}" loc tag base tmp want got new cur dst_tmp
+    # /releases/latest redirects to /releases/tag/<tag>.
+    loc=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+        "https://github.com/${repo}/releases/latest" 2>/dev/null) || loc=""
+    if [[ ! "$loc" =~ /tag/([^/?#]+) ]]; then
+        echo -e "${R}update-rules: no release found for ${repo}${NC}" >&2
+        return 1
+    fi
+    tag="${BASH_REMATCH[1]}"
+    base="https://github.com/${repo}/releases/download/${tag}"
+
+    tmp=$(mktemp -d) || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" RETURN
+    # Releases up to v0.6.0 predate the rules file, so a 404 here is expected.
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/milog-rules.tsv" "${base}/milog-rules.tsv" 2>/dev/null; then
+        echo -e "${R}update-rules: release ${tag} ships no rules file (or it could not be fetched)${NC}" >&2
+        return 1
+    fi
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/checksums.txt" "${base}/checksums.txt" 2>/dev/null; then
+        echo -e "${R}update-rules: could not fetch checksums.txt for ${tag}; refusing an unverified rules file${NC}" >&2
+        return 1
+    fi
+
+    want=$(awk '$2 == "milog-rules.tsv" {print $1; exit}' "$tmp/checksums.txt")
+    if [[ -z "$want" ]]; then
+        echo -e "${R}update-rules: milog-rules.tsv is not listed in checksums.txt for ${tag}${NC}" >&2
+        return 1
+    fi
+    got=$(_audit_sha256 "$tmp/milog-rules.tsv")
+    if [[ -z "$got" ]]; then
+        echo -e "${R}update-rules: need sha256sum or shasum to verify the download${NC}" >&2
+        return 1
+    fi
+    if [[ "$got" != "$want" ]]; then
+        echo -e "${R}update-rules: checksum mismatch for milog-rules.tsv from ${tag} (expected ${want}, got ${got})${NC}" >&2
+        return 1
+    fi
+    if ! new=$(_rules_check "$tmp/milog-rules.tsv"); then
+        echo -e "${R}update-rules: rules from ${tag} failed validation; keeping the current rules${NC}" >&2
+        return 1
+    fi
+
+    cur=$(_rules_check "$RULES_FILE" 2>/dev/null) || cur=$(_rules_default | _rules_version)
+    if (( new < cur )); then
+        echo -e "${R}update-rules: ${tag} ships rules version ${new}, older than the active version ${cur}; not downgrading${NC}" >&2
+        return 1
+    fi
+    if (( new == cur )); then
+        echo "Rules already at version ${cur}."
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$RULES_FILE")" || return 1
+    dst_tmp=$(mktemp "${RULES_FILE}.XXXXXX") || return 1
+    if ! cp "$tmp/milog-rules.tsv" "$dst_tmp" || ! chmod 0644 "$dst_tmp" || ! mv -f "$dst_tmp" "$RULES_FILE"; then
+        rm -f "$dst_tmp"
+        echo -e "${R}update-rules: could not write ${RULES_FILE}${NC}" >&2
+        return 1
+    fi
+    echo -e "${G}✓${NC} rules version ${cur} → ${new} (${tag}) written to ${RULES_FILE}"
+    echo "Running exploits/probes watchers and the daemon load rules at start; restart them to pick this up."
+}
 # milog web: start/stop/status and the systemd user unit for the milog-web binary.
 _WEB_SYSTEMD_UNIT="${HOME}/.config/systemd/user/milog-web.service"
 
@@ -7947,6 +8015,51 @@ mode_ws() {
     done <<< "$rows"
     echo
 }
+_rules_default() {
+    cat <<'MILOG_RULES_EOF'
+# version: 1
+# <kind>\t<name>\t<ERE>, matched case-insensitively. Rows of one kind are OR-ed in file order.
+# exploit: URL payloads for `milog exploits`. probe: scanner/bot traffic for `milog probes`.
+# category: classifies exploit hits for the alert key; the first matching row wins, none gives "other".
+exploit	traversal	\.\./|%2e%2e
+exploit	target-files	/etc/passwd|/etc/shadow|/proc/self/environ
+exploit	infra	/containers/json|/actuator/|/server-status|/console(/|\?)|/druid/
+exploit	device	/SDK/web|/cgi-bin/|/boaform/|/HNAP1
+exploit	wordpress	/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php
+exploit	phpmyadmin	/phpmyadmin|/pma/|/mysql/admin
+exploit	dotfiles	/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store
+exploit	config-files	/config\.(php|json|yml|yaml)|/web\.config
+exploit	log4shell	jndi:|\$\{jndi|log4j
+exploit	sqli	union[+% ]+select|select[+% ]+from|sleep\([0-9]|benchmark\(
+exploit	sqli	or[+% ]+1=1|%27[+% ]*or|%27%20or
+exploit	xss	<script|%3cscript|onerror=|onload=|javascript:
+exploit	rce	base64_decode|eval\(|system\(|passthru\(|shell_exec
+exploit	scanner-ua	libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster
+exploit	scanner-ua	dirbuster|wfuzz|l9explore|l9tcpid|hello,\s?world
+# SSH banners and TLS ClientHellos sent to plain HTTP; nginx logs the bytes as literal \xNN.
+probe	protocol	SSH-2\.0|\\x16\\x03|\\x00\\x00
+probe	pentest-tools	masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag
+probe	mass-scanners	l9explore|l9tcpid|l9retrieve|leakix|libredtail|httpx|naabu|katana|subfinder|expanseinc|censysinspect|shodan|stretchoid|internet-measurement|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe
+probe	seo-crawlers	ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat|dataforseobot|mauibot|megaindex|seznambot
+# milog adds its AI_CRAWLER_UA_RE tokens (shared with health/top) to the probe rows at load time.
+probe	ai-crawlers	diffbot
+probe	http-libraries	python-requests|python-urllib|aiohttp|go-http-client|okhttp|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize
+probe	headless	headlesschrome|phantomjs|puppeteer|playwright|selenium
+probe	generic-bot	[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester
+probe	payloads	hello,\s*world
+category	log4shell	\$\{jndi|jndi:|log4j
+category	sqli	union.*select|select.*from|sleep\(|benchmark\(| or 1=1|%27.*or
+category	xss	<script|%3cscript|onerror=|onload=|javascript:
+category	rce	base64_decode|eval\(|system\(|passthru\(|shell_exec
+category	traversal	\.\./|%2e%2e|/etc/passwd|/etc/shadow|/proc/self
+category	infra	/containers/|/actuator/|/server-status|/console|/druid/
+category	device	/SDK/web|/cgi-bin/|/boaform/|/HNAP1
+category	wordpress	/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php
+category	phpmyadmin	/phpmyadmin|/pma/|/mysql/admin
+category	dotfile	/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store|/config\.php|/config\.json|/config\.yml|/config\.yaml|/web\.config
+category	scanner	libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster|dirbuster|wfuzz|l9explore|l9tcpid|hello, world|hello,world
+MILOG_RULES_EOF
+}
 _completions_payload_bash() {
     cat <<'MILOG_COMPLETION_EOF'
 # bash-completion for milog.
@@ -7962,7 +8075,7 @@ _milog_complete() {
         cword=$COMP_CWORD
     }
 
-    local cmds="monitor tui daemon rate health top top-ip-by-app top-paths attacker slow ws stats trend replay search diff auto-tune logs grep errors exploits probes patterns suspects config alert alerts silence digest report doctor web install audit probe bench completions help"
+    local cmds="monitor tui daemon rate health top top-ip-by-app top-paths attacker slow ws stats trend replay search diff auto-tune logs grep errors exploits probes patterns suspects config alert alerts silence digest report doctor web install update-rules audit probe bench completions help"
     local config_subs="show path init edit add rm dir set validate"
     local config_keys="LOG_DIR LOGS REFRESH SPARK_LEN DISCORD_WEBHOOK SLACK_WEBHOOK TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR ALERT_LOG_MAX_BYTES ALERT_ROUTES HOOKS_DIR ALERT_HOOK_TIMEOUT P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS GEOIP_ENABLED MMDB_PATH HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS WEB_PORT WEB_BIND THRESH_REQ_WARN THRESH_REQ_CRIT THRESH_CPU_WARN THRESH_CPU_CRIT THRESH_MEM_WARN THRESH_MEM_CRIT THRESH_DISK_WARN THRESH_DISK_CRIT THRESH_4XX_WARN THRESH_5XX_WARN"
     local alert_subs="on off status test"
@@ -8066,6 +8179,7 @@ _milog() {
         'doctor:diagnostic checklist'
         'web:start/stop/status web UI'
         'install:add optional features: geoip / web / history'
+        'update-rules:fetch newer exploit/probe rules from the latest release'
         'audit:host integrity scans (fim / persistence / ports / yara / accounts / rootkit)'
         'probe:eBPF probe sidecar service'
         'bench:benchmark harness against synthetic fixtures'
@@ -8171,6 +8285,7 @@ set -l cmds \
     "doctor:diagnostic checklist" \
     "web:start/stop/status web UI" \
     "install:add optional features" \
+    "update-rules:fetch newer detection rules" \
     "audit:host integrity scans" \
     "probe:eBPF probe sidecar service" \
     "bench:benchmark harness" \
@@ -8285,6 +8400,7 @@ ${W}TAILING${NC}
 
 ${W}OPS${NC}
   ${C}install <feature>${NC}  add optional features: geoip / web / history
+  ${C}update-rules${NC}       fetch newer exploit/probe rules from the latest release
   ${C}audit fim${NC}           file integrity monitor (baseline + drift)
   ${C}audit persistence${NC}   re-entry surface diff (new cron / systemd / rc.local)
   ${C}audit ports${NC}         listening-port baseline (new TCP/UDP listeners)
@@ -8419,6 +8535,12 @@ _cmd_help() {
             echo -e "  Subs: list, <feature>, remove <feature>"
             echo -e "  Features: geoip / web / history"
             ;;
+        update-rules)
+            echo -e "${W}milog update-rules${NC}: fetch exploit/probe detection rules from the latest release"
+            echo -e "  Checks the SHA-256 against the release's checksums.txt, then that every regex compiles."
+            echo -e "  Refuses an older version than the active one; writes ${C}RULES_FILE${NC} atomically."
+            echo -e "  ${D}checksums.txt is not a signature: it comes from the same release as the rules.${NC}"
+            ;;
         audit)
             echo -e "${W}milog audit <sub>${NC} — point-in-time host integrity scans"
             echo -e "  ${C}fim baseline | check | status${NC}          SHA256 drift on watched files"
@@ -8447,7 +8569,7 @@ fi
 # Setup and host-level commands must work before any app is configured.
 if [[ ${#LOGS[@]} -eq 0 ]]; then
     case "${1:-}" in
-        -h|--help|help|config|doctor|completions|install|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
+        -h|--help|help|config|doctor|completions|install|update-rules|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
         *)
             echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
             echo "  Run 'milog config init', set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
@@ -8492,6 +8614,7 @@ case "${1:-}" in
     completions) shift; mode_completions "$@" ;;
     bench)    shift; mode_bench "$@" ;;
     install)  shift; mode_install "$@" ;;
+    update-rules) mode_update_rules ;;
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
