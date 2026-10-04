@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-1-g393d279
-# MILOG_BUILT=2026-10-04T02:35:56Z
+# MILOG_VERSION=v0.6.0-3-g1324871
+# MILOG_BUILT=2026-10-04T02:50:27Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -1485,7 +1485,8 @@ geoip_country() {
 cti_lookup() {
     local ip="${1-}" dir="$ALERT_STATE_DIR/cti"
     [[ -n "${CROWDSEC_CTI_KEY:-}" ]] || return 0
-    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$ip" =~ ^[0-9a-fA-F:]*:[0-9a-fA-F:.]*$ ]] || return 0
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || ( "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:.]*[0-9a-fA-F][0-9a-fA-F:.]*$ ) ]] || return 0
+    ip=$(printf '%s' "$ip" | tr A-F a-f)
     local f="$dir/$ip" mtime
     if [[ -f "$f" ]]; then
         mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
@@ -1497,19 +1498,25 @@ cti_lookup() {
     [[ "${2:-}" == cached ]] && return 0
     command -v curl >/dev/null 2>&1 || return 0
     mkdir -p "$dir" 2>/dev/null || return 0
+    # After a 429 every request would fail too, so pause lookups for 15 minutes.
+    [[ -n "$(find "$dir/.backoff" -mmin -15 2>/dev/null)" ]] && return 0
     local err="$ALERT_STATE_DIR/cti.err"
     # The key goes into a curl config on stdin, so a quote or newline would break out of it.
     if [[ "$CROWDSEC_CTI_KEY" == *[\"\\[:space:]]* ]]; then
         printf '%s\tCROWDSEC_CTI_KEY contains quotes, backslashes or whitespace\n' "$(date +%s)" > "$err"
         return 0
     fi
-    local resp code="" summary=""
+    local resp code="" summary="" body
     resp=$(mktemp "$dir/.resp.XXXXXX" 2>/dev/null) || return 0
     code=$(printf 'header = "x-api-key: %s"\n' "$CROWDSEC_CTI_KEY" \
-        | curl -s -m 3 -K - -o "$resp" -w '%{http_code}' "https://cti.api.crowdsec.net/v2/smoke/$ip" 2>/dev/null) || true
+        | curl -s -m 3 --max-filesize 65536 -K - -o "$resp" -w '%{http_code}' \
+              "https://cti.api.crowdsec.net/v2/smoke/$ip" 2>/dev/null) || true
     case "$code" in
         200) summary=$(tr -d '\n' < "$resp" | _cti_summary) ;;
-        404) summary="unknown" ;;
+        # Only a JSON error object counts as "no record"; a proxy or HTML 404 is a failure.
+        404) body=$(tr -d '[:space:]' < "$resp")
+             [[ "$body" == "{"* && "$body" != *'"ip"'* ]] && summary="unknown" ;;
+        429) touch "$dir/.backoff" ;;
     esac
     rm -f "$resp"
     if [[ -z "$summary" ]]; then
@@ -5174,7 +5181,9 @@ mode_doctor() {
     if [[ -z "${CROWDSEC_CTI_KEY:-}" ]]; then
         _doc_ok "off  (CROWDSEC_CTI_KEY empty, no lookups)"
     elif [[ -s "$ALERT_STATE_DIR/cti.err" ]]; then
-        _doc_warn "last lookup failed: $(cut -f2 "$ALERT_STATE_DIR/cti.err")" \
+        local cti_paused=""
+        [[ -n "$(find "$ALERT_STATE_DIR/cti/.backoff" -mmin -15 2>/dev/null)" ]] && cti_paused="  (lookups paused for 15 min)"
+        _doc_warn "last lookup failed: $(cut -f2 "$ALERT_STATE_DIR/cti.err")${cti_paused}" \
                   "401/403: key rejected; 429: rate limit hit; 000: no answer within 3s"
         warn=$(( warn + 1 ))
     else
