@@ -332,6 +332,7 @@ THRESH_DISK_WARN=80
 THRESH_DISK_CRIT=95
 THRESH_4XX_WARN=20
 THRESH_5XX_WARN=5
+THRESH_AICRAWL_WARN=30
 
 # Sparkline history depth (samples kept per app in monitor mode)
 SPARK_LEN=30
