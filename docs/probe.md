@@ -49,9 +49,17 @@ not a request preceded the exec.
 
 The probe uses alerts.log instead of the access logs because the bash
 side has already classified each request there. It reads the file only
-after a web-worker exec, and skips the read when the file has not
-changed within the window. The limits:
+after a web-worker exec, skips the read when the file has not changed
+within the window, and reads only its last 64 KB. Because the probe
+runs as root and the file belongs to your user, it refuses a symlink,
+a FIFO, or a file over 16 MB. The limits:
 
+- Any `exploit:` or `5xx:` alert in the window counts, not only the
+  request that caused the exec. On a host that is being scanned, an app
+  that execs on every request (`convert`, `ffmpeg`) can raise this alert.
+- An exploit row recorded more than 3 seconds after the exec is missed.
+  That happens when the exploit request stays open, for example a
+  reverse shell that keeps a php-fpm worker busy until it times out.
 - An exploit alert in cooldown (`ALERT_COOLDOWN`, 300s by default) or
   under a silence is not written to alerts.log, so it cannot be matched.
 - A `5xx:` row holds the per-minute count, not a request line.

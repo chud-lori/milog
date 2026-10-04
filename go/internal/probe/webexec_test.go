@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -59,12 +60,15 @@ func TestMatchWebTriggeredExecSanitisesRequest(t *testing.T) {
 	at := time.Unix(1_800_000_000, 0)
 	rows := []alertlog.Row{{
 		TS:   at.Unix() - 1,
-		Rule: "exploit:api:rce",
+		Rule: "exploit:api```\x1b:rce",
 		Body: "```GET /?c=\x1b[31mid``` \x07HTTP/1.1```",
 	}}
 	h, ok := matchWebTriggeredExec(Event{Comm: "sh", ParentComm: "nginx"}, rows, at, 30*time.Second)
 	if !ok {
 		t.Fatal("no hit")
+	}
+	if !strings.HasSuffix(h.Title, "after exploit:api:rce") {
+		t.Fatalf("rule key not sanitised in title: %q", h.Title)
 	}
 	inner := strings.TrimSuffix(strings.TrimPrefix(h.Body, "```"), "```")
 	if strings.Contains(inner, "`") || strings.ContainsAny(inner, "\x1b\x07") {
@@ -100,6 +104,71 @@ func TestWebTriggeredExec(t *testing.T) {
 	}
 	if _, ok := WebTriggeredExec(Event{Comm: "curl", ParentComm: "nginx"}, log, at); ok {
 		t.Error("alerts.log untouched for a minute still fired")
+	}
+}
+
+func TestReadAlertsTailRefusesNonRegular(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().Unix()
+	real := filepath.Join(dir, "real.log")
+	if err := os.WriteFile(real, []byte(fmt.Sprintf("%d\texploit:api:rce\t0\tt\tb\n", now)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.log")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(dir, "fifo.log")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	big := filepath.Join(dir, "big.log")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(alertsLogMaxBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	if rows, ok := readAlertsTail(real, now-30); !ok || len(rows) != 1 {
+		t.Fatalf("regular file: rows=%v ok=%v", rows, ok)
+	}
+	for _, p := range []string{link, fifo, big} {
+		done := make(chan bool)
+		go func() { _, ok := readAlertsTail(p, now-30); done <- ok }()
+		select {
+		case ok := <-done:
+			if ok {
+				t.Errorf("%s was read", filepath.Base(p))
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s blocked", filepath.Base(p))
+		}
+	}
+}
+
+func TestReadAlertsTailReadsOnlyTheTail(t *testing.T) {
+	now := time.Now().Unix()
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%d\texploit:api:old\t0\tt\tb\n", now))
+	for sb.Len() < 2*alertsTailBytes {
+		sb.WriteString(fmt.Sprintf("%d\tcpu\t0\tt\tpadding padding padding\n", now))
+	}
+	sb.WriteString(fmt.Sprintf("%d\texploit:api:new\t0\tt\tb\n", now))
+	path := filepath.Join(t.TempDir(), "alerts.log")
+	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, ok := readAlertsTail(path, now-30)
+	if !ok || rows[len(rows)-1].Rule != "exploit:api:new" {
+		t.Fatalf("ok=%v last=%+v", ok, rows[len(rows)-1])
+	}
+	for _, r := range rows {
+		if r.Rule == "exploit:api:old" || r.Rule == "" {
+			t.Fatalf("read past the tail or kept a partial row: %+v", r)
+		}
 	}
 }
 

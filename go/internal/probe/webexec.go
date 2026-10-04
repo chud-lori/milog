@@ -1,9 +1,11 @@
 package probe
 
 import (
+	"io"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -31,6 +33,12 @@ func FromWebWorker(e Event) bool {
 	return ok
 }
 
+// Bash rotates alerts.log at 10 MB, so a bigger file isn't one milog wrote.
+const (
+	alertsLogMaxBytes = 16 << 20
+	alertsTailBytes   = 64 << 10
+)
+
 // WebTriggeredExec reads alerts.log for an exploit or 5xx fire near at, the
 // time e was seen. The mtime check keeps the common case to one stat.
 func WebTriggeredExec(e Event, alertsLog string, at time.Time) (Hit, bool) {
@@ -38,15 +46,47 @@ func WebTriggeredExec(e Event, alertsLog string, at time.Time) (Hit, bool) {
 		return Hit{}, false
 	}
 	window := webExecWindow()
-	fi, err := os.Stat(alertsLog)
-	if err != nil || fi.ModTime().Before(at.Add(-window)) {
-		return Hit{}, false
-	}
-	rows, err := alertlog.Load(alertsLog, at.Add(-window).Unix(), 0)
-	if err != nil {
+	rows, ok := readAlertsTail(alertsLog, at.Add(-window).Unix())
+	if !ok {
 		return Hit{}, false
 	}
 	return matchWebTriggeredExec(e, rows, at, window)
+}
+
+// readAlertsTail parses the last alertsTailBytes of alerts.log when it was
+// modified at or after since. The file is user-writable and the probe is root,
+// so FIFOs, symlinks and oversized files are refused.
+func readAlertsTail(path string, since int64) ([]alertlog.Row, bool) {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() > alertsLogMaxBytes || fi.ModTime().Unix() < since {
+		return nil, false
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	// The path can be swapped between Lstat and open.
+	if ofi, err := f.Stat(); err != nil || !os.SameFile(fi, ofi) {
+		return nil, false
+	}
+	off := max(fi.Size()-alertsTailBytes, 0)
+	buf := make([]byte, fi.Size()-off)
+	n, err := f.ReadAt(buf, off)
+	if err != nil && err != io.EOF {
+		return nil, false
+	}
+	lines := strings.Split(string(buf[:n]), "\n")
+	if off > 0 {
+		lines = lines[1:] // partial line
+	}
+	var rows []alertlog.Row
+	for _, l := range lines {
+		if r, ok := alertlog.ParseRow(l); ok && r.TS >= since {
+			rows = append(rows, r)
+		}
+	}
+	return rows, true
 }
 
 // matchWebTriggeredExec takes the newest exploit or 5xx row from window
@@ -70,18 +110,19 @@ func matchWebTriggeredExec(e Event, rows []alertlog.Row, at time.Time, window ti
 	if prev == nil {
 		return Hit{}, false
 	}
+	rule := sanitizeRequest(prev.Rule)
 	return Hit{
 		RuleKey: "process:web_triggered_exec:" + e.ParentComm + ":" + e.Comm,
-		Title:   "Web-triggered exec: " + e.ParentComm + " → " + e.Comm + " after " + prev.Rule,
+		Title:   "Web-triggered exec: " + e.ParentComm + " → " + e.Comm + " after " + rule,
 		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
 			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
 			" parent=" + e.ParentComm + " exe=" + e.Filename +
-			"\npreceding " + prev.Rule + " at " + strconv.FormatInt(prev.TS, 10) +
+			"\npreceding " + rule + " at " + strconv.FormatInt(prev.TS, 10) +
 			": " + sanitizeRequest(prev.Body) + "```",
 	}, true
 }
 
-// sanitizeRequest strips backticks so the alerts.log body can't close the fence,
+// sanitizeRequest strips backticks so alerts.log text can't close the fence,
 // and control characters so it can't carry terminal escapes.
 func sanitizeRequest(s string) string {
 	return strings.Map(func(r rune) rune {
