@@ -354,6 +354,8 @@ brings some noise. To tune it from what actually fired:
      the same way, unless it would have to go above 100.
    - Any other rule, or a percentage that can't go high enough:
      `milog silence <rule> 7d 'noisy rule'`.
+   - `exploit:*` and `audit:*` are never offered a silence, because an
+     attacker controls how often they fire. They are listed for review.
 4. Run the lines you agree with. auto-tune never changes the config or
    adds silences itself. With `HISTORY_ENABLED=1` it also prints the
    history-based threshold table described in

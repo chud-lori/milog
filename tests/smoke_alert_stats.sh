@@ -25,7 +25,7 @@ mkdir -p "$state"
 : > "$tmp/logs/api.access.log"
 
 # Over 7 days: 5xx:api fires 100 times with counts 6..105, cpu 80 times at 100%,
-# exploit 90 times, 4xx:api 3 times, plus one fire older than the window.
+# exploit 90 times, an audit rule 80 times, 4xx:api 3 times, one fire now and one older than the window.
 now=$(date +%s)
 {
     for i in $(seq 1 100); do
@@ -41,8 +41,17 @@ now=$(date +%s)
     for i in 1 2 3; do
         printf '%s\t4xx:api\t16753920\t4xx spike: api\t25 4xx responses\n' "$(( now - i * 3000 ))"
     done
+    for i in $(seq 1 80); do
+        printf '%s\taudit:fim_drift:/etc/passwd\t15158332\tFIM drift\tchanged\n' "$(( now - i * 3000 ))"
+    done
+    printf '%s\ttoday:rule\t15158332\tT\tbody\n' "$now"
     printf '%s\told:rule\t15158332\tOld\tbody\n' "$(( now - 20 * 86400 ))"
 } | sort -n > "$state/alerts.log"
+
+"$MILOG" alert stats yesterday > "$tmp/yday.out" 2>&1
+grep -qF 'today:rule' "$tmp/yday.out" && fail "alert stats yesterday counted a fire from today"
+"$MILOG" alert stats today > "$tmp/today.out" 2>&1
+grep -qE '^ +1 +1\.0 .*today:rule' "$tmp/today.out" || fail "today's per-day rate should floor the span at one day"
 
 "$MILOG" alert stats 7d > "$tmp/stats.out" 2>&1 || fail "alert stats exited non-zero"
 first=$(awk '$1 ~ /^[0-9]+$/ { print $NF; exit }' "$tmp/stats.out")
@@ -63,6 +72,8 @@ grep -qF 'milog config set THRESH_5XX_WARN_api 36' "$tmp/tune.out" || fail "no 5
 grep -qF 'milog silence cpu 7d' "$tmp/tune.out" || fail "cpu at 100% should get a silence, not a threshold over 100"
 grep -qF 'exploit:api:sqli' "$tmp/tune.out" && fail "silenced rule still got a suggestion"
 grep -qF '4xx:api' "$tmp/tune.out" && fail "quiet rule got a suggestion"
+grep -q 'audit:fim_drift:/etc/passwd.*review the source' "$tmp/tune.out" || fail "noisy audit rule not flagged for review"
+grep -qF 'milog silence audit:' "$tmp/tune.out" && fail "auto-tune suggested silencing an audit rule"
 grep -q '^THRESH_5XX_WARN' "$MILOG_CONFIG" 2>/dev/null && fail "auto-tune changed the config"
 
 echo "smoke_alert_stats: ok"

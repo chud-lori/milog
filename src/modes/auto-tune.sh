@@ -67,6 +67,13 @@ _tune_alert_noise() {
                 continue
             fi
         fi
+        # Attackers drive these counts, so muting them would mute attack detection.
+        case "$key" in
+            exploit:*|audit:*)
+                printf "  ${W}%s${NC}  ${D}%s fires, high volume: review the source, not silenced${NC}\n" "$key" "$count"
+                continue
+                ;;
+        esac
         printf "  ${W}%s${NC}  ${D}%s fires, a threshold raise can't quiet it${NC}\n" "$key" "$count"
         printf "    milog silence %q 7d 'noisy rule'\n" "$key"
     done < <(_alerts_counts_since "$cutoff" | _tty_safe)
