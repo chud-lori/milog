@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp="$(mktemp -d)"
+# Physical path, because milog resolves its own path through symlinks such as macOS /var -> /private/var.
+tmp="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'chmod -R u+w "$tmp" 2>/dev/null; rm -rf "$tmp"' EXIT
 
 fail() { printf 'smoke_version_update: %s\n' "$1" >&2; exit 1; }
