@@ -1,4 +1,5 @@
 # milog auto-tune [days]: suggests HTTP thresholds from percentiles of metrics_minute. CPU/MEM/DISK aren't in the DB.
+# Also suggests threshold raises or silences for rules that fire too often in alerts.log.
 
 # p-th percentile (1..100) of newline-separated numbers on stdin.
 _pct_from_stdin() {
@@ -31,10 +32,58 @@ _tune_row() {
         "$metric" "$current" "$suggested" "$delta"
 }
 
+# Rules averaging more than 10 fires a day in alerts.log get a printed fix; nothing is applied.
+_tune_alert_noise() {
+    local days="$1" log_file="$ALERT_STATE_DIR/alerts.log"
+    [[ -f "$log_file" ]] || return 0
+    local cutoff=$(( $(date +%s) - days * 86400 )) max=$(( days * 10 ))
+
+    echo -e "\n${W}── MiLog: auto-tune noisy alerts (window=${days}d, over 10 fires/day) ──${NC}\n"
+    local count key var app pct current kept suggested found=0
+    while IFS=$'\t' read -r count key _; do
+        (( count > max )) || break
+        alert_is_silenced "$key" >/dev/null && continue
+        found=1
+        var="" app="" pct=0
+        case "$key" in
+            5xx:*)  var=THRESH_5XX_WARN; app="${key#5xx:}" ;;
+            4xx:*)  var=THRESH_4XX_WARN; app="${key#4xx:}" ;;
+            cpu)    var=THRESH_CPU_CRIT;  pct=1 ;;
+            mem)    var=THRESH_MEM_CRIT;  pct=1 ;;
+            disk:/) var=THRESH_DISK_CRIT; pct=1 ;;
+        esac
+        if [[ -n "$var" ]]; then
+            current=$(_thresh "$var" "$app")
+            # The body's first number is the value that tripped the rule; the new threshold lets only the top $max through.
+            kept=$(MILOG_KEY="$key" awk -F'\t' -v cutoff="$cutoff" '
+                $1 >= cutoff && $2 == ENVIRON["MILOG_KEY"] && match($5, /[0-9]+/) { print substr($5, RSTART, RLENGTH) }
+            ' "$log_file" | sort -rn | sed -n "$(( max + 1 ))p")
+            suggested=$(( kept + 1 ))
+            (( suggested > current )) || suggested=$(( current + 1 ))
+            if (( ! pct || suggested <= 100 )); then
+                [[ -n "$app" ]] && var="${var}_${app//[^A-Za-z0-9_]/_}"
+                printf "  ${W}%s${NC}  ${D}%s fires, threshold %s${NC}\n" "$key" "$count" "$current"
+                printf "    milog config set %s %s\n" "$var" "$suggested"
+                continue
+            fi
+        fi
+        printf "  ${W}%s${NC}  ${D}%s fires, a threshold raise can't quiet it${NC}\n" "$key" "$count"
+        printf "    milog silence %q 7d 'noisy rule'\n" "$key"
+    done < <(_alerts_counts_since "$cutoff" | _tty_safe)
+
+    if (( found == 0 )); then
+        echo -e "  ${D}no unsilenced rule fired more than 10 times a day${NC}"
+    else
+        echo -e "\n  ${D}nothing was applied; run the lines you agree with. Per-rule counts: milog alert stats ${days}d${NC}"
+    fi
+}
+
 mode_auto_tune() {
     local days="${1:-7}"
     [[ "$days" =~ ^[1-9][0-9]*$ ]] \
         || { echo -e "${R}auto-tune: days must be a positive integer${NC}" >&2; return 1; }
+
+    _tune_alert_noise "$days"
 
     _history_precheck || return 1
 
