@@ -82,6 +82,7 @@ jobs:
           bash tests/smoke_tty_escapes.sh
           bash tests/smoke_mode_scripts.sh
           bash tests/smoke_followups.sh
+          bash tests/smoke_ban_hooks.sh
 
       - name: Go vet
         working-directory: go
