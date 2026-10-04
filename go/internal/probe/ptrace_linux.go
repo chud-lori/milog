@@ -1,12 +1,6 @@
 //go:build linux
 
-// ptrace_linux.go — userspace loader for the ptrace anti-injection
-// probe. Same shape as file_linux.go: load embedded bpf/ptrace.bpf.o,
-// attach the sys_enter_ptrace tracepoint, stream `PtraceEvent`s into a
-// Go channel.
-//
-// Independent collection so a verifier reject on this probe doesn't
-// take down exec / tcp / file coverage.
+// Loader for the ptrace probe (sys_enter_ptrace).
 
 package probe
 
@@ -27,9 +21,7 @@ import (
 //go:embed bpf/ptrace.bpf.o
 var ptraceBpfObj []byte
 
-// ptraceRawEvent mirrors `struct ptrace_event` in ptrace.bpf.c byte-
-// for-byte. Drift here = silently misattributed alerts (wrong target
-// pid, wrong request code).
+// ptraceRawEvent must match struct ptrace_event in ptrace.bpf.c.
 type ptraceRawEvent struct {
 	PID       uint32
 	UID       uint32
@@ -38,10 +30,7 @@ type ptraceRawEvent struct {
 	Comm      [commLen]byte
 }
 
-// RunPtrace loads the ptrace probe, attaches sys_enter_ptrace, and
-// streams matched PtraceEvents into `out` until ctx is cancelled.
-// Same signature shape as Run / RunNet / RunFile — milog-probe
-// supervises via a fourth independent goroutine.
+// RunPtrace attaches sys_enter_ptrace and sends PtraceEvents until ctx is cancelled.
 func RunPtrace(ctx context.Context, out chan<- PtraceEvent) error {
 	if len(ptraceBpfObj) == 0 {
 		return errors.New("probe: bpf/ptrace.bpf.o is empty — rebuild with clang available (apt install clang llvm libbpf-dev)")

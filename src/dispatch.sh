@@ -91,9 +91,7 @@ ${D}docs → docs/   ·   source → src/   ·   plan → plan.md (gitignored)${
 "
 }
 
-# Per-command help registry. Runs when `milog <cmd> --help` is invoked. Keeps
-# each block short — usage / args / 1-2 examples. The main `show_help`
-# lists all commands; this gives you the details on one without scrolling.
+# `milog <cmd> --help` details; show_help only lists commands.
 _cmd_help() {
     local cmd="$1"
     case "$cmd" in
@@ -218,12 +216,7 @@ _cmd_help() {
     esac
 }
 
-# ==============================================================================
-# DISPATCH
-# ==============================================================================
-# Intercept `milog <cmd> --help` (and -h) before dispatching to the mode.
-# Keeps main `show_help` short while letting each command ship its own
-# detail block.
+# Dispatch.
 if [[ "${2:-}" == "--help" || "${2:-}" == "-h" ]]; then
     _cmd_help "${1:-}"
     exit $?
@@ -269,37 +262,23 @@ case "${1:-}" in
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
     probe)    shift; mode_probe "$@" ;;
-    # Hidden subcommand: invoked by milog-probe (eBPF sidecar) once per
-    # rule hit. Args are positional: <rule_key> <title> <body> <color>.
-    # Goes through the full alert path so cooldown / silence / dedup /
-    # routing / hooks all apply — same as audit-layer rules. NOT
-    # documented in user help on purpose; if a user invokes it directly,
-    # `milog alert test` is what they actually wanted.
+    # Hidden: milog-probe calls this per rule hit with <rule_key> <title> <body> [color] so the full alert path applies.
     _internal_alert)
         shift
         if (( $# < 3 )); then
             echo -e "${R}_internal_alert: needs <rule_key> <title> <body> [color]${NC}" >&2
             exit 1
         fi
-        # Gate on cooldown — milog-probe shells us out per matched
-        # event without filtering, so bursty exec floods (e.g. an
-        # attacker piping output through `xargs sh`) would otherwise
-        # spam the webhook. alert_should_fire bumps the cooldown
-        # state; alert_fire then handles silence + dedup + delivery.
+        # milog-probe doesn't filter bursts, so the cooldown gate stops exec floods from spamming.
         if alert_should_fire "$1"; then
             alert_fire "$2" "$3" "${4:-15158332}" "$1"
-            # alert_fire backgrounds each destination's curl. We wait
-            # so this one-shot CLI exits AFTER delivery — otherwise
-            # orphaned curls might be killed during systemd cgroup
-            # teardown of the milog-probe → milog cmd chain.
+            # Wait for the backgrounded sends, or systemd cgroup teardown can kill them.
             wait
         fi
         ;;
     -h|--help|help) show_help ;;
     ""|logs)  color_prefix ;;
     *)
-        # Resolve against LOGS — supports bare names plus `nginx:<name>`,
-        # `text:<name>:<path>`, `journal:<unit>`, `docker:<container>`.
         _matching_entry=$(_log_entry_by_name "$1" 2>/dev/null) || _matching_entry=""
         if [[ -n "$_matching_entry" ]]; then
             _reader_cmd=$(_log_reader_cmd "$_matching_entry") || _reader_cmd=""

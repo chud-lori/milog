@@ -1,28 +1,8 @@
-# ==============================================================================
-# MODE: search <pattern> [flags] — grep across all app logs + archives
-#
-# Tier-1 log search: a polite wrapper around `grep -F` (or `grep -E` with
-# --regex) across every configured app's access.log. Optional filters:
-#
-#   --since <spec>   : drop lines older than spec (today/Nh/Nd/Nw/all).
-#                      Reuses _alerts_window_to_epoch — same grammar.
-#   --app <name>     : scope to one app's logs.
-#   --path <sub>     : substring filter on URL path (post-grep).
-#   --regex          : pattern is ERE (grep -E) instead of fixed-string.
-#   --archives       : also search rotated logs (.log.1, .log.2.gz, ...).
-#   --limit N        : cap output to N lines (default 200; 0 = unlimited).
-#
-# Output: one prefixed line per match — `[app       ] <logline>` with per-app
-# coloring. Final tally shows total + per-app counts.
-#
-# Scaling: grep is linear; fine up to ~10 GB total log volume. Beyond that,
-# see the plan's "Full-text search, tier 2 (SQLite FTS5)" item.
-# ==============================================================================
+# milog search <pattern> [flags]: fixed-string (or --regex) grep across app logs and, with --archives, rotated ones.
 mode_search() {
     local pattern="" since="" app_filter="" path_filter=""
     local use_regex=0 include_archives=0 limit=200
 
-    # First positional (if not a flag) is the pattern.
     if [[ $# -gt 0 && "$1" != --* ]]; then
         pattern="$1"; shift
     fi
@@ -56,13 +36,10 @@ ${NC}"
     [[ "$limit" =~ ^[0-9]+$ ]] \
         || { echo -e "${R}--limit must be numeric${NC}" >&2; return 1; }
 
-    # Resolve --since to a cutoff epoch up-front (one fork, not per-line).
     local cutoff_epoch=""
     if [[ -n "$since" ]]; then
         cutoff_epoch=$(_alerts_window_to_epoch "$since") || return 1
-        # --since relies on awk's mktime() — gawk/mawk have it, BSD awk
-        # doesn't. Warn + disable gracefully on BSD-awk hosts so the search
-        # still runs (users get all matches instead of a hard failure).
+        # mktime() exists in gawk and mawk but not BSD awk; without it, skip the time filter rather than fail.
         if ! command -v gawk >/dev/null 2>&1 \
              && ! awk 'BEGIN { if (mktime("2020 1 1 0 0 0") <= 0) exit 1 }' 2>/dev/null; then
             echo -e "${Y}--since requires gawk or mawk (this awk lacks mktime); time filter skipped${NC}" >&2
@@ -70,13 +47,9 @@ ${NC}"
         fi
     fi
 
-    # Prefer gawk for the filtering awk — mawk/gawk have mktime, BSD awk
-    # doesn't. Falls back to plain `awk` when neither is explicit (works
-    # on Ubuntu where /usr/bin/awk is typically mawk).
     local awk_bin="awk"
     command -v gawk >/dev/null 2>&1 && awk_bin="gawk"
 
-    # Apps: explicit --app filter, else every configured LOGS entry.
     local apps_to_scan=()
     if [[ -n "$app_filter" ]]; then
         if [[ ! " ${LOGS[*]} " =~ " $app_filter " ]]; then
@@ -88,13 +61,10 @@ ${NC}"
         apps_to_scan=("${LOGS[@]}")
     fi
 
-    # grep -F by default (safe for user-pasted strings like "session_id=abc+xyz");
-    # --regex opts into grep -E so callers can use alternation.
     local grep_flag="-F"
     (( use_regex )) && grep_flag="-E"
 
-    # Stream all matches into a tmp file so we can tally + apply --limit
-    # after the fact without second-pass scanning the source logs.
+    # Collect matches in a temp file so --limit and the tally don't rescan the logs.
     local tmp; tmp=$(mktemp -t milog_search.XXXXXX) || return 1
     # shellcheck disable=SC2064
     trap "rm -f '$tmp'" RETURN
@@ -106,8 +76,6 @@ ${NC}"
         local label; label=$(printf "%-10s" "$app")
         idx=$(( idx + 1 ))
 
-        # Build the file list (current + optional archives). Expanded
-        # globs are sorted so rotated logs come after the current one.
         local files=()
         [[ -f "$LOG_DIR/$app.access.log" ]] && files+=("$LOG_DIR/$app.access.log")
         if (( include_archives )); then
@@ -118,9 +86,6 @@ ${NC}"
             shopt -u nullglob
         fi
 
-        # For each file, decompress if needed then grep. Piped through
-        # awk for --path / --since filtering and final prefixing. One
-        # awk instance per file keeps the per-app coloring cheap.
         local f
         for f in "${files[@]}"; do
             _search_one_file "$f" "$pattern" "$grep_flag" "$app" "$col" "$label" \
@@ -145,9 +110,7 @@ ${NC}"
         cat "$tmp"
     fi
 
-    # Per-app counts — strip the colored prefix to find the app name.
-    # The prefix shape is "[<app padded to 10>]" so we pull field-2 of
-    # the raw `[label ] rest...` pattern.
+    # Per-app counts from the `[label]` prefix.
     echo -e "\n  ${W}by app${NC}"
     awk '
         {
@@ -169,15 +132,12 @@ ${NC}"
     echo -e "\n  ${D}total: $total match(es)${NC}\n"
 }
 
-# Scan one log file for pattern, applying post-filters, prefix each
-# surviving line with `[<colored app label>]`. Handles .gz / .bz2 / plain.
-# Emits to stdout; caller appends to the tmp file.
+# Prints matching lines of one plain/.gz/.bz2/.xz file, filtered and prefixed with `[label]`.
 _search_one_file() {
     local f="$1" pattern="$2" grep_flag="$3" app="$4" col="$5" label="$6"
     local path_filter="$7" cutoff_epoch="$8" awk_bin="${9:-awk}"
 
-    # Decompression path — prefer `gzip -dc` over `zcat` because BSD zcat
-    # only handles .Z (compress), not .gz. Same for `bzip2 -dc` / `xz -dc`.
+    # gzip -dc rather than zcat: BSD zcat only reads .Z.
     local reader_cmd=""
     case "$f" in
         *.gz)   reader_cmd="gzip -dc"  ;;
@@ -185,15 +145,11 @@ _search_one_file() {
         *.xz)   reader_cmd="xz -dc"    ;;
         *)      reader_cmd="cat"       ;;
     esac
-    # Check the first word of reader_cmd is on PATH.
     local probe="${reader_cmd%% *}"
     command -v "$probe" >/dev/null 2>&1 \
         || { echo -e "${D}  (skipping $f — $probe not installed)${NC}" >&2; return 0; }
 
-    # The || true swallows grep's "no matches" exit=1 so `set -euo pipefail`
-    # doesn't abort the whole search when one file happens to not contain
-    # the pattern (very common on rotated archives). Each stage's other
-    # failure modes are intentionally swallowed too — search is best-effort.
+    # `|| true` keeps grep's no-match exit from aborting under pipefail; search is best-effort.
     $reader_cmd "$f" 2>/dev/null \
         | { grep "$grep_flag" -- "$pattern" || true; } \
         | "$awk_bin" -v app="$app" -v col="$col" -v nc="$NC" -v label="$label" \

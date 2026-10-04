@@ -122,8 +122,7 @@ func TestSuidEscalation(t *testing.T) {
 }
 
 func TestMatch_combinesHits(t *testing.T) {
-	// One event can match multiple rules — e.g. nginx spawning bash from
-	// /tmp matches both shell_from_web_worker AND exec_from_tmp.
+	// nginx spawning bash from /tmp matches both shell_from_web_worker and exec_from_tmp.
 	ev := Event{
 		Comm:       "bash",
 		ParentComm: "nginx",
@@ -178,9 +177,7 @@ func TestUitoa(t *testing.T) {
 	}
 }
 
-// resetNetAllowlistCache wipes the package-level cache so each test
-// can stage its own MILOG_PROBE_NET_ALLOWLIST. Test-only escape hatch
-// — the cache flag is unexported so production callers can't reach it.
+// resetNetAllowlistCache lets each test stage its own MILOG_PROBE_NET_ALLOWLIST.
 func resetNetAllowlistCache() {
 	cachedAllowlist = netAllowlist{}
 	allowlistReady = false
@@ -247,8 +244,7 @@ func TestMatchNet_FiresOnPublicIPv6(t *testing.T) {
 }
 
 func TestMatchNet_CustomAllowlist_TightenedDefault(t *testing.T) {
-	// Operator wants ONLY DNS + a single corporate proxy CIDR allowed.
-	// Everything else — including loopback — fires.
+	// Only DNS and one proxy CIDR allowed; even loopback fires.
 	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", ":53,10.7.0.0/16:443")
 	resetNetAllowlistCache()
 
@@ -307,18 +303,13 @@ func TestParseNetAllowlist_MalformedSkipped(t *testing.T) {
 	}
 }
 
-// resetFileRulesCache mirrors resetNetAllowlistCache for the file
-// probe — wipes the parsed-config cache so each test can stage its
-// own MILOG_PROBE_FILE_* env vars.
+// resetFileRulesCache lets each test stage its own MILOG_PROBE_FILE_* vars.
 func resetFileRulesCache() {
 	cachedFileRules = fileRules{}
 	fileRulesReady = false
 }
 
 func TestMatchFile_DefaultsFireOnSensitiveRead(t *testing.T) {
-	// A non-allowlisted process reading /etc/shadow is the canonical
-	// post-compromise signal the audit FIM module hashes for; here we
-	// catch the live read instead of the periodic re-hash.
 	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
 	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
 	resetFileRulesCache()
@@ -363,9 +354,6 @@ func TestMatchFile_DefaultsFireOnSensitiveRead(t *testing.T) {
 }
 
 func TestMatchFile_AllowlistedCommsSilent(t *testing.T) {
-	// sshd reading authorized_keys, cron reading /etc/sudoers, etc. —
-	// all expected, all allowlisted. The whole point of the comm
-	// allowlist is that operators don't get paged on every login.
 	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
 	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
 	resetFileRulesCache()
@@ -386,9 +374,7 @@ func TestMatchFile_AllowlistedCommsSilent(t *testing.T) {
 }
 
 func TestMatchFile_NonSensitivePathSilent(t *testing.T) {
-	// The BPF prefix filter is coarse (/etc /root /home /var) so the
-	// userspace gets opens that aren't on the precise sensitive list.
-	// Those must NOT fire — the rule is per-path, not per-prefix.
+	// BPF's prefix filter is coarse, so non-listed paths under /etc must not fire.
 	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
 	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
 	resetFileRulesCache()
@@ -407,9 +393,7 @@ func TestMatchFile_NonSensitivePathSilent(t *testing.T) {
 }
 
 func TestMatchFile_CustomSensitivePaths(t *testing.T) {
-	// Operator extends defaults to also alert on webroot env files.
-	// Custom list REPLACES defaults rather than appending — same
-	// semantics as MILOG_PROBE_NET_ALLOWLIST.
+	// A custom list replaces the defaults.
 	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "/var/www/.env,/etc/myapp/secret.key")
 	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
 	resetFileRulesCache()
@@ -424,29 +408,21 @@ func TestMatchFile_CustomSensitivePaths(t *testing.T) {
 }
 
 func TestMatchFile_CustomCommAllowlist(t *testing.T) {
-	// Operator runs a custom secrets-rotation tool that legitimately
-	// reads /etc/shadow. They allowlist its comm and expect silence.
 	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
 	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "rotator,backup-agent")
 	resetFileRulesCache()
 
-	// Allowlisted comms silent.
 	if hits := MatchFile(FileEvent{Comm: "rotator", Filename: "/etc/shadow"}); len(hits) != 0 {
 		t.Errorf("custom-allowlisted comm should be silent, got %+v", hits)
 	}
-	// And — because the custom list REPLACES — the previously-
-	// shipped sshd allowlist no longer applies.
+	// The custom list replaced the defaults, so sshd is no longer allowlisted.
 	if hits := MatchFile(FileEvent{Comm: "sshd", Filename: "/etc/shadow"}); len(hits) != 1 {
 		t.Errorf("custom allowlist replaces defaults; sshd should now fire, got %+v", hits)
 	}
 }
 
 func TestUhex(t *testing.T) {
-	// Spot-check the openat-flag formatter. Common openat values:
-	//   0x0  = O_RDONLY
-	//   0x1  = O_WRONLY
-	//   0x2  = O_RDWR
-	//   0x42 = O_RDWR | O_CREAT (most common open() default for write)
+	// 0x0 O_RDONLY, 0x1 O_WRONLY, 0x2 O_RDWR, 0x42 O_RDWR|O_CREAT.
 	cases := map[uint32]string{
 		0:          "0",
 		1:          "1",
@@ -462,18 +438,13 @@ func TestUhex(t *testing.T) {
 	}
 }
 
-// resetPtraceRulesCache mirrors the reset helpers for the other rule
-// engines — wipes the parsed-config cache so each test stages its own
-// MILOG_PROBE_PTRACE_DEBUGGERS.
+// resetPtraceRulesCache lets each test stage its own MILOG_PROBE_PTRACE_DEBUGGERS.
 func resetPtraceRulesCache() {
 	cachedPtraceRules = ptraceRules{}
 	ptraceRulesReady = false
 }
 
 func TestMatchPtrace_DebuggersSilent(t *testing.T) {
-	// gdb / strace / lldb / dlv all live cleanly inside the default
-	// allowlist — no operator should ever get paged on a normal debug
-	// session.
 	t.Setenv("MILOG_PROBE_PTRACE_DEBUGGERS", "")
 	resetPtraceRulesCache()
 
@@ -493,9 +464,6 @@ func TestMatchPtrace_DebuggersSilent(t *testing.T) {
 }
 
 func TestMatchPtrace_AttackerCommFires(t *testing.T) {
-	// Non-debugger comm performing a cross-process attach is the
-	// canonical post-RCE injection pattern. php-fpm child somehow
-	// running ptrace, sshd-spawned worker attaching to root pid 1, etc.
 	t.Setenv("MILOG_PROBE_PTRACE_DEBUGGERS", "")
 	resetPtraceRulesCache()
 
@@ -535,15 +503,13 @@ func TestMatchPtrace_AttackerCommFires(t *testing.T) {
 }
 
 func TestMatchPtrace_CustomDebuggerAllowlist(t *testing.T) {
-	// Operator runs an in-house profiler that uses ptrace. They want
-	// it allowlisted alongside the defaults.
 	t.Setenv("MILOG_PROBE_PTRACE_DEBUGGERS", "myprofiler,gdb")
 	resetPtraceRulesCache()
 
 	if hits := MatchPtrace(PtraceEvent{Comm: "myprofiler", TargetPID: 1, Request: 16}); len(hits) != 0 {
 		t.Errorf("custom-allowlisted comm should be silent, got %+v", hits)
 	}
-	// Custom list REPLACES — so strace (default) is no longer silent.
+	// The custom list replaces the defaults, so strace now fires.
 	if hits := MatchPtrace(PtraceEvent{Comm: "strace", TargetPID: 1, Request: 16}); len(hits) != 1 {
 		t.Errorf("custom allowlist replaces defaults; strace should now fire, got %+v", hits)
 	}
@@ -563,18 +529,14 @@ func TestPtraceRequestName(t *testing.T) {
 	}
 }
 
-// resetKmodRulesCache mirrors the others — clears parsed-config so
-// each test can stage its own MILOG_PROBE_KMOD_ALLOWLIST.
+// resetKmodRulesCache lets each test stage its own MILOG_PROBE_KMOD_ALLOWLIST.
 func resetKmodRulesCache() {
 	cachedKmodRules = kmodRules{}
 	kmodRulesReady = false
 }
 
 func TestMatchKmod_DefaultsAllowKnownLoaders(t *testing.T) {
-	// Defaults apply when the env var is UNSET (vs. the explicit-empty
-	// case, which means "no allowlist at all"). os.Unsetenv plus a
-	// cache reset stages the unset state cleanly — t.Setenv is no help
-	// here because it sets, never unsets.
+	// Unset, not empty: empty means "no allowlist", and t.Setenv can't unset.
 	if err := os.Unsetenv("MILOG_PROBE_KMOD_ALLOWLIST"); err != nil {
 		t.Fatalf("Unsetenv: %v", err)
 	}
@@ -616,9 +578,7 @@ func TestMatchKmod_NonAllowlistedFires(t *testing.T) {
 }
 
 func TestMatchKmod_ExplicitEmptyDisablesAllowlist(t *testing.T) {
-	// Locked-down host pattern: kernel.modules_disabled=1 is set, so
-	// any kmod load is signal. Operator sets MILOG_PROBE_KMOD_ALLOWLIST=""
-	// (empty STRING, not unset) to disable the allowlist entirely.
+	// MILOG_PROBE_KMOD_ALLOWLIST="" (set but empty) disables the allowlist.
 	t.Setenv("MILOG_PROBE_KMOD_ALLOWLIST", "")
 	resetKmodRulesCache()
 
@@ -629,9 +589,7 @@ func TestMatchKmod_ExplicitEmptyDisablesAllowlist(t *testing.T) {
 }
 
 func TestMatchKmod_UnknownModuleNameFallback(t *testing.T) {
-	// Defensive: if BPF couldn't read the module name (data_loc trick
-	// failed on an exotic kernel), the alert should still emit with
-	// a placeholder rather than a blank-name "load by …" title.
+	// BPF may fail to read the name on exotic kernels; the title still needs a placeholder.
 	t.Setenv("MILOG_PROBE_KMOD_ALLOWLIST", "modprobe")
 	resetKmodRulesCache()
 
@@ -645,9 +603,7 @@ func TestMatchKmod_UnknownModuleNameFallback(t *testing.T) {
 }
 
 func TestMatchRetrans_BelowThresholdSilent(t *testing.T) {
-	// Default threshold is 10 retransmits per window. A single-digit
-	// count shouldn't fire — every healthy network sees a few
-	// retransmits during connection setup.
+	// Default threshold is 10; a few retransmits are normal.
 	t.Setenv("MILOG_PROBE_RETRANS_THRESHOLD", "")
 	cases := []RetransEvent{
 		{DAddr: "1.2.3.4", DPort: 443, Count: 1, Window: 60 * time.Second},
@@ -688,7 +644,6 @@ func TestMatchRetrans_AtAndAboveThresholdFires(t *testing.T) {
 }
 
 func TestMatchRetrans_CustomThreshold(t *testing.T) {
-	// Operator on a tight link wants to alert on much smaller spikes.
 	t.Setenv("MILOG_PROBE_RETRANS_THRESHOLD", "3")
 
 	// Count=3 fires now, count=2 doesn't.
@@ -701,9 +656,7 @@ func TestMatchRetrans_CustomThreshold(t *testing.T) {
 }
 
 func TestMatchRetrans_MalformedThresholdFallsBackToDefault(t *testing.T) {
-	// A garbage env value should NOT silently disable the rule. Fall
-	// back to the default 10 so operators don't lose coverage from a
-	// typo.
+	// A bad value falls back to the default instead of disabling the rule.
 	t.Setenv("MILOG_PROBE_RETRANS_THRESHOLD", "not-a-number")
 	if hits := MatchRetrans(RetransEvent{DAddr: "1.1.1.1", DPort: 80, Count: 11, Window: 60 * time.Second}); len(hits) != 1 {
 		t.Errorf("malformed env should fall back to default 10; count=11 should fire, got %d hits", len(hits))
@@ -749,8 +702,7 @@ func TestWelford_TextbookValues(t *testing.T) {
 }
 
 func TestWelford_DegenerateCases(t *testing.T) {
-	// n=0: variance is 0 (no data); n=1: variance is 0 (no spread).
-	// Both used as the "no-σ-yet" sentinel by matchSyscallBurst.
+	// Both n=0 and n=1 give variance 0, the "no baseline yet" signal.
 	var w Welford
 	if w.Variance() != 0 || w.Stddev() != 0 {
 		t.Errorf("zero-sample Welford should report 0 variance/stddev")
@@ -783,9 +735,7 @@ func TestMatchSyscallBurst_BurnInGate(t *testing.T) {
 }
 
 func TestMatchSyscallBurst_FloorGate(t *testing.T) {
-	// A small absolute count shouldn't fire even if it's many σ
-	// above a near-zero baseline. Floor protects against the
-	// "infinite-σ on idle" pathology.
+	// Many σ above a near-idle baseline, but under the floor.
 	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "")
 	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
 
@@ -806,9 +756,7 @@ func TestMatchSyscallBurst_SpikeAboveBaselineFires(t *testing.T) {
 	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "")
 	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
 
-	// Process normally does ~5000 syscalls/min ± ~500. 50000 is
-	// 90σ above mean, well past 3σ, well past floor (1000), past
-	// burn-in (10).
+	// ~5000 ± 500 per window; 50000 clears 3σ, the floor (1000) and burn-in (10).
 	ev := RateAnomalyEvent{
 		PID: 4242, PPID: 1, UID: 33,
 		Comm: "php-fpm8.2", ParentComm: "nginx",
@@ -855,8 +803,6 @@ func TestMatchSyscallBurst_BelowSigmaSilent(t *testing.T) {
 }
 
 func TestMatchSyscallBurst_CustomFloor(t *testing.T) {
-	// Operator on a tightly-locked-down host expects all processes
-	// to be near-idle; anything over 100 syscalls/window is signal.
 	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "100")
 	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
 
@@ -874,8 +820,7 @@ func TestMatchSyscallBurst_CustomFloor(t *testing.T) {
 }
 
 func TestMatchSyscallBurst_ZeroWindowSafe(t *testing.T) {
-	// Defensive: a config bug or test passing Window=0 must not
-	// cause divide-by-zero or a NaN-laced alert title.
+	// Window=0 must not divide by zero or put NaN in the title.
 	t.Setenv("MILOG_PROBE_SYSCALL_FLOOR", "")
 	t.Setenv("MILOG_PROBE_SYSCALL_BURNIN", "")
 
@@ -940,8 +885,7 @@ func TestMatchBpfLoad_NonAllowlistedFires(t *testing.T) {
 }
 
 func TestMatchBpfLoad_CustomTightAllowlist(t *testing.T) {
-	// Locked-down host: only milog-probe is allowed to load BPF.
-	// systemd / bpftrace / docker now all fire.
+	// Only milog-probe allowed, so systemd, bpftrace and docker fire.
 	t.Setenv("MILOG_PROBE_BPFLOAD_ALLOWLIST", "milog-probe")
 	resetBpfLoadRulesCache()
 

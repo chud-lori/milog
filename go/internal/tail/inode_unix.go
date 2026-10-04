@@ -7,9 +7,7 @@ import (
 	"syscall"
 )
 
-// inode returns the filesystem inode from a FileInfo on unix systems.
-// Used to detect logrotate-style rotations: the path stays the same
-// but the inode differs.
+// inode lets the tailer spot rotation: same path, different inode.
 func inode(fi os.FileInfo) uint64 {
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		return uint64(st.Ino)

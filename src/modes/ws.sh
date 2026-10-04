@@ -1,27 +1,7 @@
-# ==============================================================================
-# MODE: ws — WebSocket session metrics (complementary to `slow`)
-#
-# nginx's `$request_time` for a WebSocket-upgraded connection is the full
-# session lifetime (start-of-HTTP-request to socket-close), not request
-# latency. `milog slow` / `top-paths` filter WS paths out so they don't
-# top the "slowest" table with healthy long-lived sessions. This mode is
-# the other side: shows WS sessions on their own terms — count, duration
-# distribution, longest, per-path breakdown.
-#
-# "Which paths are WebSocket?" comes from SLOW_EXCLUDE_PATHS (default:
-# "/ws/* /socket.io/*"). One source of truth — customising the exclude
-# list moves paths in/out of `ws` at the same time.
-#
-# Requires the combined_timed log format (with $request_time). Skipping
-# silently if no WS samples match in the window.
-# ==============================================================================
+# milog ws: WebSocket session metrics. $request_time is the whole session for these, which is why slow/top-paths exclude them.
+# WS paths are SLOW_EXCLUDE_PATHS, so both views always agree; needs $request_time in the log format.
 
-# Format a duration given in seconds into a short human string.
-#   < 1 s          → "<1s"
-#   < 60 s         → "Ns"
-#   < 3600 s       → "MmSSs"
-#   < 86400 s      → "HhMMm"
-#   >= 86400 s     → "DdHHh"
+# Seconds -> "<1s", "Ns", "MmSSs", "HhMMm" or "DdHHh".
 _ws_fmt_duration() {
     local s="$1"
     if ! [[ "$s" =~ ^[0-9]+$ ]]; then printf -- '—'; return; fi
@@ -60,9 +40,7 @@ mode_ws() {
         return 1
     fi
 
-    # Per-file extraction: emit `app \t path \t ms` for WS-prefixed paths
-    # only. Done in a loop rather than `tail -q` so we can tag each line
-    # with its source app.
+    # `app \t path \t ms` for WS paths, one file at a time so lines keep their app.
     local raw
     raw=$(
         for entry in "${files[@]}"; do
@@ -101,8 +79,6 @@ mode_ws() {
         return 0
     fi
 
-    # --- Summary across all apps --------------------------------------------
-    # Single awk pass: total count, sum, max, p50/p95, long-session count.
     local long_threshold_s=3600   # sessions > this are "long"
     local summary
     summary=$(printf '%s\n' "$raw" \
@@ -142,9 +118,7 @@ mode_ws() {
     fi
     echo
 
-    # --- Per-(app, path) breakdown -------------------------------------------
-    # Group by app+path, emit: sessions, p50, p95, max per group. Sort by
-    # session count desc.
+    # Per (app, path): sessions, p50, p95, max, busiest first.
     local rows
     rows=$(printf '%s\n' "$raw" \
         | sort -t $'\t' -k1,1 -k2,2 -k3,3n \

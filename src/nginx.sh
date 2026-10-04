@@ -1,12 +1,6 @@
-# ==============================================================================
-# NGINX ROW HELPERS
-# ==============================================================================
+# nginx access-log counters and monitor rows.
 
-# Extract the single awk pass so the daemon can reuse it without the
-# rendering side-effects of nginx_row. Prints "count c2 c3 c4 c5" (zeros
-# if the log file is missing or unreadable). One scan, four class buckets;
-# callers that only need c4/c5 just consume the first three fields they
-# care about and leave the rest as locals.
+# Prints "count c2 c3 c4 c5" for lines containing timestamp $2, or zeros when the log is missing.
 nginx_minute_counts() {
     local file="$LOG_DIR/$1.access.log"
     [[ -f "$file" ]] || { printf '0 0 0 0 0\n'; return; }
@@ -28,11 +22,7 @@ nginx_minute_counts() {
     ' "$file" 2>/dev/null
 }
 
-# Response-time percentiles for the current-minute window. Requires the
-# extended log_format that appends $request_time as the final field (see
-# README → "Response-time percentiles"). Gracefully degrades to the em-dash
-# sentinel when no numeric $request_time is present on any matching line.
-#   $1 app   $2 CUR_TIME   →   prints "p50 p95 p99" in ms, or "— — —"
+# Prints "p50 p95 p99" in ms for $1 at minute $2, or "— — —" when no line ends in a numeric $request_time.
 percentiles() {
     local name="$1" cur="$2"
     local file="$LOG_DIR/$name.access.log"
@@ -46,8 +36,7 @@ percentiles() {
         printf -- '— — —\n'
         return
     fi
-    # Ceiling-index percentile pick: idx = ceil(N*k/100), clamped to [1,N].
-    # Single awk pass over the already-sorted stream keeps us to one fork.
+    # Ceiling-index pick: idx = ceil(N*k/100), clamped to [1,N].
     printf '%s\n' "$sorted" | awk '
         { a[NR] = $1; n = NR }
         END {
@@ -59,13 +48,7 @@ percentiles() {
         }'
 }
 
-# GeoIP lookup for a single IP. Returns the 2-letter ISO country code or
-# the em-dash sentinel when disabled, when the MMDB is missing, when
-# mmdblookup isn't on $PATH, or when the IP isn't in the database.
-#
-# Performance: forks mmdblookup per call. Callers MUST only invoke this on
-# already-aggregated IP sets (post uniq/awk dedup) — never per log line in
-# a live tail, where it would fork thousands of processes.
+# ISO country code, or "—" when GeoIP is off or unavailable. Forks mmdblookup, so only call it on deduped IP sets.
 geoip_country() {
     [[ "${GEOIP_ENABLED:-0}" != "1" ]] && { printf -- '—'; return; }
     [[ ! -f "$MMDB_PATH" ]]            && { printf -- '—'; return; }
@@ -76,25 +59,10 @@ geoip_country() {
     printf '%s' "${out:-—}"
 }
 
-# Cached p95 lookup for the monitor row. Two-level cache:
-#   TIMED_APPS[name]   — unset=unknown, 0=never-timed, 1=timed. Skips the
-#                        file scan forever for apps that don't log
-#                        $request_time (restart MiLog after a log_format
-#                        change to re-probe).
-#   P95_LAST_MIN[name] — last minute string (dd/Mon/yyyy:HH:MM) we probed
-#   P95_LAST_VAL[name] — p95 value for that minute
-#
-# Within the same minute, re-use the cached p95 so a 5s monitor refresh
-# doesn't re-scan the whole log 12× per minute per app.
-#
-# Declared lazily (`-gA` inside the function) so the script stays parseable
-# on bash 3.2 hosts without associative arrays — same pattern used for HIST.
-#
-# Prints the p95 in milliseconds on stdout, or empty when unavailable.
+# p95 for the monitor row, cached per app per minute so a 5s refresh doesn't rescan the log.
+# Apps found without $request_time are never scanned again until MiLog restarts.
 _p95_cached() {
-    # On bash 3.2 (macOS dev boxes) associative arrays aren't available,
-    # so skip the cache entirely — correct result, uncached probe every
-    # call. Real deployments target bash 4+ Linux.
+    # bash 3.2 has no associative arrays, so skip the cache there.
     if (( ${BASH_VERSINFO[0]:-3} < 4 )); then
         local _p50 p95 _p99
         read -r _p50 p95 _p99 <<< "$(percentiles "$1" "$2")"
@@ -104,11 +72,8 @@ _p95_cached() {
     declare -gA TIMED_APPS P95_LAST_MIN P95_LAST_VAL
     local name="$1" cur="$2"
 
-    # Hard negative cache — don't scan apps we've already proven untimed.
     [[ "${TIMED_APPS[$name]:-}" == "0" ]] && return 0
 
-    # Per-minute positive cache — reuse the previous probe inside the same
-    # minute bucket so render loops at sub-minute cadence don't rescan.
     if [[ "${P95_LAST_MIN[$name]:-}" == "$cur" ]]; then
         printf '%s' "${P95_LAST_VAL[$name]}"
         return 0
@@ -126,11 +91,7 @@ _p95_cached() {
     fi
 }
 
-# HTTP rule-hook — fires 4xx/5xx spike alerts. Called from both nginx_row
-# (render-mode) and mode_daemon. Cooldown gate inside alert_should_fire.
-#
-# Thresholds resolve via _thresh so `THRESH_5XX_WARN_api=10` in config.sh
-# loosens just the `api` app while leaving the global default intact.
+# 4xx/5xx spike alerts, shared by nginx_row and the daemon; thresholds go through _thresh.
 nginx_check_http_alerts() {
     local name="$1" c4="$2" c5="$3"
     local t5 t4
@@ -144,8 +105,7 @@ nginx_check_http_alerts() {
     fi
 }
 
-# System rule-hook — fires CPU/MEM/DISK/workers alerts. Shared by monitor
-# and daemon so threshold logic has one home.
+# CPU/MEM/DISK/worker alerts, shared by monitor and daemon.
 sys_check_alerts() {
     local cpu="$1" mem_pct="$2" mem_used="$3" mem_total="$4"
     local disk_pct="$5" disk_used="$6" disk_total="$7" worker_count="$8"
@@ -172,9 +132,6 @@ nginx_row() {
     # shellcheck disable=SC2034
     eval "$TOTAL_ref=$(( ${!TOTAL_ref} + count ))"
 
-    # Per-app threshold overrides — config may set THRESH_REQ_WARN_<app> etc.
-    # Resolved once per row to keep the branch cheap; _thresh falls back to
-    # the global when no override exists.
     local tr_warn tr_crit t4_warn t5_warn
     tr_warn=$(_thresh THRESH_REQ_WARN  "$name")
     tr_crit=$(_thresh THRESH_REQ_CRIT  "$name")
@@ -196,15 +153,12 @@ nginx_row() {
 
     nginx_check_http_alerts "$name" "$c4" "$c5"
 
-    # Response-time p95 (skipped automatically for apps without the timed
-    # log format after the first probe — see _p95_cached / TIMED_APPS).
     local p95_ms
     p95_ms=$(_p95_cached "$name" "$CUR_TIME")
 
     local bars_plain bars_col
     if [[ "${MILOG_HIST_ENABLED:-0}" == "1" ]]; then
-        # Push current sample into ring buffer (HIST is a global assoc array).
-        # Freeze the buffer when MILOG_HIST_PAUSED=1 so paused view doesn't drift.
+        # MILOG_HIST_PAUSED=1 freezes the ring buffer while the view is paused.
         local -a hist_arr=( ${HIST[$name]:-} )
         if [[ "${MILOG_HIST_PAUSED:-0}" != "1" ]]; then
             hist_arr+=( "$count" )
@@ -213,12 +167,11 @@ nginx_row() {
             fi
             HIST[$name]="${hist_arr[*]}"
         fi
-        # Handle first tick before any samples exist
         (( ${#hist_arr[@]} == 0 )) && hist_arr=( 0 )
 
         local spark n_samples=${#hist_arr[@]}
         spark=$(sparkline_render "${hist_arr[*]}")
-        # Plain placeholder of equal column-width for padding arithmetic.
+        # Placeholder with the sparkline's width for padding maths.
         bars_plain=$(printf '.%.0s' $(seq 1 "$n_samples"))
         bars_col="${b_col}${spark}${NC}"
     else
@@ -232,9 +185,7 @@ nginx_row() {
         fi
     fi
 
-    # Build the right-aligned tag strip — 4xx/5xx counts and/or p95 — then
-    # trim the bar/sparkline to fit before concatenating. Each tag is
-    # optional; the tag strip is only applied when at least one is present.
+    # Trim the bar so the 4xx/5xx and p95 tags fit in the column.
     local etag_p="" etag_c=""
     if (( c4 > 0 || c5 > 0 )); then
         etag_p+=" 4xx:${c4} 5xx:${c5}"

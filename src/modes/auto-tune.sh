@@ -1,26 +1,6 @@
-# ==============================================================================
-# MODE: auto-tune — suggest thresholds from history baselines
-#
-# Picks thresholds that would have fired ~rarely on your actual traffic
-# instead of making users guess "what's a reasonable 5xx/min for this box?".
-# Reads metrics_minute over a recent window and prints:
-#   1) side-by-side table of CURRENT vs SUGGESTED
-#   2) a copy-paste block of `milog config set …` commands
-#
-# Percentile picks:
-#   THRESH_REQ_WARN  = p90(req)       — alert on the top 10% of minutes
-#   THRESH_REQ_CRIT  = p99(req)       — alert on clear outliers
-#   THRESH_4XX_WARN  = p95(c4xx)      — floor at 5 so tiny clients don't spam
-#   THRESH_5XX_WARN  = p95(c5xx)      — floor at 1 (any 5xx > 0 is worth a ping)
-#   P95_WARN_MS      = p75(p95_ms)    — warn when current p95 worse than 3-in-4 historical minutes
-#   P95_CRIT_MS      = p99(p95_ms)    — crit on top 1% latency outliers
-#
-# CPU/MEM/DISK are not in the DB, so those thresholds aren't tuned here.
-# ==============================================================================
+# milog auto-tune [days]: suggests HTTP thresholds from percentiles of metrics_minute. CPU/MEM/DISK aren't in the DB.
 
-# Stdin-to-percentile helper: read newline-separated numbers, print the
-# p-th percentile (1..100) using the existing `sort -n | awk positional`
-# idiom (same logic as percentiles() but for a generic stream).
+# p-th percentile (1..100) of newline-separated numbers on stdin.
 _pct_from_stdin() {
     local p=$1
     sort -n | awk -v p="$p" '
@@ -34,7 +14,7 @@ _pct_from_stdin() {
         }'
 }
 
-# Format one table row. Visual widths: METRIC(20) CURRENT(11) SUGGESTED(11) DELTA(9)
+# Columns: METRIC(20) CURRENT(11) SUGGESTED(11) DELTA(9).
 _tune_row() {
     local metric="$1" current="$2" suggested="$3"
     local delta=""
@@ -67,8 +47,7 @@ mode_auto_tune() {
 
     echo -e "\n${W}── MiLog: auto-tune (window=${days}d, ${count} rows) ──${NC}\n"
 
-    # 100 rows ≈ 100 minutes ≈ 1.6h of data — anything less and percentiles
-    # are too noisy to base thresholds on.
+    # Rows are per app per minute; fewer than 100 makes the percentiles noise.
     if (( count < 100 )); then
         echo -e "${R}Not enough history (${count} rows — need ≥100).${NC}"
         echo -e "${D}  let 'milog daemon' run for a few hours with HISTORY_ENABLED=1,${NC}"
@@ -76,9 +55,7 @@ mode_auto_tune() {
         return 1
     fi
 
-    # Pull each metric's samples once. Filtering req>0 excludes quiet-hour
-    # zeros so the percentile reflects real traffic — otherwise a mostly-idle
-    # server would suggest THRESH_REQ_WARN=0.
+    # req > 0 drops idle minutes, which would otherwise pull suggestions toward 0.
     local p95_samples req_samples c4_samples c5_samples
     p95_samples=$(sqlite3 "$HISTORY_DB" \
         "SELECT p95_ms FROM metrics_minute WHERE ts >= $since AND p95_ms IS NOT NULL AND req > 0;" 2>/dev/null)
@@ -97,13 +74,11 @@ mode_auto_tune() {
     s_p95_warn=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 75)
     s_p95_crit=$(printf '%s\n' "$p95_samples" | _pct_from_stdin 99)
 
-    # Floors so "empty" days don't suggest zeros that fire on any activity.
+    # Floors stop quiet history from suggesting thresholds that fire on any activity.
     [[ "$s_c4_warn"  =~ ^[0-9]+$ ]] && (( s_c4_warn  < 5 )) && s_c4_warn=5
     [[ "$s_c5_warn"  =~ ^[0-9]+$ ]] && (( s_c5_warn  < 1 )) && s_c5_warn=1
     [[ "$s_req_warn" =~ ^[0-9]+$ ]] && (( s_req_warn < 5 )) && s_req_warn=5
 
-    # Fall back to blank when we had zero samples for a metric (no timed
-    # traffic at all means p95 tuning is impossible).
     : "${s_req_warn:=}"; : "${s_req_crit:=}"; : "${s_c4_warn:=}"; : "${s_c5_warn:=}"
     : "${s_p95_warn:=}"; : "${s_p95_crit:=}"
 
@@ -116,7 +91,6 @@ mode_auto_tune() {
     _tune_row "P95_WARN_MS"      "$P95_WARN_MS"      "${s_p95_warn:--}"
     _tune_row "P95_CRIT_MS"      "$P95_CRIT_MS"      "${s_p95_crit:--}"
 
-    # Ready-to-apply block — skip lines we couldn't tune.
     echo -e "\n${W}Ready to apply${NC} ${D}(copy-paste to set):${NC}"
     local line printed=0
     for line in \
