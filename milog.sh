@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-125-g63d63a2
-# MILOG_BUILT=2026-10-04T02:09:43Z
+# MILOG_VERSION=v0.6.0-2-g1f66fcb
+# MILOG_BUILT=2026-10-04T02:41:29Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -5639,7 +5639,8 @@ _tui_go_binary() {
     local candidate
     for candidate in \
         /usr/local/libexec/milog/milog-tui \
-        /usr/local/bin/milog-tui; do
+        /usr/local/bin/milog-tui \
+        /usr/bin/milog-tui; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
     local self="${BASH_SOURCE[0]}"
@@ -6055,7 +6056,8 @@ _probe_binary() {
     local candidate
     for candidate in \
         /usr/local/libexec/milog/milog-probe \
-        /usr/local/bin/milog-probe; do
+        /usr/local/bin/milog-probe \
+        /usr/bin/milog-probe; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
     local self="${BASH_SOURCE[0]}"
@@ -7424,7 +7426,8 @@ _web_go_binary() {
     local candidate
     for candidate in \
         /usr/local/libexec/milog/milog-web \
-        /usr/local/bin/milog-web; do
+        /usr/local/bin/milog-web \
+        /usr/bin/milog-web; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
     local self="${BASH_SOURCE[0]}"
@@ -7460,6 +7463,7 @@ Search path checked (in order):
   \$MILOG_WEB_BIN
   /usr/local/libexec/milog/milog-web
   /usr/local/bin/milog-web
+  /usr/bin/milog-web
   <script-dir>/go/bin/milog-web        (clone / dev)
   <script-dir>/../go/bin/milog-web
 
