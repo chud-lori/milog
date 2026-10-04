@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-24-g58e9f05
-# MILOG_BUILT=2026-10-04T02:59:44Z
+# MILOG_VERSION=v0.6.0-32-g62b1f71
+# MILOG_BUILT=2026-10-04T03:03:36Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -842,6 +842,12 @@ _alert_redact_webhook() {
     else
         printf '%.40s…' "$w"
     fi
+}
+
+# Succeeds when at least one destination has every setting it needs; same args as _alert_destinations_status.
+_alert_any_destination() {
+    local d="${1:-}" s="${2:-}" tt="${3:-}" tc="${4:-}" mh="${5:-}" mt="${6:-}" mr="${7:-}" wh="${8:-}"
+    [[ -n "$d$s$wh" ]] || [[ -n "$tt" && -n "$tc" ]] || [[ -n "$mh" && -n "$mt" && -n "$mr" ]]
 }
 
 # Takes values as args so `alert status` can pass ones read from another user's config file.
@@ -1807,10 +1813,18 @@ _alert_write_config() {
     fi
 }
 
+# Root may be the reader, so only a regular, non-symlink file up to 1 MiB counts.
+_alert_config_readable() {
+    local file="$1" size
+    [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 1
+    size=$(stat -c '%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null) || return 1
+    (( size <= 1048576 ))
+}
+
 # Always returns 0, printing nothing when the file or key is missing, to stay safe under `set -e`.
 _alert_read_webhook() {
     local file="$1"
-    [[ -f "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     {
         grep -E '^[[:space:]]*DISCORD_WEBHOOK=' "$file" 2>/dev/null \
             | head -1 \
@@ -1820,11 +1834,8 @@ _alert_read_webhook() {
 }
 
 _alert_read_routes() {
-    local file="$1" size
-    # Root may be the reader, so skip symlinks, FIFOs and anything over 1 MiB.
-    [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 0
-    size=$(stat -c '%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null) || return 0
-    (( size <= 1048576 )) || return 0
+    local file="$1"
+    _alert_config_readable "$file" || return 0
     # Parsed, never sourced: under sudo this is another user's file and we're root.
     awk '
         !on && /^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/ {
@@ -1843,7 +1854,7 @@ _alert_read_routes() {
 
 _alert_read_key() {
     local file="$1" key="$2"
-    [[ -f "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     {
         grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null \
             | head -1 \
@@ -1914,9 +1925,7 @@ alert_on() {
     mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
     mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
     mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
-    if [[ -z "$d_url$s_url$wh_url" ]] \
-        && [[ -z "$tg_token" || -z "$tg_chat" ]] \
-        && [[ -z "$mx_hs" || -z "$mx_token" || -z "$mx_room" ]]; then
+    if ! _alert_any_destination "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room" "$wh_url"; then
         echo -e "${R}no alert destination configured in $target_config${NC}" >&2
         echo "  pass a Discord webhook:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
         echo "  or set SLACK_WEBHOOK, TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID, MATRIX_* or WEBHOOK_URL there" >&2
@@ -2125,7 +2134,7 @@ alert_help() {
 ${W}milog alert${NC} — toggle alerting and manage the systemd service
 
 ${W}USAGE${NC}
-  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts (Discord); install + start systemd
+  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts; install + start systemd
   ${C}milog alert off${NC}                disable alerts; stop + disable service
   ${C}milog alert status${NC}             show destinations/service/recent-fire state
   ${C}milog alert test${NC}               fire one test alert to EVERY configured
@@ -4612,12 +4621,13 @@ mode_daemon() {
         exit 1
     fi
 
-    local hook_state
-    hook_state="disabled"
-    [[ "$ALERTS_ENABLED" == "1" && -n "$DISCORD_WEBHOOK" ]] && hook_state="enabled"
+    local hook_state="disabled" have_dest=0
+    _alert_any_destination "$DISCORD_WEBHOOK" "$SLACK_WEBHOOK" "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" \
+        "$MATRIX_HOMESERVER" "$MATRIX_TOKEN" "$MATRIX_ROOM" "$WEBHOOK_URL" && have_dest=1
+    [[ "$ALERTS_ENABLED" == "1" ]] && (( have_dest )) && hook_state="enabled"
     _dlog "milog daemon starting — refresh=${REFRESH}s alerts=${hook_state} history=${HISTORY_ENABLED} apps=(${LOGS[*]})"
     [[ "$ALERTS_ENABLED" != "1" ]] && _dlog "WARNING: ALERTS_ENABLED=0 — rules will log but no webhooks will be fired"
-    [[ -z "$DISCORD_WEBHOOK"    ]] && _dlog "WARNING: DISCORD_WEBHOOK empty — no webhooks will be fired"
+    (( have_dest )) || _dlog "WARNING: no alert destination configured — no webhooks will be fired"
 
     history_init   # no-op when HISTORY_ENABLED=0; disables itself on error
 
@@ -6920,7 +6930,7 @@ _silence_add() {
     local until_fmt; until_fmt=$(_silence_fmt_epoch "$until_epoch")
     local rem_fmt;   rem_fmt=$(_silence_fmt_remaining "$until_epoch")
     echo -e "${G}✓${NC} silenced ${Y}$key${NC} until ${W}$until_fmt${NC} (${rem_fmt})"
-    [[ -n "$message" ]] && echo -e "${D}  note: $message${NC}"
+    [[ -z "$message" ]] || echo -e "${D}  note: $message${NC}"
 }
 
 _silence_clear() {
@@ -8225,7 +8235,7 @@ ${W}DASHBOARDS${NC}
                      ${D}keys: q=quit  p=pause  r=refresh  +/-=rate${NC}
   ${C}tui${NC}                rich Charm TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
   ${C}rate${NC}               nginx-only req/min dashboard
-  ${C}daemon${NC}             headless alerter — no TUI, fires Discord webhooks
+  ${C}daemon${NC}             headless alerter — no TUI, fires every configured destination
 
 ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
@@ -8244,10 +8254,10 @@ ${W}ANALYSIS${NC}
   ${C}search <pat> ...${NC}   grep across all apps (flags: --since/--app/--path/--regex/--archives)
 
 ${W}ALERTING${NC}
-  ${C}alert on [URL]${NC}     enable Discord alerts + install systemd service
+  ${C}alert on [URL]${NC}     enable alerts + install systemd service
   ${C}alert off${NC}          disable alerts + stop service
   ${C}alert status${NC}       webhook / service / recent-fire state
-  ${C}alert test${NC}         send a test Discord embed right now
+  ${C}alert test${NC}         send a test alert to every destination
   ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
   ${C}silence ...${NC}        mute a rule while on-call works the fix ${D}(milog silence --help)${NC}
   ${C}digest [window]${NC}     exec-summary (day / week / Nh / Nd)
