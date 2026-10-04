@@ -159,6 +159,27 @@ func ParseLine(raw string) Line {
 	return ln
 }
 
+// AICrawlerTokens must equal AI_CRAWLER_UA_RE in src/nginx.sh; TestAICrawlerTokensMatchBash checks it.
+var AICrawlerTokens = []string{
+	"gptbot", "chatgpt-user", "oai-searchbot",
+	"claudebot", "claude-user", "claude-searchbot", "anthropic-ai",
+	"perplexitybot", "perplexity-user",
+	"meta-externalagent", "meta-externalfetcher",
+	"bytespider", "amazonbot", "ccbot", "cohere-ai",
+	"duckassistbot", "mistralai-user", "youbot",
+}
+
+// IsAICrawler reports whether ua contains any AICrawlerTokens entry, ignoring case.
+func IsAICrawler(ua string) bool {
+	ua = strings.ToLower(ua)
+	for _, tok := range AICrawlerTokens {
+		if strings.Contains(ua, tok) {
+			return true
+		}
+	}
+	return false
+}
+
 // TailLines returns the last n lines, reading the whole file into memory.
 func TailLines(path string, n int) ([]string, error) {
 	if n <= 0 {

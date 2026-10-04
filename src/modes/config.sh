@@ -50,6 +50,7 @@ config_show() {
     printf "  %-22s warn=%s crit=%s\n" "mem"      "$THRESH_MEM_WARN"  "$THRESH_MEM_CRIT"
     printf "  %-22s warn=%s crit=%s\n" "disk"     "$THRESH_DISK_WARN" "$THRESH_DISK_CRIT"
     printf "  %-22s 4xx=%s 5xx=%s\n"   "status thresholds" "$THRESH_4XX_WARN" "$THRESH_5XX_WARN"
+    printf "  %-22s %s/min\n" "AI crawler alert" "$THRESH_AICRAWL_WARN"
     printf "  %-22s warn=%sms crit=%sms\n" "p95 response time" "$P95_WARN_MS" "$P95_CRIT_MS"
     printf "  %-22s %s\n" "SLOW_WINDOW"   "$SLOW_WINDOW"
     printf "  %-22s enabled=%s mmdb=%s\n" "geoip" "$GEOIP_ENABLED" \
@@ -100,6 +101,7 @@ config_init() {
 # THRESH_DISK_CRIT=95
 # THRESH_4XX_WARN=20
 # THRESH_5XX_WARN=5
+# THRESH_AICRAWL_WARN=30   # AI-crawler requests/min per app before an aicrawl alert
 # P95_WARN_MS=500
 # P95_CRIT_MS=1500
 # SLOW_WINDOW=1000      # lines scanned per app by `milog slow`
@@ -270,6 +272,7 @@ config_validate() {
         THRESH_MEM_WARN THRESH_MEM_CRIT
         THRESH_DISK_WARN THRESH_DISK_CRIT
         THRESH_4XX_WARN THRESH_5XX_WARN
+        THRESH_AICRAWL_WARN
     )
     # Prefixes for per-app overrides like THRESH_REQ_CRIT_finance.
     local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ AUDIT_ )
@@ -328,6 +331,7 @@ config_validate() {
     _check_int THRESH_MEM_CRIT  0 100
     _check_int THRESH_DISK_WARN 0 100
     _check_int THRESH_DISK_CRIT 0 100
+    _check_int THRESH_AICRAWL_WARN 0
     _check_int P95_WARN_MS 0
     _check_int P95_CRIT_MS 0
     _check_int SLOW_WINDOW 1

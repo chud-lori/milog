@@ -154,6 +154,7 @@ the three Matrix vars — the alert would silently no-op otherwise.
 | ----------------- | ------------------------------------ | ----------------------------------------------------------------------------- |
 | 5xx spike         | `5xx:<app>`                          | last minute ≥ `THRESH_5XX_WARN` (default 5)                                  |
 | 4xx spike         | `4xx:<app>`                          | last minute ≥ `THRESH_4XX_WARN` (default 20)                                |
+| AI crawler surge  | `aicrawl:<app>`                      | AI-crawler requests in the last minute ≥ `THRESH_AICRAWL_WARN` (default 30), daemon only |
 | CPU / MEM / Disk  | `cpu` / `mem` / `disk:/`             | ≥ corresponding `THRESH_*_CRIT`                                              |
 | Workers down      | `workers`                            | zero nginx worker processes                                                  |
 | Exploit match     | `exploit:<app>:<category>`           | `mode_exploits` pattern hit                                                  |

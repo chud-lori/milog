@@ -1,5 +1,8 @@
 # nginx access-log counters and monitor rows.
 
+# Lowercase UA tokens of AI crawlers and assistant fetchers; go/internal/nginxlog mirrors it and a test checks they match.
+AI_CRAWLER_UA_RE='gptbot|chatgpt-user|oai-searchbot|claudebot|claude-user|claude-searchbot|anthropic-ai|perplexitybot|perplexity-user|meta-externalagent|meta-externalfetcher|bytespider|amazonbot|ccbot|cohere-ai|duckassistbot|mistralai-user|youbot'
+
 # Prints "count c2 c3 c4 c5" for lines containing timestamp $2, or zeros when the log is missing.
 nginx_minute_counts() {
     local file="$LOG_DIR/$1.access.log"
@@ -102,6 +105,28 @@ nginx_check_http_alerts() {
     fi
     if (( c4 >= t4 )) && alert_should_fire "4xx:$name"; then
         alert_fire "4xx spike: $name" "${c4} 4xx responses in the last minute (threshold ${t4})" 16753920 "4xx:$name" &
+    fi
+}
+
+# Prints "ai total" for $1, counting only lines with timestamp $2 when given; matches the UA field, not the whole line.
+nginx_ai_counts() {
+    local file="$LOG_DIR/$1.access.log"
+    [[ -f "$file" ]] || { printf '0 0\n'; return; }
+    awk -v t="${2:-}" -v re="$AI_CRAWLER_UA_RE" '
+        t == "" || index($4, t) == 2 {
+            n++
+            split($0, q, "\"")
+            if (tolower(q[6]) ~ re) ai++
+        }
+        END { printf "%d %d\n", ai+0, n+0 }
+    ' "$file" 2>/dev/null
+}
+
+nginx_check_ai_alert() {
+    local name="$1" ai="$2" total="$3" t
+    t=$(_thresh THRESH_AICRAWL_WARN "$name")
+    if (( ai > 0 && ai >= t )) && alert_should_fire "aicrawl:$name"; then
+        alert_fire "AI crawler surge: $name" "${ai} AI-crawler requests in the last minute, $(( ai * 100 / total ))% of ${total} (threshold ${t})" 15844367 "aicrawl:$name" &
     fi
 }
 
