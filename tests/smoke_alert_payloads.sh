@@ -88,7 +88,7 @@ ts="03/Oct/2026:10:00"
     printf '203.0.113.9 - - [%s:03 +0000] "GET / HTTP/1.1" 200 404 "-" "ua 500 "\n' "$ts"
 } > "$tmp/logs/app.access.log"
 counts=$(nginx_minute_counts app "$ts")
-[[ "$counts" == "3 1 0 2 0" ]] || fail "nginx_minute_counts gave '$counts' (want '3 1 0 2 0')"
+[[ "$counts" == "3 1 0 2 0 0" ]] || fail "nginx_minute_counts gave '$counts' (want '3 1 0 2 0 0')"
 health=$(mode_health | sed 's/\x1b\[[0-9;]*m//g' | awk '$1 == "app" {print $2, $3, $4, $5, $6}')
 [[ "$health" == "3 1 0 2 0" ]] || fail "health gave '$health' (want '3 1 0 2 0')"
 
