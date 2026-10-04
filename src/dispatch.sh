@@ -75,6 +75,7 @@ ${W}OPS${NC}
   ${C}audit yara${NC}          YARA scan over webroot (webshell + obfuscation rules)
   ${C}audit accounts${NC}      passwd / sudoers / SSH-key line-level diff
   ${C}audit rootkit${NC}       hidden-process / ld.so.preload / tmp-exec heuristics
+  ${C}audit history${NC}       drift the daemon recorded over the last 7 days
 
 ${W}KERNEL OBSERVABILITY${NC} (Linux only — needs ${C}milog-probe${NC} sidecar)
   ${C}probe status${NC}              is the eBPF probe sidecar running?
@@ -211,6 +212,7 @@ _cmd_help() {
             echo -e "  ${C}yara init | scan | status${NC}              YARA scan over webroot"
             echo -e "  ${C}accounts baseline | check | status${NC}     line-level diff over passwd / sudoers / authorized_keys"
             echo -e "  ${C}rootkit check | status${NC}                 hidden-process / ld.so.preload / tmp-exec"
+            echo -e "  ${C}history [days]${NC}                         drift the daemon recorded (default 7 days)"
             echo -e "  Watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC}"
             echo -e "  YARA additionally needs the system ${C}yara${NC} binary + ${C}AUDIT_YARA_PATHS${NC}"
             echo -e "  Rootkit scan is Linux-only (relies on /proc); silent no-op on macOS / BSD"
