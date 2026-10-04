@@ -1,7 +1,7 @@
 // milog-tui is the Bubble Tea TUI for MiLog. It shares internal/* with
 // milog-web, so both show the same numbers.
 //
-// Six views:
+// Eight views:
 //
 //	overview    header + system bars + per-app table (default)
 //	drilldown   one app: top paths, top IPs, recent alerts
@@ -9,6 +9,8 @@
 //	paths       top paths summed across every configured app
 //	errors      pattern-fire aggregation (app:* rule keys) with per-source breakdown
 //	trend       per-app request-rate sparklines over the last hour from the SQLite history DB
+//	history     alerts.log newest first, with per-alert detail and silencing
+//	silences    active alerts.silences rows, shared with `milog silence`
 //
 // Key bindings:
 //
@@ -23,6 +25,8 @@
 //	P           open the paths-cross-app view (capital P; lowercase p is pause)
 //	e           open the errors aggregation view
 //	t           open the trend view
+//	H / S       open alert history / active silences
+//	s / x       silence the selected alert's rule / clear the selected silence
 //	esc / h     leave drill-down / alerts / paths / errors / trend → overview
 package main
 
@@ -77,6 +81,8 @@ const (
 	viewPaths
 	viewErrors
 	viewTrend
+	viewHistory
+	viewSilences
 )
 
 const (
@@ -302,6 +308,7 @@ type model struct {
 	paths       pathsData     // current paths-view payload (empty when not in viewPaths)
 	errors      errorsData    // current errors-view payload (empty when not in viewErrors)
 	trend       trendData     // current trend-view payload (empty when not in viewTrend)
+	hist        historyState  // history and silences views
 }
 
 // sampleCmd runs the blocking sampling off the UI goroutine.
@@ -669,6 +676,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.hist.prompting {
+			return m.updateSilencePrompt(msg)
+		}
 		keys := m.controls()
 		// Keys that behave the same in every view.
 		switch {
@@ -706,9 +716,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, errorsSampleCmd(m.cfg)
 			case viewTrend:
 				return m, trendSampleCmd(m.cfg)
+			case viewHistory, viewSilences:
+				return m, historyLoadCmd(m.cfg)
 			default:
 				return m, sampleCmd(m.cfg)
 			}
+		}
+		if next, cmd, handled := m.updateHistoryKey(msg); handled {
+			return next, cmd
 		}
 		switch m.view {
 		case viewOverview:
@@ -819,6 +834,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			batch = append(batch, errorsSampleCmd(m.cfg))
 		case viewTrend:
 			batch = append(batch, trendSampleCmd(m.cfg))
+		case viewHistory, viewSilences:
+			batch = append(batch, historyLoadCmd(m.cfg))
 		}
 		return m, tea.Batch(batch...)
 
@@ -880,6 +897,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.trend = msg.data
 		// The trend view shows loadErr inline, so leave m.status alone.
 		m.syncViewportContent()
+
+	case historyMsg:
+		m.applyHistory(msg)
+		m.syncViewportContent()
+
+	case silenceDoneMsg:
+		return m.applySilenceDone(msg)
 	}
 	return m, nil
 }
@@ -955,6 +979,10 @@ func (m model) renderBodyContent() string {
 		return m.renderErrorsView()
 	case viewTrend:
 		return m.renderTrendView()
+	case viewHistory:
+		return m.renderHistoryView()
+	case viewSilences:
+		return m.renderSilencesView()
 	default:
 		var overview strings.Builder
 		overview.WriteString(m.renderSystem())
@@ -1472,6 +1500,9 @@ func renderSparkline(buf []int, width int) string {
 }
 
 func (m model) renderFooter() string {
+	if m.hist.prompting {
+		return m.renderSilencePrompt()
+	}
 	status := ""
 	if m.status != "" {
 		status = " · " + critStyle.Render(m.status)
@@ -1493,6 +1524,8 @@ func (m model) renderFooter() string {
 			bindingHint(keys.Paths),
 			bindingHint(keys.Errors),
 			bindingHint(keys.Trend),
+			bindingHint(historyKeys.History),
+			bindingHint(historyKeys.Silences),
 		)
 	case viewDrilldown:
 		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
@@ -1504,6 +1537,8 @@ func (m model) renderFooter() string {
 		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
 	case viewTrend:
 		parts = append(parts, bindingHint(keys.Back), "↑↓:scroll", bindingHint(keys.PageDown), bindingHint(keys.PageUp))
+	case viewHistory, viewSilences:
+		parts = append(parts, historyFooterHints(m)...)
 	}
 	return dimStyle.Render("  " + strings.Join(parts, "  ") + status)
 }
@@ -1536,7 +1571,7 @@ func (m model) ShortHelp() []key.Binding {
 	out := []key.Binding{keys.Quit, keys.Pause, keys.Refresh, keys.Faster, keys.Help}
 	switch m.view {
 	case viewOverview:
-		out = append(out, keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend)
+		out = append(out, keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend, historyKeys.History, historyKeys.Silences)
 	default:
 		out = append(out, keys.Up, keys.Down, keys.PageDown, keys.PageUp, keys.Back)
 	}
@@ -1552,6 +1587,7 @@ func (m model) FullHelp() [][]key.Binding {
 	case viewOverview:
 		groups = append(groups, []key.Binding{
 			keys.Up, keys.Down, keys.Drill, keys.Alerts, keys.Paths, keys.Errors, keys.Trend,
+			historyKeys.History, historyKeys.Silences,
 		})
 	default:
 		groups = append(groups, []key.Binding{
@@ -1592,8 +1628,10 @@ KEYS (inside the TUI)
   P            open paths-cross-app view (capital P; lowercase p is pause)
   e            open errors aggregation view
   t            open trend view (per-app sparklines, last hour)
+  H            open alert history (enter: detail, s: silence the rule)
+  S            open active silences (x: clear one)
   ↑/k ↓/j      scroll focused views; f/pgdn and b/pgup page
-  esc / h      back from drill-down / alerts / paths / errors / trend`)
+  esc / h      back from any view to the overview`)
 			return
 		}
 	}
