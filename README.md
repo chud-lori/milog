@@ -226,7 +226,13 @@ state dirs so re-installing preserves your settings).
 The shipping artifact `milog.sh` is generated from `src/*.sh` by
 `build.sh`. Don't edit `milog.sh` by hand — edit the file under `src/`
 that owns the code, then run `bash build.sh` to regenerate the bundle.
-Commit both the source change and the regenerated `milog.sh`.
+Commit the source change first, then run `bash build.sh` on the clean
+tree and commit the regenerated `milog.sh`. A bundle built from a tree
+with uncommitted changes is stamped `-dirty`, and CI rejects it.
 
 See [`src/README.md`](src/README.md) for the source layout and
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for design internals.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
