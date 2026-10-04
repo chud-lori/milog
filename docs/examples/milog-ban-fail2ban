@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# milog-ban-fail2ban <rule_key> <ip>: bans the source IP of an exploit:* alert in the fail2ban jail "milog".
+set -euo pipefail
+
+rule="${1:-}" ip="${2:-}"
+[[ "$rule" == exploit:* ]] || exit 0
+
+octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+if [[ ! "$ip" =~ ^$octet\.$octet\.$octet\.$octet$ && ! ( "$ip" =~ ^[0-9a-fA-F:]{3,39}$ && "$ip" == *:*:* ) ]]; then
+    echo "invalid IP: $ip" >&2
+    exit 1
+fi
+# A loopback or private source is usually a reverse proxy; banning it would cut off every client.
+if [[ "$ip" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|::1$|[fF][cdCD]|[fF][eE][89abAB]) ]]; then
+    echo "refusing to ban local address $ip" >&2
+    exit 1
+fi
+
+# banip on an already-banned IP succeeds without a second ban.
+fail2ban-client set milog banip "$ip" >/dev/null
