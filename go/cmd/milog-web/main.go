@@ -401,6 +401,7 @@ func logsStreamHandler(cfg *config.Config) http.HandlerFunc {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 			return
 		}
+		clearWriteDeadline(w)
 
 		emit := func(line nginxlog.Line) bool {
 			b, err := json.Marshal(line)
@@ -488,6 +489,7 @@ func streamHandler(cfg *config.Config) http.HandlerFunc {
 			http.Error(w, "streaming unsupported by server", http.StatusInternalServerError)
 			return
 		}
+		clearWriteDeadline(w)
 
 		// ?refresh= lets one client tighten the default cadence.
 		cadence := time.Duration(cfg.Refresh) * time.Second
@@ -522,6 +524,13 @@ func streamHandler(cfg *config.Config) http.HandlerFunc {
 				flusher.Flush()
 			}
 		}
+	}
+}
+
+// clearWriteDeadline exempts a long-lived SSE response from the server's WriteTimeout.
+func clearWriteDeadline(w http.ResponseWriter) {
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		log.Printf("milog-web: clear write deadline: %v", err)
 	}
 }
 
