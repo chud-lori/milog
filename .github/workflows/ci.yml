@@ -76,6 +76,7 @@ jobs:
           bash tests/smoke_exploits.sh
           bash tests/smoke_audit_tempfiles.sh
           bash tests/smoke_alert_payloads.sh
+          bash tests/smoke_alert_retry.sh
           bash tests/smoke_docs_drift.sh
           bash tests/smoke_installer_checksums.sh
           bash tests/smoke_install_completions.sh

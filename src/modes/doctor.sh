@@ -176,10 +176,14 @@ mode_doctor() {
     fi
     local flog="$ALERT_STATE_DIR/send_failures.log"
     if [[ -s "$flog" ]]; then
-        local fail_cutoff fail_count fail_dests
+        local fail_cutoff fail_count fail_dests fail_status
         fail_cutoff=$(( $(date +%s) - 86400 ))
         fail_count=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c' "$flog" | wc -l | tr -d ' ')
         fail_dests=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c {print $2}' "$flog" | sort -u | tr '\n' ' ')
+        # Rows written before the status column existed have no $3.
+        fail_status=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c && $3 != "" {print $3}' "$flog" \
+            | sort | uniq -c | sort -rn | awk 'NR == 1 {print $2}')
+        [[ -n "$fail_status" ]] && fail_dests="${fail_dests% }; mostly HTTP ${fail_status}"
         if (( fail_count > 0 )); then
             _doc_warn "${fail_count} alert deliveries failed in the last 24h  (${fail_dests% })" \
                       "see $flog; test with 'milog alert test'"
