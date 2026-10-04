@@ -36,12 +36,14 @@ Everything in-depth lives under [`docs/`](docs/) — skim the
 
 - [**Configuration**](docs/configuration.md) — variables, env overrides, nginx `log_format`
 - [**Alerts**](docs/alerts.md) — Discord / Slack / Telegram / Matrix setup, rule catalog, history
+- [**Ban hooks**](docs/ban-hooks.md) — pass exploit source IPs to fail2ban or an nftables set
 - [**Host integrity audits**](docs/audit.md) — `milog audit` (fim / rootkit / persistence / ports / accounts / yara), provocations to verify detection
 - [**Web dashboard**](docs/web-dashboard.md) — `milog web`, systemd user service, SSH / Tailscale / Cloudflare Tunnel exposure patterns
 - [**Historical metrics**](docs/historical-metrics.md) — SQLite time series, `trend` / `diff` / `auto-tune`
 - [**`milog daemon`**](docs/daemon.md) — headless mode, systemd service, permissions
 - [**Kernel observability (`milog probe`)**](docs/probe.md) — eBPF sidecar, the 8 probes, `install-service`, allowlist tuning
 - [**GeoIP enrichment**](docs/geoip.md) — MaxMind license + weekly auto-refresh
+- [**CrowdSec CTI enrichment**](docs/crowdsec-cti.md) — opt-in IP reputation in `attacker`, `suspects` and exploit/probe alerts
 - [**Troubleshooting**](docs/troubleshooting.md) — `milog doctor` + common failure modes
 
 Plus: [ARCHITECTURE.md](ARCHITECTURE.md) for contributors and
@@ -151,6 +153,11 @@ sudo milog probe install-service
 sudo journalctl -u milog-probe.service -f
 ```
 
+The probe does not alert on milog's own webhook sends (`curl` inside
+`milog.service` or `milog-probe.service`). Its comm allowlists also
+match a thread's process name, so `YDService` covers that agent's
+`ParseLoop` thread. Tuning: [docs/probe.md](docs/probe.md).
+
 Full command list: `milog help`.
 
 ## Commands at a glance
@@ -176,6 +183,7 @@ milog diff                 # per-app: now vs 1d / 7d ago
 milog auto-tune [D]        # suggest thresholds from history
 milog replay <file>        # postmortem for one archived log
 milog alerts [window]      # local fire history
+milog alert stats [window] # fires per rule, busiest first
 
 milog errors               # live 4xx/5xx tail
 milog exploits             # LFI / RCE / SQLi / XSS / infra-probe live tail
@@ -185,7 +193,7 @@ milog <app>                # raw tail of one app
 
 milog web [install-service|stop|status]
 milog probe [status|install-service|uninstall-service]   # Linux only — eBPF sidecar
-milog alert [on|off|status|test]
+milog alert [on|off|status|test|stats]
 milog audit [fim|persistence|ports|yara|accounts|rootkit] [baseline|check|status]
 milog silence <rule_or_glob> <duration> [msg]
 milog config [init|add|rm|dir|set|edit]

@@ -63,6 +63,86 @@ geoip_country() {
     printf '%s' "${out:-—}"
 }
 
+# Prints "<reputation> (<behaviors>)", or "unknown" when CTI has no record; empty when off or failing.
+# Results are cached per IP for a day; pass `cached` to skip the network. Failures land in cti.err for doctor.
+cti_lookup() {
+    local ip="${1-}" dir="$ALERT_STATE_DIR/cti"
+    [[ -n "${CROWDSEC_CTI_KEY:-}" ]] || return 0
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || ( "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:.]*[0-9a-fA-F][0-9a-fA-F:.]*$ ) ]] || return 0
+    ip=$(printf '%s' "$ip" | tr A-F a-f)
+    local f="$dir/$ip" mtime
+    if [[ -f "$f" ]]; then
+        mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+        if (( $(date +%s) - mtime < 86400 )); then
+            cat "$f"
+            return 0
+        fi
+    fi
+    [[ "${2:-}" == cached ]] && return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    # After a 429 every request would fail too, so pause lookups for 15 minutes.
+    [[ -n "$(find "$dir/.backoff" -mmin -15 2>/dev/null)" ]] && return 0
+    local err="$ALERT_STATE_DIR/cti.err"
+    # The key goes into a curl config on stdin, so a quote or newline would break out of it.
+    if [[ "$CROWDSEC_CTI_KEY" == *[\"\\[:space:]]* ]]; then
+        printf '%s\tCROWDSEC_CTI_KEY contains quotes, backslashes or whitespace\n' "$(date +%s)" > "$err"
+        return 0
+    fi
+    local resp code="" summary="" body
+    resp=$(mktemp "$dir/.resp.XXXXXX" 2>/dev/null) || return 0
+    code=$(printf 'header = "x-api-key: %s"\n' "$CROWDSEC_CTI_KEY" \
+        | curl -s -m 3 --max-filesize 65536 -K - -o "$resp" -w '%{http_code}' \
+              "https://cti.api.crowdsec.net/v2/smoke/$ip" 2>/dev/null) || true
+    case "$code" in
+        200) summary=$(tr -d '\n' < "$resp" | _cti_summary) ;;
+        # Only a JSON error object counts as "no record"; a proxy or HTML 404 is a failure.
+        404) body=$(tr -d '[:space:]' < "$resp")
+             [[ "$body" == "{"* && "$body" != *'"ip"'* ]] && summary="unknown" ;;
+        429) touch "$dir/.backoff" ;;
+    esac
+    rm -f "$resp"
+    if [[ -z "$summary" ]]; then
+        printf '%s\tHTTP %s for %s\n' "$(date +%s)" "${code:-000}" "$ip" > "$err"
+        return 0
+    fi
+    rm -f "$err"
+    printf '%s\n' "$summary" > "$f"
+    printf '%s\n' "$summary"
+}
+
+# Reads one smoke-API JSON object on a single line; output is limited to [A-Za-z0-9 :._,()/-].
+_cti_summary() {
+    awk '
+        { s = s $0 }
+        END {
+            if (!match(s, /"reputation" *: *"[a-z_]*"/)) exit
+            rep = substr(s, RSTART, RLENGTH)
+            sub(/^"reputation" *: *"/, "", rep); sub(/"$/, "", rep)
+            labels = ""; n = 0
+            if (match(s, /"behaviors" *: *\[[^]]*\]/)) {
+                b = substr(s, RSTART, RLENGTH)
+                while (n < 3 && match(b, /"label" *: *"[^"]*"/)) {
+                    l = substr(b, RSTART, RLENGTH)
+                    b = substr(b, RSTART + RLENGTH)
+                    sub(/^"label" *: *"/, "", l); sub(/"$/, "", l)
+                    labels = labels (n++ ? ", " : "") l
+                }
+            }
+            out = rep (labels != "" ? " (" labels ")" : "")
+            gsub(/[^A-Za-z0-9 :._,()\/-]/, "", out)
+            print out
+        }'
+}
+
+# Alert-body suffix for exploit and probe alerts; looks up only when alerts are on.
+cti_alert_note() {
+    [[ "${ALERTS_ENABLED:-0}" == "1" ]] || return 0
+    local s; s=$(cti_lookup "${1-}")
+    [[ -n "$s" ]] && printf '\nCrowdSec: %s' "$s"
+    return 0
+}
+
 # p95 for the monitor row, cached per app per minute so a 5s refresh doesn't rescan the log.
 # Apps found without $request_time are never scanned again until MiLog restarts.
 _p95_cached() {

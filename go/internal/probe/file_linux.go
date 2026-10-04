@@ -95,7 +95,7 @@ func RunFile(ctx context.Context, out chan<- FileEvent) error {
 			Comm:     trimNul(raw.Comm[:]),
 			Filename: trimNul(raw.Filename[:]),
 		}
-		ev.PPID, ev.ParentComm = lookupParent(raw.PID)
+		ev.PPID, ev.ParentComm, ev.ProcComm = lookupProc(raw.PID)
 
 		select {
 		case out <- ev:

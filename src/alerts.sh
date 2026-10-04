@@ -347,12 +347,12 @@ _alert_route_for() {
 }
 
 # Runs every executable in HOOKS_DIR/on_alert.d/ in the background with MILOG_RULE_KEY, MILOG_TITLE, MILOG_BODY,
-# MILOG_SEV, MILOG_COLOR and MILOG_TS set. Non-zero exits are logged to hooks.log, never propagated.
+# MILOG_SEV, MILOG_COLOR, MILOG_TS and MILOG_IP set. Non-zero exits are logged to hooks.log, never propagated.
 _alert_run_hooks() {
     local hook_dir="${HOOKS_DIR:-$HOME/.config/milog/hooks}/on_alert.d"
     [[ -d "$hook_dir" ]] || return 0
 
-    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}" ip="${5:-}"
     local sev
     case "$color" in
         15158332|16711680)  sev=crit ;;
@@ -380,6 +380,7 @@ _alert_run_hooks() {
                       MILOG_SEV="$sev"           \
                       MILOG_COLOR="$color"       \
                       MILOG_TS="$ts"             \
+                      MILOG_IP="$ip"             \
                       timeout "$timeout_s" "$hook" 2>&1)
                 rc=$?
             else
@@ -389,6 +390,7 @@ _alert_run_hooks() {
                       MILOG_SEV="$sev"           \
                       MILOG_COLOR="$color"       \
                       MILOG_TS="$ts"             \
+                      MILOG_IP="$ip"             \
                       "$hook" 2>&1)
                 rc=$?
             fi
@@ -403,10 +405,10 @@ _alert_run_hooks() {
     done
 }
 
-# alert_fire <title> <body> [color] [rule_key]. Each destination is sent in the background.
+# alert_fire <title> <body> [color] [rule_key] [ip]. Each destination is sent in the background; ip only reaches hooks.
 alert_fire() {
     [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
-    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}" ip="${5:-}"
     # Silenced fires are not recorded either; the silence row is the audit trail.
     if [[ -n "$rule_key" ]] && alert_is_silenced "$rule_key" >/dev/null; then
         return 0
@@ -415,7 +417,7 @@ alert_fire() {
     _alert_record "$rule_key" "$title" "$body" "$color"
 
     # Hooks run before the curl check; they don't need it.
-    _alert_run_hooks "$title" "$body" "$color" "$rule_key"
+    _alert_run_hooks "$title" "$body" "$color" "$rule_key" "$ip"
 
     command -v curl >/dev/null 2>&1 || return 0
 
