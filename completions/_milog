@@ -35,6 +35,7 @@ _milog() {
         'alerts:local fire history'
         'silence:mute a rule while on-call fixes it'
         'digest:exec-summary view over last day / week'
+        'report:static markdown / HTML report'
         'doctor:diagnostic checklist'
         'web:start/stop/status web UI'
         'install:add optional features: geoip / web / history'
@@ -87,7 +88,7 @@ _milog() {
         alert)    (( CURRENT == 3 )) && _describe 'alert subcommand' alert_subs ;;
         silence)  (( CURRENT == 3 )) && _describe 'silence subcommand' silence_subs ;;
         web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
-        alerts|digest) (( CURRENT == 3 )) && _describe 'window' window_vals ;;
+        alerts|digest|report) (( CURRENT == 3 )) && _describe 'window' window_vals ;;
     esac
 }
 

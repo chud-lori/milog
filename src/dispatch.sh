@@ -35,6 +35,7 @@ ${W}ALERTING${NC}
   ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
   ${C}silence ...${NC}        mute a rule while on-call works the fix ${D}(milog silence --help)${NC}
   ${C}digest [window]${NC}     exec-summary (day / week / Nh / Nd)
+  ${C}report [window]${NC}     static markdown / HTML report ${D}(default 7d; --html, -o FILE)${NC}
 
 ${W}DIAGNOSTICS${NC}
   ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
@@ -180,6 +181,11 @@ _cmd_help() {
             echo -e "${W}milog digest [window]${NC} — exec-summary for the period"
             echo -e "  Windows: day (default) / week / 12h / 7d / …"
             ;;
+        report)
+            echo -e "${W}milog report [window] [--html] [-o FILE]${NC} — static report for sharing"
+            echo -e "  Traffic per app, top IPs by 4xx, alert fires per rule, anomalies, audit drift."
+            echo -e "  Markdown by default; ${C}--html${NC} writes one self-contained page. Windows as digest (default 7d)."
+            ;;
         doctor)   echo -e "${W}milog doctor${NC} — diagnostic checklist" ;;
         web)
             echo -e "${W}milog web${NC} — read-only local HTTP dashboard"
@@ -266,6 +272,7 @@ case "${1:-}" in
     alerts)   mode_alerts "${2:-today}" ;;
     silence)  shift; mode_silence "$@" ;;
     digest)   mode_digest "${2:-day}" ;;
+    report)   shift; mode_report "$@" ;;
     completions) shift; mode_completions "$@" ;;
     bench)    shift; mode_bench "$@" ;;
     install)  shift; mode_install "$@" ;;

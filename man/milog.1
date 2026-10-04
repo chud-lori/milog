@@ -197,6 +197,14 @@ Mute a rule. Also: \fBsilence list\fR, \fBsilence clear\fR \fIRULE\fR.
 .BR digest " [\fIWINDOW\fR]"
 Exec-summary for the period.
 .TP
+.BR report " [\fIWINDOW\fR] [\fB\-\-html\fR] [\fB\-o\fR \fIFILE\fR]"
+Static report for the window (default \fB7d\fR; same grammar as
+\fBdigest\fR): requests, 4xx and 5xx per app, the top 10 IPs by 4xx
+responses, alert fires per rule, anomaly alerts, and audit drift when the
+history database has an audit table. Markdown by default; \fB\-\-html\fR
+prints one self-contained HTML page with no scripts. Writes to stdout, or
+to \fIFILE\fR with \fB\-o\fR.
+.TP
 .B doctor
 Diagnostic checklist \(em flags every degraded optional capability with a
 one-line fix.
