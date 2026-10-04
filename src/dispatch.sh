@@ -70,6 +70,7 @@ ${W}TAILING${NC}
 
 ${W}OPS${NC}
   ${C}install <feature>${NC}  add optional features: geoip / web / history
+  ${C}update-rules${NC}       fetch newer exploit/probe rules from the latest release
   ${C}audit fim${NC}           file integrity monitor (baseline + drift)
   ${C}audit persistence${NC}   re-entry surface diff (new cron / systemd / rc.local)
   ${C}audit ports${NC}         listening-port baseline (new TCP/UDP listeners)
@@ -205,6 +206,12 @@ _cmd_help() {
             echo -e "  Subs: list, <feature>, remove <feature>"
             echo -e "  Features: geoip / web / history"
             ;;
+        update-rules)
+            echo -e "${W}milog update-rules${NC}: fetch exploit/probe detection rules from the latest release"
+            echo -e "  Checks the SHA-256 against the release's checksums.txt, then that every regex compiles."
+            echo -e "  Refuses an older version than the active one; writes ${C}RULES_FILE${NC} atomically."
+            echo -e "  ${D}checksums.txt is not a signature: it comes from the same release as the rules.${NC}"
+            ;;
         audit)
             echo -e "${W}milog audit <sub>${NC} — point-in-time host integrity scans"
             echo -e "  ${C}fim baseline | check | status${NC}          SHA256 drift on watched files"
@@ -234,7 +241,7 @@ fi
 # Setup and host-level commands must work before any app is configured.
 if [[ ${#LOGS[@]} -eq 0 ]]; then
     case "${1:-}" in
-        -h|--help|help|config|doctor|completions|install|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
+        -h|--help|help|config|doctor|completions|install|update-rules|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
         *)
             echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
             echo "  Run 'milog config init', set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
@@ -279,6 +286,7 @@ case "${1:-}" in
     completions) shift; mode_completions "$@" ;;
     bench)    shift; mode_bench "$@" ;;
     install)  shift; mode_install "$@" ;;
+    update-rules) mode_update_rules ;;
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;

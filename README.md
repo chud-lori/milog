@@ -197,6 +197,7 @@ milog alert [on|off|status|test|stats]
 milog audit [fim|persistence|ports|yara|accounts|rootkit] [baseline|check|status]
 milog silence <rule_or_glob> <duration> [msg]
 milog config [init|add|rm|dir|set|edit]
+milog update-rules         # newer exploit/probe rules from the latest release
 milog doctor               # diagnostic checklist
 milog help
 ```

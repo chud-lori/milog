@@ -43,6 +43,7 @@ set -l cmds \
     "doctor:diagnostic checklist" \
     "web:start/stop/status web UI" \
     "install:add optional features" \
+    "update-rules:fetch newer detection rules" \
     "audit:host integrity scans" \
     "probe:eBPF probe sidecar service" \
     "bench:benchmark harness" \
