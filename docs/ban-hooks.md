@@ -12,6 +12,12 @@ for `exploit:<app>:<category>` and `probe:<app>` fires and is empty for
 every other rule. The value is the first field of the matching access-log
 line, which is `$remote_addr` in the nginx `combined` format.
 
+Only use these recipes when that first field is `$remote_addr`, and,
+behind a proxy, when nginx rewrites it with `real_ip_header` and a
+`set_real_ip_from` list of your own proxies only. If your `log_format`
+puts a request header such as `$http_x_forwarded_for` first, the client
+writes that field and can make you ban any address it likes.
+
 The example scripts act on `exploit:*` only. `probe:*` also matches SEO
 crawlers, AI crawlers and HTTP client libraries, which you may not want to
 block.
@@ -25,10 +31,7 @@ Limits to know before relying on this:
 - Silenced rules don't run hooks.
 - Hooks only run when alerts are enabled (`ALERTS_ENABLED=1`) and a watcher
   is running: `milog daemon` or `milog exploits`.
-- Behind a reverse proxy or CDN, `$remote_addr` is the proxy unless nginx
-  rewrites it with `real_ip_header` / `set_real_ip_from`. Only list proxies
-  you trust in `set_real_ip_from`, or a client can choose the IP you ban.
-  When clients reach nginx through a CDN, a host firewall ban never sees
+- When clients reach nginx through a CDN, a host firewall ban never sees
   their traffic at all; block at the CDN instead.
 
 ## How the scripts are wired

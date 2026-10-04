@@ -281,7 +281,7 @@ chmod +x ~/.config/milog/hooks/on_alert.d/10-log
 | ------------------ | ---------------------------------------------- |
 | `MILOG_RULE_KEY`   | `5xx:api`, `exploit:api:sqli`, `cpu`, ...      |
 | `MILOG_TITLE`      | alert title (`"5xx spike: api"`)               |
-| `MILOG_BODY`       | alert body (newlines stripped to spaces)       |
+| `MILOG_BODY`       | alert body, verbatim (may contain newlines and log text) |
 | `MILOG_SEV`        | `crit` / `warn` / `info`                       |
 | `MILOG_COLOR`      | raw Discord color int (for custom severity maps) |
 | `MILOG_TS`         | fire epoch seconds                             |

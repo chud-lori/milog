@@ -59,12 +59,17 @@ for tool in fail2ban-client nft; do
     printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/calls"\n' "$tmp" > "$tmp/bin/$tool"
     chmod +x "$tmp/bin/$tool"
 done
+# The scripts pin PATH, so test copies put the stubs in front of it.
+for script in milog-ban-fail2ban milog-ban-nft; do
+    sed "s|^PATH=|PATH=$tmp/bin:|" "$ROOT/docs/examples/$script" > "$tmp/$script"
+    chmod +x "$tmp/$script"
+done
 
 # expect <script> <rule> <ip> <exit-code> <call or empty>
 expect() {
     local script="$1" rule="$2" ip="$3" want_rc="$4" want_call="$5" rc=0
     : > "$tmp/calls"
-    PATH="$tmp/bin:$PATH" "$ROOT/docs/examples/$script" "$rule" "$ip" 2>/dev/null || rc=$?
+    "$tmp/$script" "$rule" "$ip" 2>/dev/null || rc=$?
     [[ "$rc" == "$want_rc" ]] || fail "$script $rule '$ip': exit $rc, want $want_rc"
     [[ "$(cat "$tmp/calls")" == "$want_call" ]] || fail "$script $rule '$ip': called '$(cat "$tmp/calls")', want '$want_call'"
 }
@@ -79,6 +84,9 @@ for script in milog-ban-fail2ban milog-ban-nft; do
     expect "$script" exploit:app:sqli   "127.0.0.1"       1 ""
     expect "$script" exploit:app:sqli   "172.20.0.5"      1 ""
     expect "$script" exploit:app:sqli   "fd00::1"         1 ""
+    for ip in ::ffff:7f00:1 ::ffff:a00:1 ::ffff:c0a8:101 ::0001 0:0:0:0:0:0:0:1 ::FFFF:7F00:1 ::ffff:127.0.0.1 1:2:3:4:5:6:7:8:9 0fc00::1; do
+        expect "$script" exploit:app:sqli "$ip" 1 ""
+    done
 done
 expect milog-ban-fail2ban exploit:app:sqli 203.0.113.7  0 "set milog banip 203.0.113.7"
 expect milog-ban-fail2ban exploit:app:sqli 2001:db8::7  0 "set milog banip 2001:db8::7"
