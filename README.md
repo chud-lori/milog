@@ -162,8 +162,8 @@ milog tui          # Charm Bubble Tea TUI (richer panels, help footer, same data
 milog rate         # nginx-only req/min dashboard
 milog daemon       # headless — fire alerts, no TUI
 
-milog health       # 2xx/3xx/4xx/5xx totals per app
-milog top [N]              # top N source IPs
+milog health       # 2xx/3xx/4xx/5xx totals and AI-crawler share per app
+milog top [N]              # top N source IPs, plus AI-crawler share
 milog top-paths [N]        # top N URLs: req / 4xx / 5xx / p95 per path
 milog slow [N]             # slowest endpoints by p95
 milog stats <app>          # hourly request histogram

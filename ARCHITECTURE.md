@@ -353,7 +353,7 @@ Stable, grep-friendly strings used by the cooldown gate:
 | Audit ports            | `audit:ports:<proto>:<port>`                                              |
 | Audit YARA             | `audit:yara:<rule>:<path>`                                                |
 | Audit rootkit          | `audit:rootkit:<heuristic>`                                               |
-| Probe — process        | `process:shell_from_web_worker:<parent>:<child>`, `process:exec_from_tmp:<comm>`, `process:suid_escalation:<parent>:<child>`, `process:syscall_burst:<comm>` |
+| Probe — process        | `process:shell_from_web_worker:<parent>:<child>`, `process:exec_from_tmp:<comm>`, `process:suid_escalation:<parent>:<child>`, `process:web_triggered_exec:<parent>:<child>`, `process:syscall_burst:<comm>` |
 | Probe — file           | `file:sensitive_read:<comm>:<path>`                                       |
 | Probe — net            | `net:unexpected_outbound:<comm>`, `net:retrans_spike:<dst>:<port>`        |
 | Probe — kernel         | `proc:ptrace_inject:<comm>`, `proc:kmod_load:<module>`, `proc:bpf_load:<comm>` |
