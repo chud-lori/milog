@@ -162,3 +162,47 @@ func TestLoadMinutes_NoSqliteBinaryReturnsErrNoBinary(t *testing.T) {
 		t.Errorf("expected ErrNoBinary with empty PATH; got %v", err)
 	}
 }
+
+func TestLoadAuditEvents_NewestFirstSinceFilters(t *testing.T) {
+	requireSqlite(t)
+	dbPath := filepath.Join(t.TempDir(), "metrics.db")
+	cmd := exec.Command("sqlite3", dbPath)
+	cmd.Stdin = strings.NewReader(`
+		CREATE TABLE audit_event (ts INTEGER NOT NULL, scanner TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL);
+		INSERT INTO audit_event VALUES(1700000000,'fim','modified','/etc/hosts');
+		INSERT INTO audit_event VALUES(1700000300,'ports','appeared','0.0.0.0:4444/tcp');
+		INSERT INTO audit_event VALUES(1700000600,'yara','match','webshell /srv/www/a' || char(9) || 'b.php');
+	`)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("seed sqlite: %v: %s", err, out)
+	}
+
+	got, err := LoadAuditEvents(dbPath, 1700000300)
+	if err != nil {
+		t.Fatalf("LoadAuditEvents: %v", err)
+	}
+	want := []AuditEvent{
+		{TS: 1700000600, Scanner: "yara", Kind: "match", Subject: "webshell /srv/www/a\tb.php"},
+		{TS: 1700000300, Scanner: "ports", Kind: "appeared", Subject: "0.0.0.0:4444/tcp"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadAuditEvents_TableMissingIsEmpty(t *testing.T) {
+	requireSqlite(t)
+	db := makeDB(t, t.TempDir(), []MinuteRow{{TS: 1700000000, Req: 1}}, "api")
+	got, err := LoadAuditEvents(db, 0)
+	if err != nil || len(got) != 0 {
+		t.Errorf("expected no rows and no error before the daemon creates audit_event; got %+v, %v", got, err)
+	}
+}
+
+func TestLoadAuditEvents_MissingDBReturnsErrNotConfigured(t *testing.T) {
+	requireSqlite(t)
+	_, err := LoadAuditEvents(filepath.Join(t.TempDir(), "does-not-exist.db"), 0)
+	if !errors.Is(err, ErrNotConfigured) {
+		t.Errorf("expected ErrNotConfigured for missing DB; got %v", err)
+	}
+}
