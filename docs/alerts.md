@@ -176,6 +176,42 @@ Alerts fire from the interactive modes (`monitor`, `exploits`,
 stable strings — you can grep `$ALERT_STATE_DIR/alerts.state` to see
 the most recent fire time for any rule.
 
+## Detection rules
+
+The regexes behind `exploit:*` and `probe:*` live in
+[`rules/milog-rules.tsv`](../rules/milog-rules.tsv). Each line is
+`<kind><TAB><name><TAB><regex>`, and the first line is `# version: N`.
+`exploit` and `probe` rows are joined with `|` and matched
+case-insensitively with `grep -Ei`. `category` rows name the
+`<category>` in `exploit:<app>:<category>`: the first matching row wins,
+and a hit no row matches is `other`.
+
+`build.sh` bakes this file into `milog.sh`. To pick up rule changes
+without upgrading milog:
+
+```bash
+milog update-rules
+```
+
+It downloads `milog-rules.tsv` from the latest GitHub release of
+`MILOG_RELEASE_REPO` (default `chud-lori/milog`) and checks its SHA-256
+against that release's `checksums.txt`. It then checks that the version
+line is present, that every regex compiles with `grep -E`, and that no
+regex matches an empty line. It refuses a version lower than the
+active rules, and writes `RULES_FILE` (default
+`~/.config/milog/rules.tsv`) through a temp file and `mv`. Restart
+`milog daemon` and any running `exploits`/`probes` afterwards: rules
+load when those modes start.
+
+`checksums.txt` is published by the same release as the rules file, so
+the check catches a corrupted or truncated download. It is not a
+signature: anyone who can modify the release can also modify the
+checksum.
+
+You can also write `RULES_FILE` by hand. milog loads it when it passes
+the same checks; when it doesn't, milog prints a warning and uses the
+built-in rules.
+
 ## Dedup: two layers
 
 Every alert passes through two gates before delivery:

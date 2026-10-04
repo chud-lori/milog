@@ -602,23 +602,61 @@ alert_fingerprint_from_line() {
     printf '%s:%s' "$ip" "$path"
 }
 
-# Rough substring classification, only used to group alerts by rule key.
+# Prints the `# version: N` from the first line of a rules file on stdin.
+_rules_version() {
+    sed -n '1s/^# version: \([0-9][0-9]*\)$/\1/p'
+}
+
+# Prints the version of a valid rules file; otherwise prints the reason to stderr and fails.
+_rules_check() {
+    local f="$1" version bad kind name re rc
+    version=$(_rules_version < "$f")
+    [[ -n "$version" ]] || { echo "$f: first line must be '# version: N'" >&2; return 1; }
+    bad=$(awk -F'\t' '!/^#/ && NF && !(NF == 3 && $1 ~ /^(exploit|probe|category)$/ && $2 != "" && $3 != "") { print NR; exit }' "$f")
+    [[ -z "$bad" ]] || { echo "$f:$bad: want <exploit|probe|category><TAB><name><TAB><regex>" >&2; return 1; }
+    for kind in exploit probe; do
+        grep -q "^$kind"$'\t' "$f" || { echo "$f: no $kind rules" >&2; return 1; }
+    done
+    while IFS=$'\t' read -r kind name re; do
+        [[ -n "$kind" && "$kind" != \#* ]] || continue
+        # Exit 2 is a bad regex; 0 means it matches an empty line and would flag every request.
+        rc=0; grep -Eq -- "$re" <<< "" 2>/dev/null || rc=$?
+        (( rc == 1 )) || { echo "$f: $kind/$name: regex does not compile or matches everything: $re" >&2; return 1; }
+    done < "$f"
+    printf '%s' "$version"
+}
+
+# RULES_FILE wins when it passes _rules_check; otherwise the rules baked in by build.sh apply.
+_rules_load() {
+    local text="" kind name re
+    if [[ -f "$RULES_FILE" ]]; then
+        if _rules_check "$RULES_FILE" >/dev/null; then
+            text=$(cat "$RULES_FILE")
+        else
+            echo "milog: ignoring $RULES_FILE, using the built-in rules" >&2
+        fi
+    fi
+    [[ -n "$text" ]] || text=$(_rules_default)
+    RULES_EXPLOIT="" RULES_PROBE="" RULES_CATEGORY_NAMES=() RULES_CATEGORY_RES=()
+    while IFS=$'\t' read -r kind name re; do
+        case "$kind" in
+            exploit)  RULES_EXPLOIT+="${RULES_EXPLOIT:+|}$re" ;;
+            probe)    RULES_PROBE+="${RULES_PROBE:+|}$re" ;;
+            category) RULES_CATEGORY_NAMES+=("$name"); RULES_CATEGORY_RES+=("$re") ;;
+        esac
+    done <<< "$text"
+}
+
+# First matching category row names the alert's rule key; needs _rules_load first.
 _exploit_category() {
-    local line="$1" cat="other"
+    local line="$1" cat="other" i
     shopt -s nocasematch
-    case "$line" in
-        *'${jndi'*|*'jndi:'*|*log4j*)                                            cat=log4shell ;;
-        *union*select*|*select*from*|*'sleep('*|*'benchmark('*|*' or 1=1'*|*%27*or*) cat=sqli ;;
-        *'<script'*|*%3cscript*|*'onerror='*|*'onload='*|*'javascript:'*)        cat=xss ;;
-        *base64_decode*|*'eval('*|*'system('*|*'passthru('*|*shell_exec*)         cat=rce ;;
-        *'../'*|*%2e%2e*|*/etc/passwd*|*/etc/shadow*|*/proc/self*)               cat=traversal ;;
-        */containers/*|*/actuator/*|*/server-status*|*/console*|*/druid/*)       cat=infra ;;
-        */SDK/web*|*/cgi-bin/*|*/boaform/*|*/HNAP1*)                             cat=device ;;
-        */wp-admin*|*/wp-login*|*/wp-content/plugins*|*/xmlrpc.php*)             cat=wordpress ;;
-        */phpmyadmin*|*/pma/*|*/mysql/admin*)                                    cat=phpmyadmin ;;
-        */.env*|*/.git/*|*/.aws/*|*/.ssh/*|*/.DS_Store*|*/config.php*|*/config.json*|*/config.yml*|*/config.yaml*|*/web.config*) cat=dotfile ;;
-        *libredtail*|*nikto*|*masscan*|*zgrab*|*sqlmap*|*nuclei*|*gobuster*|*dirbuster*|*wfuzz*|*l9explore*|*l9tcpid*|*'hello, world'*|*'hello,world'*) cat=scanner ;;
-    esac
+    for i in "${!RULES_CATEGORY_RES[@]}"; do
+        if [[ "$line" =~ ${RULES_CATEGORY_RES[$i]} ]]; then
+            cat="${RULES_CATEGORY_NAMES[$i]}"
+            break
+        fi
+    done
     shopt -u nocasematch
     printf '%s' "$cat"
 }

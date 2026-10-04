@@ -38,6 +38,7 @@ _milog() {
         'doctor:diagnostic checklist'
         'web:start/stop/status web UI'
         'install:add optional features: geoip / web / history'
+        'update-rules:fetch newer exploit/probe rules from the latest release'
         'audit:host integrity scans (fim / persistence / ports / yara / accounts / rootkit)'
         'probe:eBPF probe sidecar service'
         'bench:benchmark harness against synthetic fixtures'

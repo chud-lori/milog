@@ -114,6 +114,7 @@ no per-app form — they're not app-scoped.
 | `ALERT_LOG_MAX_BYTES` | `10485760` (10 MB)  | In-place rotate alerts.log past this size; `0` disables |
 | `HOOKS_DIR`           | `~/.config/milog/hooks` | Parent of `on_alert.d/` — user hook scripts, see [alerts.md](alerts.md#hook-scripts--custom-integrations-without-a-pr) |
 | `ALERT_HOOK_TIMEOUT`  | `10`                | Per-hook run time cap in seconds                |
+| `RULES_FILE`          | `~/.config/milog/rules.tsv` | Exploit/probe detection rules written by `milog update-rules`; see [alerts.md](alerts.md#detection-rules) |
 | `ALERT_ROUTES`        | (empty — fan out)   | Per-rule destination mapping; see [alerts.md](alerts.md#routing--different-rules-to-different-destinations) |
 | `DISCORD_WEBHOOK`     | (empty)             | Set to enable Discord                     |
 | `SLACK_WEBHOOK`       | (empty)             | Set to enable Slack                       |

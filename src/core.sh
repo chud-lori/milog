@@ -89,6 +89,9 @@ ALERT_LOG_MAX_BYTES=10485760  # 10 MB
 HOOKS_DIR="$HOME/.config/milog/hooks"
 ALERT_HOOK_TIMEOUT=10
 
+# Detection regexes for exploits/probes; `milog update-rules` writes this file, and without it the built-in copy applies.
+RULES_FILE="$HOME/.config/milog/rules.tsv"
+
 # Per-rule destinations, one `key: dest ...` per line; lookup is exact rule, then prefix before `:`, then `default`.
 # Destinations: discord slack telegram matrix webhook, or `skip`; empty fans out to everything.
 #   ALERT_ROUTES="
