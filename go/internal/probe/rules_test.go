@@ -362,7 +362,8 @@ func TestMatchFile_AllowlistedCommsSilent(t *testing.T) {
 		{Comm: "sshd", Filename: "/root/.ssh/authorized_keys"},
 		{Comm: "sudo", Filename: "/etc/sudoers"},
 		{Comm: "cron", Filename: "/etc/shadow"},
-		{Comm: "systemd", Filename: "/etc/passwd"},
+		{Comm: "systemd", Filename: "/etc/shadow"},
+		{Comm: "sshd-socket-gen", Filename: "/etc/ssh/sshd_config.d/50-cloud-init.conf"},
 		{Comm: "auditd", Filename: "/etc/shadow"},
 		{Comm: "milog-probe", Filename: "/etc/shadow"},
 	}
@@ -384,6 +385,7 @@ func TestMatchFile_NonSensitivePathSilent(t *testing.T) {
 		{Comm: "vim", Filename: "/home/alice/notes.md"},
 		{Comm: "tail", Filename: "/var/log/syslog"},
 		{Comm: "less", Filename: "/etc/hostname"},
+		{Comm: "getent", Filename: "/etc/passwd"},
 	}
 	for _, ev := range cases {
 		if hits := MatchFile(ev); len(hits) != 0 {

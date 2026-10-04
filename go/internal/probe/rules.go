@@ -383,6 +383,7 @@ func MatchFile(e FileEvent) []Hit {
 var defaultSensitiveCommAllowlist = []string{
 	"sshd",
 	"sshd-session",
+	"sshd-socket-gen",
 	"sudo",
 	"su",
 	"login",
@@ -415,9 +416,8 @@ var defaultSensitiveCommAllowlist = []string{
 }
 
 // defaultSensitivePaths match exactly, or by prefix when they end in `/`.
-// They mirror the audit FIM defaults.
+// /etc/passwd is left out: it is world-readable and every NSS lookup opens it.
 var defaultSensitivePaths = []string{
-	"/etc/passwd",
 	"/etc/shadow",
 	"/etc/gshadow",
 	"/etc/sudoers",
