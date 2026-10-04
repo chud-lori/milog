@@ -1,26 +1,7 @@
-# ==============================================================================
-# MODE: install — on-demand feature installer
-#
-# Complement to install.sh's --with-X flags. Lets users add optional
-# capabilities AFTER initial install, without re-running the one-liner with
-# a different flag set. Idempotent: `install <feature>` is safe to re-run.
-#
-# Each feature is a declarative spec — package-manager deps + optional
-# post-install hint. Binary downloads (for Go-binary features) will plug
-# into the same shape once those land.
-#
-# Usage:
-#   milog install list                   # matrix of features + installed status
-#   milog install <feature>              # install feature + its system deps
-#   milog install remove <feature>       # uninstall (keeps config/data)
-#
-# Scope today: geoip, web, history. Future: ebpf, audit, sse — they need
-# the corresponding Go binaries to land first.
-# ==============================================================================
+# milog install list | <feature> | remove <feature>: add optional system deps after the first install.
+# `remove` only prints the package manager command; other tools may depend on the package.
 
-# Feature catalog. Each feature is a colon-separated record:
-#   name : check_cmd : apt_pkg : dnf_pkg : pacman_pkg : description
-# check_cmd is what we run to decide "installed=yes/no".
+# name : check_cmd : apt_pkg : dnf_pkg : pacman_pkg : description; check_cmd on PATH means installed.
 _install_catalog() {
     cat <<"EOF"
 geoip:mmdblookup:mmdb-bin:libmaxminddb:libmaxminddb:GeoIP COUNTRY column via MaxMind lookup

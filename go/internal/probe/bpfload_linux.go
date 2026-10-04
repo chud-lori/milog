@@ -1,8 +1,6 @@
 //go:build linux
 
-// bpfload_linux.go — userspace loader for the BPF-program-load probe.
-// Streaming shape (ringbuf), same as ptrace / kmod — load events are
-// rare on a healthy host so per-event delivery is cheap.
+// Loader for the BPF program-load probe (sys_enter_bpf).
 
 package probe
 
@@ -23,8 +21,7 @@ import (
 //go:embed bpf/bpfload.bpf.o
 var bpfLoadBpfObj []byte
 
-// bpfLoadRawEvent mirrors `struct bpfload_event` in bpfload.bpf.c
-// byte-for-byte.
+// bpfLoadRawEvent must match struct bpfload_event in bpfload.bpf.c.
 type bpfLoadRawEvent struct {
 	PID  uint32
 	UID  uint32
@@ -32,8 +29,7 @@ type bpfLoadRawEvent struct {
 	Comm [commLen]byte
 }
 
-// RunBpfLoad loads the bpf-load probe, attaches sys_enter_bpf, and
-// streams BpfLoadEvents into `out` until ctx is cancelled.
+// RunBpfLoad attaches sys_enter_bpf and sends BpfLoadEvents until ctx is cancelled.
 func RunBpfLoad(ctx context.Context, out chan<- BpfLoadEvent) error {
 	if len(bpfLoadBpfObj) == 0 {
 		return errors.New("probe: bpf/bpfload.bpf.o is empty — rebuild with clang available (apt install clang llvm libbpf-dev)")

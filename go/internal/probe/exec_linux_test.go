@@ -1,22 +1,8 @@
 //go:build linux
 
-// Smoke tests for the embedded BPF exec probe. Two tiers, deliberate:
-//
-//   - TestExecBpfObject_Spec — parses the embedded .bpf.o without
-//     touching the kernel. Catches structural regressions (renamed
-//     program, missing map, wrong section, dropped license) on every
-//     PR. Runs as the non-root CI user; no privileges required.
-//
-//   - TestExecBpfObject_KernelLoad — actually loads the program into
-//     the runner's kernel via cilium/ebpf. Catches "compiles clean
-//     but the verifier rejects on this kernel" — the regression class
-//     that makes BPF painful in production. Skips when EUID != 0
-//     because BPF program loading needs CAP_BPF; CI invokes this test
-//     in a separate `sudo go test ...` step (see ci.yml) so the
-//     non-sudo run stays green for everyone.
-//
-// Together they keep iteration on the BPF C side honest without
-// requiring the user's Linux box in the loop for every change.
+// BPF object tests. *_Spec parses the embedded .bpf.o without the kernel
+// and runs as any user; *_KernelLoad loads it to catch verifier rejects,
+// skips without root, and runs under sudo in a separate CI step.
 
 package probe
 
@@ -40,9 +26,7 @@ func TestExecBpfObject_Spec(t *testing.T) {
 		t.Fatalf("LoadCollectionSpecFromReader: %v", err)
 	}
 
-	// Program shape — name + type. Both are load-bearing for the
-	// userspace attach call (link.Tracepoint(prog, …)) and for the
-	// audit alert path; renaming either silently breaks production.
+	// The attach call depends on the program name and type.
 	prog, ok := spec.Programs["handle_exec"]
 	if !ok {
 		t.Fatalf("expected program 'handle_exec', got: %v", programNames(spec))
@@ -51,10 +35,7 @@ func TestExecBpfObject_Spec(t *testing.T) {
 		t.Errorf("handle_exec.Type = %v, want TracePoint", prog.Type)
 	}
 
-	// Map shape — name, type, capacity floor. The 64 KiB floor is a
-	// loose guard: the C side declares 256 KiB; if a future tweak
-	// drops below, the userspace ring reader will start dropping
-	// events under sustained exec storms long before anyone notices.
+	// Loose 64 KiB floor (C declares 256 KiB); smaller drops events in exec storms.
 	m, ok := spec.Maps["events"]
 	if !ok {
 		t.Fatalf("expected map 'events', got: %v", mapNames(spec))
@@ -71,10 +52,7 @@ func TestExecBpfObject_KernelLoad(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root (CAP_BPF) — see ci.yml's sudo step")
 	}
-	// Removing the locked-memory rlimit is the same prep the production
-	// loader does. Without it, BPF map allocation fails with EPERM on
-	// older kernels; on recent ones the limit is unlimited by default
-	// for root, but stay defensive.
+	// Older kernels need the memlock rlimit removed to allocate maps.
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("rlimit.RemoveMemlock: %v", err)
 	}
@@ -84,9 +62,7 @@ func TestExecBpfObject_KernelLoad(t *testing.T) {
 	}
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
-		// Surface verifier errors verbatim — they're the most useful
-		// signal when iterating on the BPF C side. Other errors get
-		// the standard %v.
+		// Print verifier logs verbatim; they're the useful part.
 		var verr *ebpf.VerifierError
 		if errors.As(err, &verr) {
 			t.Fatalf("BPF verifier rejected handle_exec on kernel %s:\n%+v", uname(), verr)
@@ -95,18 +71,12 @@ func TestExecBpfObject_KernelLoad(t *testing.T) {
 	}
 	defer coll.Close()
 
-	// Sanity-check that the loaded collection still has handle_exec.
-	// This catches a different bug class than the spec test: the spec
-	// said "handle_exec exists" but loading silently dropped it (very
-	// unlikely with current cilium/ebpf, but free to assert).
 	if _, ok := coll.Programs["handle_exec"]; !ok {
 		t.Errorf("loaded collection missing program 'handle_exec'")
 	}
 }
 
-// uname returns "uname -r" output for verifier-error context, falling
-// back to a marker string when the file isn't readable. Only used in
-// failure messages, so a missing read is non-fatal.
+// uname returns the kernel release for verifier-error messages.
 func uname() string {
 	b, err := os.ReadFile("/proc/sys/kernel/osrelease")
 	if err != nil {
@@ -130,10 +100,6 @@ func mapNames(spec *ebpf.CollectionSpec) []string {
 	}
 	return out
 }
-
-// =============================================================================
-// tcp connect probe — same two-tier shape as the exec probe above.
-// =============================================================================
 
 func TestTcpBpfObject_Spec(t *testing.T) {
 	if len(tcpBpfObj) == 0 {
@@ -190,10 +156,6 @@ func TestTcpBpfObject_KernelLoad(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// file audit probe — same two-tier shape.
-// =============================================================================
-
 func TestFileBpfObject_Spec(t *testing.T) {
 	if len(fileBpfObj) == 0 {
 		t.Fatal("fileBpfObj is empty — build.sh didn't produce bpf/file.bpf.o " +
@@ -248,10 +210,6 @@ func TestFileBpfObject_KernelLoad(t *testing.T) {
 		t.Errorf("loaded collection missing program 'handle_openat'")
 	}
 }
-
-// =============================================================================
-// ptrace anti-injection probe — same two-tier shape.
-// =============================================================================
 
 func TestPtraceBpfObject_Spec(t *testing.T) {
 	if len(ptraceBpfObj) == 0 {
@@ -308,10 +266,6 @@ func TestPtraceBpfObject_KernelLoad(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Kernel module load probe — same two-tier shape.
-// =============================================================================
-
 func TestKmodBpfObject_Spec(t *testing.T) {
 	if len(kmodBpfObj) == 0 {
 		t.Fatal("kmodBpfObj is empty — build.sh didn't produce bpf/kmod.bpf.o " +
@@ -367,12 +321,6 @@ func TestKmodBpfObject_KernelLoad(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// TCP retransmit observability probe — same two-tier shape, but the
-// map is LRU_HASH instead of RingBuf since this probe samples rather
-// than streams.
-// =============================================================================
-
 func TestRetransBpfObject_Spec(t *testing.T) {
 	if len(retransBpfObj) == 0 {
 		t.Fatal("retransBpfObj is empty — build.sh didn't produce bpf/retrans.bpf.o " +
@@ -398,9 +346,7 @@ func TestRetransBpfObject_Spec(t *testing.T) {
 	if m.Type != ebpf.LRUHash {
 		t.Errorf("retrans_counts.Type = %v, want LRUHash", m.Type)
 	}
-	// 1024-entry floor — well below the BPF-side 4096 declaration so
-	// regressions that drop the cap (e.g. someone tightens it during
-	// memory tuning) still leave reasonable headroom.
+	// 1024-entry floor, well under the declared 4096.
 	if m.MaxEntries < 1024 {
 		t.Errorf("retrans_counts.MaxEntries = %d, want >= 1024", m.MaxEntries)
 	}
@@ -431,10 +377,6 @@ func TestRetransBpfObject_KernelLoad(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Per-PID syscall rate probe — raw_tracepoint program, LRU_PERCPU_HASH map.
-// =============================================================================
-
 func TestSyscallBpfObject_Spec(t *testing.T) {
 	if len(syscallBpfObj) == 0 {
 		t.Fatal("syscallBpfObj is empty — build.sh didn't produce bpf/syscall.bpf.o " +
@@ -449,12 +391,8 @@ func TestSyscallBpfObject_Spec(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected program 'handle_sys_enter', got: %v", programNames(spec))
 	}
-	// raw_tracepoint programs report Type == RawTracepoint, distinct
-	// from the regular TracePoint type the other probes use. Asserting
-	// the exact type catches a regression where someone "fixes" the
-	// SEC() name to tracepoint/raw_syscalls/sys_enter and silently
-	// burns CPU on the per-event arg formatting we deliberately
-	// avoided.
+	// A raw tracepoint, not tracepoint/raw_syscalls/sys_enter, avoids
+	// per-event argument formatting cost.
 	if prog.Type != ebpf.RawTracepoint {
 		t.Errorf("handle_sys_enter.Type = %v, want RawTracepoint", prog.Type)
 	}
@@ -495,10 +433,6 @@ func TestSyscallBpfObject_KernelLoad(t *testing.T) {
 		t.Errorf("loaded collection missing program 'handle_sys_enter'")
 	}
 }
-
-// =============================================================================
-// BPF program-load probe — anti-rootkit.
-// =============================================================================
 
 func TestBpfLoadBpfObject_Spec(t *testing.T) {
 	if len(bpfLoadBpfObj) == 0 {

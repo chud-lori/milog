@@ -1,15 +1,4 @@
-# ==============================================================================
-# MODE: top-paths — aggregate URLs across all app logs, show per-path stats
-#
-# The single most useful incident question ("what URL is eating traffic?" or
-# "what URL is spiking 5xx?") isn't well served by `top` (IPs) or `slow`
-# (p95). This surfaces REQ + 4xx + 5xx + p95 per path. Query string is
-# stripped so /search?q=x and /search?q=y collapse into one row.
-#
-# Pipeline mirrors mode_slow: awk emit → external sort by path → group awk
-# → sort by count → head N. p95 requires the extended log format; shows
-# "—" when $request_time is absent.
-# ==============================================================================
+# milog top-paths [N]: requests, 4xx, 5xx and p95 per path (query strings stripped); p95 shows n/a without $request_time.
 mode_top_paths() {
     local n="${1:-20}"
     local window="${SLOW_WINDOW:-2000}"
@@ -29,17 +18,7 @@ mode_top_paths() {
         return 1
     fi
 
-    # awk pass 1: extract (path, status, ms-or-"-") per line.
-    #   $7  = request URI  (nginx combined: `"GET /path HTTP/1.1"` is fields 6-8)
-    #   $9  = status code
-    #   $NF = $request_time when combined_timed is in use (plain number)
-    # Query string is stripped so /x?a=1 + /x?a=2 collapse to /x.
-    #
-    # awk pass 2: sort by path + ms-numeric, group, emit count/4xx/5xx/p95.
-    # Numeric sort with "-" present: gawk/sort put "-" first (treated as 0),
-    # numeric values follow in ascending order — our group-awk only counts
-    # numerics into v[], so the p95 position is computed against just the
-    # timed samples for each path.
+    # Rows of path, status, ms (or "-"); sorting by ms within each path lets the group pass index p95 over the timed samples only.
     local rows
     rows=$(tail -q -n "$window" "${files[@]}" 2>/dev/null \
         | awk -v EXCLUDE_LIST="${SLOW_EXCLUDE_PATHS:-}" '
@@ -120,13 +99,11 @@ mode_top_paths() {
         (( c5 > 0 )) && col_err="$R"
         col_err+=""    # no-op but keeps the colour local
         if [[ "$p95" == "-" ]]; then
-            # ASCII placeholder so printf byte-width == visual width. Unicode
-            # em-dash is 3 bytes / 1 column → throws off alignment.
+            # ASCII, because the 3-byte em-dash breaks printf width alignment.
             p95_disp=$(printf "%b%9s%b" "$D" "n/a" "$NC")
             col_p95=""
         else
             col_p95=$(tcol "$p95" "$P95_WARN_MS" "$P95_CRIT_MS")
-            # 7-wide number + "ms" = 9 visible chars (matches %9s header)
             p95_disp=$(printf "%b%7sms%b" "$col_p95" "$p95" "$NC")
         fi
         display="$path"

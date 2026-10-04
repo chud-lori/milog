@@ -1,20 +1,4 @@
-# ==============================================================================
-# MODE: digest — exec-summary view over the last day / week
-#
-# Uses the same data the other modes do: alerts.log for fire counts, the
-# history DB for capacity trend (when HISTORY_ENABLED), and a short scan of
-# the live log files for traffic / error / latency rollups.
-#
-# Designed to be piped into alert destinations as a scheduled summary for
-# quiet servers where live alerts rarely fire — you still want the weekly
-# "nothing happened, here's what happened anyway" email.
-#
-# Usage:
-#   milog digest          # last 24h (default)
-#   milog digest day
-#   milog digest week
-#   milog digest 12h      # arbitrary N<h|d|w>
-# ==============================================================================
+# milog digest [day|week|N<h|d|w>]: summary of alert fires, per-app traffic and top IPs.
 
 _digest_window_to_secs() {
     local w="${1:-day}"
@@ -44,7 +28,6 @@ mode_digest() {
     echo -e "\n${W}── MiLog: Digest (${window_human}) ──${NC}\n"
     echo -e "${D}  generated $(date -Iseconds 2>/dev/null || date) · host $(hostname 2>/dev/null || echo host)${NC}\n"
 
-    # --- Alerts ---------------------------------------------------------------
     local alog="${ALERT_STATE_DIR:-$HOME/.cache/milog}/alerts.log"
     echo -e "${W}Alerts fired${NC}"
     if [[ ! -f "$alog" ]]; then
@@ -67,7 +50,6 @@ mode_digest() {
     fi
     echo
 
-    # --- Traffic + errors per app --------------------------------------------
     echo -e "${W}Traffic${NC}"
     printf "  %-14s  %10s  %8s  %8s\n" "APP" "REQ" "4XX" "5XX"
     printf "  %-14s  %10s  %8s  %8s\n" "────────────" "──────────" "────────" "────────"
@@ -77,9 +59,7 @@ mode_digest() {
         name=$(_log_name_for "$entry")
         file=$(_log_path_for "$entry")
         [[ -f "$file" ]] || continue
-        # Count lines in-window via nginx timestamp. Shell out to awk with a
-        # cutoff; safe-fallback emits zeros if the date format unexpectedly
-        # doesn't match our scan.
+        # cutoff is passed but never used, so these counts cover the whole file.
         read -r req c4 c5 <<< "$(awk -v cutoff="$cutoff" '
             {
                 # [24/Apr/2026:12:34:56 +0000] → crude parse: keep any row,
@@ -93,7 +73,7 @@ mode_digest() {
     done
     echo
 
-    # --- Top attacker IPs (window-agnostic: scans whole access logs) ---------
+    # Not windowed: reads the whole access logs.
     echo -e "${W}Top attacker IPs (this window)${NC}"
     local ip_rollup
     ip_rollup=$(
@@ -114,7 +94,6 @@ mode_digest() {
     fi
     echo
 
-    # --- Capacity (if history DB is available) -------------------------------
     if [[ "${HISTORY_ENABLED:-0}" == "1" && -f "$HISTORY_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
         echo -e "${W}Capacity (start of window → now)${NC}"
         local cap

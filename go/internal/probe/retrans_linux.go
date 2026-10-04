@@ -1,15 +1,8 @@
 //go:build linux
 
-// retrans_linux.go — userspace loader for the TCP retransmit
-// observability probe. Differs from the streaming probes (exec /
-// tcp connect / file / ptrace / kmod): there's no ringbuf, just a
-// LRU_HASH counter map that BPF increments and Go reads on a tick.
-//
-// The tick window + delta computation pattern keeps event rate
-// bounded by destination cardinality (max 4096 entries via LRU)
-// rather than by per-packet retransmit volume — a flaky link
-// produces hundreds of retransmits per second but only one
-// RetransEvent per (daddr, dport) per window.
+// Loader for the TCP retransmit probe. No ring buffer: BPF increments an
+// LRU hash of per-destination counts (4096 entries) that Go samples each
+// window, so event volume scales with destinations, not packets.
 
 package probe
 
@@ -31,25 +24,19 @@ import (
 //go:embed bpf/retrans.bpf.o
 var retransBpfObj []byte
 
-// retransKey mirrors `struct retrans_key` in retrans.bpf.c byte-for-
-// byte. 16 bytes for daddr (v4 in first 4 bytes, v6 full 16) +
-// 2 bytes dport + 2 bytes family = 20 bytes total, no padding.
+// retransKey must match struct retrans_key in retrans.bpf.c: 16-byte daddr
+// (v4 in the first 4), 2-byte dport, 2-byte family, no padding.
 type retransKey struct {
 	Daddr  [16]byte
 	DPort  uint16
 	Family uint16
 }
 
-// defaultRetransWindow is the BPF-map sample interval. Picked at 60s
-// because it's the smallest window that keeps single-packet
-// retransmits from spiking into the alert path while still being
-// short enough to surface a developing problem before the operator
-// notices via end-user complaints.
+// defaultRetransWindow is the sample interval.
 const defaultRetransWindow = 60 * time.Second
 
-// envRetransWindow returns the operator-configured window or the
-// default. Parse failure → default; we don't want a malformed env
-// var to silently make the probe never tick.
+// envRetransWindow falls back to the default on a bad value so the probe
+// keeps ticking.
 func envRetransWindow() time.Duration {
 	v := os.Getenv("MILOG_PROBE_RETRANS_WINDOW")
 	if v == "" {
@@ -62,15 +49,9 @@ func envRetransWindow() time.Duration {
 	return d
 }
 
-// RunRetrans loads the retransmit probe, attaches
-// tracepoint:tcp:tcp_retransmit_skb, and ticks every window emitting
-// RetransEvents for any (daddr, dport) pair whose count grew since
-// the last sample. Threshold filtering happens in MatchRetrans —
-// the loader emits all non-zero deltas.
-//
-// The tracepoint is non-fatal-but-useful — older kernels (<4.16)
-// don't have it. attach failure surfaces as the goroutine error
-// and milog-probe logs "retransmit coverage degraded".
+// RunRetrans attaches tcp:tcp_retransmit_skb (kernel 4.16+) and emits a
+// RetransEvent per destination whose count grew; MatchRetrans applies the
+// threshold.
 func RunRetrans(ctx context.Context, out chan<- RetransEvent) error {
 	if len(retransBpfObj) == 0 {
 		return errors.New("probe: bpf/retrans.bpf.o is empty — rebuild with clang available (apt install clang llvm libbpf-dev)")
@@ -107,11 +88,7 @@ func RunRetrans(ctx context.Context, out chan<- RetransEvent) error {
 	}
 
 	window := envRetransWindow()
-	// lastSeen caches the previous sample's count per key so we can
-	// emit deltas rather than absolute totals. A new key (not in the
-	// map) implies last=0, so the first observation registers as a
-	// delta equal to the count itself — which is correct: that's
-	// how many retransmits happened in the most recent window.
+	// Previous count per key; a new key counts from 0.
 	lastSeen := make(map[retransKey]uint64, 64)
 
 	ticker := time.NewTicker(window)
@@ -129,12 +106,7 @@ func RunRetrans(ctx context.Context, out chan<- RetransEvent) error {
 	}
 }
 
-// emitRetransDeltas walks the BPF count map once, computes the
-// delta vs the previous sample for each key, and pushes a
-// RetransEvent for any non-zero delta. LRU eviction can drop keys
-// out from under us — we lazily age out lastSeen entries that
-// disappeared from the BPF map to keep the cache from growing
-// unbounded over a long-running probe.
+// emitRetransDeltas emits non-zero deltas and forgets keys the LRU evicted.
 func emitRetransDeltas(
 	ctx context.Context,
 	m *ebpf.Map,
@@ -150,11 +122,8 @@ func emitRetransDeltas(
 	for iter.Next(&key, &count) {
 		seen[key] = struct{}{}
 		prev := lastSeen[key]
-		// Counter wraparound on uint64 is theoretical (2^64 events
-		// at 1ns each = 584 years) — but a kernel-side reset, key
-		// re-insertion after LRU eviction, or sample skip during
-		// userspace shutdown could produce count < prev. Treat that
-		// as "no delta" rather than emitting a wraparound event.
+		// A shrinking count means a reset or LRU re-insertion, not
+		// wraparound; treat it as no delta.
 		if count < prev {
 			lastSeen[key] = count
 			continue
@@ -178,9 +147,7 @@ func emitRetransDeltas(
 			ev.DAddr = net.IP(key.Daddr[:]).String()
 			ev.IsIPv6 = true
 		default:
-			// BPF-side already filters AF_INET / AF_INET6 — getting
-			// here means a kernel bug or layout drift; skip rather
-			// than emit garbage.
+			// BPF already filters other families; this means layout drift.
 			continue
 		}
 
@@ -194,10 +161,6 @@ func emitRetransDeltas(
 		return fmt.Errorf("retrans map iterate: %w", err)
 	}
 
-	// Age-out: anything in lastSeen that's NOT in seen disappeared
-	// from the BPF map (LRU evicted, or we picked it up during a
-	// rare empty interval and the key was reused). Drop it from
-	// our cache so memory doesn't grow.
 	for k := range lastSeen {
 		if _, ok := seen[k]; !ok {
 			delete(lastSeen, k)

@@ -8,8 +8,6 @@ import (
 	"time"
 )
 
-// Faster interval for tests — 30 ms is snappy enough without being
-// flaky on loaded CI runners.
 func fastOpts() Options { return Options{Interval: 30 * time.Millisecond} }
 
 func writeAppend(t *testing.T, path, s string) {

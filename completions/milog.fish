@@ -16,6 +16,7 @@ set -l cmds \
     "rate:nginx req/min dashboard" \
     "health:2xx/3xx/4xx/5xx per app" \
     "top:top N source IPs" \
+    "top-ip-by-app:top N source IPs per app" \
     "top-paths:top N URLs by req/4xx/5xx/p95" \
     "attacker:forensic view of one IP" \
     "slow:top N slow endpoints" \
@@ -26,10 +27,12 @@ set -l cmds \
     "search:grep across current + archived logs" \
     "diff:per-app req now vs 1d/7d ago" \
     "auto-tune:suggest thresholds" \
+    "logs:tail all logs, color prefixed" \
     "grep:filter-tail one app" \
     "errors:live 4xx/5xx tail" \
     "exploits:LFI/RCE/SQLi/XSS/infra probe tail" \
     "probes:scanner/bot traffic tail" \
+    "patterns:app-error signatures" \
     "suspects:heuristic bot ranking" \
     "config:show/edit/set/init/validate" \
     "alert:toggle alerting + systemd" \
@@ -38,6 +41,11 @@ set -l cmds \
     "digest:exec-summary view last day / week" \
     "doctor:diagnostic checklist" \
     "web:start/stop/status web UI" \
+    "install:add optional features" \
+    "audit:host integrity scans" \
+    "probe:eBPF probe sidecar service" \
+    "bench:benchmark harness" \
+    "completions:install / print shell completions" \
     "help:show help"
 
 for entry in $cmds

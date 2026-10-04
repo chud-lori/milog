@@ -1,8 +1,4 @@
-// Package sysinfo exposes tiny OS primitives that don't warrant a dep.
-//
-// The broader /proc readers (CPU %, mem, disk) live separately in
-// internal/sysstat. This file only covers uptime + hostname — the bits
-// /api/meta.json needs.
+// Package sysinfo provides uptime and hostname for /api/meta.json.
 package sysinfo
 
 import (
@@ -14,12 +10,9 @@ import (
 	"time"
 )
 
-// Uptime returns a human-readable uptime string, matching the `uptime -p`
-// format bash uses ("up 3 hours, 42 minutes" → we strip the "up "). On
-// unsupported OSes returns empty string, not an error — meta.json treats
-// it as informational.
+// Uptime returns `uptime -p` style text without the "up " prefix, or "" where
+// /proc/uptime doesn't exist.
 func Uptime() string {
-	// Linux: /proc/uptime is "secs.fraction idle.fraction"
 	if runtime.GOOS == "linux" {
 		b, err := os.ReadFile("/proc/uptime")
 		if err == nil {
@@ -32,12 +25,10 @@ func Uptime() string {
 			}
 		}
 	}
-	// Fallback: no uptime available (darwin dev, minimal containers, etc.)
 	return ""
 }
 
-// Hostname is a thin wrapper over os.Hostname that swallows errors so the
-// returned value is always a usable string (empty on error, not "error").
+// Hostname returns os.Hostname, or "" on error.
 func Hostname() string {
 	if h, err := os.Hostname(); err == nil {
 		return h
@@ -45,8 +36,6 @@ func Hostname() string {
 	return ""
 }
 
-// formatDuration renders something like "3 hours, 42 minutes" for the
-// common ranges (seconds/minutes/hours/days).
 func formatDuration(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%d seconds", int(d.Seconds()))
