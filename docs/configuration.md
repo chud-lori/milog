@@ -144,6 +144,7 @@ See [alerts.md](alerts.md) for full destination setup.
 | `ANOMALY_FLOOR_P95`      | `100`                                   | Current p95 ms floor                                               |
 | `GEOIP_ENABLED`          | `0`                                     | Enable COUNTRY column           |
 | `MMDB_PATH`              | `/var/lib/GeoIP/GeoLite2-Country.mmdb`  | MaxMind DB path                 |
+| `CROWDSEC_CTI_KEY`       | `""`                                    | CrowdSec CTI API key; empty disables reputation lookups. See [crowdsec-cti.md](crowdsec-cti.md) |
 | `WEB_PORT`               | `8765`                                  | `milog web` listen port         |
 | `WEB_BIND`               | `127.0.0.1`                             | `milog web` bind address        |
 | `SLOW_WINDOW`            | `1000`                                  | Lines/app scanned by `milog slow` |
@@ -179,6 +180,7 @@ systemd units, one-shot runs, or CI:
 | `MILOG_WEBHOOK_CONTENT_TYPE`  | `WEBHOOK_CONTENT_TYPE`  |
 | `MILOG_GEOIP_ENABLED`         | `GEOIP_ENABLED`         |
 | `MILOG_MMDB_PATH`             | `MMDB_PATH`             |
+| `MILOG_CROWDSEC_CTI_KEY`      | `CROWDSEC_CTI_KEY`      |
 | `MILOG_HISTORY_ENABLED`       | `HISTORY_ENABLED`       |
 | `MILOG_HISTORY_DB`            | `HISTORY_DB`            |
 | `MILOG_ANOMALY_ENABLED`       | `ANOMALY_ENABLED`       |

@@ -236,6 +236,19 @@ mode_doctor() {
         fi
     fi
 
+    _doc_head "crowdsec cti"
+    if [[ -z "${CROWDSEC_CTI_KEY:-}" ]]; then
+        _doc_ok "off  (CROWDSEC_CTI_KEY empty, no lookups)"
+    elif [[ -s "$ALERT_STATE_DIR/cti.err" ]]; then
+        _doc_warn "last lookup failed: $(cut -f2 "$ALERT_STATE_DIR/cti.err")" \
+                  "401/403: key rejected; 429: rate limit hit; 000: no answer within 3s"
+        warn=$(( warn + 1 ))
+    else
+        local cti_cached
+        cti_cached=$(find "$ALERT_STATE_DIR/cti" -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+        _doc_ok "on  (${cti_cached} IPs cached in $ALERT_STATE_DIR/cti)"
+    fi
+
     # Web dashboard.
     _doc_head "web dashboard"
     local web_bin

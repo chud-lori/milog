@@ -60,6 +60,8 @@ mode_attacker() {
     printf "  %-14s %s\n"  "first seen:" "${first_seen:-?}"
     printf "  %-14s %s\n"  "last seen:"  "${last_seen:-?}"
     printf "  %-14s %d of %d\n" "apps touched:" "$apps_hit" "${#LOGS[@]}"
+    local cti; cti=$(cti_lookup "$ip")
+    [[ -n "$cti" ]] && printf "  %-14s %s\n" "crowdsec:" "$cti"
 
     echo -e "\n  ${W}per-app${NC}"
     awk -F'\t' '
