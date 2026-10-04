@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-17-g9341c14
-# MILOG_BUILT=2026-10-04T02:44:23Z
+# MILOG_VERSION=v0.6.0-27-g5e54b9c
+# MILOG_BUILT=2026-10-04T02:58:17Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -443,15 +443,33 @@ _alert_record() {
     _alert_rotate_if_big "$log_file"
 }
 
-# Log a failed delivery (network or HTTP >= 400) for `milog doctor`.
+# Log a failed delivery (network or HTTP >= 400) for `milog doctor`; status 000 means no HTTP response.
 _alert_send_failed() {
     local log_file="$ALERT_STATE_DIR/send_failures.log"
     mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
-    printf '%s\t%s\n' "$(date +%s)" "${1:-unknown}" >> "$log_file" 2>/dev/null || true
+    printf '%s\t%s\t%s\n' "$(date +%s)" "${1:-unknown}" "${2:-000}" >> "$log_file" 2>/dev/null || true
     _alert_rotate_if_big "$log_file"
 }
 
-# Senders return 0 when unconfigured and record failures with _alert_send_failed.
+# _alert_post <dest> <curl args...>. A 429 is retried once when the server asks to wait 5s or less.
+_alert_post() {
+    local dest="$1"; shift
+    local out code wait try
+    for try in 1 2; do
+        out=$(curl -sS -m 5 -i -w '\n%{http_code}' "$@" 2>/dev/null) || :
+        code="${out##*$'\n'}"
+        [[ "$code" == 429 && "$try" == 1 ]] || break
+        wait=$(printf '%s\n' "$out" | sed -n -E \
+            -e '/"retry_after": *[0-9]/{s/.*"retry_after": *([0-9][0-9.]*).*/\1/p;q;}' \
+            -e '/^[Rr]etry-[Aa]fter: *[0-9]/{s/^[^:]*: *([0-9][0-9.]*).*/\1/p;q;}') || :
+        # A string match, since arithmetic on a server-supplied number can overflow.
+        [[ "$wait" =~ ^([0-4](\.[0-9]+)?|5(\.0+)?)$ ]] || break
+        sleep "$wait" || break
+    done
+    [[ "$code" =~ ^[1-3][0-9][0-9]$ ]] || _alert_send_failed "$dest" "$code"
+}
+
+# Senders return 0 when unconfigured and post through _alert_post, which records failures.
 # The body carries attacker-controlled log text, so each sender escapes it and disables mentions where the API allows.
 
 # allowed_mentions.parse=[] stops @everyone / role pings.
@@ -461,8 +479,8 @@ _alert_send_discord() {
     local payload
     payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")
-    curl -sS -f -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed discord
+    _alert_post discord -H "Content-Type: application/json" \
+         -d "$payload" "$DISCORD_WEBHOOK"
 }
 
 # link_names=0 keeps `<@channel>` literal; the body goes in a code block with backticks swapped for single quotes.
@@ -474,8 +492,8 @@ _alert_send_slack() {
     local payload
     payload=$(printf '{"text":%s,"mrkdwn":true,"link_names":0}' \
         "$(json_escape "$text")")
-    curl -sS -f -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed slack
+    _alert_post slack -H "Content-Type: application/json" \
+         -d "$payload" "$SLACK_WEBHOOK"
 }
 
 # parse_mode=HTML, so every value goes through html_escape.
@@ -490,9 +508,8 @@ _alert_send_telegram() {
     local payload
     payload=$(printf '{"chat_id":%s,"text":%s,"parse_mode":"HTML","disable_web_page_preview":true,"disable_notification":false}' \
         "$(json_escape "$TELEGRAM_CHAT_ID")" "$(json_escape "$text")")
-    curl -sS -f -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-         >/dev/null 2>&1 || _alert_send_failed telegram
+    _alert_post telegram -H "Content-Type: application/json" \
+         -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
 }
 
 # Free-form POST driven by WEBHOOK_TEMPLATE; the color-to-severity mapping matches alerts.log.
@@ -520,8 +537,8 @@ _alert_send_webhook() {
     done
     payload+="$rest"
     local ctype="${WEBHOOK_CONTENT_TYPE:-application/json}"
-    curl -sS -f -m 5 -H "Content-Type: ${ctype}" \
-         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || _alert_send_failed webhook
+    _alert_post webhook -H "Content-Type: ${ctype}" \
+         -d "$payload" "$WEBHOOK_URL"
 }
 
 # Room IDs are percent-encoded; the txn id only needs to be unique within the server's dedup window.
@@ -542,12 +559,11 @@ ${body}"
     room_enc=$(_url_encode "$MATRIX_ROOM")
     txn_id="milog-$(date +%s)-$RANDOM"
     local hs="${MATRIX_HOMESERVER%/}"
-    curl -sS -f -m 5 -X PUT \
+    _alert_post matrix -X PUT \
          -H "Authorization: Bearer ${MATRIX_TOKEN}" \
          -H "Content-Type: application/json" \
          -d "$payload" \
-         "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}" \
-         >/dev/null 2>&1 || _alert_send_failed matrix
+         "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}"
 }
 
 # Silences: explicit mutes that outrank cooldown and dedup.
@@ -5060,10 +5076,14 @@ mode_doctor() {
     fi
     local flog="$ALERT_STATE_DIR/send_failures.log"
     if [[ -s "$flog" ]]; then
-        local fail_cutoff fail_count fail_dests
+        local fail_cutoff fail_count fail_dests fail_status
         fail_cutoff=$(( $(date +%s) - 86400 ))
         fail_count=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c' "$flog" | wc -l | tr -d ' ')
         fail_dests=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c {print $2}' "$flog" | sort -u | tr '\n' ' ')
+        # Rows written before the status column existed have no $3.
+        fail_status=$(awk -F'\t' -v c="$fail_cutoff" '$1 >= c && $3 != "" {print $3}' "$flog" \
+            | sort | uniq -c | sort -rn | awk 'NR == 1 {print $2}')
+        [[ -n "$fail_status" ]] && fail_dests="${fail_dests% }; mostly HTTP ${fail_status}"
         if (( fail_count > 0 )); then
             _doc_warn "${fail_count} alert deliveries failed in the last 24h  (${fail_dests% })" \
                       "see $flog; test with 'milog alert test'"
@@ -6057,7 +6077,7 @@ mode_patterns_list() {
 _PROBE_SYSTEMD_UNIT="/etc/systemd/system/milog-probe.service"
 
 # File-probe comm allowlist written into the unit; override with MILOG_PROBE_FILE_ALLOWLIST at install time.
-_PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,milog,milog-probe,ps,runc,runc:[2:INIT],watchtower,whoami"
+_PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sshd-socket-gen,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,milog,milog-probe,ps,runc,runc:[2:INIT],watchtower,whoami"
 
 _probe_service_active() {
     command -v systemctl >/dev/null 2>&1 || return 1
