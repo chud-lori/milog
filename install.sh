@@ -163,11 +163,21 @@ _release_resolve_tag() {
     printf '%s' "${BASH_REMATCH[1]}"
 }
 
-# Atomic replace of one binary; returns non-zero on any failure.
+# SHA-256 via sha256sum or shasum; empty when neither exists.
+_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+# Atomic replace of one binary. Returns non-zero when the archive isn't published; dies when it fails checksums.txt.
 _release_download_binary() {
     local name="$1" dst_dir="$2" tag="$3" os="$4" arch="$5"
     local archive="milog_${tag#v}_${os}_${arch}.tar.gz"
-    local url="https://github.com/${MILOG_RELEASE_REPO}/releases/download/${tag}/${archive}"
+    local base="https://github.com/${MILOG_RELEASE_REPO}/releases/download/${tag}"
+    local url="${base}/${archive}"
     local tmp
     tmp=$(mktemp -d) || return 1
     # shellcheck disable=SC2064
@@ -176,6 +186,27 @@ _release_download_binary() {
     if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/a.tar.gz" "$url" 2>/dev/null; then
         return 1
     fi
+
+    local want got
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/checksums.txt" "${base}/checksums.txt" 2>/dev/null; then
+        rm -rf "$tmp"
+        die "${name}: could not fetch checksums.txt for ${tag}; refusing to install an unverified binary"
+    fi
+    want=$(awk -v f="$archive" '$2 == f {print $1; exit}' "$tmp/checksums.txt")
+    if [[ -z "$want" ]]; then
+        rm -rf "$tmp"
+        die "${name}: ${archive} is not listed in checksums.txt for ${tag}; refusing to install"
+    fi
+    got=$(_sha256 "$tmp/a.tar.gz")
+    if [[ -z "$got" ]]; then
+        rm -rf "$tmp"
+        die "${name}: need sha256sum or shasum to verify ${archive}; refusing to install"
+    fi
+    if [[ "$got" != "$want" ]]; then
+        rm -rf "$tmp"
+        die "${name}: checksum mismatch for ${archive} (expected ${want}, got ${got}); refusing to install"
+    fi
+
     tar -xzf "$tmp/a.tar.gz" -C "$tmp" "$name" 2>/dev/null || return 1
     [[ -f "$tmp/$name" ]] || return 1
 
@@ -187,7 +218,7 @@ _release_download_binary() {
     info "Installed ${name} → ${dst_dir}/${name} (from ${tag})"
 }
 
-# Never fails the install: milog.sh is already in place.
+# A missing binary is not fatal (milog.sh is already in place), but a failed checksum aborts the install.
 _release_install_companions() {
     local dst_dir="$1"
     local os arch tag
