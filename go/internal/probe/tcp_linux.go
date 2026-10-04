@@ -1,12 +1,7 @@
 //go:build linux
 
-// tcp_linux.go — userspace loader for the tcp connect probe.
-//
-// Mirrors the structure of exec_linux.go: load embedded BPF object,
-// attach a tracepoint, stream events into a Go channel until the ctx
-// is cancelled. Lives in a separate file (and uses a separate ring
-// buffer + map name) so a verifier-reject on one program doesn't block
-// the other from loading.
+// Loader for the tcp connect probe, in its own collection and ring buffer so
+// a verifier reject doesn't affect the other probes.
 
 package probe
 
@@ -28,15 +23,9 @@ import (
 //go:embed bpf/tcp.bpf.o
 var tcpBpfObj []byte
 
-// tcpRawEvent is the binary layout written by the BPF program. Field
-// order, sizes, and padding match `struct tcp_event` in tcp.bpf.c. A
-// drift between the two is silent corruption — the probe would emit
-// alerts with the wrong port, comm, or destination IP.
-//
-// The 4-byte ints (Family, DPort) are wider than they need to be on
-// the wire (Family is u16-equivalent, DPort is u16) — bumped to u32
-// so the struct is naturally 4-byte aligned and we don't need explicit
-// padding bytes. The C side declares them the same way for symmetry.
+// tcpRawEvent must match struct tcp_event in tcp.bpf.c; a mismatch silently
+// garbles ports and addresses. Family and DPort are u32 on both sides for
+// natural alignment.
 type tcpRawEvent struct {
 	PID     uint32
 	UID     uint32
@@ -47,34 +36,21 @@ type tcpRawEvent struct {
 	Comm    [commLen]byte
 }
 
-// AF_INET / AF_INET6 — same constants the kernel uses. Hardcoded
-// rather than imported from `golang.org/x/sys/unix` to keep the probe
-// dependency-light (cilium/ebpf is the only non-stdlib import here
-// that actually pulls in foreign code). Left UNTYPED so they
-// implicit-convert against either uint32 (tcp probe) or uint16
-// (retrans probe, which packs Family into a 16-bit hash-key field).
+// Untyped so they compare against both uint32 (tcp) and uint16 (retrans)
+// fields; hardcoded to avoid pulling in x/sys/unix.
 const (
 	afInet  = 2
 	afInet6 = 10
 )
 
-// RunNet loads the tcp connect probe, attaches the
-// sock:inet_sock_set_state tracepoint, and streams matched NetEvents
-// into `out` until ctx is cancelled. Errors out on a verifier reject
-// or rlimit failure — milog-probe surfaces the error and lets systemd
-// restart it.
-//
-// Designed to run alongside Run() in a separate goroutine; both
-// programs live in independent collections so a load failure on one
-// doesn't take down the other.
+// RunNet attaches sock:inet_sock_set_state and sends a NetEvent per outbound
+// connect until ctx is cancelled; load and attach failures are returned.
 func RunNet(ctx context.Context, out chan<- NetEvent) error {
 	if len(tcpBpfObj) == 0 {
 		return errors.New("probe: bpf/tcp.bpf.o is empty — rebuild with clang available (apt install clang llvm libbpf-dev)")
 	}
 
-	// rlimit.RemoveMemlock is idempotent — calling it again from
-	// RunNet after Run already did is harmless. Cheaper than
-	// requiring callers to coordinate.
+	// RemoveMemlock is idempotent, so each loader can call it.
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("probe: remove memlock rlimit: %w", err)
 	}
@@ -141,14 +117,9 @@ func RunNet(ctx context.Context, out chan<- NetEvent) error {
 			ev.DAddr = net.IP(raw.DaddrV6[:]).String()
 			ev.IsIPv6 = true
 		default:
-			// BPF side already filters AF_INET / AF_INET6 — getting
-			// here means a kernel-side bug or a layout drift. Skip
-			// rather than emit a garbage event.
+			// BPF already filters other families; this means layout drift.
 			continue
 		}
-		// /proc lookup for ParentComm — same userspace-cheap pattern
-		// as the exec probe. Useful in alert bodies for "which web
-		// worker spawned this connect?" forensics.
 		ev.PPID, ev.ParentComm = lookupParent(raw.PID)
 
 		select {

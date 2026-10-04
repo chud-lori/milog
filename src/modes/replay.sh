@@ -1,10 +1,4 @@
-# ==============================================================================
-# MODE: replay — postmortem summary of one archived log file
-# Read-only: never writes history. Handles .gz / .bz2 transparently.
-# Three passes of the file: counts + date range, timings (sort + percentile),
-# top source IPs. Each pass is single-awk-per-metric — same discipline as
-# the live dashboard helpers.
-# ==============================================================================
+# milog replay <file>: read-only postmortem summary of one log file, plain, .gz or .bz2.
 mode_replay() {
     local file="${1:-}"
     if [[ -z "$file" ]]; then
@@ -13,8 +7,6 @@ mode_replay() {
     fi
     [[ -f "$file" ]] || { echo -e "${R}Not found: $file${NC}" >&2; return 1; }
 
-    # Pick reader based on extension. Array form so no word-splitting risks
-    # when $file contains spaces.
     local -a reader=(cat --)
     case "$file" in
         *.gz)
@@ -32,7 +24,6 @@ mode_replay() {
 
     echo -e "\n${W}── MiLog: Replay — ${file} ──${NC}\n"
 
-    # Pass 1: lines, first/last timestamp, status-class tallies.
     local summary n first last e2 e3 e4 e5
     summary=$("${reader[@]}" "$file" 2>/dev/null | awk '
         {
@@ -63,7 +54,7 @@ mode_replay() {
     printf "  %-10s  2xx=%s  3xx=%s  ${Y}4xx=%s${NC}  ${R}5xx=%s${NC}\n" \
            "status"  "$e2" "$e3" "$e4" "$e5"
 
-    # Pass 2: percentiles, only if any line has a numeric final field.
+    # Percentiles only when some line ends in a number.
     local sorted
     sorted=$("${reader[@]}" "$file" 2>/dev/null \
         | awk '$NF ~ /^[0-9]+(\.[0-9]+)?$/ { print int($NF * 1000 + 0.5) }' \
@@ -82,7 +73,6 @@ mode_replay() {
         printf "  %-10s  p50=%dms  p95=%dms  p99=%dms\n" "response" "$p50" "$p95" "$p99"
     fi
 
-    # Pass 3: top 10 source IPs.
     echo
     echo -e "  ${W}Top source IPs:${NC}"
     "${reader[@]}" "$file" 2>/dev/null \

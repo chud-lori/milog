@@ -1,15 +1,7 @@
 //go:build linux
 
-// file_linux.go — userspace loader for the file-audit probe.
-//
-// Mirrors tcp_linux.go: load embedded bpf/file.bpf.o, attach the
-// sys_enter_openat tracepoint, stream `FileEvent`s into a Go channel.
-// Coarse prefix filter lives BPF-side (see file.bpf.c); precise
-// per-path matching against the configurable sensitive list happens
-// in rules.go's MatchFile.
-//
-// Independent collection so a verifier reject on the file probe doesn't
-// take down exec or tcp coverage.
+// Loader for the file-audit probe. BPF does a coarse prefix filter on
+// sys_enter_openat; MatchFile does the exact path matching.
 
 package probe
 
@@ -30,9 +22,7 @@ import (
 //go:embed bpf/file.bpf.o
 var fileBpfObj []byte
 
-// fileRawEvent is the binary layout written by handle_openat. Field
-// order, sizes, padding match `struct file_event` in file.bpf.c —
-// drift here is silent corruption (mis-attributed paths in alerts).
+// fileRawEvent must match struct file_event in file.bpf.c.
 type fileRawEvent struct {
 	PID      uint32
 	UID      uint32
@@ -41,9 +31,7 @@ type fileRawEvent struct {
 	Filename [filenameLen]byte
 }
 
-// RunFile loads the file-audit probe, attaches sys_enter_openat, and
-// streams matched FileEvents into `out` until ctx is cancelled. Same
-// shape as Run / RunNet — three independent goroutines in milog-probe.
+// RunFile attaches sys_enter_openat and sends FileEvents until ctx is cancelled.
 func RunFile(ctx context.Context, out chan<- FileEvent) error {
 	if len(fileBpfObj) == 0 {
 		return errors.New("probe: bpf/file.bpf.o is empty — rebuild with clang available (apt install clang llvm libbpf-dev)")

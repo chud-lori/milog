@@ -1,6 +1,4 @@
-# ==============================================================================
-# MODE: top
-# ==============================================================================
+# milog top [N]: busiest IPs across all apps.
 mode_top() {
     local n="${1:-10}"
     echo -e "\n${W}── MiLog: Top ${n} IPs ──${NC}\n"
@@ -23,8 +21,7 @@ mode_top() {
             && awk '{print $1}' "$LOG_DIR/$name.access.log" >> "$tmp"
     done
 
-    # Geo lookup happens here — after uniq has already collapsed the IP set
-    # to at most $n rows, so we fork mmdblookup $n times, not once per line.
+    # Geo lookup after uniq, so mmdblookup forks at most $n times.
     local i=1 count ip col country
     while read -r count ip; do
         col=""
