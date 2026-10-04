@@ -36,10 +36,18 @@ _alert_write_config() {
     fi
 }
 
+# Root may be the reader, so only a regular, non-symlink file up to 1 MiB counts.
+_alert_config_readable() {
+    local file="$1" size
+    [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 1
+    size=$(stat -c '%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null) || return 1
+    (( size <= 1048576 ))
+}
+
 # Always returns 0, printing nothing when the file or key is missing, to stay safe under `set -e`.
 _alert_read_webhook() {
     local file="$1"
-    [[ -f "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     {
         grep -E '^[[:space:]]*DISCORD_WEBHOOK=' "$file" 2>/dev/null \
             | head -1 \
@@ -49,11 +57,8 @@ _alert_read_webhook() {
 }
 
 _alert_read_routes() {
-    local file="$1" size
-    # Root may be the reader, so skip symlinks, FIFOs and anything over 1 MiB.
-    [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 0
-    size=$(stat -c '%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null) || return 0
-    (( size <= 1048576 )) || return 0
+    local file="$1"
+    _alert_config_readable "$file" || return 0
     # Parsed, never sourced: under sudo this is another user's file and we're root.
     awk '
         !on && /^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/ {
@@ -72,7 +77,7 @@ _alert_read_routes() {
 
 _alert_read_key() {
     local file="$1" key="$2"
-    [[ -f "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     {
         grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null \
             | head -1 \
@@ -143,9 +148,7 @@ alert_on() {
     mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
     mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
     mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
-    if [[ -z "$d_url$s_url$wh_url" ]] \
-        && [[ -z "$tg_token" || -z "$tg_chat" ]] \
-        && [[ -z "$mx_hs" || -z "$mx_token" || -z "$mx_room" ]]; then
+    if ! _alert_any_destination "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room" "$wh_url"; then
         echo -e "${R}no alert destination configured in $target_config${NC}" >&2
         echo "  pass a Discord webhook:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
         echo "  or set SLACK_WEBHOOK, TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID, MATRIX_* or WEBHOOK_URL there" >&2
@@ -354,7 +357,7 @@ alert_help() {
 ${W}milog alert${NC} — toggle alerting and manage the systemd service
 
 ${W}USAGE${NC}
-  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts (Discord); install + start systemd
+  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts; install + start systemd
   ${C}milog alert off${NC}                disable alerts; stop + disable service
   ${C}milog alert status${NC}             show destinations/service/recent-fire state
   ${C}milog alert test${NC}               fire one test alert to EVERY configured

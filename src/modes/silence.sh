@@ -78,7 +78,7 @@ _silence_add() {
     local until_fmt; until_fmt=$(_silence_fmt_epoch "$until_epoch")
     local rem_fmt;   rem_fmt=$(_silence_fmt_remaining "$until_epoch")
     echo -e "${G}✓${NC} silenced ${Y}$key${NC} until ${W}$until_fmt${NC} (${rem_fmt})"
-    [[ -n "$message" ]] && echo -e "${D}  note: $message${NC}"
+    [[ -z "$message" ]] || echo -e "${D}  note: $message${NC}"
 }
 
 _silence_clear() {

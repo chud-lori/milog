@@ -485,6 +485,12 @@ _alert_redact_webhook() {
     fi
 }
 
+# Succeeds when at least one destination has every setting it needs; same args as _alert_destinations_status.
+_alert_any_destination() {
+    local d="${1:-}" s="${2:-}" tt="${3:-}" tc="${4:-}" mh="${5:-}" mt="${6:-}" mr="${7:-}" wh="${8:-}"
+    [[ -n "$d$s$wh" ]] || [[ -n "$tt" && -n "$tc" ]] || [[ -n "$mh" && -n "$mt" && -n "$mr" ]]
+}
+
 # Takes values as args so `alert status` can pass ones read from another user's config file.
 # Args: discord_url slack_url tg_token tg_chat matrix_hs matrix_token matrix_room webhook_url
 _alert_destinations_status() {

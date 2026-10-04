@@ -9,12 +9,13 @@ mode_daemon() {
         exit 1
     fi
 
-    local hook_state
-    hook_state="disabled"
-    [[ "$ALERTS_ENABLED" == "1" && -n "$DISCORD_WEBHOOK" ]] && hook_state="enabled"
+    local hook_state="disabled" have_dest=0
+    _alert_any_destination "$DISCORD_WEBHOOK" "$SLACK_WEBHOOK" "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" \
+        "$MATRIX_HOMESERVER" "$MATRIX_TOKEN" "$MATRIX_ROOM" "$WEBHOOK_URL" && have_dest=1
+    [[ "$ALERTS_ENABLED" == "1" ]] && (( have_dest )) && hook_state="enabled"
     _dlog "milog daemon starting — refresh=${REFRESH}s alerts=${hook_state} history=${HISTORY_ENABLED} apps=(${LOGS[*]})"
     [[ "$ALERTS_ENABLED" != "1" ]] && _dlog "WARNING: ALERTS_ENABLED=0 — rules will log but no webhooks will be fired"
-    [[ -z "$DISCORD_WEBHOOK"    ]] && _dlog "WARNING: DISCORD_WEBHOOK empty — no webhooks will be fired"
+    (( have_dest )) || _dlog "WARNING: no alert destination configured — no webhooks will be fired"
 
     history_init   # no-op when HISTORY_ENABLED=0; disables itself on error
 
