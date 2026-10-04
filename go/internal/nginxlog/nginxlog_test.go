@@ -118,6 +118,44 @@ func TestParseLine(t *testing.T) {
 	}
 }
 
+func TestIsAICrawler(t *testing.T) {
+	cases := []struct {
+		ua   string
+		want bool
+	}{
+		{"Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)", true},
+		{"Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)", true},
+		{"meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)", true},
+		{"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", false},
+		{"curl/8.5.0", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := IsAICrawler(c.ua); got != c.want {
+			t.Errorf("IsAICrawler(%q) = %v, want %v", c.ua, got, c.want)
+		}
+	}
+}
+
+func TestAICrawlerTokensMatchBash(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "..", "src", "nginx.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const prefix = "AI_CRAWLER_UA_RE='"
+	for _, line := range strings.Split(string(src), "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		got := strings.TrimSuffix(strings.TrimPrefix(line, prefix), "'")
+		if want := strings.Join(AICrawlerTokens, "|"); got != want {
+			t.Errorf("src/nginx.sh has %q, AICrawlerTokens has %q", got, want)
+		}
+		return
+	}
+	t.Fatal("AI_CRAWLER_UA_RE not found in src/nginx.sh")
+}
+
 func TestParseLine_MalformedReturnsZero(t *testing.T) {
 	cases := []string{
 		`garbage without quotes`,

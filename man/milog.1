@@ -78,10 +78,12 @@ reports errors; warnings are allowed.
 .SS Per-app inspection
 .TP
 .B health
-Per-app totals \(em 2xx / 3xx / 4xx / 5xx counts.
+Per-app totals \(em 2xx / 3xx / 4xx / 5xx counts, plus the share of
+requests from AI crawler user-agents (GPTBot, ClaudeBot, PerplexityBot, …).
 .TP
 .BR top " [\fIN\fR]"
-Top \fIN\fR source IPs across all apps (default 10). Adds a country
+Top \fIN\fR source IPs across all apps (default 10). Ends with the
+AI-crawler share of all requests. Adds a country
 column when
 .B GEOIP_ENABLED=1
 and
@@ -201,6 +203,13 @@ Mute a rule. Also: \fBsilence list\fR, \fBsilence clear\fR \fIRULE\fR.
 .TP
 .BR digest " [\fIWINDOW\fR]"
 Exec-summary for the period.
+.TP
+.BR report " [\fIWINDOW\fR] [\fB\-\-html\fR] [\fB\-o\fR \fIFILE\fR]"
+Static report for the window (default \fB7d\fR; same grammar as
+\fBdigest\fR): requests, 4xx and 5xx per app, the top 10 IPs by 4xx
+responses, alert fires per rule, and anomaly alerts. Markdown by default;
+\fB\-\-html\fR prints one self-contained HTML page with no scripts. Writes to stdout, or
+to \fIFILE\fR with \fB\-o\fR.
 .TP
 .B doctor
 Diagnostic checklist \(em flags every degraded optional capability with a
