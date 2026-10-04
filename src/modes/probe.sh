@@ -20,14 +20,9 @@
 #   as that user too (MILOG_PROBE_ALERT_USER), never as root.
 # ==============================================================================
 
-# Path to the systemd system unit. Kept in sync with _probe_service_install.
 _PROBE_SYSTEMD_UNIT="/etc/systemd/system/milog-probe.service"
 
-# Default file allowlist baked into the unit at install-service time.
-# Conservative system-tools list plus comm names observed as benign noise
-# in real deployments (Docker runc init stages, Tencent Cloud agents,
-# udev). Operators tune at install time via MILOG_PROBE_FILE_ALLOWLIST or
-# by editing the Environment= line in the unit afterward.
+# File-probe comm allowlist written into the unit; override with MILOG_PROBE_FILE_ALLOWLIST at install time.
 _PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,milog,milog-probe,ps,runc,runc:[2:INIT],watchtower,whoami"
 
 _probe_service_active() {
@@ -52,9 +47,7 @@ _probe_status() {
     fi
 }
 
-# Locate milog-probe, the Go companion binary. Same preference order as
-# _web_go_binary — explicit override, libexec/, /usr/local/bin, then a
-# clone-relative dev path.
+# Same lookup order as _web_go_binary.
 _probe_binary() {
     if [[ -n "${MILOG_PROBE_BIN:-}" && -x "$MILOG_PROBE_BIN" ]]; then
         printf '%s' "$MILOG_PROBE_BIN"; return 0
@@ -159,10 +152,7 @@ _probe_service_install() {
         return 1
     fi
 
-    # Capture the user who invoked sudo so the probe-spawned milog can
-    # write alerts + read silences from THAT user's $HOME, not root's.
-    # SUDO_USER is set by sudo; logname falls back for direct-root login.
-    # If everything fails (boot-time root shell), default to root + warn.
+    # SUDO_USER, else logname, else root.
     local target_user="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
     local target_home
     target_home=$(getent passwd "$target_user" 2>/dev/null | cut -d: -f6)

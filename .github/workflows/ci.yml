@@ -57,6 +57,17 @@ jobs:
           diff <(grep -v '^# MILOG_\(VERSION\|BUILT\)=' milog.sh) \
                <(git show HEAD:milog.sh | grep -v '^# MILOG_\(VERSION\|BUILT\)=')
 
+      - name: Bash bundle version stamp
+        # A -dirty stamp means milog.sh was built before its src/ change was committed.
+        run: |
+          stamp=$(git show HEAD:milog.sh | sed -n '/^# MILOG_VERSION=/p')
+          echo "$stamp"
+          case "$stamp" in
+            *-dirty)
+              echo "milog.sh carries a -dirty MILOG_VERSION; commit src/ first, then rebuild on a clean tree" >&2
+              exit 1 ;;
+          esac
+
       - name: Bash bundle syntax check
         run: bash -n milog.sh
 
@@ -64,6 +75,10 @@ jobs:
         run: |
           bash tests/smoke_exploits.sh
           bash tests/smoke_audit_tempfiles.sh
+          bash tests/smoke_alert_payloads.sh
+          bash tests/smoke_docs_drift.sh
+          bash tests/smoke_installer_checksums.sh
+          bash tests/smoke_install_completions.sh
           bash tests/smoke_tty_escapes.sh
 
       - name: Go vet

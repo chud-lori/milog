@@ -30,8 +30,7 @@ func TestDiskAt_CurrentDir(t *testing.T) {
 }
 
 func TestCPU_NonLinuxReturnsZero(t *testing.T) {
-	// Not a strict check — on Linux CPU() returns a number; on darwin it
-	// returns 0,nil. Either is acceptable. Just confirm no panic.
+	// Off Linux CPU returns 0, nil; only check it doesn't fail.
 	_, err := CPU()
 	if err != nil {
 		t.Errorf("CPU unexpected error: %v", err)

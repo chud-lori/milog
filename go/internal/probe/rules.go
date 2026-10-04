@@ -1,18 +1,8 @@
-// Package probe — eBPF-backed exec watcher and rule engine.
+// Package probe is milog-probe's eBPF event loaders and rule engine.
 //
-// rules.go holds the rule-matching logic, deliberately OS-independent
-// so it can be unit-tested on any platform. The actual BPF loading +
-// ringbuf consumption lives in exec_linux.go / tcp_linux.go /
-// file_linux.go / ptrace_linux.go / kmod_linux.go (and a stub
-// exec_other.go for non-Linux builds).
-//
-// Rule firing is fingerprint-based: the userspace consumer feeds an
-// `Event` / `NetEvent` / `FileEvent` / `PtraceEvent` / `KmodEvent` to
-// `Match` / `MatchNet` / `MatchFile` / `MatchPtrace` / `MatchKmod`,
-// gets back a slice of `Hit` (rule key + body detail) per matching
-// rule, and shells those out to milog's existing alert path. Cooldown
-// / silence / dedup all apply via the rule key — no parallel state in
-// the probe.
+// rules.go is OS-independent so the rules test anywhere. Each Match* function
+// turns one event into Hits whose RuleKey goes through milog's alert path,
+// so cooldown, silence and dedup apply there rather than in the probe.
 package probe
 
 import (
@@ -24,13 +14,8 @@ import (
 	"time"
 )
 
-// Event is the userspace mirror of the BPF-side `struct exec_event`,
-// enriched with parent-process info that's cheaper to look up in /proc
-// than to follow CO-RE chain reads from the BPF program itself.
-//
-// Field-order with the C struct does NOT have to match — Go only sees
-// this Go-side type. The wire format for events from BPF is laid out
-// in exec_linux.go.
+// Event is a process exec, with parent info looked up in /proc rather than
+// read through CO-RE chains in BPF.
 type Event struct {
 	PID        uint32
 	PPID       uint32 // looked up via /proc/<pid>/status
@@ -40,21 +25,15 @@ type Event struct {
 	Filename   string // exe path captured at tracepoint
 }
 
-// Hit represents one rule firing for one event. RuleKey is the
-// `process:<rule>:<detail>` string passed to milog's alert path —
-// cooldown groups by this exact string.
+// Hit is one rule firing. RuleKey is what milog's cooldown groups by.
 type Hit struct {
 	RuleKey string
 	Title   string
 	Body    string
 }
 
-// webWorkerComms — process names that almost never legitimately spawn
-// an interactive shell. nginx workers sometimes spawn `sh` for cgi-bin
-// or temp file rotation, but on most production setups any shell
-// descendant of a web worker is a strong RCE indicator. Operators
-// running cgi-bin can silence the rule with `milog silence
-// process:shell_from_web_worker:* 1h` while they triage.
+// webWorkerComms are servers whose shell children are a strong RCE signal.
+// Hosts running cgi-bin can silence process:shell_from_web_worker:*.
 var webWorkerComms = map[string]struct{}{
 	"nginx":       {},
 	"php-fpm":     {},
@@ -71,11 +50,7 @@ var webWorkerComms = map[string]struct{}{
 	"uwsgi":       {},
 }
 
-// shellComms — process names treated as "interactive shell". A
-// hardcoded list rather than checking `/etc/shells` because attackers
-// rename their shell, and we want to alert on the *original* name as
-// captured by the kernel comm field (which is the actual exec name,
-// not what the process later calls itself).
+// shellComms is a fixed list rather than /etc/shells.
 var shellComms = map[string]struct{}{
 	"sh":   {},
 	"bash": {},
@@ -86,9 +61,7 @@ var shellComms = map[string]struct{}{
 	"tcsh": {},
 }
 
-// Trusted shell-launching parents whose children we DON'T flag — these
-// are normal tools that legitimately exec shells. Interactive admin
-// sessions, build tools, package managers etc.
+// shellParentAllowlist lists parents that routinely exec shells.
 var shellParentAllowlist = map[string]struct{}{
 	"sshd":           {},
 	"login":          {},
@@ -108,18 +81,14 @@ var shellParentAllowlist = map[string]struct{}{
 	"pnpm":           {},
 }
 
-// tmpExecPrefixes — directories where attacker-dropped binaries
-// typically land. /home/<user>/tmp etc. is NOT here because legitimate
-// build tools (cargo, go) do drop binaries under user temp paths.
+// tmpExecPrefixes omits per-user temp dirs, where cargo and go legitimately drop binaries.
 var tmpExecPrefixes = []string{
 	"/tmp/",
 	"/var/tmp/",
 	"/dev/shm/",
 }
 
-// Match runs every rule against the event and returns the hits.
-// Empty slice when nothing matched — caller checks len, fires nothing
-// when zero.
+// Match runs every exec rule against e.
 func Match(e Event) []Hit {
 	var hits []Hit
 
@@ -135,12 +104,8 @@ func Match(e Event) []Hit {
 	return hits
 }
 
-// matchShellFromWebWorker fires when an HTTP server process (nginx,
-// php-fpm, apache, etc.) spawns an interactive shell. Classic RCE tell:
-// PHP eval()/system()/passthru() of attacker input dropping into /bin/sh.
-//
-// The allowlist on shellParentAllowlist lets sshd/sudo/cron-style
-// flows through — those are normal admin sessions, not RCE.
+// matchShellFromWebWorker catches a web server spawning a shell, the usual
+// result of eval/system on attacker input.
 func matchShellFromWebWorker(e Event) (Hit, bool) {
 	if _, isShell := shellComms[e.Comm]; !isShell {
 		return Hit{}, false
@@ -148,9 +113,6 @@ func matchShellFromWebWorker(e Event) (Hit, bool) {
 	if _, isWebParent := webWorkerComms[e.ParentComm]; !isWebParent {
 		return Hit{}, false
 	}
-	// Per-(parent, child) rule key so both nginx→bash and php-fpm→sh
-	// are tracked independently. Cooldown groups by the full key, so
-	// the same flow re-firing within ALERT_COOLDOWN is silenced.
 	return Hit{
 		RuleKey: "process:shell_from_web_worker:" + e.ParentComm + ":" + e.Comm,
 		Title:   "Shell from web worker: " + e.ParentComm + " → " + e.Comm,
@@ -160,13 +122,8 @@ func matchShellFromWebWorker(e Event) (Hit, bool) {
 	}, true
 }
 
-// matchExecFromTmp fires when a binary executes from /tmp, /var/tmp,
-// or /dev/shm. Attacker payload drop sites — almost no legitimate
-// software lives there.
-//
-// The rule key embeds the comm so a single misbehaving program
-// re-execing itself doesn't cooldown-mask other tmp-drops in the same
-// window.
+// matchExecFromTmp keys on comm so one program re-execing itself doesn't
+// cooldown-mask other drops.
 func matchExecFromTmp(e Event) (Hit, bool) {
 	for _, prefix := range tmpExecPrefixes {
 		if strings.HasPrefix(e.Filename, prefix) {
@@ -182,23 +139,13 @@ func matchExecFromTmp(e Event) (Hit, bool) {
 	return Hit{}, false
 }
 
-// matchSuidEscalation fires when a setuid binary executes AND the
-// effective UID at exec time differs from the parent's expected UID.
-// Without BPF-side capture of pre/post UID we approximate: alert when
-// uid==0 and the exec is from a non-root parent comm — the strongest
-// signal that doesn't require root-privilege task_struct CO-RE chains.
-//
-// In practice: a non-root web worker (e.g. php-fpm running as
-// www-data) is the parent, but the child exec lands at uid=0. That's
-// suid escalation in flight.
+// matchSuidEscalation flags a uid 0 exec whose parent is a web worker,
+// approximating setuid escalation without capturing pre/post UIDs in BPF.
 func matchSuidEscalation(e Event) (Hit, bool) {
 	if e.UID != 0 {
 		return Hit{}, false
 	}
-	// Limit false-positive surface: only flag when the parent is a web
-	// worker. Normal sudo/login flows already have allowlisted parents
-	// elsewhere; widening this rule beyond webserver-descendant exec
-	// would page on every cron job.
+	// Limited to web-worker parents; wider would page on every cron job.
 	if _, isWeb := webWorkerComms[e.ParentComm]; !isWeb {
 		return Hit{}, false
 	}
@@ -211,9 +158,7 @@ func matchSuidEscalation(e Event) (Hit, bool) {
 	}, true
 }
 
-// uitoa is a tiny stdlib-free uint→ascii helper. Kept inline so the
-// probe binary doesn't pull strconv just for body formatting on the
-// hot path. PID/UID values are always small (<10 digits).
+// uitoa formats v in decimal.
 func uitoa(v uint32) string {
 	if v == 0 {
 		return "0"
@@ -228,16 +173,8 @@ func uitoa(v uint32) string {
 	return string(buf[i:])
 }
 
-// =============================================================================
-// Network probe — outbound TCP connect monitoring.
-// =============================================================================
-
-// NetEvent is the userspace mirror of `struct tcp_event` from
-// tcp.bpf.c. Fired once per outbound TCP connect attempt
-// (TCP_CLOSE → TCP_SYN_SENT transition). DAddr is the destination
-// formatted as a string ("1.2.3.4" for v4, RFC 5952 for v6) so the
-// rule engine doesn't need to handle byte-array/IP conversion in two
-// places.
+// NetEvent is one outbound TCP connect (TCP_CLOSE -> TCP_SYN_SENT), with
+// DAddr already formatted as a string.
 type NetEvent struct {
 	PID        uint32
 	PPID       uint32 // looked up via /proc/<pid>/status
@@ -249,10 +186,7 @@ type NetEvent struct {
 	IsIPv6     bool
 }
 
-// MatchNet runs every network rule against the event and returns hits.
-// Mirrors Match() for exec events. Currently one rule
-// (`net:unexpected_outbound`); space for `net:retrans_spike` once the
-// retransmit probe lands.
+// MatchNet runs every network rule against e.
 func MatchNet(e NetEvent) []Hit {
 	var hits []Hit
 	if h, ok := matchUnexpectedOutbound(e); ok {
@@ -261,18 +195,9 @@ func MatchNet(e NetEvent) []Hit {
 	return hits
 }
 
-// matchUnexpectedOutbound fires when a process initiates a TCP connect
-// to a destination not on the operator-configured allowlist. Defaults
-// cover loopback + DNS + NTP + RFC1918/ULA private ranges so a
-// freshly-installed milog probe doesn't immediately page on every
-// internal hop. Operators tighten the allowlist via
-// MILOG_PROBE_NET_ALLOWLIST or by silencing the rule key per-flow.
-//
-// The rule key embeds the comm so a single misbehaving process
-// connecting to many destinations shows up as one cooldown group, not
-// fifty. If you need per-destination granularity, swap the key suffix
-// to `:<comm>:<daddr>:<dport>` — but expect cooldown noise on long
-// connection bursts.
+// matchUnexpectedOutbound flags connects outside the allowlist (default:
+// loopback, DNS, NTP and private ranges). Keyed by comm so one process
+// hitting many destinations is one cooldown group.
 func matchUnexpectedOutbound(e NetEvent) (Hit, bool) {
 	allow := loadNetAllowlist()
 	if allow.permits(e.DAddr, e.DPort) {
@@ -288,15 +213,7 @@ func matchUnexpectedOutbound(e NetEvent) (Hit, bool) {
 	}, true
 }
 
-// netAllowlist holds the parsed allowlist as IP networks + bare ports.
-// Each connect event is checked against three buckets:
-//
-//   1. Wildcard ports — entries like `:53`, match any IP at that port.
-//   2. Networks       — entries like `10.0.0.0/8`, match any port in that net.
-//   3. Network+port   — entries like `10.0.0.0/8:443`, match both.
-//
-// Buckets are computed once via loadNetAllowlist(); subsequent events
-// reuse the cached value.
+// netAllowlist matches `:port` (any IP), `cidr` (any port) or `cidr:port`.
 type netAllowlist struct {
 	wildcardPorts map[uint16]struct{}
 	nets          []*net.IPNet
@@ -314,8 +231,7 @@ func (a *netAllowlist) permits(addr string, port uint16) bool {
 	}
 	ip := net.ParseIP(addr)
 	if ip == nil {
-		// Bad address from the BPF side — better to alert than to
-		// silently allow. Return false so the rule fires.
+		// Unparseable address from BPF: alert rather than allow.
 		return false
 	}
 	for _, n := range a.nets {
@@ -331,25 +247,16 @@ func (a *netAllowlist) permits(addr string, port uint16) bool {
 	return false
 }
 
-// defaultNetAllowlist is the baseline shipped with milog-probe. Picks
-// the conservative set: loopback (always benign), DNS / NTP (every
-// machine does these), and RFC1918 / ULA / link-local (typical
-// private-network infra). Operators on a tightly-firewalled host can
-// override via MILOG_PROBE_NET_ALLOWLIST to drop the private-net
-// entries and force every outbound to be explicit.
+// defaultNetAllowlist covers loopback, DNS, NTP and private ranges; tightly
+// firewalled hosts can drop the private ranges via MILOG_PROBE_NET_ALLOWLIST.
 const defaultNetAllowlist = "127.0.0.0/8,::1/128," +
 	":53,:123," +
 	"10.0.0.0/8,172.16.0.0/12,192.168.0.0/16," +
 	"169.254.0.0/16," +
 	"fc00::/7,fe80::/10"
 
-// allowlistCache holds the parsed allowlist so MatchNet doesn't re-parse
-// on every event. Single-shot init via the `cached` flag — if the env
-// changes mid-run the operator restarts milog-probe to pick it up.
-//
-// Not a sync.Once because tests need to clear the cache between cases.
-// resetNetAllowlistCache is a test-only escape hatch declared in
-// rules_test.go.
+// Parsed once; env changes need a probe restart. Not a sync.Once so tests
+// can reset it.
 var (
 	cachedAllowlist netAllowlist
 	allowlistReady  bool
@@ -368,17 +275,9 @@ func loadNetAllowlist() *netAllowlist {
 	return &cachedAllowlist
 }
 
-// parseNetAllowlist accepts a comma-separated list. Each entry is one
-// of three shapes:
-//
-//	":<port>"                    — bare port, any IP
-//	"<cidr>"                     — network, any port
-//	"<cidr>:<port>"              — both
-//
-// Bare IPs (no /mask) are normalised to /32 (v4) or /128 (v6).
-// Malformed entries are skipped silently — the only effect of a typo
-// is that the entry doesn't allowlist anything, which fails safe (the
-// alert fires).
+// parseNetAllowlist takes comma-separated `:port`, `cidr` or `cidr:port`
+// entries; bare IPs become /32 or /128. Malformed entries are skipped,
+// which fails safe because nothing gets allowlisted.
 func parseNetAllowlist(src string) netAllowlist {
 	out := netAllowlist{wildcardPorts: map[uint16]struct{}{}}
 	for _, raw := range strings.Split(src, ",") {
@@ -386,24 +285,14 @@ func parseNetAllowlist(src string) netAllowlist {
 		if entry == "" {
 			continue
 		}
-		// Bare port: ":53" or ":123". Guard against IPv6 literals
-		// like "::1/128" — those also start with ":" but the second
-		// colon means "address", not "port". Distinguish by the
-		// double-colon shape, not by attempting ParseUint (a parse
-		// failure would silently drop the entry, which the v0.1 of
-		// this code did and caused the IPv6 loopback default to never
-		// take effect).
+		// Bare port. Check for "::" so IPv6 entries like "::1/128" aren't
+		// taken for ports and dropped.
 		if strings.HasPrefix(entry, ":") && !strings.HasPrefix(entry, "::") {
 			if p, err := strconv.ParseUint(entry[1:], 10, 16); err == nil {
 				out.wildcardPorts[uint16(p)] = struct{}{}
 			}
 			continue
 		}
-		// CIDR + optional :port. Tricky bit: ParseCIDR doesn't accept
-		// trailing :port, and IPv6 literals already contain colons —
-		// disambiguate by splitting on the LAST colon only when what
-		// follows looks like a port number (and there's a `/` somewhere
-		// before it, signalling we're past the v6 body).
 		cidr, port, hasPort := splitCIDRPort(entry)
 		ipnet, err := parseCIDROrIP(cidr)
 		if err != nil {
@@ -418,14 +307,9 @@ func parseNetAllowlist(src string) netAllowlist {
 	return out
 }
 
-// splitCIDRPort separates an entry like "10.0.0.0/8:443" into
-// "10.0.0.0/8" + 443. For pure-IPv6 CIDRs ("fc00::/7") with no port,
-// returns the input unchanged with hasPort=false. For an IPv6 entry
-// WITH a port we require the bracket form ("[fc00::/7]:443") to
-// disambiguate from the v6 colons themselves; that's standard URL
-// notation and matches what `net.JoinHostPort` produces.
+// splitCIDRPort splits "10.0.0.0/8:443". IPv6 with a port needs brackets,
+// "[fc00::/7]:443", as net.JoinHostPort writes it.
 func splitCIDRPort(entry string) (cidr string, port uint16, hasPort bool) {
-	// Bracketed v6: "[<cidr>]:<port>"
 	if strings.HasPrefix(entry, "[") {
 		end := strings.Index(entry, "]")
 		if end < 0 || end+1 >= len(entry) || entry[end+1] != ':' {
@@ -438,10 +322,8 @@ func splitCIDRPort(entry string) (cidr string, port uint16, hasPort bool) {
 		}
 		return body, uint16(p), true
 	}
-	// IPv4-style "<cidr>:<port>". A v6 literal without brackets has
-	// multiple colons; we explicitly only treat the LAST colon as a
-	// port separator if the part after parses as a uint16 AND the
-	// part before contains a slash (i.e. it's a CIDR).
+	// Unbracketed: the last colon is a port separator only if a uint16
+	// follows and the part before is a CIDR.
 	last := strings.LastIndex(entry, ":")
 	if last < 0 {
 		return entry, 0, false
@@ -452,17 +334,13 @@ func splitCIDRPort(entry string) (cidr string, port uint16, hasPort bool) {
 		return entry, 0, false
 	}
 	body := entry[:last]
-	// IPv6 cidr without brackets ("fc00::/7"): body would have multiple
-	// colons. Don't treat as port-suffixed.
 	if strings.Count(body, ":") > 0 && !strings.Contains(body, "/") {
 		return entry, 0, false
 	}
 	return body, uint16(p), true
 }
 
-// parseCIDROrIP wraps net.ParseCIDR so a bare "1.2.3.4" or "fe80::1"
-// works as if `/32` or `/128` was specified. Saves operators having
-// to remember the mask suffix for single-host allowlist entries.
+// parseCIDROrIP treats a bare IP as /32 or /128.
 func parseCIDROrIP(s string) (*net.IPNet, error) {
 	if strings.Contains(s, "/") {
 		_, n, err := net.ParseCIDR(s)
@@ -478,15 +356,9 @@ func parseCIDROrIP(s string) (*net.IPNet, error) {
 	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}, nil
 }
 
-// =============================================================================
-// File-audit probe — sensitive-path open monitoring.
-// =============================================================================
-
-// FileEvent is the userspace mirror of `struct file_event` from
-// file.bpf.c. Fired once per openat(2) on a file under one of the
-// BPF-side prefixes (`/etc/`, `/root`, `/home`, `/var/`); precise
-// per-path matching against the configurable sensitive list happens
-// here so operators can tune without re-compiling BPF.
+// FileEvent is one openat(2) under a BPF-side prefix (/etc/, /root,
+// /home, /var/); exact path matching happens here so it's tunable without
+// rebuilding BPF.
 type FileEvent struct {
 	PID        uint32
 	PPID       uint32 // looked up via /proc/<pid>/status
@@ -497,11 +369,7 @@ type FileEvent struct {
 	Filename   string
 }
 
-// MatchFile runs every file rule against the event and returns hits.
-// Mirrors Match / MatchNet. Currently one rule
-// (`file:sensitive_read`); space for `file:cred_write` once we plumb
-// write-flag detection (the openat tracepoint already gives us the
-// flags, the rule just hasn't been written yet).
+// MatchFile runs every file rule against e.
 func MatchFile(e FileEvent) []Hit {
 	var hits []Hit
 	if h, ok := matchSensitiveRead(e); ok {
@@ -510,15 +378,8 @@ func MatchFile(e FileEvent) []Hit {
 	return hits
 }
 
-// sensitiveCommAllowlist — processes that legitimately read sensitive
-// files as part of normal operation. Any of these reading
-// /etc/shadow / authorized_keys / sudoers is expected; alerting on
-// them would be pure noise. Operators can override via
-// MILOG_PROBE_FILE_ALLOWLIST (comma-separated comm names).
-//
-// Kept conservative: PAM / nss / system auth path get implicit access
-// via their toolnames, but anything beyond this list (curl, cat, less,
-// php-fpm, nginx, …) reading a sensitive file is the alert-worthy case.
+// defaultSensitiveCommAllowlist lists processes that read auth files as
+// part of normal operation. MILOG_PROBE_FILE_ALLOWLIST replaces it.
 var defaultSensitiveCommAllowlist = []string{
 	"sshd",
 	"sshd-session",
@@ -553,15 +414,8 @@ var defaultSensitiveCommAllowlist = []string{
 	"milog-probe",
 }
 
-// defaultSensitivePaths — files whose reads are alert-worthy when
-// performed by a non-allowlisted process. Entries ending in `/` are
-// treated as prefix matches (covers /etc/sudoers.d/anything,
-// /etc/ssh/sshd_config + host keys, /root/.ssh/* including
-// authorized_keys2 + known_hosts).
-//
-// Mirrors the audit FIM module's defaults so file:sensitive_read
-// alerts and the audit-side hash-change alerts cover the same
-// ground from two different angles (live vs. periodic).
+// defaultSensitivePaths match exactly, or by prefix when they end in `/`.
+// They mirror the audit FIM defaults.
 var defaultSensitivePaths = []string{
 	"/etc/passwd",
 	"/etc/shadow",
@@ -573,10 +427,7 @@ var defaultSensitivePaths = []string{
 	"/root/.ssh/",
 }
 
-// fileRules holds the parsed file-audit configuration. Computed once
-// via loadFileRules(); subsequent events reuse the cached value.
-// Same single-shot init pattern as netAllowlist — operator restarts
-// milog-probe to pick up env changes.
+// fileRules is parsed once; env changes need a probe restart.
 type fileRules struct {
 	sensitivePaths []string            // raw entries; suffix `/` means prefix match
 	allowedComms   map[string]struct{} // exact-match comm allowlist
@@ -619,11 +470,8 @@ func loadFileRules() *fileRules {
 	return &cachedFileRules
 }
 
-// parseFileRules accepts comma-separated overrides for the sensitive
-// path list and the comm allowlist. Empty string → use the defaults;
-// any non-empty value REPLACES the default rather than appending, so
-// operators tightening the policy don't accidentally inherit the
-// shipped list. Same shape as MILOG_PROBE_NET_ALLOWLIST.
+// parseFileRules: a non-empty override replaces the defaults instead of
+// appending to them.
 func parseFileRules(pathsSrc, commsSrc string) fileRules {
 	out := fileRules{allowedComms: map[string]struct{}{}}
 
@@ -657,12 +505,7 @@ func parseFileRules(pathsSrc, commsSrc string) fileRules {
 	return out
 }
 
-// matchSensitiveRead fires when a non-allowlisted process opens a
-// sensitive file. The rule key embeds the comm AND the path so that
-// different (comm, path) pairs alert independently — e.g. nginx
-// reading /etc/shadow and curl reading /root/.ssh/id_rsa are two
-// distinct cooldown groups. Same process opening the same file
-// repeatedly within ALERT_COOLDOWN dedups to a single alert.
+// matchSensitiveRead keys on comm and path, so each pair has its own cooldown.
 func matchSensitiveRead(e FileEvent) (Hit, bool) {
 	rules := loadFileRules()
 	if rules.commAllowed(e.Comm) {
@@ -681,10 +524,7 @@ func matchSensitiveRead(e FileEvent) (Hit, bool) {
 	}, true
 }
 
-// uhex is the lowercase-hex sibling of uitoa, used for openat flag
-// rendering in alert bodies. Same stdlib-free constraint — strconv
-// would pull a fair bit of code into the probe binary just for
-// formatting on the hot path.
+// uhex formats v in lowercase hex.
 func uhex(v uint32) string {
 	if v == 0 {
 		return "0"
@@ -700,15 +540,8 @@ func uhex(v uint32) string {
 	return string(buf[i:])
 }
 
-// =============================================================================
-// ptrace anti-injection probe — cross-process attach monitoring.
-// =============================================================================
-
-// PtraceEvent is the userspace mirror of `struct ptrace_event` from
-// ptrace.bpf.c. Fired once per attach-class ptrace call
-// (PTRACE_TRACEME, PTRACE_ATTACH, PTRACE_SEIZE) — the BPF side filters
-// out per-attached-target operations (PEEK/POKE/CONT/…) so userspace
-// only sees the "begin tracing" events.
+// PtraceEvent is one attach-class ptrace (TRACEME, ATTACH, SEIZE); BPF
+// drops the per-target requests.
 type PtraceEvent struct {
 	PID        uint32
 	PPID       uint32
@@ -719,8 +552,7 @@ type PtraceEvent struct {
 	Request    uint32 // PTRACE_TRACEME=0, PTRACE_ATTACH=16, PTRACE_SEIZE=0x4206
 }
 
-// MatchPtrace runs every ptrace rule against the event. Mirrors
-// Match / MatchNet / MatchFile.
+// MatchPtrace runs every ptrace rule against e.
 func MatchPtrace(e PtraceEvent) []Hit {
 	var hits []Hit
 	if h, ok := matchPtraceInject(e); ok {
@@ -729,16 +561,8 @@ func MatchPtrace(e PtraceEvent) []Hit {
 	return hits
 }
 
-// defaultPtraceDebuggers — comms that legitimately use ptrace as
-// their primary mechanism. Any of these attaching is part of normal
-// engineering / ops work and shouldn't page anyone. Operators add
-// custom debuggers via MILOG_PROBE_PTRACE_DEBUGGERS (replaces, not
-// appends — same semantics as the other env overrides).
-//
-// `dlv` is the Go debugger. `py-spy` and `bpftrace` use ptrace under
-// the hood for their sampling probes. `criu` is checkpoint/restore.
-// Generic "node" / "python" are NOT here — those would whitelist any
-// scripted attacker who runs their tool as `python rce.py`.
+// defaultPtraceDebuggers is replaced by MILOG_PROBE_PTRACE_DEBUGGERS.
+// Interpreters like python stay off so `python exploit.py` can't hide.
 var defaultPtraceDebuggers = []string{
 	"gdb",
 	"strace",
@@ -795,10 +619,7 @@ func parsePtraceRules(src string) ptraceRules {
 	return out
 }
 
-// ptraceRequestName returns the human-readable mnemonic for the three
-// attach-class request values the BPF side captures. Other values
-// shouldn't reach here (BPF filtered them out) — fall back to hex
-// rather than swallowing a kernel-side bug.
+// ptraceRequestName falls back to hex for values BPF should have filtered.
 func ptraceRequestName(req uint32) string {
 	switch req {
 	case 0:
@@ -812,12 +633,8 @@ func ptraceRequestName(req uint32) string {
 	}
 }
 
-// matchPtraceInject fires when a non-debugger comm performs an
-// attach-class ptrace. The rule key embeds (comm, target_pid) so
-// distinct attacker→victim pairs alert independently. PTRACE_TRACEME
-// from a debugger startup pattern (parent attached BEFORE its child
-// runs the target binary) is permitted by the comm allowlist filter
-// up the call chain — only attacker comms reach here.
+// matchPtraceInject keys on comm and target pid so each attacker/victim
+// pair alerts separately.
 func matchPtraceInject(e PtraceEvent) (Hit, bool) {
 	rules := loadPtraceRules()
 	if rules.isDebugger(e.Comm) {
@@ -834,13 +651,8 @@ func matchPtraceInject(e PtraceEvent) (Hit, bool) {
 	}, true
 }
 
-// =============================================================================
-// Kernel module load probe — rootkit / persistence monitoring.
-// =============================================================================
-
-// KmodEvent is the userspace mirror of `struct kmod_event` from
-// kmod.bpf.c. Fired once per `module:module_load` tracepoint —
-// covers both init_module(2) and finit_module(2) paths.
+// KmodEvent is one module_load tracepoint, covering init_module and
+// finit_module.
 type KmodEvent struct {
 	PID        uint32
 	PPID       uint32
@@ -850,7 +662,7 @@ type KmodEvent struct {
 	Module     string // module name, e.g. "nf_conntrack"
 }
 
-// MatchKmod runs every module-load rule against the event.
+// MatchKmod runs every module-load rule against e.
 func MatchKmod(e KmodEvent) []Hit {
 	var hits []Hit
 	if h, ok := matchKmodLoad(e); ok {
@@ -859,16 +671,8 @@ func MatchKmod(e KmodEvent) []Hit {
 	return hits
 }
 
-// defaultKmodLoaders — comms that legitimately load kernel modules
-// during normal operation. systemd-modules-load runs at boot from
-// /etc/modules-load.d; modprobe is invoked by udev rules + manual
-// admin work; dkms rebuilds modules on kernel upgrade. Anything else
-// loading a kernel module is alert-worthy.
-//
-// Operators on locked-down hosts (kernel.modules_disabled=1 after
-// boot) should set MILOG_PROBE_KMOD_ALLOWLIST="" to alert on EVERY
-// module load — on those hosts a module load shouldn't be possible
-// at all, so any event is signal.
+// defaultKmodLoaders is replaced by MILOG_PROBE_KMOD_ALLOWLIST; set it to ""
+// on hosts with kernel.modules_disabled=1 so every load alerts.
 var defaultKmodLoaders = []string{
 	"systemd-modules",       // systemd kernel-modules-load.service
 	"systemd-modules-load",  // alternate name on some distros
@@ -893,13 +697,8 @@ var (
 	kmodRulesReady  bool
 )
 
-// loadKmodRules differs subtly from loadFileRules / loadPtraceRules:
-// an EXPLICITLY EMPTY MILOG_PROBE_KMOD_ALLOWLIST="" is a meaningful
-// "no allowlist, alert on EVERY load" setting — the locked-down host
-// pattern (`kernel.modules_disabled=1` post-boot, where any module
-// load attempt is signal). An undefined env var falls back to the
-// shipped defaults. os.LookupEnv distinguishes the two; os.Getenv
-// would conflate them.
+// loadKmodRules treats an explicitly empty MILOG_PROBE_KMOD_ALLOWLIST as
+// "no allowlist", so it needs os.LookupEnv; unset means the defaults.
 func loadKmodRules() *kmodRules {
 	if kmodRulesReady {
 		return &cachedKmodRules
@@ -914,9 +713,7 @@ func loadKmodRules() *kmodRules {
 	return &cachedKmodRules
 }
 
-// parseKmodRules takes an env-string override; empty / whitespace-only
-// → shipped defaults, comma-separated → custom list (replaces, not
-// appends — same semantics as the other env overrides).
+// parseKmodRules: a non-empty list replaces the defaults.
 func parseKmodRules(src string) kmodRules {
 	out := kmodRules{allowedLoaders: map[string]struct{}{}}
 	list := defaultKmodLoaders
@@ -935,10 +732,7 @@ func parseKmodRules(src string) kmodRules {
 	return out
 }
 
-// matchKmodLoad fires when a non-allowlisted process loads a kernel
-// module. The rule key embeds (comm, module) so distinct loads alert
-// independently. Same module reloaded by the same process within
-// cooldown dedups to one alert.
+// matchKmodLoad keys on comm and module.
 func matchKmodLoad(e KmodEvent) (Hit, bool) {
 	rules := loadKmodRules()
 	if rules.isAllowedLoader(e.Comm) {
@@ -957,16 +751,9 @@ func matchKmodLoad(e KmodEvent) (Hit, bool) {
 	}, true
 }
 
-// =============================================================================
-// TCP retransmit observability — periodic-sample probe.
-// =============================================================================
-
-// RetransEvent is a sampled count, not a per-packet event. The
-// userspace loader (retrans_linux.go) ticks every Window, reads the
-// BPF count map, computes deltas vs the previous sample, and emits
-// one RetransEvent per (DAddr, DPort) whose count grew. No process
-// attribution: tcp_retransmit_skb fires from softirq context where
-// bpf_get_current_pid_tgid would be confidently wrong.
+// RetransEvent is a per-destination retransmit count for one sample window.
+// It has no process: tcp_retransmit_skb runs in softirq context, where the
+// current pid is meaningless.
 type RetransEvent struct {
 	DAddr  string        // destination IP, already stringified
 	DPort  uint16
@@ -975,8 +762,7 @@ type RetransEvent struct {
 	Window time.Duration // sample window — included so alert body shows the rate context
 }
 
-// MatchRetrans runs every retransmit rule against the event. Mirrors
-// MatchNet shape; only one rule for now (`net:retrans_spike`).
+// MatchRetrans runs every retransmit rule against e.
 func MatchRetrans(e RetransEvent) []Hit {
 	var hits []Hit
 	if h, ok := matchRetransSpike(e); ok {
@@ -985,12 +771,8 @@ func MatchRetrans(e RetransEvent) []Hit {
 	return hits
 }
 
-// defaultRetransThreshold — minimum retransmit count per window
-// before the rule fires. 10 retransmits in 60s is a sustained ~1
-// retransmit every 6s to a single destination, which on most healthy
-// flows is well above noise. Operators on lossy links can raise via
-// MILOG_PROBE_RETRANS_THRESHOLD; on tight links lower it to catch
-// developing problems earlier.
+// defaultRetransThreshold is retransmits per window per destination;
+// tune with MILOG_PROBE_RETRANS_THRESHOLD.
 const defaultRetransThreshold uint64 = 10
 
 func retransThreshold() uint64 {
@@ -1005,15 +787,8 @@ func retransThreshold() uint64 {
 	return n
 }
 
-// matchRetransSpike fires when a destination's retransmit count
-// during the current sample window exceeds the threshold. Per-(daddr,
-// dport) rule key — distinct flows alert independently, the same
-// flow re-spiking dedups via cooldown.
-//
-// Threshold filtering happens here rather than in the loader so the
-// rule engine's tunable knob lives in one place (alongside the other
-// MILOG_PROBE_* env vars) and unit tests can stage thresholds
-// without spinning up the BPF side.
+// matchRetransSpike keys on destination. The threshold lives here, not in
+// the loader, so tests can drive it without BPF.
 func matchRetransSpike(e RetransEvent) (Hit, bool) {
 	if e.Count < retransThreshold() {
 		return Hit{}, false
@@ -1027,10 +802,7 @@ func matchRetransSpike(e RetransEvent) (Hit, bool) {
 	}, true
 }
 
-// uitoa64 is the uint64 sibling of uitoa — same stdlib-free formatter
-// constraint, just with a wider value space. Retransmit counts can
-// theoretically exceed uint32 on a long-running probe + busy host
-// (though in practice they reset every window).
+// uitoa64 formats v in decimal.
 func uitoa64(v uint64) string {
 	if v == 0 {
 		return "0"
@@ -1045,27 +817,15 @@ func uitoa64(v uint64) string {
 	return string(buf[i:])
 }
 
-// =============================================================================
-// Per-PID syscall rate anomaly probe — sampled with Welford σ baselines.
-// =============================================================================
-
-// Welford is an online (single-pass) mean + variance accumulator. Used
-// to track per-PID syscall counts without storing the full sample
-// history — memory bound is constant per tracked PID. Public so the
-// userspace loader can carry the state alongside other per-PID
-// bookkeeping (`lastSeenAt` for age-out, `last` for delta vs. raw
-// counter), and so unit tests can drive it directly.
-//
-// References: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
+// Welford is an online mean and variance accumulator with constant memory
+// per tracked PID.
 type Welford struct {
 	N    uint64  // sample count
 	Mean float64 // running mean
 	M2   float64 // sum of squared deltas — used to compute variance
 }
 
-// Update folds one new sample into the running statistics. O(1)
-// memory, O(1) time. Numerically stable for the count ranges we'll
-// see (syscalls/window is at most ~10^9 even on a torture-test host).
+// Update folds in one sample.
 func (w *Welford) Update(x float64) {
 	w.N++
 	delta := x - w.Mean
@@ -1074,9 +834,8 @@ func (w *Welford) Update(x float64) {
 	w.M2 += delta * delta2
 }
 
-// Variance returns the sample variance (n-1 denominator). Returns 0
-// for n < 2 — a single sample has no spread, and we use this 0 as
-// the "no-σ-yet" signal in matchSyscallBurst.
+// Variance returns the sample variance, or 0 below two samples, which
+// matchSyscallBurst reads as "no baseline yet".
 func (w *Welford) Variance() float64 {
 	if w.N < 2 {
 		return 0
@@ -1084,22 +843,14 @@ func (w *Welford) Variance() float64 {
 	return w.M2 / float64(w.N-1)
 }
 
-// Stddev wraps Variance — just sqrt. Kept as a method for callsite
-// readability ("threshold = mean + 3*stddev" reads cleaner).
+// Stddev returns the square root of Variance.
 func (w *Welford) Stddev() float64 {
 	return math.Sqrt(w.Variance())
 }
 
-// RateAnomalyEvent is the userspace-side projection of one PID's
-// behaviour during one sample window: the count for THIS window plus
-// the running baseline (mean, stddev) computed by Welford from prior
-// windows. The rule decides whether the count is far enough above
-// baseline to alert.
-//
-// Carrying the baseline in the event (rather than recomputing in the
-// rule) is deliberate: it keeps `matchSyscallBurst` pure-functional
-// for unit testing, and lets the alert body show the operator the
-// numbers that drove the decision.
+// RateAnomalyEvent is one PID's syscall count for a window plus its
+// baseline from earlier windows, carried in the event so the rule stays
+// pure and the alert can show the numbers.
 type RateAnomalyEvent struct {
 	PID        uint32
 	PPID       uint32
@@ -1113,8 +864,7 @@ type RateAnomalyEvent struct {
 	Samples    uint64        // total samples included in mean/stddev — used for burn-in gate
 }
 
-// MatchRateAnomaly runs the rate-anomaly rule against the event.
-// Mirrors the other Match* functions.
+// MatchRateAnomaly runs the rate-anomaly rule against e.
 func MatchRateAnomaly(e RateAnomalyEvent) []Hit {
 	var hits []Hit
 	if h, ok := matchSyscallBurst(e); ok {
@@ -1123,24 +873,12 @@ func MatchRateAnomaly(e RateAnomalyEvent) []Hit {
 	return hits
 }
 
-// defaultSyscallFloor — minimum count-per-window before the rule can
-// fire. Suppresses two classes of false positive:
-//   1. Near-idle processes: mean ≈ 0, σ ≈ 0, ANY non-zero count would
-//      otherwise look like an "infinite-σ spike". The floor blocks
-//      those until the absolute count is meaningful on its own.
-//   2. Newly-tracked PIDs whose baseline isn't established yet —
-//      the burn-in gate handles the mean stability part, the floor
-//      handles the absolute-magnitude part.
-//
-// Default scales with the default window (60s); operator on a tight
-// host (rare syscalls, small expected counts) can lower via
-// MILOG_PROBE_SYSCALL_FLOOR; on a database/web-server host the
-// shipped defaults already filter out the bulk of normal load.
+// defaultSyscallFloor stops near-idle processes, whose σ is about 0, from
+// alerting on any small count. Tune with MILOG_PROBE_SYSCALL_FLOOR.
 const defaultSyscallFloor uint64 = 1000
 
-// defaultSyscallBurnIn — number of samples the Welford state must
-// see before its (mean, σ) is considered stable enough to gate
-// alerts on. 10 windows × 60s = 10 minutes of warm-up per process.
+// defaultSyscallBurnIn is the number of windows a PID's baseline needs
+// before it can alert.
 const defaultSyscallBurnIn uint64 = 10
 
 func syscallFloor() uint64 {
@@ -1167,16 +905,8 @@ func syscallBurnIn() uint64 {
 	return n
 }
 
-// matchSyscallBurst fires when a PID's syscall count for the current
-// window is more than 3σ above its running mean AND above the
-// absolute floor AND past the burn-in. Per-(comm, pid) rule key —
-// distinct processes alert independently; the same process bursting
-// repeatedly within ALERT_COOLDOWN dedups to one alert.
-//
-// PID reuse is an accepted false-positive source: when a long-idle
-// PID's baseline gets inherited by a new process that reuses the
-// PID after the original exits. Mitigation lives userspace-side via
-// age-out — practical risk is low on hosts with PID-max ~4M.
+// matchSyscallBurst needs count > mean+3σ, the floor and the burn-in.
+// A reused PID can inherit an old baseline; the loader's age-out limits that.
 func matchSyscallBurst(e RateAnomalyEvent) (Hit, bool) {
 	if e.Count < syscallFloor() {
 		return Hit{}, false
@@ -1190,8 +920,7 @@ func matchSyscallBurst(e RateAnomalyEvent) (Hit, bool) {
 	}
 	windowSec := e.Window.Seconds()
 	if windowSec <= 0 {
-		// Can't compute rate without a positive window — guard
-		// against config error or tests that pass zero. Don't fire.
+		// A zero window means a config or test error; don't fire.
 		return Hit{}, false
 	}
 	rate := float64(e.Count) / windowSec
@@ -1209,23 +938,12 @@ func matchSyscallBurst(e RateAnomalyEvent) (Hit, bool) {
 	}, true
 }
 
-// ftoa1 formats a float64 with one decimal place. Used by the
-// syscall-burst rule to render rate / mean / stddev in alert
-// bodies. Uses strconv (already imported for the netallowlist
-// parser) rather than rolling our own — float formatting isn't
-// hot-path here, runs at most a handful of times per minute.
+// ftoa1 formats v with one decimal place.
 func ftoa1(v float64) string {
 	return strconv.FormatFloat(v, 'f', 1, 64)
 }
 
-// =============================================================================
-// BPF program-load probe — anti-rootkit / competing-instance monitoring.
-// =============================================================================
-
-// BpfLoadEvent is the userspace mirror of `struct bpfload_event` from
-// bpfload.bpf.c. Fired once per `bpf(BPF_PROG_LOAD, ...)` syscall —
-// the BPF side filters all other bpf() cmds (map ops, prog attach,
-// btf load) so userspace only sees actual program loads.
+// BpfLoadEvent is one bpf(BPF_PROG_LOAD); BPF filters out other commands.
 type BpfLoadEvent struct {
 	PID        uint32
 	PPID       uint32
@@ -1235,7 +953,7 @@ type BpfLoadEvent struct {
 	ParentComm string
 }
 
-// MatchBpfLoad runs every bpf-load rule against the event.
+// MatchBpfLoad runs every bpf-load rule against e.
 func MatchBpfLoad(e BpfLoadEvent) []Hit {
 	var hits []Hit
 	if h, ok := matchBpfLoad(e); ok {
@@ -1244,17 +962,8 @@ func MatchBpfLoad(e BpfLoadEvent) []Hit {
 	return hits
 }
 
-// defaultBpfLoaders — comms that legitimately load BPF programs as
-// part of normal operation. systemd 240+ uses BPF for cgroup-v2
-// socket/cgroup attach (so it loads programs at boot AND on cgroup
-// reconfigure); container runtimes load network policies; observability
-// tools (bpftrace, bcc) load on every invocation. Allowing these
-// is the price of running on a modern systemd host with containers.
-//
-// `milog-probe` MUST be in this list — we'd alert on ourselves
-// otherwise. Operators on extremely locked-down hosts (no containers,
-// no ad-hoc bpftrace) can shrink this via MILOG_PROBE_BPFLOAD_ALLOWLIST
-// to just "milog-probe" and alert on every other load.
+// defaultBpfLoaders covers systemd's cgroup programs, container runtimes and
+// tracing tools. It must include milog-probe or the probe alerts on itself.
 var defaultBpfLoaders = []string{
 	"milog-probe",
 	"systemd",
@@ -1322,11 +1031,7 @@ func parseBpfLoadRules(src string) bpfLoadRules {
 	return out
 }
 
-// matchBpfLoad fires when a non-allowlisted process loads a BPF
-// program. Per-comm rule key — multiple loads from the same comm
-// dedupe via cooldown. Different attacker-driven comms (an attacker
-// who renames their loader) would each alert independently, which
-// is fine — the alert path handles cardinality.
+// matchBpfLoad keys on comm.
 func matchBpfLoad(e BpfLoadEvent) (Hit, bool) {
 	rules := loadBpfLoadRules()
 	if rules.isAllowed(e.Comm) {

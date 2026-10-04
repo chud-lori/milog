@@ -1,9 +1,6 @@
 //go:build linux
 
-// kmod_linux.go — userspace loader for the kernel-module load probe.
-// Same shape as the other Run* loaders: load embedded
-// bpf/kmod.bpf.o, attach module:module_load, stream `KmodEvent`s
-// into a Go channel.
+// Loader for the kernel-module load probe (module:module_load).
 
 package probe
 
@@ -24,10 +21,8 @@ import (
 //go:embed bpf/kmod.bpf.o
 var kmodBpfObj []byte
 
-// kmodNameLen mirrors NAME_LEN in kmod.bpf.c. Linux module names are
-// capped at MODULE_NAME_LEN = 64 (`#define MODULE_NAME_LEN (64-sizeof(unsigned long))`
-// in include/linux/module.h on most arches; we round up to 64 for
-// alignment, the trailing NULs trim cleanly).
+// kmodNameLen matches NAME_LEN in kmod.bpf.c. The kernel's MODULE_NAME_LEN
+// is 64 - sizeof(unsigned long), so 64 bytes always fits.
 const kmodNameLen = 64
 
 // kmodRawEvent mirrors `struct kmod_event` in kmod.bpf.c.
@@ -38,12 +33,7 @@ type kmodRawEvent struct {
 	Name [kmodNameLen]byte
 }
 
-// RunKmod loads the kmod probe, attaches module:module_load, and
-// streams KmodEvents into `out` until ctx is cancelled. Module load
-// is rare on production hosts — this goroutine is mostly idle, ring
-// buffer pressure is essentially zero. We still budget 64 KiB for
-// it to handle module-storm corner cases (initramfs unpacking on
-// custom kernels, dkms rebuilds).
+// RunKmod attaches module:module_load and sends KmodEvents until ctx is cancelled.
 func RunKmod(ctx context.Context, out chan<- KmodEvent) error {
 	if len(kmodBpfObj) == 0 {
 		return errors.New("probe: bpf/kmod.bpf.o is empty — rebuild with clang available (apt install clang llvm libbpf-dev)")
