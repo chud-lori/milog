@@ -42,7 +42,7 @@ mode_probes() {
                 tail -F "$file" 2>/dev/null | \
                     grep --line-buffered -Ei "$pat" | \
                 while IFS= read -r line; do
-                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$line"
+                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$(_tty_safe <<< "$line")"
                     # Dedup with exploits, which often matches the same scanner line.
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-97-g949fa28
-# MILOG_BUILT=2026-10-04T02:03:50Z
+# MILOG_VERSION=v0.3.0-104-gc12a6af
+# MILOG_BUILT=2026-10-04T02:04:47Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -1012,6 +1012,11 @@ milog_update_geometry    # initialise for non-TUI modes that use draw_row
 
 spc() { printf '%*s' "$1" ''; }
 hrule() { printf '─%.0s' $(seq 1 "$1"); }
+
+# Filter: replace C0 controls (except tab), DEL and UTF-8 C1 with '?' so log text can't drive the terminal.
+_tty_safe() {
+    LC_ALL=C awk '{ gsub(/[\001-\010\013-\037\177]/, "?"); gsub(/\302[\200-\237]/, "?"); print; fflush() }'
+}
 
 bdr_top() { printf "${W}┌$(hrule $((W_APP+2)))┬$(hrule $((W_REQ+2)))┬$(hrule $((W_ST+2)))┬$(hrule $((W_BAR+2)))┐${NC}\n"; }
 bdr_hdr() { printf "${W}├$(hrule $((W_APP+2)))┼$(hrule $((W_REQ+2)))┼$(hrule $((W_ST+2)))┼$(hrule $((W_BAR+2)))┤${NC}\n"; }
@@ -2257,7 +2262,7 @@ mode_attacker() {
     for name in "${LOGS[@]}"; do
         local f="$LOG_DIR/$name.access.log"
         [[ -f "$f" ]] || continue
-        awk -v ip="$ip" -v app="$name" '$1 == ip { print app "\t" $0 }' "$f" >> "$tmp"
+        awk -v ip="$ip" -v app="$name" '$1 == ip { print app "\t" $0 }' "$f" | _tty_safe >> "$tmp"
     done
 
     local total; total=$(wc -l < "$tmp" | tr -d ' ')
@@ -5336,7 +5341,7 @@ mode_exploits() {
                 tail -F "$file" 2>/dev/null | \
                     grep --line-buffered -Ei "$pat" | \
                 while IFS= read -r line; do
-                    printf '%b[%s]%b %b[EXPLOIT]%b %s\n' "$col" "$label" "$NC" "$R" "$NC" "$line"
+                    printf '%b[%s]%b %b[EXPLOIT]%b %s\n' "$col" "$label" "$NC" "$R" "$NC" "$(_tty_safe <<< "$line")"
                     cat_slug=$(_exploit_category "$line")
                     # The fingerprint gate stops a second alert when probes matches the same line.
                     fp=$(alert_fingerprint_from_line "$line")
@@ -5370,7 +5375,7 @@ mode_grep() {
         echo -e "${R}cannot build reader for $name${NC}" >&2; exit 1; }
     [[ -z "$cmd" ]] && { echo -e "${R}reader empty for $name${NC}" >&2; exit 1; }
     echo -e "${D}stream $matching | grep '$pattern'  (Ctrl+C)${NC}\n"
-    bash -c "$cmd" 2>/dev/null | grep --line-buffered -i "$pattern"
+    bash -c "$cmd" 2>/dev/null | grep --line-buffered -i "$pattern" | _tty_safe
 }
 
 # milog health: status-class totals per app.
@@ -6272,7 +6277,7 @@ mode_probes() {
                 tail -F "$file" 2>/dev/null | \
                     grep --line-buffered -Ei "$pat" | \
                 while IFS= read -r line; do
-                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$line"
+                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$(_tty_safe <<< "$line")"
                     # Dedup with exploits, which often matches the same scanner line.
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \
