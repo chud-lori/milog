@@ -56,10 +56,11 @@ With `HISTORY_ENABLED=1` as well, the daemon also stores each finding in
 the `audit_event` table of the history DB (see
 [historical-metrics.md](historical-metrics.md)). Silenced and
 cooled-down findings are stored too, and so are removals the scanners
-don't alert on (`ports` removed, `persistence` removed). A finding that
-persists across checks is stored once: per baseline for `fim`,
-`persistence`, `ports` and `accounts`, per retention window for
-`rootkit`, and per new match for `yara`. `accounts` rows name the file, never the changed line.
+don't alert on (`ports`, `persistence` and `accounts` removed). A
+finding that persists across checks is stored once: per baseline for
+`fim`, `persistence`, `ports` and `accounts`, per retention window for
+`rootkit` (and for `accounts` baselines written before milog started
+recording a `.encoded` marker), and per new match for `yara`. `accounts` rows name the file, never the changed line.
 
 ```bash
 milog audit history        # last 7 days, newest first

@@ -1,7 +1,8 @@
 # History: SQLite per-minute metrics and hourly top-IP rollups, one sqlite3 process per write.
 
 # Doubles single quotes and wraps the value in ''.
-_sql_quote() { local s="${1//\'/\'\'}"; printf "'%s'" "$s"; }
+# The quote goes through a variable because bash < 4.3 keeps the backslashes in "${1//\'/\'\'}".
+_sql_quote() { local q="'"; printf "'%s'" "${1//$q/$q$q}"; }
 
 # Epoch -> log timestamp prefix (dd/Mon/yyyy:HH:MM); tries GNU `date -d @` then BSD `date -r`.
 _cur_time_at() {
@@ -128,10 +129,12 @@ history_write_audit() {
     local scanner="$1" since="${2:-0}" rows="$3"
     [[ "$since" =~ ^[0-9]+$ ]] || since=0
     local now; now=$(date +%s)
-    local sql="" kind subject s k j
+    local sql="" kind subject k j q="'" s
+    s=$(_sql_quote "$scanner")
+    # Quoted inline, not via _sql_quote: a subshell per row stalls the daemon tick when thousands of findings persist.
     while IFS=$'\t' read -r kind subject; do
         [[ -n "$kind" && -n "$subject" ]] || continue
-        s=$(_sql_quote "$scanner"); k="lower($(_sql_quote "$kind"))"; j=$(_sql_quote "$subject")
+        k="lower('${kind//$q/$q$q}')"; j="'${subject//$q/$q$q}'"
         sql+="INSERT INTO audit_event SELECT $now, $s, $k, $j WHERE NOT EXISTS"
         sql+=" (SELECT 1 FROM audit_event WHERE scanner = $s AND kind = $k AND subject = $j AND ts >= $since);"$'\n'
     done <<< "$rows"

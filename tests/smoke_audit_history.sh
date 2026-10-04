@@ -22,6 +22,8 @@ fi
 mkdir -p "$tmp/home/.config/milog" "$tmp/logs" "$tmp/watch" "$tmp/acc"
 : > "$tmp/logs/app.access.log"
 printf 'v1\n' > "$tmp/fim-target"
+# An empty persistence glob trips bash 3.2's unbound empty-array expansion.
+: > "$tmp/watch/known"
 printf 'root:x:0:0\n' > "$tmp/acc/passwd"
 {
     printf 'AUDIT_FIM_PATHS=(%q)\n' "$tmp/fim-target"
@@ -72,6 +74,8 @@ PATH="$tmp/bin" MILOG_HISTORY_ENABLED=1 ticks || fail 'ticks failed without sqli
 
 export MILOG_HISTORY_ENABLED=1
 : > "$tmp/watch/cronjob"
+odd="$tmp/watch/it's"$'\t'"x"
+: > "$odd"
 printf 'evil:x:0:0\n' >> "$tmp/acc/passwd"
 ticks
 ticks
@@ -79,6 +83,8 @@ ticks
     || fail 'fim drift not stored exactly once across two ticks'
 [[ "$(count "scanner='persistence' AND kind='appeared' AND subject='$tmp/watch/cronjob'")" == 1 ]] \
     || fail 'persistence drift not stored exactly once'
+q="'"
+[[ "$(count "subject = '${odd//$q/$q$q}'")" == 1 ]] || fail "a subject with a quote and a tab was not stored"
 [[ "$(count "scanner='accounts' AND kind='added' AND subject='$tmp/acc/passwd'")" == 1 ]] \
     || fail 'accounts drift not stored exactly once'
 [[ "$(count "subject LIKE '%evil%'")" == 0 ]] || fail 'account file contents reached the DB'
@@ -89,10 +95,11 @@ sqlite3 "$db" "UPDATE audit_event SET ts = ts - 10 WHERE scanner = 'fim';"
 printf 'v3\n' > "$tmp/fim-target"
 ticks
 [[ "$(count "scanner='fim'")" == 2 ]] || fail 'drift after a re-baseline was not stored'
-[[ "$(count "scanner='persistence'")" == 1 ]] || fail 'persistence drift stored again without a re-baseline'
+[[ "$(count "scanner='persistence'")" == 2 ]] || fail 'persistence drift stored again without a re-baseline'
 
 out=$("$ROOT/milog.sh" audit history)
 [[ "$out" == *persistence*appeared*"$tmp/watch/cronjob"* ]] || fail "audit history missing the persistence row: $out"
+[[ "$out" == *"$odd"* ]] || fail "audit history truncated a subject with a tab: $out"
 
 sqlite3 "$db" "INSERT INTO audit_event VALUES (1, 'ports', 'appeared', 'old');"
 bash -c '. "$1" help >/dev/null; _dlog() { :; }; HISTORY_RETAIN_DAYS=1 history_prune' _ "$ROOT/milog.sh"

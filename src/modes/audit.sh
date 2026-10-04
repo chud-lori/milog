@@ -1373,5 +1373,5 @@ _audit_history_subcmd() {
         echo -e "${G}no drift recorded${NC} in the last ${days}d"
         return 0
     fi
-    printf '%s\n' "$out" | awk -F'\t' '{ printf "  %s  %-11s  %-10s  %s\n", $1, $2, $3, $4 }' | _tty_safe
+    printf '%s\n' "$out" | awk -F'\t' '{ printf "  %s  %-11s  %-10s  %s\n", $1, $2, $3, substr($0, length($1 $2 $3) + 4) }' | _tty_safe
 }
