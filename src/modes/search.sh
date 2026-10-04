@@ -152,6 +152,7 @@ _search_one_file() {
     # `|| true` keeps grep's no-match exit from aborting under pipefail; search is best-effort.
     $reader_cmd "$f" 2>/dev/null \
         | { grep "$grep_flag" -- "$pattern" || true; } \
+        | _tty_safe \
         | "$awk_bin" -v app="$app" -v col="$col" -v nc="$NC" -v label="$label" \
               -v pathf="$path_filter" -v cutoff="$cutoff_epoch" '
             BEGIN {

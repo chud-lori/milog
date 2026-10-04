@@ -48,11 +48,23 @@ _alert_read_webhook() {
     return 0
 }
 
-# Sources the file in a subshell because ALERT_ROUTES is usually a multi-line string the grep readers can't parse.
 _alert_read_routes() {
     local file="$1"
     [[ -r "$file" ]] || return 0
-    ( set +u; ALERT_ROUTES=""; . "$file" 2>/dev/null; printf '%s' "$ALERT_ROUTES" ) || true
+    # Parsed, never sourced: under sudo this is another user's file and we're root.
+    awk '
+        !on && /^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/ {
+            sub(/^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/, ""); val = ""
+            q = substr($0, 1, 1)
+            if (q != "\"" && q != "\047") { sub(/[[:space:]].*$/, ""); val = $0; next }
+            $0 = substr($0, 2); on = 1
+        }
+        on {
+            i = index($0, q)
+            if (i) { val = val substr($0, 1, i - 1); on = 0; next }
+            val = val $0 "\n"
+        }
+        END { printf "%s", val }' "$file" 2>/dev/null || true
 }
 
 _alert_read_key() {

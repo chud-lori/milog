@@ -228,7 +228,7 @@ mode_doctor() {
     else
         local probe
         probe=$(geoip_country 8.8.8.8 2>/dev/null)
-        if [[ -n "$probe" && "$probe" != "--" ]]; then
+        if [[ -n "$probe" && "$probe" != "—" ]]; then
             _doc_ok "$MMDB_PATH  (8.8.8.8 → $probe)"
         else
             _doc_warn "$MMDB_PATH present but lookup returned empty — DB may be corrupt"

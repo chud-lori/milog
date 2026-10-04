@@ -118,6 +118,36 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+func TestYesterdayExcludesToday(t *testing.T) {
+	ref := time.Date(2026, 4, 24, 15, 30, 0, 0, time.UTC)
+	midnight := ref.Unix() - (ref.Unix() % 86400)
+
+	from, until, err := WindowToRange("yesterday", ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if from != midnight-86400 || until != midnight {
+		t.Fatalf("yesterday: got [%d, %d) want [%d, %d)", from, until, midnight-86400, midnight)
+	}
+	if _, until, _ := WindowToRange("today", ref); until != 0 {
+		t.Errorf("today: until should be open-ended, got %d", until)
+	}
+
+	file := filepath.Join(t.TempDir(), "alerts.log")
+	data := fmt.Sprintf("%d\tcpu\t15158332\tyesterday\tx\n%d\tmem\t15158332\ttoday\tx\n",
+		midnight-3600, midnight+60)
+	if err := os.WriteFile(file, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := LoadRange(file, from, until, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Rule != "cpu" {
+		t.Fatalf("yesterday rows: got %+v want only the cpu row", rows)
+	}
+}
+
 func TestLoad_MissingFile(t *testing.T) {
 	rows, err := Load("/does/not/exist", 0, 100)
 	if err != nil {

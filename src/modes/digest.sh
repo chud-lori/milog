@@ -109,22 +109,4 @@ mode_digest() {
         echo -e "  ${D}—${NC}"
     fi
     echo
-
-    if [[ "${HISTORY_ENABLED:-0}" == "1" && -f "$HISTORY_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
-        echo -e "${W}Capacity (start of window → now)${NC}"
-        local cap
-        cap=$(sqlite3 "$HISTORY_DB" \
-            "SELECT printf('%d → %d', MIN(cpu), MAX(cpu)), printf('%d → %d', MIN(mem_pct), MAX(mem_pct)), printf('%d → %d', MIN(disk_pct), MAX(disk_pct)) FROM system WHERE ts >= $cutoff;" 2>/dev/null)
-        if [[ -n "$cap" ]]; then
-            IFS='|' read -r cpu_r mem_r disk_r <<< "$cap"
-            printf "  %-16s %s%%\n" "cpu"  "${cpu_r:-—}"
-            printf "  %-16s %s%%\n" "memory" "${mem_r:-—}"
-            printf "  %-16s %s%%\n" "disk" "${disk_r:-—}"
-        else
-            echo -e "  ${D}no history rows in window${NC}"
-        fi
-    else
-        echo -e "${D}Capacity: history disabled (HISTORY_ENABLED=0)${NC}"
-    fi
-    echo
 }

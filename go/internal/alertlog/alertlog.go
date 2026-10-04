@@ -46,6 +46,19 @@ func WindowToCutoff(w string, now time.Time) (int64, error) {
 	return 0, fmt.Errorf("invalid window: %q", w)
 }
 
+// WindowToRange is WindowToCutoff plus an exclusive upper bound; until is 0
+// for every open-ended window, and today's midnight for "yesterday".
+func WindowToRange(w string, now time.Time) (from, until int64, err error) {
+	from, err = WindowToCutoff(w, now)
+	if err != nil {
+		return 0, 0, err
+	}
+	if w == "yesterday" {
+		until = from + 86400
+	}
+	return from, until, nil
+}
+
 func relative(w string, unitSec int64) (int64, error) {
 	n, err := strconv.ParseInt(w[:len(w)-1], 10, 64)
 	if err != nil || n < 0 {
@@ -70,6 +83,11 @@ func Severity(color int64) string {
 // file order (oldest first). A missing file returns no rows; malformed rows
 // are skipped.
 func Load(path string, cutoff int64, maxRows int) ([]Row, error) {
+	return LoadRange(path, cutoff, 0, maxRows)
+}
+
+// LoadRange is Load with an exclusive upper bound; until <= 0 means none.
+func LoadRange(path string, cutoff, until int64, maxRows int) ([]Row, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -89,7 +107,7 @@ func Load(path string, cutoff int64, maxRows int) ([]Row, error) {
 			continue
 		}
 		ts, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil || ts < cutoff {
+		if err != nil || ts < cutoff || (until > 0 && ts >= until) {
 			continue
 		}
 		color, _ := strconv.ParseInt(parts[2], 10, 64)

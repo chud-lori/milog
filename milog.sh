@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-111-g0271a38
-# MILOG_BUILT=2026-10-04T02:06:14Z
+# MILOG_VERSION=v0.3.0-125-g63d63a2
+# MILOG_BUILT=2026-10-04T02:09:43Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -1804,11 +1804,23 @@ _alert_read_webhook() {
     return 0
 }
 
-# Sources the file in a subshell because ALERT_ROUTES is usually a multi-line string the grep readers can't parse.
 _alert_read_routes() {
     local file="$1"
     [[ -r "$file" ]] || return 0
-    ( set +u; ALERT_ROUTES=""; . "$file" 2>/dev/null; printf '%s' "$ALERT_ROUTES" ) || true
+    # Parsed, never sourced: under sudo this is another user's file and we're root.
+    awk '
+        !on && /^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/ {
+            sub(/^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/, ""); val = ""
+            q = substr($0, 1, 1)
+            if (q != "\"" && q != "\047") { sub(/[[:space:]].*$/, ""); val = $0; next }
+            $0 = substr($0, 2); on = 1
+        }
+        on {
+            i = index($0, q)
+            if (i) { val = val substr($0, 1, i - 1); on = 0; next }
+            val = val $0 "\n"
+        }
+        END { printf "%s", val }' "$file" 2>/dev/null || true
 }
 
 _alert_read_key() {
@@ -2164,6 +2176,16 @@ _alerts_window_to_epoch() {
     esac
 }
 
+# Exclusive upper bound for a window spec, same midnight math as above; 0 = open-ended.
+_alerts_window_end_epoch() {
+    local now; now=$(date +%s)
+    if [[ "$1" == "yesterday" ]]; then
+        echo $(( now - (now % 86400) ))
+    else
+        echo 0
+    fi
+}
+
 _alerts_fmt_epoch() {
     date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
     || date -r  "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
@@ -2180,9 +2202,10 @@ mode_alerts() {
         return 0
     fi
 
-    local cutoff cutoff_fmt
+    local cutoff cutoff_fmt end
     cutoff=$(_alerts_window_to_epoch "$window") || return 1
     cutoff_fmt=$(_alerts_fmt_epoch "$cutoff")
+    end=$(_alerts_window_end_epoch "$window")
 
     echo -e "\n${W}── MiLog: Alerts since ${cutoff_fmt} (window=$window) ──${NC}\n"
 
@@ -2190,7 +2213,7 @@ mode_alerts() {
     # shellcheck disable=SC2064
     trap "rm -f '$filtered'" RETURN
 
-    awk -F'\t' -v cutoff="$cutoff" '$1 >= cutoff' "$log_file" > "$filtered"
+    awk -F'\t' -v cutoff="$cutoff" -v end="$end" '$1 >= cutoff && (end == 0 || $1 < end)' "$log_file" > "$filtered"
 
     local total; total=$(wc -l < "$filtered" | tr -d ' ')
     total=${total:-0}
@@ -2273,7 +2296,7 @@ mode_attacker() {
     local country=""
     country=$(geoip_country "$ip" 2>/dev/null || true)
     local tag=""
-    [[ -n "$country" && "$country" != "--" ]] && tag="  ${D}[${country}]${NC}"
+    [[ -n "$country" && "$country" != "—" ]] && tag="  ${D}[${country}]${NC}"
 
     echo -e "\n${W}── MiLog: Attacker — ${ip}${tag}${W} ──${NC}\n"
 
@@ -4515,7 +4538,7 @@ color_prefix() {
         {
             local idx
             for idx in "${!F_files[@]}"; do
-                tail -n 10 "${F_files[$idx]}" 2>/dev/null | \
+                tail -n 10 "${F_files[$idx]}" 2>/dev/null | _tty_safe | \
                     awk -v col="${F_fcols[$idx]}" -v lbl="${F_flabels[$idx]}" -v nc="$NC" '
                     {
                         if (match($0, /\[[0-9]{2}\/[A-Za-z]+\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
@@ -4537,7 +4560,7 @@ color_prefix() {
 
     local idx
     for idx in "${!S_cmds[@]}"; do
-        bash -c "${S_cmds[$idx]}" 2>/dev/null | \
+        bash -c "${S_cmds[$idx]}" 2>/dev/null | _tty_safe | \
             awk -v col="${S_cols[$idx]}" -v lbl="${S_labels[$idx]}" -v nc="$NC" \
                 '{print col"["lbl"]"nc" "$0; fflush()}' &
         pids+=($!)
@@ -4550,13 +4573,13 @@ color_prefix() {
 
 mode_daemon() {
     # Refuse to start on config errors; warnings only get printed.
-    if ! config_validate >&2; then
-        local rc=$?
-        if (( rc == 1 )); then
-            _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
-            exit 1
-        fi
+    local rc=0
+    config_validate >&2 || rc=$?
+    if (( rc == 1 )); then
+        _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
+        exit 1
     fi
+    # rc=2 means warnings only → continue, user's been told.
 
     local hook_state
     hook_state="disabled"
@@ -4826,24 +4849,6 @@ mode_digest() {
         echo -e "  ${D}—${NC}"
     fi
     echo
-
-    if [[ "${HISTORY_ENABLED:-0}" == "1" && -f "$HISTORY_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
-        echo -e "${W}Capacity (start of window → now)${NC}"
-        local cap
-        cap=$(sqlite3 "$HISTORY_DB" \
-            "SELECT printf('%d → %d', MIN(cpu), MAX(cpu)), printf('%d → %d', MIN(mem_pct), MAX(mem_pct)), printf('%d → %d', MIN(disk_pct), MAX(disk_pct)) FROM system WHERE ts >= $cutoff;" 2>/dev/null)
-        if [[ -n "$cap" ]]; then
-            IFS='|' read -r cpu_r mem_r disk_r <<< "$cap"
-            printf "  %-16s %s%%\n" "cpu"  "${cpu_r:-—}"
-            printf "  %-16s %s%%\n" "memory" "${mem_r:-—}"
-            printf "  %-16s %s%%\n" "disk" "${disk_r:-—}"
-        else
-            echo -e "  ${D}no history rows in window${NC}"
-        fi
-    else
-        echo -e "${D}Capacity: history disabled (HISTORY_ENABLED=0)${NC}"
-    fi
-    echo
 }
 # milog doctor: shows every missing or degraded capability with a hint. Exits 1 only when a required dep is missing.
 _doc_line() {
@@ -5075,7 +5080,7 @@ mode_doctor() {
     else
         local probe
         probe=$(geoip_country 8.8.8.8 2>/dev/null)
-        if [[ -n "$probe" && "$probe" != "--" ]]; then
+        if [[ -n "$probe" && "$probe" != "—" ]]; then
             _doc_ok "$MMDB_PATH  (8.8.8.8 → $probe)"
         else
             _doc_warn "$MMDB_PATH present but lookup returned empty — DB may be corrupt"
@@ -5215,6 +5220,7 @@ _errors_live() {
             nginx)
                 ( bash -c "$cmd" 2>/dev/null \
                     | grep --line-buffered -E ' [45][0-9][0-9] ' \
+                    | _tty_safe \
                     | awk -v col="$col" -v lbl="$label" -v nc="$NC" \
                         '{print col"["lbl"]"nc" "$0; fflush()}' ) &
                 pids+=($!)
@@ -5225,6 +5231,7 @@ _errors_live() {
                     ( bash -c "$cmd" 2>/dev/null \
                         | grep --line-buffered -v '^#' \
                         | grep --line-buffered -E -i -- "$pattern_union" \
+                        | _tty_safe \
                         | awk -v col="$col" -v lbl="$label" -v nc="$NC" \
                             '{print col"["lbl"]"nc" "$0; fflush()}' ) &
                     pids+=($!)
@@ -5264,9 +5271,10 @@ _errors_summary() {
         return 0
     fi
 
-    local cutoff cutoff_fmt
+    local cutoff cutoff_fmt end
     cutoff=$(_alerts_window_to_epoch "$window") || return 1
     cutoff_fmt=$(_alerts_fmt_epoch "$cutoff")
+    end=$(_alerts_window_end_epoch "$window")
 
     local filtered; filtered=$(mktemp -t milog_errors.XXXXXX) || return 1
     # shellcheck disable=SC2064
@@ -5274,9 +5282,11 @@ _errors_summary() {
 
     awk -F'\t' \
         -v cutoff="$cutoff" \
+        -v end="$end" \
         -v want_src="$want_source" \
         -v want_pat="$want_pattern" '
         $1 < cutoff { next }
+        end != 0 && $1 >= end { next }
         $2 !~ /^app:/ { next }
         {
             n = split($2, parts, ":")
@@ -5323,7 +5333,7 @@ _errors_summary() {
         sample="${body#\`\`\`}"; sample="${sample%\`\`\`}"
         (( ${#sample} > 60 )) && sample="${sample:0:57}..."
         printf "  %-16s  ${R}%-12s${NC}  ${Y}%-22s${NC}  %s\n" "$when" "$src" "$pat" "$sample"
-    done < <(tail -n "$list_cap" "$filtered")
+    done < <(tail -n "$list_cap" "$filtered" | _tty_safe)
 
     echo -e "\n  ${D}total: $total fire(s) — log at $log_file${NC}\n"
 }
@@ -6582,6 +6592,7 @@ _search_one_file() {
     # `|| true` keeps grep's no-match exit from aborting under pipefail; search is best-effort.
     $reader_cmd "$f" 2>/dev/null \
         | { grep "$grep_flag" -- "$pattern" || true; } \
+        | _tty_safe \
         | "$awk_bin" -v app="$app" -v col="$col" -v nc="$NC" -v label="$label" \
               -v pathf="$path_filter" -v cutoff="$cutoff_epoch" '
             BEGIN {
@@ -6727,7 +6738,7 @@ ${W}EXAMPLES${NC}
   milog silence 5xx:api 2h 'investigating deploy, auth service'
 
   ${D}# Glob — silence every exploit category at once:${NC}
-  milog silence 'exploits:*' 30m 'pentester doing authorized scan'
+  milog silence 'exploit:*' 30m 'pentester doing authorized scan'
 
   ${D}# Done early, unmute:${NC}
   milog silence clear 5xx:api
@@ -6839,7 +6850,8 @@ mode_slow() {
             }
             END { emit() }' \
         | sort -t $'\t' -k2,2 -rn \
-        | head -n "$n")
+        | head -n "$n" \
+        | _tty_safe)
 
     if [[ -z "$top_rows" ]]; then
         echo -e "${D}No timed samples in window — is \$request_time in your log_format?${NC}"
@@ -7059,7 +7071,8 @@ mode_top_paths() {
             }
             END { emit() }' \
         | sort -t $'\t' -k2,2 -rn \
-        | head -n "$n")
+        | head -n "$n" \
+        | _tty_safe)
 
     if [[ -z "$rows" ]]; then
         echo -e "${D}No loglines matched in window.${NC}\n"

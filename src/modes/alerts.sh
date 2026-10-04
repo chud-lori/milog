@@ -42,6 +42,16 @@ _alerts_window_to_epoch() {
     esac
 }
 
+# Exclusive upper bound for a window spec, same midnight math as above; 0 = open-ended.
+_alerts_window_end_epoch() {
+    local now; now=$(date +%s)
+    if [[ "$1" == "yesterday" ]]; then
+        echo $(( now - (now % 86400) ))
+    else
+        echo 0
+    fi
+}
+
 _alerts_fmt_epoch() {
     date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
     || date -r  "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
@@ -58,9 +68,10 @@ mode_alerts() {
         return 0
     fi
 
-    local cutoff cutoff_fmt
+    local cutoff cutoff_fmt end
     cutoff=$(_alerts_window_to_epoch "$window") || return 1
     cutoff_fmt=$(_alerts_fmt_epoch "$cutoff")
+    end=$(_alerts_window_end_epoch "$window")
 
     echo -e "\n${W}── MiLog: Alerts since ${cutoff_fmt} (window=$window) ──${NC}\n"
 
@@ -68,7 +79,7 @@ mode_alerts() {
     # shellcheck disable=SC2064
     trap "rm -f '$filtered'" RETURN
 
-    awk -F'\t' -v cutoff="$cutoff" '$1 >= cutoff' "$log_file" > "$filtered"
+    awk -F'\t' -v cutoff="$cutoff" -v end="$end" '$1 >= cutoff && (end == 0 || $1 < end)' "$log_file" > "$filtered"
 
     local total; total=$(wc -l < "$filtered" | tr -d ' ')
     total=${total:-0}

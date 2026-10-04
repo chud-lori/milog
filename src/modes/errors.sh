@@ -54,6 +54,7 @@ _errors_live() {
             nginx)
                 ( bash -c "$cmd" 2>/dev/null \
                     | grep --line-buffered -E ' [45][0-9][0-9] ' \
+                    | _tty_safe \
                     | awk -v col="$col" -v lbl="$label" -v nc="$NC" \
                         '{print col"["lbl"]"nc" "$0; fflush()}' ) &
                 pids+=($!)
@@ -64,6 +65,7 @@ _errors_live() {
                     ( bash -c "$cmd" 2>/dev/null \
                         | grep --line-buffered -v '^#' \
                         | grep --line-buffered -E -i -- "$pattern_union" \
+                        | _tty_safe \
                         | awk -v col="$col" -v lbl="$label" -v nc="$NC" \
                             '{print col"["lbl"]"nc" "$0; fflush()}' ) &
                     pids+=($!)
@@ -103,9 +105,10 @@ _errors_summary() {
         return 0
     fi
 
-    local cutoff cutoff_fmt
+    local cutoff cutoff_fmt end
     cutoff=$(_alerts_window_to_epoch "$window") || return 1
     cutoff_fmt=$(_alerts_fmt_epoch "$cutoff")
+    end=$(_alerts_window_end_epoch "$window")
 
     local filtered; filtered=$(mktemp -t milog_errors.XXXXXX) || return 1
     # shellcheck disable=SC2064
@@ -113,9 +116,11 @@ _errors_summary() {
 
     awk -F'\t' \
         -v cutoff="$cutoff" \
+        -v end="$end" \
         -v want_src="$want_source" \
         -v want_pat="$want_pattern" '
         $1 < cutoff { next }
+        end != 0 && $1 >= end { next }
         $2 !~ /^app:/ { next }
         {
             n = split($2, parts, ":")
@@ -162,7 +167,7 @@ _errors_summary() {
         sample="${body#\`\`\`}"; sample="${sample%\`\`\`}"
         (( ${#sample} > 60 )) && sample="${sample:0:57}..."
         printf "  %-16s  ${R}%-12s${NC}  ${Y}%-22s${NC}  %s\n" "$when" "$src" "$pat" "$sample"
-    done < <(tail -n "$list_cap" "$filtered")
+    done < <(tail -n "$list_cap" "$filtered" | _tty_safe)
 
     echo -e "\n  ${D}total: $total fire(s) — log at $log_file${NC}\n"
 }

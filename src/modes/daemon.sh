@@ -2,13 +2,13 @@
 
 mode_daemon() {
     # Refuse to start on config errors; warnings only get printed.
-    if ! config_validate >&2; then
-        local rc=$?
-        if (( rc == 1 )); then
-            _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
-            exit 1
-        fi
+    local rc=0
+    config_validate >&2 || rc=$?
+    if (( rc == 1 )); then
+        _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
+        exit 1
     fi
+    # rc=2 means warnings only → continue, user's been told.
 
     local hook_state
     hook_state="disabled"

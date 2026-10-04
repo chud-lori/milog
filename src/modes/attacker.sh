@@ -39,7 +39,7 @@ mode_attacker() {
     local country=""
     country=$(geoip_country "$ip" 2>/dev/null || true)
     local tag=""
-    [[ -n "$country" && "$country" != "--" ]] && tag="  ${D}[${country}]${NC}"
+    [[ -n "$country" && "$country" != "—" ]] && tag="  ${D}[${country}]${NC}"
 
     echo -e "\n${W}── MiLog: Attacker — ${ip}${tag}${W} ──${NC}\n"
 

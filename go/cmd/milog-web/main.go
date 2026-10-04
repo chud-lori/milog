@@ -153,12 +153,12 @@ func alertsHandler(cfg *config.Config) http.HandlerFunc {
 		if window == "" {
 			window = "24h"
 		}
-		cutoff, err := alertlog.WindowToCutoff(window, time.Now())
+		cutoff, until, err := alertlog.WindowToRange(window, time.Now())
 		if err != nil {
 			// Bad values only come from URL fiddling, so fall back to 24h.
 			cutoff, _ = alertlog.WindowToCutoff("24h", time.Now())
 		}
-		rows, err := alertlog.Load(filepath.Join(cfg.AlertStateDir, "alerts.log"), cutoff, 100)
+		rows, err := alertlog.LoadRange(filepath.Join(cfg.AlertStateDir, "alerts.log"), cutoff, until, 100)
 		if err != nil {
 			// The panel is informational: log and return an empty set.
 			log.Printf("milog-web: alertlog.Load: %v", err)

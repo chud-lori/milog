@@ -97,7 +97,7 @@ after substitution):
 | `%TITLE%`    | alert title (e.g. `"5xx spike: api"`)            |
 | `%BODY%`     | alert body (short description)                   |
 | `%SEV%`      | severity word — `"crit"` / `"warn"` / `"info"`   |
-| `%RULE%`     | rule key (e.g. `"5xx:api"`, `"exploits:sqli"`)   |
+| `%RULE%`     | rule key (e.g. `"5xx:api"`, `"exploit:api:sqli"`) |
 
 **Default template** (good for most JSON-ingest APIs):
 ```json
@@ -107,7 +107,7 @@ after substitution):
 **Using this destination in `ALERT_ROUTES`:** routes accept a
 `webhook` token alongside `discord` / `slack` / `telegram` /
 `matrix` — e.g. `default: webhook` to send everything through a
-single pipe, or `exploits: webhook slack` to fan out to both.
+single pipe, or `exploit: webhook slack` to fan out to both.
 
 Limits today:
 - One webhook URL. For multiple endpoints, route through an
@@ -195,7 +195,7 @@ different `(ip, path)` fingerprints fires each alert as expected.
 ## Routing — different rules to different destinations
 
 By default, every configured destination receives every fire. At any
-team scale that's wrong: `exploits:*` belongs in a security channel,
+team scale that's wrong: `exploit:*` belongs in a security channel,
 `cpu`/`mem`/`disk` in ops, `5xx` in dev-on-call. `ALERT_ROUTES` maps
 rule keys (or their prefixes) to subset destination lists.
 
@@ -205,7 +205,7 @@ Config format (multiline string; `#` starts a comment):
 # ~/.config/milog/config.sh
 ALERT_ROUTES="
     # Security-relevant rules → Slack security channel + Telegram
-    exploits:   slack telegram
+    exploit:    slack telegram
     audit:      slack telegram
     # System-level stuff → Discord ops
     cpu:        discord
@@ -217,7 +217,7 @@ ALERT_ROUTES="
     4xx:        discord
     # Known-noise rules → intentionally drop (no fire, but rule still
     # runs and can be observed in alerts.log via webhook-less path)
-    probes:     skip
+    probe:      skip
     # Catch-all for anything unmatched
     default:    discord
 "
@@ -233,7 +233,7 @@ Resolution is leftmost-match first:
 
 Destination types: `discord`, `slack`, `telegram`, `matrix`. Also
 `skip` / `none` for "don't fire at all" — useful for rules like
-`probes:scanner` that you want catalogued in `alerts.log` but not
+`probe:<app>` that you want catalogued in `alerts.log` but not
 paged. Unknown tokens are silently ignored (forward-compatible for
 adapters not yet implemented).
 
@@ -279,7 +279,7 @@ chmod +x ~/.config/milog/hooks/on_alert.d/10-log
 
 | Var                | Value                                          |
 | ------------------ | ---------------------------------------------- |
-| `MILOG_RULE_KEY`   | `5xx:api`, `exploits:sqli`, `cpu`, ...         |
+| `MILOG_RULE_KEY`   | `5xx:api`, `exploit:api:sqli`, `cpu`, ...      |
 | `MILOG_TITLE`      | alert title (`"5xx spike: api"`)               |
 | `MILOG_BODY`       | alert body (newlines stripped to spaces)       |
 | `MILOG_SEV`        | `crit` / `warn` / `info`                       |

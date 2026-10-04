@@ -458,6 +458,41 @@ func TestRenderPathsView_RendersRowsWithBreakdown(t *testing.T) {
 	}
 }
 
+func TestTTYSafe(t *testing.T) {
+	cases := map[string]string{
+		"/plain\tpath":    "/plain\tpath",
+		"/x\x1b[2Jy":      "/x?[2Jy",
+		"/a\x07\x7fb\r\n": "/a??b??",
+		"/c\u009b31mred":  "/c?31mred",
+		"/café/☃":         "/café/☃",
+	}
+	for in, want := range cases {
+		if got := ttySafe(in); got != want {
+			t.Errorf("ttySafe(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestRenderViews_StripLogControlBytes(t *testing.T) {
+	evil := "/x\x1b]0;pwned\x07\u009b2J"
+	paths := model{
+		cfg:   &config.Config{Apps: []string{"api"}},
+		width: 120,
+		view:  viewPaths,
+		paths: pathsData{
+			appsSampled: []string{"api"},
+			rows:        []pathRow{{path: evil, total: 1, byApp: []kv{{key: "api", count: 1}}}},
+		},
+	}.renderPathsView()
+	pane := renderTopPane("TOP PATHS", []kv{{key: evil, count: 1}}, 60)
+	row := renderAlertRow(alertlog.Row{TS: 1714000000, Sev: "crit", Rule: "exploit:api:lfi", Body: "```GET " + evil + "```"})
+	for name, out := range map[string]string{"paths view": paths, "top pane": pane, "alert row": row} {
+		if strings.Contains(out, "\x1b]0;") || strings.Contains(out, "\x07") || strings.Contains(out, "\u009b") {
+			t.Errorf("%s leaked control bytes: %q", name, out)
+		}
+	}
+}
+
 func TestRenderPathsView_SingleAppRowHasEmptyBreakdown(t *testing.T) {
 	m := model{
 		cfg:        &config.Config{Apps: []string{"api"}},
