@@ -1,13 +1,5 @@
-# ==============================================================================
-# MODE: suspects — heuristic IP ranking (behavioral, not just UA)
-# Scores each IP in the last N log lines across all apps, using:
-#   4xx hits      × 2   (probing non-existent paths)
-#   5xx hits      × 3   (causing errors)
-#   missing UA    × 1   (scripted requests often send "-")
-#   scanner UA    + 10  (flat bonus if UA matches known tool)
-#   unique paths  / 5   (scanning behavior — many endpoints from one IP)
-# Prints top N with flags explaining why.
-# ==============================================================================
+# milog suspects [N] [lines]: ranks IPs over the last <lines> per app.
+# Score = 4xx×2 + 5xx×3 + missing-UA hits + 10 for a scanner UA + unique requests/5.
 mode_suspects() {
     local topn="${1:-20}"
     local window="${2:-2000}"
@@ -36,9 +28,7 @@ mode_suspects() {
         [[ -f "$file" ]] && tail -n "$window" "$file" >> "$tmp"
     done
 
-    # Score + top-N in one awk+sort pipeline. Post-aggregation, we pretty-
-    # print in bash so we can slot in an optional per-IP country lookup
-    # (mmdblookup runs at most $topn times — never per-line).
+    # Country lookups happen after ranking, so mmdblookup runs at most $topn times.
     local ranked
     ranked=$(awk '
         BEGIN { FS = "\"" }

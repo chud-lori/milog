@@ -1,24 +1,6 @@
-# ==============================================================================
-# MODE: errors — show what's broken right now, across every log source
-#
-# Two faces:
-#
-#   1. Live tail (default, backward-compatible)
-#      `milog errors`      → tail every source. nginx-typed sources show
-#                            4xx/5xx lines; journal/docker/text sources show
-#                            app-pattern matches (Go panics, OOM kills, …).
-#
-#   2. Summary report (any flag triggers it)
-#      `milog errors --since 24h [--source X] [--pattern Y]`
-#                          → scan alerts.log for `app:<source>:<pattern>`
-#                            fires in the window, group counts, list samples.
-#
-# Window grammar mirrors `milog alerts`: today / yesterday / all / Nh/Nd/Nw.
-# ==============================================================================
+# milog errors: live tail of failures per source by default; any flag switches to a summary of `app:` fires from alerts.log.
 
 mode_errors() {
-    # Flag-driven summary mode. Plain `milog errors` keeps doing the live
-    # mixed tail — that's what existing scripts and muscle memory expect.
     case "${1:-}" in
         --since|--since=*|--source|--source=*|--pattern|--pattern=*|--summary|summary)
             _errors_summary "$@"; return $? ;;
@@ -33,8 +15,7 @@ mode_errors() {
 }
 
 _errors_help() {
-    # printf '%b' interprets the \033 escapes embedded in the color vars.
-    # `cat <<EOF` would dump them as literal text on real terminals.
+    # printf '%b' renders the colour escapes; a heredoc would print them literally.
     printf '%b' "
 ${W}milog errors${NC} — what's broken right now, across every log source
 
@@ -53,10 +34,7 @@ within the window. Window grammar: today / yesterday / all / Nm / Nh / Nd / Nw.
 "
 }
 
-# --- Live tail ----------------------------------------------------------------
-# Nginx sources: classic 4xx/5xx line filter.
-# Non-nginx sources: pattern union from the patterns module — same source of
-# truth as `milog patterns`, so adding a pattern there extends this view too.
+# nginx sources show 4xx/5xx lines; others show matches of the `milog patterns` union.
 _errors_live() {
     echo -e "${D}Watching errors across all sources... (Ctrl+C)${NC}"
     echo -e "${D}  nginx sources: 4xx/5xx tail   |   other sources: app-pattern matches${NC}\n"
@@ -74,8 +52,6 @@ _errors_live() {
 
         case "$type" in
             nginx)
-                # Backward-compat tail: 4xx/5xx HTTP status filter on the
-                # combined-format access line. Same regex as v1.
                 ( bash -c "$cmd" 2>/dev/null \
                     | grep --line-buffered -E ' [45][0-9][0-9] ' \
                     | _tty_safe \
@@ -84,9 +60,7 @@ _errors_live() {
                 pids+=($!)
                 ;;
             *)
-                # App-pattern tail — only spawn when at least one pattern is
-                # defined; otherwise the union ERE is empty and grep would
-                # match every line.
+                # An empty union would make grep match every line.
                 if [[ -n "$pattern_union" ]]; then
                     ( bash -c "$cmd" 2>/dev/null \
                         | grep --line-buffered -v '^#' \
@@ -108,10 +82,7 @@ _errors_live() {
     wait
 }
 
-# --- Summary report -----------------------------------------------------------
-# Reads alerts.log for `app:<source>:<pattern>` fires in the window. Optional
-# --source / --pattern filters narrow the report; both are exact match on the
-# rule-key segment so users can paste from `milog patterns list`.
+# --source and --pattern match rule-key segments exactly, so names pasted from `milog patterns list` work.
 _errors_summary() {
     local window="today" want_source="" want_pattern="" arg
     while (( $# )); do
@@ -139,9 +110,6 @@ _errors_summary() {
     cutoff_fmt=$(_alerts_fmt_epoch "$cutoff")
     end=$(_alerts_window_end_epoch "$window")
 
-    # Filter once: in-window AND rule_key starts with `app:`. Optional
-    # source/pattern filters refine further. awk does the heavy lift; bash
-    # consumes the small filtered result.
     local filtered; filtered=$(mktemp -t milog_errors.XXXXXX) || return 1
     # shellcheck disable=SC2064
     trap "rm -f '$filtered'" RETURN
@@ -195,8 +163,7 @@ _errors_summary() {
     while IFS=$'\t' read -r epoch rule color title body src pat; do
         [[ -z "$epoch" ]] && continue
         when=$(_alerts_fmt_epoch "$epoch")
-        # Body is the matched line wrapped in ```; strip the fences and cap
-        # at 60 chars so the row stays scanable.
+        # Strip the ``` fences from the body for the sample column.
         sample="${body#\`\`\`}"; sample="${sample%\`\`\`}"
         (( ${#sample} > 60 )) && sample="${sample:0:57}..."
         printf "  %-16s  ${R}%-12s${NC}  ${Y}%-22s${NC}  %s\n" "$when" "$src" "$pat" "$sample"

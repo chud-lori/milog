@@ -1,15 +1,8 @@
-# ==============================================================================
-# MODE: trend — ASCII sparkline chart from metrics_minute history
-# Requires HISTORY_ENABLED daemon to have written the DB. Renders two rows
-# per app: req/min (green) and 4xx+5xx errors (red). Bucket-aggregates so
-# the sparkline fits the fixed 60-char width.
-# ==============================================================================
+# milog trend [app] [hours]: req/min and 4xx+5xx sparklines per app from metrics_minute.
 _render_trend_one() {
     local app="$1" since="$2" window_sec="$3" width="$4"
 
-    # SQL buckets row timestamps into exactly `width` columns across the
-    # window. Empty columns (no samples) won't appear in output — we fill
-    # them in with zeros on the shell side below.
+    # Buckets with no rows are missing from the SQL output and filled with zeros below.
     local rows
     rows=$(sqlite3 -separator $'\t' "$HISTORY_DB" <<SQL 2>/dev/null
 SELECT CAST((ts - $since) * $width / $window_sec AS INTEGER) AS col,
@@ -60,8 +53,7 @@ mode_trend() {
 
     _history_precheck || return 1
 
-    # Sparkline width scales with terminal: 40-char floor so short terms
-    # still show something useful; each bucket maps to window_sec/width seconds.
+    # Terminal-width sparkline, at least 40 columns.
     milog_update_geometry
     local now since width window_sec
     width=$(( INNER - 40 ))
@@ -72,8 +64,6 @@ mode_trend() {
 
     local -a apps
     if [[ -n "$app_arg" ]]; then
-        # Reject app names that can't appear in LOGS, so a typo doesn't
-        # render "no data" forever.
         local ok=0 name
         for name in "${LOGS[@]}"; do
             [[ "$name" == "$app_arg" ]] && { ok=1; break; }

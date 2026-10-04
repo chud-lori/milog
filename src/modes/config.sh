@@ -1,5 +1,4 @@
-# MODE: config — manage the user config file without opening an editor
-# ==============================================================================
+# milog config: edit the user config file from the CLI.
 
 _cfg_ensure_dir() {
     local d; d=$(dirname "$MILOG_CONFIG")
@@ -7,8 +6,7 @@ _cfg_ensure_dir() {
         echo -e "${R}Cannot create config directory: $d${NC}" >&2; return 1; }
 }
 
-# Read LOGS array as defined LITERALLY in the config file (ignores the
-# hardcoded script defaults). Outputs one app per line; empty if no LOGS= line.
+# LOGS as written in the config file, ignoring script defaults; one app per line.
 _cfg_read_logs() {
     [[ -f "$MILOG_CONFIG" ]] || return 0
     (
@@ -19,7 +17,6 @@ _cfg_read_logs() {
     )
 }
 
-# Replace or append a single-line assignment `KEY=VALUE` in the config file.
 _cfg_write_line() {
     local line="$1" key="${1%%=*}"
     _cfg_ensure_dir || return 1
@@ -61,10 +58,7 @@ config_show() {
         "$HISTORY_ENABLED" "$HISTORY_DB" "$HISTORY_RETAIN_DAYS"
     printf "  %-22s enabled=%s cooldown=%ss dedup=%ss\n" "alerts" \
         "$ALERTS_ENABLED" "$ALERT_COOLDOWN" "${ALERT_DEDUP_WINDOW:-300}"
-    # Render per-destination status from the process-sourced env (same
-    # values the running daemon/TUI would use). For a target-user view
-    # under sudo, use `milog alert status` instead — it reads the
-    # target's config file directly.
+    # Process env view; `milog alert status` reads a target user's config under sudo.
     _alert_destinations_status \
         "${DISCORD_WEBHOOK:-}" \
         "${SLACK_WEBHOOK:-}" \
@@ -146,12 +140,11 @@ config_set() {
         echo -e "${R}Usage:${NC} milog config set <KEY> <VALUE>"
         return 1
     fi
-    # Numeric values unquoted; strings double-quoted; empty string → ""
+    # Integers stay bare; everything else is double-quoted.
     local quoted
     if [[ "$val" =~ ^-?[0-9]+$ ]]; then
         quoted="$val"
     else
-        # Escape any embedded double-quotes
         quoted="\"${val//\"/\\\"}\""
     fi
     _cfg_write_line "${key}=${quoted}"
@@ -172,8 +165,7 @@ config_add() {
     cur+=("$name")
     _cfg_write_line "LOGS=(${cur[*]})"
     echo -e "${G}Added${NC} '$name' → LOGS=(${cur[*]})"
-    # Type-aware existence hint. Only surfaces when we can check cheaply;
-    # docker/journal liveness is better diagnosed at stream time.
+    # Only file-backed sources can be checked cheaply here.
     local _type; _type=$(_log_type_for "$name")
     case "$_type" in
         nginx|text)
@@ -256,18 +248,10 @@ mode_config() {
     esac
 }
 
-# Config validator — checks the RESOLVED config (after file + env overrides).
-# Surfaces typos (unknown keys), invalid ranges, unreachable paths, and
-# malformed destinations. Two modes:
-#   - called standalone → prints a report + returns 0 if clean, 2 if warnings,
-#     1 if errors. Useful for CI / pre-flight.
-#   - imported from `milog daemon` startup → same logic, only errors are
-#     fatal; the daemon refuses to start with a clearly-broken config.
+# Validates the resolved config (file plus env). Returns 0 clean, 2 warnings only, 1 errors.
 config_validate() {
     local errors=0 warnings=0
 
-    # Known top-level keys + per-app-threshold families. Any VAR starting
-    # with these is legal; anything else in the user's config is suspicious.
     local known_exact=(
         LOG_DIR LOGS REFRESH SPARK_LEN
         DISCORD_WEBHOOK SLACK_WEBHOOK
@@ -287,13 +271,13 @@ config_validate() {
         THRESH_DISK_WARN THRESH_DISK_CRIT
         THRESH_4XX_WARN THRESH_5XX_WARN
     )
-    # Families — prefix-matched for per-app overrides like THRESH_REQ_CRIT_finance.
-    local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ )
+    # Prefixes for per-app overrides like THRESH_REQ_CRIT_finance.
+    local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ AUDIT_ )
 
     echo -e "\n${W}── MiLog: Config validate ──${NC}\n"
     echo -e "  ${D}config: $MILOG_CONFIG${NC}"
 
-    # 1. Unknown keys in the user's config file (source-level, not env).
+    # Unknown keys, read from the config file itself rather than the environment.
     if [[ -r "$MILOG_CONFIG" ]]; then
         local line key known fam
         while IFS= read -r line; do
@@ -318,7 +302,6 @@ config_validate() {
         done < "$MILOG_CONFIG"
     fi
 
-    # 2. Numeric range checks.
     local v
     _check_int() {
         local name="$1" min="${2:-}" max="${3:-}" val
@@ -349,7 +332,6 @@ config_validate() {
     _check_int P95_CRIT_MS 0
     _check_int SLOW_WINDOW 1
 
-    # 3. LOG_DIR readable.
     if [[ ! -d "$LOG_DIR" ]]; then
         echo -e "  ${R}err${NC}   LOG_DIR does not exist: $LOG_DIR"
         errors=$((errors+1))
@@ -358,7 +340,7 @@ config_validate() {
         errors=$((errors+1))
     fi
 
-    # 4. Destinations syntactically valid (lightweight — no network).
+    # Syntax only; nothing touches the network.
     if [[ -n "${DISCORD_WEBHOOK:-}" && ! "$DISCORD_WEBHOOK" =~ ^https:// ]]; then
         echo -e "  ${Y}warn${NC}  DISCORD_WEBHOOK should start with https://"
         warnings=$((warnings+1))
@@ -375,7 +357,7 @@ config_validate() {
         echo -e "  ${Y}warn${NC}  MATRIX_HOMESERVER should start with https://"
         warnings=$((warnings+1))
     fi
-    # Partial Telegram / Matrix — hard errors because the destination won't fire.
+    # A partial Telegram or Matrix config can never send, so it's an error.
     if [[ -n "${TELEGRAM_BOT_TOKEN:-}$TELEGRAM_CHAT_ID" ]]; then
         if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
             echo -e "  ${R}err${NC}   Telegram partial config — need both BOT_TOKEN and CHAT_ID"
@@ -400,15 +382,10 @@ config_validate() {
     return 2
 }
 
-# ==============================================================================
-# COLOR PREFIX — merged initial dump sorted by nginx timestamp, then live tails
-# ==============================================================================
+# Default `milog` view: the last 10 lines of every file source merged by timestamp, then live tails of every source.
 color_prefix() {
     local pids=()
     local colors=("$B" "$C" "$G" "$M" "$Y" "$R")
-    # File-based sources (nginx / text) can participate in the initial
-    # merged-by-timestamp dump. Streaming-only sources (journal /
-    # docker) skip it — their commands come through separately.
     local -a F_files=() F_fcols=() F_flabels=()
     local -a S_cmds=()  S_cols=()  S_labels=()
     local i=0
@@ -426,7 +403,6 @@ color_prefix() {
         S_cols+=("$col")
         S_labels+=("$label")
 
-        # Gather file-type sources for the initial merged-dump pass.
         if [[ "$type" == "nginx" || "$type" == "text" ]]; then
             local file; file=$(_log_path_for "$entry")
             if [[ -f "$file" ]]; then
@@ -438,10 +414,7 @@ color_prefix() {
         (( i++ )) || true
     done
 
-    # Initial dump: last 10 lines from every FILE source, merged and
-    # sorted by log timestamp. Streaming sources (journal / docker)
-    # stream live-only — no retrospective view since their readers don't
-    # cheaply support "last N matching lines".
+    # journal and docker sources have no cheap "last N lines", so they only stream live.
     if (( ${#F_files[@]} > 0 )); then
         {
             local idx
@@ -466,9 +439,6 @@ color_prefix() {
         } | sort -k1,1 | cut -f2-
     fi
 
-    # Live tails from every source — files via tail -F, journal via
-    # journalctl -f, docker via the unwrap pipeline. All reach stdout
-    # the same way; awk prefixes each with the coloured app label.
     local idx
     for idx in "${!S_cmds[@]}"; do
         bash -c "${S_cmds[$idx]}" 2>/dev/null | _tty_safe | \
@@ -480,6 +450,3 @@ color_prefix() {
     wait
 }
 
-# ==============================================================================
-# HELP
-# ==============================================================================

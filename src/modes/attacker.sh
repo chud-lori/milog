@@ -1,28 +1,4 @@
-# ==============================================================================
-# MODE: attacker <IP> — forensic view of one IP's activity across all apps
-#
-# Used during/after an incident: given an IP pulled from `milog top`,
-# `milog suspects`, a Discord alert, or a fail2ban ban event — this mode
-# shows everything that IP did, across all configured apps, in one report.
-#
-# Output sections (in order):
-#   1. Header:         ip, geo country, scan window
-#   2. Summary:        total hits, first-seen, last-seen, unique apps
-#   3. Per-app:        hits / 4xx / 5xx per app
-#   4. Top paths:      most-requested URLs (query strings stripped)
-#   5. Top UAs:        distinct user-agents, ranked
-#   6. Classification: exploit vs probe vs normal distribution
-#   7. Sample:         first 3 + last 3 raw loglines for context
-#
-# Scope: reads current `.access.log` files only. Rotated logs (.1, .gz)
-# are ignored — run multiple times with different `LOG_DIR` overrides if
-# you need older data, or add a --archives flag later.
-#
-# IP is passed through a character-class regex guard (digits / hex / . / :)
-# before it ever reaches grep, so an attacker can't inject regex metachars
-# via, say, a webhook-triggered invocation. grep uses -F for fixed-string
-# matching too.
-# ==============================================================================
+# milog attacker <IP>: everything one IP did across all apps' current access logs (rotated logs are not read).
 mode_attacker() {
     local ip="${1:-}"
     if [[ -z "$ip" ]]; then
@@ -30,14 +6,12 @@ mode_attacker() {
         echo -e "${D}  scans all apps' current access.log for one IP's activity${NC}" >&2
         return 1
     fi
-    # Allow v4 (dots + digits) and v6 (hex + colons). Reject everything else
-    # so no regex metacharacter ever reaches awk/grep.
+    # Only hex digits, dots and colons get through to awk.
     if [[ ! "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
         echo -e "${R}invalid IP: $ip${NC}" >&2
         return 1
     fi
 
-    # Gather files.
     local files=() name
     for name in "${LOGS[@]}"; do
         [[ -f "$LOG_DIR/$name.access.log" ]] && files+=("$LOG_DIR/$name.access.log")
@@ -47,25 +21,21 @@ mode_attacker() {
         return 1
     fi
 
-    # Tmp: one tab-separated row per request: "<app>\t<raw_logline>".
+    # One "<app>\t<raw line>" row per request.
     local tmp; tmp=$(mktemp -t milog_attacker.XXXXXX) || return 1
-    # Use RETURN trap so tmp is cleaned even on a `return` path below.
     # shellcheck disable=SC2064
     trap "rm -f '$tmp'" RETURN
 
-    # Stream each app's log, keep only lines where field 1 == $ip. awk's
-    # exact-field match beats grep here — avoids matching "10.0.0.10" when
-    # probing for "10.0.0.1".
+    # Exact field match, so 10.0.0.1 doesn't also match 10.0.0.10.
     for name in "${LOGS[@]}"; do
         local f="$LOG_DIR/$name.access.log"
         [[ -f "$f" ]] || continue
-        awk -v ip="$ip" -v app="$name" '$1 == ip { print app "\t" $0 }' "$f" >> "$tmp"
+        awk -v ip="$ip" -v app="$name" '$1 == ip { print app "\t" $0 }' "$f" | _tty_safe >> "$tmp"
     done
 
     local total; total=$(wc -l < "$tmp" | tr -d ' ')
     total=${total:-0}
 
-    # --- Header --------------------------------------------------------------
     local country=""
     country=$(geoip_country "$ip" 2>/dev/null || true)
     local tag=""
@@ -78,9 +48,7 @@ mode_attacker() {
         return 0
     fi
 
-    # --- Summary -------------------------------------------------------------
-    # Timestamp extraction: portable awk (POSIX match returns RSTART/RLENGTH —
-    # the gawk-only 3-arg form breaks on BSD awk / mawk).
+    # 2-arg match() only; the 3-arg form is gawk-only.
     local first_seen last_seen apps_hit
     first_seen=$(head -n 1 "$tmp" | awk -F'\t' '
         { if (match($2, /\[[^]]+\]/)) print substr($2, RSTART+1, RLENGTH-2) }')
@@ -93,7 +61,6 @@ mode_attacker() {
     printf "  %-14s %s\n"  "last seen:"  "${last_seen:-?}"
     printf "  %-14s %d of %d\n" "apps touched:" "$apps_hit" "${#LOGS[@]}"
 
-    # --- Per-app breakdown ---------------------------------------------------
     echo -e "\n  ${W}per-app${NC}"
     awk -F'\t' '
         {
@@ -120,7 +87,6 @@ mode_attacker() {
                    $2, $1, c4col, $3, c4end, c5col, $4, c5end
         }'
 
-    # --- Top paths -----------------------------------------------------------
     echo -e "\n  ${W}top paths${NC}"
     awk -F'\t' '
         {
@@ -141,7 +107,6 @@ mode_attacker() {
         printf "    %5d  %s\n", $1, p
     }'
 
-    # --- Top user-agents -----------------------------------------------------
     echo -e "\n  ${W}top user-agents${NC}"
     awk -F'\t' '
         {
@@ -171,10 +136,7 @@ mode_attacker() {
         printf "    %5d  %s\n", $1, u
     }'
 
-    # --- Classification ------------------------------------------------------
-    # Substring-matched against the path — cheap, deterministic, close enough
-    # for "is this exploit/probe traffic?" not "CVE-level precision".
-    # Categories mirror src/alerts.sh::_exploit_category.
+    # Rough path-substring buckets, close to but not identical to _exploit_category.
     echo -e "\n  ${W}classification${NC}"
     awk -F'\t' '
         {
@@ -203,7 +165,6 @@ mode_attacker() {
             printf "    %s%5d  %-12s%s\n", col, $1, $2, nc
         }'
 
-    # --- Sample loglines -----------------------------------------------------
     echo -e "\n  ${W}sample (first 3 + last 3)${NC}"
     local head_lines tail_lines
     head_lines=$(( total < 3 ? total : 3 ))

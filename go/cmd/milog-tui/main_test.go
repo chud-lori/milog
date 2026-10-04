@@ -13,10 +13,8 @@ import (
 	"github.com/chud-lori/milog/internal/history"
 )
 
-// keyMsg builds a tea.KeyMsg for tests. Special names ("esc", "enter",
-// "up" ...) map to their KeyType counterparts; anything else is treated
-// as a single-rune Runes key. Only the names this TUI actually uses
-// are mapped — the table grows when a new keybind needs testing.
+// keyMsg maps the special key names this TUI uses ("esc", "enter", "up",
+// ...) to KeyTypes; anything else is a rune key.
 func keyMsg(s string) tea.KeyMsg {
 	switch s {
 	case "esc":
@@ -104,7 +102,6 @@ func TestView_RendersHeaderAndTable(t *testing.T) {
 		},
 	}
 	view := m.View()
-	// ANSI-tolerant substring checks.
 	for _, s := range []string{"MiLog TUI", "CPU", "MEM", "DISK", "api", "web", "q:quit"} {
 		if !strings.Contains(view, s) {
 			t.Errorf("View missing %q; got:\n%s", s, view)
@@ -219,8 +216,7 @@ func TestRenderAlertsView_RendersRowsLatestFirst(t *testing.T) {
 		view:       viewAlerts,
 		alerts: alertsData{
 			total: 2,
-			// alertsSampleCmd reverses to newest-first before storing,
-			// so we feed pre-reversed rows here.
+			// alertsSampleCmd stores rows newest first.
 			rows: []alertlog.Row{
 				{TS: 1714000200, Sev: "crit", Rule: "process:exec_from_tmp:dropper",
 					Title: "Exec from tmp", Body: "```/tmp/x```"},
@@ -250,7 +246,6 @@ func TestRenderAlertsView_RendersRowsLatestFirst(t *testing.T) {
 }
 
 func TestRenderAlertsView_CapNotice(t *testing.T) {
-	// total > rows means we hit the cap. View should say so explicitly.
 	m := model{
 		cfg:        &config.Config{Apps: []string{"api"}},
 		width:      120,
@@ -499,8 +494,6 @@ func TestRenderViews_StripLogControlBytes(t *testing.T) {
 }
 
 func TestRenderPathsView_SingleAppRowHasEmptyBreakdown(t *testing.T) {
-	// A path that only appeared on one app gets no per-app breakdown
-	// rendered — visual signal that it isn't cross-app scan traffic.
 	m := model{
 		cfg:        &config.Config{Apps: []string{"api"}},
 		width:      120,
@@ -518,9 +511,6 @@ func TestRenderPathsView_SingleAppRowHasEmptyBreakdown(t *testing.T) {
 	if !strings.Contains(view, "/v1/internal") {
 		t.Fatalf("expected path in view; got:\n%s", view)
 	}
-	// A breakdown like `api:7` would be rendered for cross-app rows.
-	// For a one-app row there should be no `api:` segment because the
-	// total column already conveys it.
 	if strings.Contains(view, "api:7") {
 		t.Errorf("expected NO breakdown for single-app row; got:\n%s", view)
 	}
@@ -541,8 +531,7 @@ func TestRenderPathsView_NoAppsSampledMessage(t *testing.T) {
 }
 
 func TestRenderPathsView_QuietAppsMessage(t *testing.T) {
-	// Apps were sampled but produced zero parsed paths (e.g. clean
-	// startup before any traffic). Distinct from "config broken".
+	// Apps were read but had no paths, which differs from a broken config.
 	m := model{
 		cfg:        &config.Config{Apps: []string{"api", "web"}},
 		width:      120,
@@ -616,8 +605,7 @@ func TestUpdate_PCapitalOpensPathsViewFromOverview(t *testing.T) {
 }
 
 func TestUpdate_LowercasePStillPausesNotPaths(t *testing.T) {
-	// Regression guard: lowercase 'p' must keep its existing pause
-	// semantics. Capital P is the paths-view binding.
+	// Lowercase p must stay pause; capital P opens paths.
 	m := model{
 		cfg:        &config.Config{Apps: []string{"api"}, AlertStateDir: t.TempDir()},
 		width:      120,
@@ -746,11 +734,7 @@ func TestRenderErrorsView_AggregatesAcrossSources(t *testing.T) {
 }
 
 func TestRenderErrorsView_SingleSourceRowHasEmptyBreakdown(t *testing.T) {
-	// A pattern that only fires on one source gets no breakdown column —
-	// same convention as the paths view, signalling "concentrated, not
-	// cross-source". The renderAlertRow truncation rules differ from
-	// renderErrorsView: errors-row truncates pattern at the patW
-	// budget, never at 32.
+	// A single-source pattern gets no breakdown, like the paths view.
 	m := model{
 		cfg:        &config.Config{Apps: []string{"api"}},
 		width:      120,

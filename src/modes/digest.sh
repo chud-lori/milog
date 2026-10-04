@@ -1,19 +1,4 @@
-# ==============================================================================
-# MODE: digest — exec-summary view over the last day / week
-#
-# Uses the same data the other modes do: alerts.log for fire counts and a
-# short scan of the live log files for traffic / error / latency rollups.
-#
-# Designed to be piped into alert destinations as a scheduled summary for
-# quiet servers where live alerts rarely fire — you still want the weekly
-# "nothing happened, here's what happened anyway" email.
-#
-# Usage:
-#   milog digest          # last 24h (default)
-#   milog digest day
-#   milog digest week
-#   milog digest 12h      # arbitrary N<h|d|w>
-# ==============================================================================
+# milog digest [day|week|N<h|d|w>]: summary of alert fires, per-app traffic and top IPs.
 
 _digest_window_to_secs() {
     local w="${1:-day}"
@@ -26,6 +11,26 @@ _digest_window_to_secs() {
         *[wW])           local n="${w%[wW]}"; [[ "$n" =~ ^[0-9]+$ ]] && echo $(( n * 604800 )) || return 1 ;;
         *)               return 1 ;;
     esac
+}
+
+# Epoch math is hand-rolled because BSD awk and busybox awk lack mktime().
+_digest_in_window() {
+    awk -v cutoff="$1" '
+        BEGIN {
+            split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", m, " ")
+            for (i = 1; i <= 12; i++) mon[m[i]] = i
+        }
+        {
+            split(substr($4, 2), t, /[\/:]/)
+            if (!(t[2] in mon)) next
+            y = t[3] + 0; mo = mon[t[2]]
+            if (mo <= 2) { y--; mo += 12 }
+            days = 365*y + int(y/4) - int(y/100) + int(y/400) + int((153*(mo-3) + 2) / 5) + t[1] - 719469
+            ts = days*86400 + t[4]*3600 + t[5]*60 + t[6]
+            off = (substr($5, 2, 2)*60 + substr($5, 4, 2)) * 60
+            ts += (substr($5, 1, 1) == "-") ? off : -off
+            if (ts >= cutoff) print
+        }' "$2"
 }
 
 mode_digest() {
@@ -43,7 +48,6 @@ mode_digest() {
     echo -e "\n${W}── MiLog: Digest (${window_human}) ──${NC}\n"
     echo -e "${D}  generated $(date -Iseconds 2>/dev/null || date) · host $(hostname 2>/dev/null || echo host)${NC}\n"
 
-    # --- Alerts ---------------------------------------------------------------
     local alog="${ALERT_STATE_DIR:-$HOME/.cache/milog}/alerts.log"
     echo -e "${W}Alerts fired${NC}"
     if [[ ! -f "$alog" ]]; then
@@ -66,7 +70,6 @@ mode_digest() {
     fi
     echo
 
-    # --- Traffic + errors per app --------------------------------------------
     echo -e "${W}Traffic${NC}"
     printf "  %-14s  %10s  %8s  %8s\n" "APP" "REQ" "4XX" "5XX"
     printf "  %-14s  %10s  %8s  %8s\n" "────────────" "──────────" "────────" "────────"
@@ -76,23 +79,17 @@ mode_digest() {
         name=$(_log_name_for "$entry")
         file=$(_log_path_for "$entry")
         [[ -f "$file" ]] || continue
-        # Count lines in-window via nginx timestamp. Shell out to awk with a
-        # cutoff; safe-fallback emits zeros if the date format unexpectedly
-        # doesn't match our scan.
-        read -r req c4 c5 <<< "$(awk -v cutoff="$cutoff" '
+        read -r req c4 c5 <<< "$(_digest_in_window "$cutoff" "$file" 2>/dev/null | awk '
             {
-                # [24/Apr/2026:12:34:56 +0000] → crude parse: keep any row,
-                # count by status class (fields reliable in combined format).
                 n++
                 if ($9 ~ /^4/) c4++
                 else if ($9 ~ /^5/) c5++
             }
-            END { printf "%d %d %d\n", n+0, c4+0, c5+0 }' "$file" 2>/dev/null)"
+            END { printf "%d %d %d\n", n+0, c4+0, c5+0 }')"
         printf "  %-14s  %10d  ${Y}%8d${NC}  ${R}%8d${NC}\n" "$name" "${req:-0}" "${c4:-0}" "${c5:-0}"
     done
     echo
 
-    # --- Top attacker IPs (window-agnostic: scans whole access logs) ---------
     echo -e "${W}Top attacker IPs (this window)${NC}"
     local ip_rollup
     ip_rollup=$(
@@ -100,7 +97,7 @@ mode_digest() {
             [[ "$(_log_type_for "$entry")" == "nginx" ]] || continue
             file=$(_log_path_for "$entry")
             [[ -f "$file" ]] || continue
-            awk '{print $1}' "$file"
+            _digest_in_window "$cutoff" "$file" | awk '{print $1}'
         done | sort | uniq -c | sort -rn | head -10
     )
     if [[ -n "$ip_rollup" ]]; then

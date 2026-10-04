@@ -1,36 +1,6 @@
-# ==============================================================================
-# anomaly.sh — daily-pattern anomaly detection over per-minute history.
-#
-# For every (app, metric) tuple, the rolling window of values at the SAME
-# minute-of-day across the last 14 days forms a baseline. When the
-# freshly-written row exceeds mean + sigma*stddev AND clears an absolute
-# floor, alert_fire is called with rule key anomaly:<app>:<metric>.
-#
-# Why same-minute-of-day:
-#   Daily traffic patterns dwarf weekly ones for a typical nginx host.
-#   A naive "anomalous vs all of yesterday" check pages on every 9am
-#   rush because the average includes the 3am quiet. Same-minute-of-day
-#   absorbs the daily curve so what's left is genuine deviation.
-#
-# Hard sample-count gate: skip until ANOMALY_MIN_DAYS distinct days exist
-# in the rolling window (default 14). Without it the rule alert-spams
-# during ramp-up while history accumulates.
-#
-# Floors prevent low-volume noise: at near-zero baseline, a single hit
-# is mathematically 3σ above zero. The current value must clear an
-# absolute floor before we even consult the σ band.
-#
-# Three metrics covered:
-#   req   — request count per minute
-#   c5xx  — 5xx count per minute
-#   p95   — p95 request time (ms; rows with NULL p95_ms skipped)
-#
-# Wire point: src/modes/daemon.sh calls _anomaly_check_minute right
-# after history_write_minute lands the row.
-# ==============================================================================
+# Anomaly detection: each new minute vs the same minute of day over the last ANOMALY_MIN_DAYS days (req, c5xx, p95).
+# Fires only once every day in the window has data and the value clears its floor; near-zero baselines put one hit above 3σ.
 
-# Per-metric defaults. Operators tune via ANOMALY_FLOOR_<METRIC>=…
-# in milog config or the matching MILOG_ANOMALY_FLOOR_* env var.
 _anomaly_floor() {
     case "$1" in
         req)  printf '%s' "${ANOMALY_FLOOR_REQ:-10}"  ;;
@@ -39,7 +9,6 @@ _anomaly_floor() {
     esac
 }
 
-# Pretty metric name for the alert title.
 _anomaly_label() {
     case "$1" in
         req)  printf '%s' "request rate" ;;
@@ -49,8 +18,6 @@ _anomaly_label() {
     esac
 }
 
-# Unit suffix on the current value in the body (req/c5xx are unitless
-# counts; p95 is milliseconds).
 _anomaly_unit() {
     case "$1" in
         p95)  printf '%s' " ms" ;;
@@ -58,10 +25,7 @@ _anomaly_unit() {
     esac
 }
 
-# Run the check for one freshly-landed minute. Called from the daemon
-# loop after history_write_minute. Self-gates on ANOMALY_ENABLED +
-# HISTORY_ENABLED + sqlite3 + DB existence — cheap to call every tick;
-# returns immediately when prerequisites aren't met.
+# Cheap to call every tick: returns at once unless anomaly, history, sqlite3 and the DB are all available.
 _anomaly_check_minute() {
     [[ "${ANOMALY_ENABLED:-0}" != "1" ]] && return 0
     [[ "${HISTORY_ENABLED:-0}" != "1" ]] && return 0
@@ -71,7 +35,6 @@ _anomaly_check_minute() {
     local write_ts="$1"
     [[ "$write_ts" =~ ^[0-9]+$ ]] || return 0
 
-    local minute_of_day=$(( write_ts % 86400 ))
     local min_days="${ANOMALY_MIN_DAYS:-14}"
     local since_ts=$((     write_ts - min_days * 86400 ))
     local sigma="${ANOMALY_SIGMA:-3}"
@@ -82,16 +45,13 @@ _anomaly_check_minute() {
 
     local app
     for app in "${LOGS[@]}"; do
-        # Single sqlite3 invocation per app: every baseline row tagged
-        # 'B', the current row tagged 'C'. awk pivots to mean+stddev
-        # per metric and prints one line per breached metric. Cheaper
-        # than two round-trips at minute-rollover frequency.
+        # One query per app: baseline rows tagged B, the current row tagged C.
         local out
         out=$(sqlite3 "$HISTORY_DB" <<SQL 2>/dev/null
 SELECT 'B', req, c5xx, IFNULL(p95_ms,-1), ts/86400
   FROM metrics_minute
   WHERE app=$(_sql_quote "$app")
-    AND (ts%86400)=$minute_of_day
+    AND strftime('%H:%M', ts, 'unixepoch', 'localtime')=strftime('%H:%M', $write_ts, 'unixepoch', 'localtime')
     AND ts>=$since_ts
     AND ts<$write_ts;
 SELECT 'C', req, c5xx, IFNULL(p95_ms,-1), 0
@@ -102,10 +62,7 @@ SQL
         )
         [[ -z "$out" ]] && continue
 
-        # Each line: TYPE|req|c5xx|p95(-1=NULL)|day_idx
-        # awk computes mean + stddev (Welford-equivalent via E[X²]-E[X]²)
-        # for each metric over baseline rows, then prints one line per
-        # breach: <metric> <current> <mean> <stddev> <z>.
+        # Rows: TYPE|req|c5xx|p95 (-1 = NULL)|day. Prints `<metric> <current> <mean> <stddev> <z>` per breach.
         local hits
         hits=$(printf '%s\n' "$out" | awk -F'|' \
             -v sigma="$sigma" -v min_days="$min_days" \
@@ -154,9 +111,6 @@ SQL
 
         [[ -z "$hits" ]] && continue
 
-        # One alert per breached metric. alert_should_fire applies
-        # ALERT_COOLDOWN per rule key so a sustained anomaly doesn't
-        # spam the webhook every minute.
         local metric current mean stddev z key title body
         while read -r metric current mean stddev z; do
             [[ -z "$metric" ]] && continue

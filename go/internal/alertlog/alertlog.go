@@ -1,18 +1,6 @@
-// Package alertlog reads MiLog's alerts.log history (TSV) and filters it
-// by a user-supplied window.
-//
-// File format (one row per fired alert):
+// Package alertlog reads alerts.log, the TSV written by bash _alert_record:
 //
 //	<epoch>  <rule_key>  <color_int>  <title>  <body_truncated>
-//
-// separated by literal TABs. Written by bash `_alert_record`.
-//
-// Window grammar (same as `milog alerts`):
-//
-//	today         since local midnight
-//	yesterday     24h window ending at today's midnight
-//	all           no cutoff
-//	<N>h / d / w  relative to now
 package alertlog
 
 import (
@@ -32,9 +20,9 @@ type Row struct {
 	Body  string `json:"body"`
 }
 
-// WindowToCutoff resolves a window string into a Unix-epoch cutoff. Rows
-// with TS >= cutoff are included; anything older is filtered out.
-// Returns (0, nil) for "all" — include every row.
+// WindowToCutoff turns today | yesterday | all | Nh | Nd | Nw into the
+// oldest epoch to include; all is 0. There's no upper bound, so yesterday
+// includes today.
 func WindowToCutoff(w string, now time.Time) (int64, error) {
 	if w == "" {
 		w = "today"
@@ -42,8 +30,7 @@ func WindowToCutoff(w string, now time.Time) (int64, error) {
 	nowU := now.Unix()
 	switch {
 	case w == "today":
-		// Local midnight today — approximate by (now - now%86400); exact to
-		// the timezone boundary isn't critical for this view.
+		// UTC midnight, not local; close enough for this view.
 		return nowU - (nowU % 86400), nil
 	case w == "yesterday":
 		return nowU - (nowU % 86400) - 86400, nil
@@ -80,9 +67,7 @@ func relative(w string, unitSec int64) (int64, error) {
 	return time.Now().Unix() - n*unitSec, nil
 }
 
-// Severity maps the Discord color int recorded per row to a short word
-// used by the web panel for styling. Matches the bash `milog alerts`
-// colour map exactly — same numeric constants, same outcome.
+// Severity maps the color int to crit/warn/info, the same mapping bash uses.
 func Severity(color int64) string {
 	switch color {
 	case 15158332, 16711680:
@@ -94,12 +79,9 @@ func Severity(color int64) string {
 	}
 }
 
-// Load reads the TSV file, filtering rows with epoch >= cutoff and
-// truncating the result to at most maxRows (oldest-first is the file's
-// natural order; we keep the latest N by slicing at the tail).
-//
-// Missing file is not an error — returns an empty slice. Rows with
-// malformed fields are silently skipped (matching bash awk behaviour).
+// Load returns rows with epoch >= cutoff, keeping the newest maxRows in
+// file order (oldest first). A missing file returns no rows; malformed rows
+// are skipped.
 func Load(path string, cutoff int64, maxRows int) ([]Row, error) {
 	return LoadRange(path, cutoff, 0, maxRows)
 }
@@ -141,7 +123,6 @@ func LoadRange(path string, cutoff, until int64, maxRows int) ([]Row, error) {
 		return rows, err
 	}
 
-	// Cap at maxRows, keeping the newest.
 	if maxRows > 0 && len(rows) > maxRows {
 		rows = rows[len(rows)-maxRows:]
 	}

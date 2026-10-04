@@ -1,23 +1,5 @@
-# ==============================================================================
-# MODE: alert — toggle alerting + manage the systemd service
-#
-# Subcommands:
-#   on [WEBHOOK_URL]  — set Discord webhook (optional), enable, install+start systemd
-#   off               — disable alerts, stop + disable systemd
-#   status            — show destinations / service / recent-fire state
-#   test              — fire a one-off alert to EVERY configured destination
-#                       (Discord + Slack + Telegram + Matrix), bypassing
-#                       cooldown and ALERTS_ENABLED. Any silent channel is
-#                       a wire issue, not config.
-#
-# `milog alert on` wires only Discord (historical default). Other
-# destinations are opt-in via config file or env var — see docs/alerts.md.
-#
-# When invoked via sudo, we write config into the *invoking* user's home
-# (resolved from SUDO_USER) and run the systemd service as that user — not
-# as root. Matches user intuition: `sudo milog alert on` sets up alerting
-# for the person who ran it, not for root.
-# ==============================================================================
+# milog alert on|off|status|test: toggle alerting and the systemd service.
+# Under sudo, config goes to SUDO_USER's home and the service runs as that user, not root.
 
 _alert_target_user() {
     if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
@@ -33,8 +15,7 @@ _alert_target_home() {
     [[ -n "$h" ]] && printf '%s' "$h" || printf '%s' "${HOME:-/root}"
 }
 
-# Upsert a single KEY=VALUE line in the target user's config file. Handles
-# dir creation + ownership fix when running as root on behalf of a user.
+# Upserts KEY=VALUE in the target user's config.
 _alert_write_config() {
     local target_user="$1" target_home="$2" line="$3"
     local dir="$target_home/.config/milog" file="$target_home/.config/milog/config.sh"
@@ -50,16 +31,12 @@ _alert_write_config() {
     else
         printf '%s\n' "$line" >> "$file"
     fi
-    # Fix ownership so the target user can read/edit their own config when
-    # the write happened as root.
     if [[ $(id -u) -eq 0 && "$target_user" != "root" ]]; then
         chown -R "$target_user:$target_user" "$dir" 2>/dev/null || true
     fi
 }
 
-# Read DISCORD_WEBHOOK from a config file (strips surrounding quotes).
-# Always returns 0 and emits empty string when the config doesn't exist or
-# doesn't set the key — keeps callers simple under `set -euo pipefail`.
+# Always returns 0, printing nothing when the file or key is missing, to stay safe under `set -e`.
 _alert_read_webhook() {
     local file="$1"
     [[ -f "$file" ]] || return 0
@@ -71,11 +48,6 @@ _alert_read_webhook() {
     return 0
 }
 
-# Read the (possibly multiline) ALERT_ROUTES value from a config file.
-# `_alert_read_key` grep-hack can't handle multiline quoted assignments,
-# so routing gets its own helper.
-#
-# Silent + empty on any error — caller treats empty as "no routing".
 _alert_read_routes() {
     local file="$1"
     [[ -r "$file" ]] || return 0
@@ -95,7 +67,6 @@ _alert_read_routes() {
         END { printf "%s", val }' "$file" 2>/dev/null || true
 }
 
-# Read a simple KEY's value from the config file — same no-fail contract.
 _alert_read_key() {
     local file="$1" key="$2"
     [[ -f "$file" ]] || return 0
@@ -107,7 +78,7 @@ _alert_read_key() {
     return 0
 }
 
-# Write + enable the milog systemd unit. Caller must already be root.
+# Caller must be root.
 _alert_install_service() {
     local target_user="$1" target_config="$2"
     local exe unit="/etc/systemd/system/milog.service"
@@ -133,7 +104,6 @@ EOF
     systemctl restart milog.service
 }
 
-# Short human-readable duration — "12s", "3m", "5h", "2d".
 _alert_fmt_dur() {
     local s="$1"
     if   (( s < 60 ));    then printf '%ds' "$s"
@@ -218,9 +188,7 @@ alert_status() {
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
 
-    # Read all destinations from the target config. Done via _alert_read_key
-    # (not env) so `sudo milog alert status` shows alice's real config,
-    # not root's. Empty strings when unset.
+    # Read from the target config, not env, so `sudo milog alert status` shows the user's settings rather than root's.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url
     d_url=$(_alert_read_webhook "$target_config")
     s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
@@ -258,9 +226,6 @@ alert_status() {
     printf "  %-18s %s\n"  "config"          "$target_config"
     printf "  %-18s %b\n"  "systemd service" "$svc_state"
 
-    # Routing block — only shown when ALERT_ROUTES is configured. Reads the
-    # full block from the target config (not env) for the same sudo-vs-user
-    # reason as destinations above.
     local routes_raw
     routes_raw=$(_alert_read_routes "$target_config")
     if [[ -n "$routes_raw" ]]; then
@@ -308,10 +273,7 @@ alert_test() {
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
 
-    # Pull every destination from the target-user's config file, not the
-    # env this process started with. Makes `sudo milog alert test` test
-    # alice's full fanout (Discord + Slack + Telegram + Matrix + Webhook),
-    # not just whatever happens to live in root's env.
+    # Target user's config, not this process's env, for the same sudo reason as alert_status.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url wh_template wh_ctype
     d_url=$(      _alert_read_webhook "$target_config")
     s_url=$(      _alert_read_key "$target_config" "SLACK_WEBHOOK")
@@ -324,9 +286,6 @@ alert_test() {
     wh_template=$(_alert_read_key "$target_config" "WEBHOOK_TEMPLATE")
     wh_ctype=$(   _alert_read_key "$target_config" "WEBHOOK_CONTENT_TYPE")
 
-    # Track which destinations will actually fire so we can print a
-    # per-destination line. Mirrors the readiness logic in each
-    # _alert_send_* guard.
     local -a dests_ok=() dests_partial=()
     [[ -n "$d_url"    ]] && dests_ok+=("discord")
     [[ -n "$s_url"    ]] && dests_ok+=("slack")
@@ -346,10 +305,7 @@ alert_test() {
         return 1
     fi
 
-    # Swap every destination var into the process env so alert_fire's
-    # fanout picks them all up. Saved + restored so a subsequent interactive
-    # alert (same bash session) still sees the original state. Force
-    # ALERTS_ENABLED=1 — test bypasses the master switch by design.
+    # Swap the target's destinations into the env for alert_fire, forcing ALERTS_ENABLED=1, then restore them.
     local _s_enabled="$ALERTS_ENABLED" _s_dw="$DISCORD_WEBHOOK" _s_sw="$SLACK_WEBHOOK"
     local _s_tt="$TELEGRAM_BOT_TOKEN" _s_tc="$TELEGRAM_CHAT_ID"
     local _s_mh="$MATRIX_HOMESERVER"  _s_mt="$MATRIX_TOKEN"    _s_mr="$MATRIX_ROOM"
@@ -360,7 +316,6 @@ alert_test() {
     TELEGRAM_BOT_TOKEN="$tg_token"; TELEGRAM_CHAT_ID="$tg_chat"
     MATRIX_HOMESERVER="$mx_hs";     MATRIX_TOKEN="$mx_token";  MATRIX_ROOM="$mx_room"
     WEBHOOK_URL="$wh_url"
-    # Empty template / ctype from target config → keep the process defaults.
     [[ -n "$wh_template" ]] && WEBHOOK_TEMPLATE="$wh_template"
     [[ -n "$wh_ctype"    ]] && WEBHOOK_CONTENT_TYPE="$wh_ctype"
 
