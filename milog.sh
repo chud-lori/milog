@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-1-g28d0106
-# MILOG_BUILT=2026-10-04T02:27:42Z
+# MILOG_VERSION=v0.6.0-3-gf2fc4d1
+# MILOG_BUILT=2026-10-04T02:41:30Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -2136,7 +2136,7 @@ mode_alert() {
 
 # milog alerts [window]: what fired, read from alerts.log.
 
-# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; there is no upper bound, so `yesterday` includes today.
+# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; pair with _alerts_window_end_epoch for the upper bound.
 _alerts_window_to_epoch() {
     local w="$1"
     local now; now=$(date +%s)
@@ -2258,10 +2258,10 @@ mode_alerts() {
     echo -e "\n  ${D}total: $total alert(s) in window — log at $log_file${NC}\n"
 }
 
-# TSV per rule key in alerts.log since epoch $1: fires, key, last fire epoch; busiest first.
+# TSV per rule key in alerts.log from epoch $1 to before $2 (0 = open): fires, key, last fire epoch; busiest first.
 _alerts_counts_since() {
-    awk -F'\t' -v cutoff="$1" '
-        $1 >= cutoff && $2 != "" { c[$2]++; if ($1 > last[$2]) last[$2] = $1 }
+    awk -F'\t' -v cutoff="$1" -v end="${2:-0}" '
+        $1 >= cutoff && (end == 0 || $1 < end) && $2 != "" { c[$2]++; if ($1 > last[$2]) last[$2] = $1 }
         END { for (k in c) printf "%d\t%s\t%d\n", c[k], k, last[k] }
     ' "$ALERT_STATE_DIR/alerts.log" | sort -t "$(printf '\t')" -k1,1rn -k2,2
 }
@@ -2276,10 +2276,11 @@ alert_stats() {
         return 0
     fi
 
-    local cutoff now rows
+    local cutoff end rows
     cutoff=$(_alerts_window_to_epoch "$window") || return 1
-    now=$(date +%s)
-    rows=$(_alerts_counts_since "$cutoff")
+    end=$(_alerts_window_end_epoch "$window")
+    rows=$(_alerts_counts_since "$cutoff" "$end")
+    (( end == 0 )) && end=$(date +%s)
 
     echo -e "\n${W}── MiLog: alert stats since $(_alerts_fmt_epoch "$cutoff") (window=$window) ──${NC}\n"
 
@@ -2290,8 +2291,9 @@ alert_stats() {
 
     # `all` has no window length, so the per-day rate runs from the oldest fire.
     (( cutoff == 0 )) && cutoff=$(awk -F'\t' '{ print $1; exit }' "$log_file")
-    local span=$(( now - cutoff ))
-    (( span > 0 )) || span=1
+    # Floor of one day so a short window like `today` just after midnight doesn't extrapolate.
+    local span=$(( end - cutoff ))
+    (( span >= 86400 )) || span=86400
 
     printf "  %6s  %7s  %-16s  %s\n" "FIRES" "PER DAY" "LAST" "RULE"
     printf "  %6s  %7s  %-16s  %s\n" "──────" "───────" "────────────────" "────"
@@ -3885,6 +3887,13 @@ _tune_alert_noise() {
                 continue
             fi
         fi
+        # Attackers drive these counts, so muting them would mute attack detection.
+        case "$key" in
+            exploit:*|audit:*)
+                printf "  ${W}%s${NC}  ${D}%s fires, high volume: review the source, not silenced${NC}\n" "$key" "$count"
+                continue
+                ;;
+        esac
         printf "  ${W}%s${NC}  ${D}%s fires, a threshold raise can't quiet it${NC}\n" "$key" "$count"
         printf "    milog silence %q 7d 'noisy rule'\n" "$key"
     done < <(_alerts_counts_since "$cutoff" | _tty_safe)
