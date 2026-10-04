@@ -17,10 +17,9 @@ mode_probes() {
     pat+='|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe'
     # SEO / advertising crawlers (often unwanted)
     pat+='|ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat'
-    pat+='|dataforseobot|bytespider|mauibot|megaindex|seznambot'
+    pat+='|dataforseobot|mauibot|megaindex|seznambot'
     # AI crawlers
-    pat+='|claudebot|gptbot|ccbot|anthropic-ai|perplexitybot|youbot'
-    pat+='|amazonbot|applebot-extended|cohere-ai|diffbot'
+    pat+="|$AI_CRAWLER_UA_RE|diffbot"
     # Generic HTTP libraries (legit use exists but often scripted)
     pat+='|python-requests|python-urllib|aiohttp|go-http-client|okhttp'
     pat+='|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2'
