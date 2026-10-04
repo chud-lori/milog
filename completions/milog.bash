@@ -18,6 +18,7 @@ _milog_complete() {
     local silence_subs="list clear"
     local web_subs="start stop status install-service uninstall-service rotate-token"
     local window_vals="today yesterday 1h 6h 12h 24h 7d 30d all"
+    local digest_window_vals="day week 1h 6h 12h 24h 7d 30d"
 
     case $cword in
         1)
@@ -54,9 +55,14 @@ _milog_complete() {
                 2) COMPREPLY=($(compgen -W "$web_subs" -- "$cur")) ;;
             esac
             ;;
-        alerts|digest|report)
+        alerts)
             case $cword in
                 2) COMPREPLY=($(compgen -W "$window_vals" -- "$cur")) ;;
+            esac
+            ;;
+        digest|report)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "$digest_window_vals" -- "$cur")) ;;
             esac
             ;;
     esac

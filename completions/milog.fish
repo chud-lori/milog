@@ -77,5 +77,10 @@ end
 
 set -l window_vals today yesterday 1h 6h 12h 24h 7d 30d all
 for v in $window_vals
-    complete -c milog -n "__milog_seen_cmd alerts; or __milog_seen_cmd digest; or __milog_seen_cmd report" -a "$v"
+    complete -c milog -n "__milog_seen_cmd alerts" -a "$v"
+end
+
+set -l digest_window_vals day week 1h 6h 12h 24h 7d 30d
+for v in $digest_window_vals
+    complete -c milog -n "__milog_seen_cmd digest; or __milog_seen_cmd report" -a "$v"
 end

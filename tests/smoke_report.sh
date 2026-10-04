@@ -52,7 +52,6 @@ grep -qF '| 5xx:api | 2 |' <<< "$md" || fail "rule fire count wrong: $md"
 grep -qF 'old:rule' <<< "$md" && fail "out-of-window alert counted"
 grep -qF '| &lt;img&gt; | 1 | 1 |' <<< "$md" || fail "markdown IP not escaped: $md"
 grep -qF 'current=&lt;script&gt;x&lt;/script&gt; a&#124;b &#91;l&#93;(u) ?&#91;2J' <<< "$md" || fail "markdown anomaly not escaped: $md"
-grep -qF 'Audit drift' <<< "$md" && fail "audit section shown without an audit table"
 
 "$ROOT/milog.sh" report 7d --html -o "$tmp/r.html" || fail "html report exited non-zero"
 html=$(cat "$tmp/r.html")
@@ -72,17 +71,29 @@ md=$("$ROOT/milog.sh" report 1m 2>&1 || true)
 grep -q 'invalid window' <<< "$md" || fail "bad window not rejected: $md"
 md=$("$ROOT/milog.sh" report 1h)
 grep -qF 'No IP got a 4xx response in this window.' <<< "$md" || fail "empty attacker section: $md"
-grep -qF 'no alert has fired on this host' <<< "$md" || fail "missing alerts.log not stated: $md"
+grep -qF "No alerts.log at $HOME/.cache/milog/alerts.log." <<< "$md" || fail "missing alerts.log not stated: $md"
 grep -qF 'Anomaly detection is off' <<< "$md" || fail "anomaly empty state: $md"
 
-if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 "$MILOG_HISTORY_DB" "CREATE TABLE audit_history (ts INTEGER, scanner TEXT, detail TEXT);
-        INSERT INTO audit_history VALUES ($recent, 'ports', 'new listener <0.0.0.0:4444>');
-        INSERT INTO audit_history VALUES ($old, 'fim', 'stale');"
+# -o refuses a symlink and leaves its target alone.
+echo keep > "$tmp/target"
+ln -s "$tmp/target" "$tmp/link"
+"$ROOT/milog.sh" report -o "$tmp/link" 2>/dev/null && fail "-o wrote through a symlink"
+[[ "$(cat "$tmp/target")" == keep ]] || fail "symlink target was modified"
+
+# Capped sections say how many rows exist.
+for i in $(seq 1 55); do
+    printf '%s\t%s\t15158332\tAnomaly\tbody\n' "$recent" "anomaly:api:req"
+done > "$HOME/.cache/milog/alerts.log"
+for i in $(seq 1 12); do line "10.1.0.$i" "$recent" /x 404; done >> "$tmp/logs/api.access.log"
+md=$("$ROOT/milog.sh" report 7d)
+grep -qF 'Showing the latest 50 of 55.' <<< "$md" || fail "anomaly cap not stated: $md"
+grep -qF 'Showing 10 of 14.' <<< "$md" || fail "attacker cap not stated: $md"
+
+# Root can read mode-000 files, so this only bites as a normal user.
+if (( $(id -u) != 0 )); then
+    chmod 000 "$tmp/logs/web.access.log"
     md=$("$ROOT/milog.sh" report 7d)
-    grep -qF '## Audit drift' <<< "$md" || fail "audit section missing: $md"
-    grep -qF '| ports | new listener &lt;0.0.0.0:4444&gt; |' <<< "$md" || fail "audit row wrong: $md"
-    grep -qF 'stale' <<< "$md" && fail "out-of-window audit row shown"
+    grep -qF '| web | log not readable | - | - |' <<< "$md" || fail "unreadable log not reported: $md"
 fi
 
 echo "smoke_report: ok"

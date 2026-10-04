@@ -183,7 +183,7 @@ _cmd_help() {
             ;;
         report)
             echo -e "${W}milog report [window] [--html] [-o FILE]${NC} — static report for sharing"
-            echo -e "  Traffic per app, top IPs by 4xx, alert fires per rule, anomalies, audit drift."
+            echo -e "  Traffic per app, top IPs by 4xx, alert fires per rule, anomalies."
             echo -e "  Markdown by default; ${C}--html${NC} writes one self-contained page. Windows as digest (default 7d)."
             ;;
         doctor)   echo -e "${W}milog doctor${NC} — diagnostic checklist" ;;
