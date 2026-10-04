@@ -81,14 +81,14 @@ The eBPF features it relies on:
 
 ## Tuning the file allowlist
 
-The file probe is the chattiest by far. `/etc/passwd` is not in the
-default watch list: it is world-readable and every `ps`, `getent`,
-`apt-get` or `curl` reads it through glibc's NSS. To watch it anyway,
-set `MILOG_PROBE_FILE_SENSITIVE` to the full list including it, e.g.
-`/etc/passwd,/etc/shadow,/etc/gshadow,/etc/sudoers,/etc/sudoers.d/,/etc/ssh/,/etc/ld.so.preload,/root/.ssh/`.
-The default comm allowlist covers the obvious system tools (`sshd`,
-`sudo`, `systemd*`, etc.) but not the noisier real-world sources
-observed during smoke testing.
+The file probe is the chattiest by far. `/etc/passwd` alerts only when
+it is opened for writing (`O_WRONLY`, `O_RDWR`, `O_TRUNC` or
+`O_APPEND`): it is world-readable and every `ps`, `getent`, `apt-get`
+or `curl` reads it through glibc's NSS. A tool that writes a temp file
+and renames it over `/etc/passwd` is not caught here; the audit FIM
+check covers that when `AUDIT_ENABLED=1`. The default comm allowlist
+covers the obvious system tools (`sshd`, `sudo`, `systemd*`, etc.) but
+not the noisier real-world sources observed during smoke testing.
 
 Edit the unit's `Environment=MILOG_PROBE_FILE_ALLOWLIST=…` line:
 
@@ -168,7 +168,7 @@ lines. To change one: `sudoedit` the unit, `daemon-reload`, restart.
 | `MILOG_CONFIG`                   | `$HOME/.config/milog/config.sh`               | Bash-side config the probe-spawned milog reads               |
 | `MILOG_PROBE_ALERT_USER`         | (unset → alerts run as root)                  | User the probe-spawned milog runs as. Without it, milog running as root only sources a root-owned, non-group/other-writable `MILOG_CONFIG`. |
 | `MILOG_PROBE_FILE_ALLOWLIST`     | conservative system-tools list                | Comma-separated `comm` names exempt from `file:sensitive_read` |
-| `MILOG_PROBE_FILE_SENSITIVE`     | `/etc/shadow`, `/etc/sudoers`, `/root/.ssh/`, etc. (not `/etc/passwd`) | Comma-separated paths the probe watches; replaces the defaults |
+| `MILOG_PROBE_FILE_SENSITIVE`     | `/etc/shadow`, `/etc/sudoers`, `/root/.ssh/`, etc. (`/etc/passwd` on writes only) | Comma-separated paths the probe watches; replaces the defaults |
 | `MILOG_PROBE_NET_ALLOWLIST`      | loopback + private CIDRs + DNS / NTP          | CIDR list + bare port (`:53`) entries; CIDR+port (`10.0.0.0/8:443`) supported |
 | `MILOG_PROBE_PTRACE_DEBUGGERS`   | `gdb,lldb,strace,…`                           | Allowlist of legitimate ptracers (replaces, not extends)     |
 | `MILOG_PROBE_KMOD_ALLOWLIST`     | conservative module set                       | Set to `""` (explicit empty) to alert on **every** module load |

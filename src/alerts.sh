@@ -103,7 +103,8 @@ _alert_post() {
         wait=$(printf '%s\n' "$out" | sed -n -E \
             -e '/"retry_after": *[0-9]/{s/.*"retry_after": *([0-9][0-9.]*).*/\1/p;q;}' \
             -e '/^[Rr]etry-[Aa]fter: *[0-9]/{s/^[^:]*: *([0-9][0-9.]*).*/\1/p;q;}') || :
-        [[ -n "$wait" ]] && { (( ${wait%%.*} < 5 )) || [[ "$wait" == 5 ]]; } || break
+        # A string match, since arithmetic on a server-supplied number can overflow.
+        [[ "$wait" =~ ^([0-4](\.[0-9]+)?|5(\.0+)?)$ ]] || break
         sleep "$wait" || break
     done
     [[ "$code" =~ ^[1-3][0-9][0-9]$ ]] || _alert_send_failed "$dest" "$code"
