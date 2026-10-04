@@ -37,6 +37,8 @@ _milog() {
         'digest:exec-summary view over last day / week'
         'report:static markdown / HTML report'
         'doctor:diagnostic checklist'
+        'version:milog and companion binary versions'
+        'update:install the latest release'
         'web:start/stop/status web UI'
         'install:add optional features: geoip / web / history'
         'audit:host integrity scans (fim / persistence / ports / yara / accounts / rootkit)'
@@ -91,6 +93,7 @@ _milog() {
         web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
         alerts)   (( CURRENT == 3 )) && _describe 'window' window_vals ;;
         digest|report) (( CURRENT == 3 )) && _describe 'window' digest_window_vals ;;
+        update)   (( CURRENT == 3 )) && compadd -- --check ;;
     esac
 }
 

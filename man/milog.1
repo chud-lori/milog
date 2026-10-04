@@ -209,6 +209,25 @@ to \fIFILE\fR with \fB\-o\fR.
 .B doctor
 Diagnostic checklist \(em flags every degraded optional capability with a
 one-line fix.
+.TP
+.B version
+Prints the \fBMILOG_VERSION\fR and \fBMILOG_BUILT\fR stamp of the running
+milog, then one line per companion binary found (\fBmilog\-web\fR,
+\fBmilog\-tui\fR, \fBmilog\-probe\fR) with the version it reports.
+Also \fB\-\-version\fR and \fB\-V\fR.
+.TP
+.BR update " [\fB\-\-check\fR]"
+Downloads the latest release of \fBMILOG_RELEASE_REPO\fR (default
+\fBchud\-lori/milog\fR) for this OS and architecture, verifies it against the
+release's \fIchecksums.txt\fR, and replaces the running milog and every
+companion binary already installed. Each file is swapped with a rename, so a
+failed download or checksum leaves the install untouched. Refuses when a
+system package owns milog and prints the package-manager command instead.
+Never escalates; when the install directory is not writable it says to run
+\fBsudo milog update\fR. Prints restart commands for active
+\fBmilog.service\fR and \fBmilog\-probe.service\fR units.
+\fB\-\-check\fR only compares versions: exit 0 when up to date, 10 when a
+newer release exists.
 .SS Host audit
 .B audit
 runs point-in-time integrity scans. It reads no log files. Baselines and
@@ -424,6 +443,12 @@ sources when
 .BR docker (1)
 inspect is unavailable (default
 .IR /var/lib/docker ).
+.TP
+.B MILOG_RELEASE_REPO
+GitHub repository
+.B update
+installs from (default
+.BR chud\-lori/milog ).
 .PP
 See
 .B milog config
@@ -467,6 +492,10 @@ Success.
 .B 1
 Error \(em invalid arguments, unknown command, broken config, missing
 required tool. Diagnostic on stderr.
+.TP
+.B 10
+.B update \-\-check
+found a newer release.
 .SH EXAMPLES
 .TP
 Bash dashboard with default refresh:

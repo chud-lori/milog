@@ -190,6 +190,8 @@ milog audit [fim|persistence|ports|yara|accounts|rootkit] [baseline|check|status
 milog silence <rule_or_glob> <duration> [msg]
 milog config [init|add|rm|dir|set|edit]
 milog doctor               # diagnostic checklist
+milog version              # milog + companion binary versions
+milog update [--check]     # install the latest release (checksum-verified)
 milog help
 ```
 
