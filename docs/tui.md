@@ -96,6 +96,7 @@ Keys (inside the TUI):
 | `S`                      | active silences                                                       |
 | `s`                      | in alert history: silence the selected alert's rule                   |
 | `x`                      | in silences: clear the selected silence                               |
+| `i`                      | integrity view (audit drift from the last 7 days, newest first, from history DB) |
 
 Scrolling / long-view behavior is intentionally operator-oriented:
 the TUI keeps dense summaries on screen, caps the expensive top lists,
