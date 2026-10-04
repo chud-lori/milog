@@ -899,3 +899,112 @@ func TestMatchBpfLoad_CustomTightAllowlist(t *testing.T) {
 		t.Errorf("custom allowlist replaces; bpftrace should now fire, got %d hits", len(hits))
 	}
 }
+
+func TestMatchNet_MilogDeliverySilent(t *testing.T) {
+	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", "")
+	resetNetAllowlistCache()
+
+	cases := []NetEvent{
+		{Comm: "curl", Exe: "/usr/bin/curl", Cgroup: "/system.slice/milog.service", DAddr: "162.159.128.233", DPort: 443},
+		{Comm: "curl", Exe: "/usr/bin/curl", Cgroup: "/system.slice/milog-probe.service", DAddr: "162.159.137.232", DPort: 443},
+		{Comm: "curl", Exe: "/usr/local/bin/curl", Cgroup: "/system.slice/milog.service", DAddr: "2001:db8::1", DPort: 443, IsIPv6: true},
+	}
+	for _, ev := range cases {
+		if hits := MatchNet(ev); len(hits) != 0 {
+			t.Errorf("milog's own delivery should be silent: %+v → %+v", ev, hits)
+		}
+	}
+}
+
+func TestMatchNet_MilogLookalikesFire(t *testing.T) {
+	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", "")
+	resetNetAllowlistCache()
+
+	cases := []struct {
+		name string
+		ev   NetEvent
+	}{
+		{"curl outside milog's units", NetEvent{
+			Comm: "curl", Exe: "/usr/bin/curl", Cgroup: "/system.slice/nginx.service",
+		}},
+		{"curl in a user-manager unit named milog.service", NetEvent{
+			Comm: "curl", Exe: "/usr/bin/curl",
+			Cgroup: "/user.slice/user-1000.slice/user@1000.service/app.slice/milog.service",
+		}},
+		{"sub-cgroup of milog.service", NetEvent{
+			Comm: "curl", Exe: "/usr/bin/curl", Cgroup: "/system.slice/milog.service/x",
+		}},
+		{"non-curl binary in milog.service", NetEvent{
+			Comm: "nc", Exe: "/usr/bin/nc.openbsd", Cgroup: "/system.slice/milog.service",
+		}},
+		{"binary renamed to curl in milog.service", NetEvent{
+			Comm: "curl", Exe: "/tmp/curl", Cgroup: "/system.slice/milog-probe.service",
+		}},
+		{"process gone before /proc lookup", NetEvent{Comm: "curl"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			c.ev.DAddr, c.ev.DPort = "203.0.113.42", 443
+			if hits := MatchNet(c.ev); len(hits) != 1 {
+				t.Errorf("expected 1 hit, got %d: %+v", len(hits), hits)
+			}
+		})
+	}
+}
+
+func TestCgroupPathParse(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"unified", "0::/system.slice/milog.service\n", "/system.slice/milog.service"},
+		{"hybrid prefers unified",
+			"12:pids:/system.slice/milog.service\n1:name=systemd:/system.slice/legacy.service\n0::/system.slice/milog.service\n",
+			"/system.slice/milog.service"},
+		{"legacy v1", "4:memory:/x\n1:name=systemd:/system.slice/milog-probe.service\n", "/system.slice/milog-probe.service"},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := cgroupPath(c.in); got != c.want {
+				t.Errorf("cgroupPath = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestProcCommMatchesAllowlists(t *testing.T) {
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "YDService")
+	t.Setenv("MILOG_PROBE_PTRACE_DEBUGGERS", "YDService")
+	t.Setenv("MILOG_PROBE_KMOD_ALLOWLIST", "YDService")
+	t.Setenv("MILOG_PROBE_BPFLOAD_ALLOWLIST", "YDService")
+	resetFileRulesCache()
+	resetPtraceRulesCache()
+	resetKmodRulesCache()
+	resetBpfLoadRulesCache()
+
+	if hits := MatchFile(FileEvent{Comm: "ParseLoop", ProcComm: "YDService", Filename: "/etc/shadow"}); len(hits) != 0 {
+		t.Errorf("file: thread of allowlisted process should be silent, got %+v", hits)
+	}
+	if hits := MatchPtrace(PtraceEvent{Comm: "ParseLoop", ProcComm: "YDService", TargetPID: 1, Request: 16}); len(hits) != 0 {
+		t.Errorf("ptrace: thread of allowlisted process should be silent, got %+v", hits)
+	}
+	if hits := MatchKmod(KmodEvent{Comm: "ParseLoop", ProcComm: "YDService", Module: "x"}); len(hits) != 0 {
+		t.Errorf("kmod: thread of allowlisted process should be silent, got %+v", hits)
+	}
+	if hits := MatchBpfLoad(BpfLoadEvent{Comm: "ParseLoop", ProcComm: "YDService"}); len(hits) != 0 {
+		t.Errorf("bpf-load: thread of allowlisted process should be silent, got %+v", hits)
+	}
+
+	hits := MatchFile(FileEvent{Comm: "ParseLoop", ProcComm: "otheragent", Filename: "/etc/shadow"})
+	if len(hits) != 1 {
+		t.Fatalf("file: unlisted process should fire, got %d hits", len(hits))
+	}
+	if h := hits[0]; h.RuleKey != "file:sensitive_read:ParseLoop:/etc/shadow" || !strings.Contains(h.Body, "comm=ParseLoop proc=otheragent ") {
+		t.Errorf("unexpected hit: %+v", h)
+	}
+	hits = MatchFile(FileEvent{Comm: "cat", ProcComm: "cat", Filename: "/etc/shadow"})
+	if len(hits) != 1 || strings.Contains(hits[0].Body, "proc=") {
+		t.Errorf("proc= should be omitted when it equals comm: %+v", hits)
+	}
+}

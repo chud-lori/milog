@@ -33,6 +33,8 @@ quick start; this directory has everything else.
   tuning, anomaly detector
 - [**GeoIP enrichment**](geoip.md) — MaxMind license + `geoipupdate`
   weekly timer + the COUNTRY column
+- [**CrowdSec CTI enrichment**](crowdsec-cti.md) — opt-in IP reputation
+  in `attacker`, `suspects` and exploit/probe alerts, cached per IP
 - [**Troubleshooting**](troubleshooting.md) — `milog doctor`, common
   failure modes, where to look when something's wrong
 

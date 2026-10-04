@@ -42,6 +42,7 @@ Everything in-depth lives under [`docs/`](docs/) — skim the
 - [**`milog daemon`**](docs/daemon.md) — headless mode, systemd service, permissions
 - [**Kernel observability (`milog probe`)**](docs/probe.md) — eBPF sidecar, the 8 probes, `install-service`, allowlist tuning
 - [**GeoIP enrichment**](docs/geoip.md) — MaxMind license + weekly auto-refresh
+- [**CrowdSec CTI enrichment**](docs/crowdsec-cti.md) — opt-in IP reputation in `attacker`, `suspects` and exploit/probe alerts
 - [**Troubleshooting**](docs/troubleshooting.md) — `milog doctor` + common failure modes
 
 Plus: [ARCHITECTURE.md](ARCHITECTURE.md) for contributors and
@@ -150,6 +151,11 @@ milog alerts 24h
 sudo milog probe install-service
 sudo journalctl -u milog-probe.service -f
 ```
+
+The probe does not alert on milog's own webhook sends (`curl` inside
+`milog.service` or `milog-probe.service`). Its comm allowlists also
+match a thread's process name, so `YDService` covers that agent's
+`ParseLoop` thread. Tuning: [docs/probe.md](docs/probe.md).
 
 Full command list: `milog help`.
 

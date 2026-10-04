@@ -85,6 +85,7 @@ jobs:
           bash tests/smoke_followups.sh
           bash tests/smoke_ai_crawlers.sh
           bash tests/smoke_report.sh
+          bash tests/smoke_crowdsec_cti.sh
           bash tests/smoke_version_update.sh
 
       - name: Go vet
