@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-27-gfb319d8
-# MILOG_BUILT=2026-10-04T02:52:34Z
+# MILOG_VERSION=v0.6.0-35-gfc98f82
+# MILOG_BUILT=2026-10-04T03:48:24Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -1287,6 +1287,14 @@ history_write_audit() {
     if ! { printf 'BEGIN;\n%sCOMMIT;\n' "$sql"; } | sqlite3 "$HISTORY_DB" 2>/dev/null; then
         _dlog "history: audit write failed for $scanner"
     fi
+}
+
+# audit_event rows with ts >= since, newest first: local time, scanner, kind, subject (tab-separated).
+_history_audit_rows() {
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    sqlite3 -readonly -separator $'\t' "$HISTORY_DB" \
+        "SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'), scanner, kind, subject
+         FROM audit_event WHERE ts >= $1 ORDER BY ts DESC;"
 }
 
 history_prune() {
@@ -3857,9 +3865,7 @@ _audit_history_subcmd() {
     _history_precheck || return 1
 
     local since=$(( $(date +%s) - days * 86400 )) out
-    if ! out=$(sqlite3 -readonly -separator $'\t' "$HISTORY_DB" \
-            "SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'), scanner, kind, subject
-             FROM audit_event WHERE ts >= $since ORDER BY ts DESC;" 2>/dev/null); then
+    if ! out=$(_history_audit_rows "$since" 2>/dev/null); then
         echo -e "${Y}no audit history in $HISTORY_DB yet${NC}, the daemon creates it on start" >&2
         return 1
     fi
@@ -6549,7 +6555,7 @@ mode_replay() {
     echo
 }
 
-# milog report [window] [--html] [-o FILE]: static traffic / attacker / alert / anomaly summary.
+# milog report [window] [--html] [-o FILE]: static traffic / attacker / alert / anomaly / audit drift summary.
 
 # Stdin records, tab-separated: T title, M meta line, H section, P note, E empty state, C header cells, R row cells.
 _report_render() {
@@ -6699,6 +6705,42 @@ _report_alerts() {
     fi
 }
 
+_report_audit() {
+    local cutoff="$1" rows total n=0 ts scanner kind subject
+    printf 'H\tAudit drift\n'
+    if [[ "$HISTORY_ENABLED" != "1" ]]; then
+        printf 'E\tHistory is off (HISTORY_ENABLED=0), so audit drift is not recorded.\n'
+        return 0
+    fi
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        printf 'E\tsqlite3 is not installed, so audit drift cannot be read.\n'
+        return 0
+    fi
+    if [[ ! -f "$HISTORY_DB" ]]; then
+        printf 'E\tNo history DB at %s.\n' "$HISTORY_DB"
+        return 0
+    fi
+    if ! rows=$(_history_audit_rows "$cutoff" 2>&1); then
+        if [[ "$rows" == *"no such table: audit_event"* ]]; then
+            printf 'E\tNo audit_event table in %s yet. The daemon creates it when it next starts.\n' "$HISTORY_DB"
+        else
+            printf 'E\tCould not read %s: %s\n' "$HISTORY_DB" "$(printf '%s' "$rows" | tr '\t\n' '  ')"
+        fi
+        return 0
+    fi
+    if [[ -z "$rows" ]]; then
+        printf 'E\tNo audit drift recorded in this window.\n'
+        return 0
+    fi
+    total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+    if (( total > 50 )); then printf 'P\tShowing the latest 50 of %s.\n' "$total"; fi
+    printf 'C\tTime\tScanner\tKind\tSubject\n'
+    while IFS=$'\t' read -r ts scanner kind subject; do
+        (( ++n > 50 )) && break
+        printf 'R\t%s\t%s\t%s\t%s\n' "$ts" "$scanner" "$kind" "${subject//$'\t'/ }"
+    done <<< "$rows"
+}
+
 mode_report() {
     local window="7d" html=0 out="" secs now cutoff report tmp
     while (( $# )); do
@@ -6720,6 +6762,7 @@ mode_report() {
         printf 'M\t%s to %s\n' "$(_alerts_fmt_epoch "$cutoff")" "$(_alerts_fmt_epoch "$now")"
         _report_traffic "$cutoff"
         _report_alerts "$cutoff"
+        _report_audit "$cutoff"
     )
     if [[ -n "$out" ]]; then
         [[ -L "$out" ]] && { echo -e "${R}report: refusing to write through symlink: $out${NC}" >&2; return 1; }
@@ -8478,7 +8521,7 @@ _cmd_help() {
             ;;
         report)
             echo -e "${W}milog report [window] [--html] [-o FILE]${NC} — static report for sharing"
-            echo -e "  Traffic per app, top IPs by 4xx, alert fires per rule, anomalies."
+            echo -e "  Traffic per app, top IPs by 4xx, alert fires per rule, anomalies, audit drift."
             echo -e "  Markdown by default; ${C}--html${NC} writes one self-contained page. Windows as digest (default 7d)."
             ;;
         doctor)   echo -e "${W}milog doctor${NC} — diagnostic checklist" ;;
