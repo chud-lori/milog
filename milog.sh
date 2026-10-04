@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-3-gf2fc4d1
-# MILOG_BUILT=2026-10-04T02:41:30Z
+# MILOG_VERSION=v0.6.0-5-ga9fe543
+# MILOG_BUILT=2026-10-04T02:44:23Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -3889,7 +3889,7 @@ _tune_alert_noise() {
         fi
         # Attackers drive these counts, so muting them would mute attack detection.
         case "$key" in
-            exploit:*|audit:*)
+            exploit:*|audit:*|process:*|proc:*|net:*|file:*)
                 printf "  ${W}%s${NC}  ${D}%s fires, high volume: review the source, not silenced${NC}\n" "$key" "$count"
                 continue
                 ;;
