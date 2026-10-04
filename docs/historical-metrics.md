@@ -45,7 +45,19 @@ top_ip_hour (
     hits     INTEGER,
     PRIMARY KEY (ts_hour, app, ip)
 )
+
+audit_event (
+    ts       INTEGER,   -- epoch when the daemon stored the finding
+    scanner  TEXT,      -- fim, persistence, ports, yara, accounts, rootkit
+    kind     TEXT,      -- appeared, removed, modified, added, match, hint, ...
+    subject  TEXT       -- path, bind:port/proto, account file, or heuristic
+)
 ```
+
+`audit_event` gets a row when an audit scanner in the daemon reports a
+finding (`AUDIT_ENABLED=1`). A finding that keeps showing up on later
+checks is not stored again (details in [audit.md](audit.md#drift-history)). Read it with
+`milog audit history [days]` or the TUI integrity view (`i`).
 
 The daemon writes to `metrics_minute` once per minute and rolls up
 `top_ip_hour` once per hour (keeping the top N IPs per app per hour —
@@ -153,8 +165,8 @@ and use `milog monitor` ad hoc.
 ## Retention
 
 `HISTORY_RETAIN_DAYS` (default 30) bounds the DB size. The daemon runs
-a prune query once per day that deletes `metrics_minute` and
-`top_ip_hour` rows older than the retention window. Rough sizing: ~15
+a prune query once per day that deletes `metrics_minute`,
+`top_ip_hour` and `audit_event` rows older than the retention window. Rough sizing: ~15
 KB per app per day for `metrics_minute`, plus ~3 KB per app per hour
 for the hourly rollup — at 30d retention and 6 apps, expect ~3 MB.
 
