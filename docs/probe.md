@@ -19,7 +19,7 @@ own load — a verifier reject on one doesn't take the others down.
 
 | Probe          | BPF tracepoint                              | Rule keys it can fire                                                       |
 | -------------- | ------------------------------------------- | --------------------------------------------------------------------------- |
-| **exec**       | `sched:sched_process_exec`                  | `process:shell_from_web_worker:…`, `process:exec_from_tmp:<comm>`, `process:suid_escalation:…` |
+| **exec**       | `sched:sched_process_exec`                  | `process:shell_from_web_worker:…`, `process:exec_from_tmp:<comm>`, `process:suid_escalation:…`, `process:web_triggered_exec:…` |
 | **tcp**        | `sock:inet_sock_set_state`                  | `net:unexpected_outbound:<comm>`                                            |
 | **file**       | `syscalls:sys_enter_openat`                 | `file:sensitive_read:<comm>:<path>`                                         |
 | **ptrace**     | `syscalls:sys_enter_ptrace`                 | `proc:ptrace_inject:<comm>`                                                 |
@@ -31,6 +31,39 @@ own load — a verifier reject on one doesn't take the others down.
 Each BPF program is embedded into the Go binary as a CO-RE
 relocatable object — one binary works across kernels ≥ 4.18 with BTF
 available.
+
+## Web-triggered exec
+
+When a web server process (nginx, php-fpm, apache2, httpd, caddy,
+haproxy, unicorn, uwsgi) execs any program, the probe waits 3 seconds,
+then reads `$HOME/.cache/milog/alerts.log`. If an `exploit:` or `5xx:`
+alert was recorded between `MILOG_PROBE_WEB_EXEC_WINDOW` seconds before
+the exec and 3 seconds after it, the probe fires
+`process:web_triggered_exec:<parent>:<child>`. The body holds the exec
+details plus the newest matching alert's rule key, time and body, with
+backticks and control characters removed. For an exploit alert, that
+body is the request line.
+
+This alert is extra. The other exec rules fire as before, whether or
+not a request preceded the exec.
+
+The probe uses alerts.log instead of the access logs because the bash
+side has already classified each request there. It reads the file only
+after a web-worker exec, skips the read when the file has not changed
+within the window, and reads only its last 64 KB. Because the probe
+runs as root and the file belongs to your user, it refuses a symlink,
+a FIFO, or a file over 16 MB. The limits:
+
+- Any `exploit:` or `5xx:` alert in the window counts, not only the
+  request that caused the exec. On a host that is being scanned, an app
+  that execs on every request (`convert`, `ffmpeg`) can raise this alert.
+- An exploit row recorded more than 3 seconds after the exec is missed.
+  That happens when the exploit request stays open, for example a
+  reverse shell that keeps a php-fpm worker busy until it times out.
+- An exploit alert in cooldown (`ALERT_COOLDOWN`, 300s by default) or
+  under a silence is not written to alerts.log, so it cannot be matched.
+- A `5xx:` row holds the per-minute count, not a request line.
+- `--json` mode does not run this check.
 
 ## Install + start
 
@@ -173,6 +206,7 @@ lines. To change one: `sudoedit` the unit, `daemon-reload`, restart.
 | `MILOG_PROBE_SYSCALL_FLOOR`      | absolute floor for syscall-rate σ check       | Prevents low-volume false positives                          |
 | `MILOG_PROBE_SYSCALL_BURNIN`     | observations before σ baseline is trusted     | First N samples per PID feed Welford but don't fire          |
 | `MILOG_PROBE_BPFLOAD_ALLOWLIST`  | `milog-probe,systemd-udevd,…`                 | Set to a tight list to alert on every ad-hoc bpftrace        |
+| `MILOG_PROBE_WEB_EXEC_WINDOW`    | `30`                                          | Seconds an `exploit:` or `5xx:` alert links a later web-worker exec to it |
 
 ## Manage / debug
 

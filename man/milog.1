@@ -78,10 +78,12 @@ reports errors; warnings are allowed.
 .SS Per-app inspection
 .TP
 .B health
-Per-app totals \(em 2xx / 3xx / 4xx / 5xx counts.
+Per-app totals \(em 2xx / 3xx / 4xx / 5xx counts, plus the share of
+requests from AI crawler user-agents (GPTBot, ClaudeBot, PerplexityBot, …).
 .TP
 .BR top " [\fIN\fR]"
-Top \fIN\fR source IPs across all apps (default 10). Adds a country
+Top \fIN\fR source IPs across all apps (default 10). Ends with the
+AI-crawler share of all requests. Adds a country
 column when
 .B GEOIP_ENABLED=1
 and
