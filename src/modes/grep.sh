@@ -1,6 +1,4 @@
-# ==============================================================================
-# MODE: grep — filter-tail one source (any type: nginx / text / journal / docker)
-# ==============================================================================
+# milog grep <app> <pattern>: filtered tail of one source of any type.
 mode_grep() {
     local name="${1:-}" pattern="${2:-.}"
     if [[ -z "$name" ]]; then
@@ -17,6 +15,6 @@ mode_grep() {
         echo -e "${R}cannot build reader for $name${NC}" >&2; exit 1; }
     [[ -z "$cmd" ]] && { echo -e "${R}reader empty for $name${NC}" >&2; exit 1; }
     echo -e "${D}stream $matching | grep '$pattern'  (Ctrl+C)${NC}\n"
-    bash -c "$cmd" 2>/dev/null | grep --line-buffered -i "$pattern"
+    bash -c "$cmd" 2>/dev/null | grep --line-buffered -i "$pattern" | _tty_safe
 }
 

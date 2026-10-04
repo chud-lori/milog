@@ -1,14 +1,9 @@
-# ==============================================================================
-# MODE: probes — scanner / bot traffic by user-agent + protocol-level probes
-# Wide UA database covering security tools, mass scanners, SEO bots,
-# generic HTTP libs, AI crawlers, and non-HTTP protocol smuggling attempts.
-# ==============================================================================
+# milog probes: scanner, bot and crawler traffic by user-agent, plus non-HTTP protocol probes.
 mode_probes() {
     echo -e "${D}Watching scanner/bot traffic across all apps... (Ctrl+C)${NC}\n"
     local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
 
-    # Protocol-level: SSH banner, TLS ClientHello sent to plain HTTP (nginx logs
-    # the bytes as literal \xNN — double backslash so grep sees one).
+    # SSH banners and TLS ClientHellos sent to plain HTTP; nginx logs the bytes as literal \xNN.
     local pat='SSH-2\.0|\\x16\\x03|\\x00\\x00'
     # Security / pentest tools
     pat+='|masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster'
@@ -47,13 +42,12 @@ mode_probes() {
                 tail -F "$file" 2>/dev/null | \
                     grep --line-buffered -Ei "$pat" | \
                 while IFS= read -r line; do
-                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$line"
-                    # Fingerprint gate runs AFTER cooldown — see exploits.sh
-                    # for rationale. Scanner hits commonly match both rules.
+                    printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$(_tty_safe <<< "$line")"
+                    # Dedup with exploits, which often matches the same scanner line.
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_fire "Probe traffic: $app" "\`\`\`${line:0:1800}\`\`\`" 15844367 "probe:$app" &
+                        alert_fire "Probe traffic: $app" "$(_alert_fence "${line:0:1800}")" 15844367 "probe:$app" &
                     fi
                 done
             ) &

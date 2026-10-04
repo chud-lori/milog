@@ -1,14 +1,9 @@
-# ==============================================================================
-# HISTORY — SQLite-backed per-minute time series + hourly top-IP rollups
-# All writes go through a single sqlite3 invocation per call (heredoc),
-# per the plan's "don't spawn one process per app" rule.
-# ==============================================================================
+# History: SQLite per-minute metrics and hourly top-IP rollups, one sqlite3 process per write.
 
-# SQLite string literal escape: doubles embedded single quotes, wraps in ''.
+# Doubles single quotes and wraps the value in ''.
 _sql_quote() { local s="${1//\'/\'\'}"; printf "'%s'" "$s"; }
 
-# Portable "date at epoch" → log-line prefix (dd/Mon/yyyy:HH:MM). GNU date
-# takes `-d @TS`, BSD date takes `-r TS`. We just try both.
+# Epoch -> log timestamp prefix (dd/Mon/yyyy:HH:MM); tries GNU `date -d @` then BSD `date -r`.
 _cur_time_at() {
     local ts="$1"
     date -d "@${ts}" '+%d/%b/%Y:%H:%M' 2>/dev/null \
@@ -16,9 +11,7 @@ _cur_time_at() {
         || printf ''
 }
 
-# Create tables + indexes if missing. Idempotent; safe to call on every
-# daemon start. Disables history on any failure mode (missing sqlite3,
-# unwritable path) so the rest of the daemon keeps running.
+# Idempotent; any failure disables history so the daemon keeps running.
 history_init() {
     [[ "$HISTORY_ENABLED" != "1" ]] && return 0
 
@@ -68,9 +61,7 @@ SQL
     _dlog "history: schema ready at $HISTORY_DB"
 }
 
-# Insert one row per configured app for a completed minute. The timestamp
-# string must match the log format (dd/Mon/yyyy:HH:MM) so awk filters work.
-# p50/p95/p99 land as SQL NULL when the app has no $request_time samples.
+# cur_time must match the log's dd/Mon/yyyy:HH:MM prefix; percentiles land as NULL when there are no $request_time samples.
 history_write_minute() {
     [[ "$HISTORY_ENABLED" != "1" ]] && return 0
     local ts="$1" cur_time="$2"
@@ -95,9 +86,7 @@ history_write_minute() {
     fi
 }
 
-# Hourly top-IP rollup. Scans each app's log for lines prefixed with the
-# hour pattern (dd/Mon/yyyy:HH:), counts, and stores the top N. Lower N
-# caps the database size on servers with very bursty IP diversity.
+# Stores the top HISTORY_TOP_IP_N IPs per app for the hour.
 history_write_hour() {
     [[ "$HISTORY_ENABLED" != "1" ]] && return 0
     local ts_hour="$1"
@@ -126,8 +115,6 @@ history_write_hour() {
     fi
 }
 
-# Delete rows older than HISTORY_RETAIN_DAYS days from both tables. One
-# sqlite3 invocation, transactional. Called once per day from the daemon.
 history_prune() {
     [[ "$HISTORY_ENABLED" != "1" ]] && return 0
     [[ -f "$HISTORY_DB" ]] || return 0
@@ -147,8 +134,6 @@ SQL
     fi
 }
 
-# Gate for read-only history modes (trend / diff). Prints a friendly
-# message to stderr and returns 1 when sqlite3 or the DB are missing.
 _history_precheck() {
     if ! command -v sqlite3 >/dev/null 2>&1; then
         echo -e "${R}sqlite3 is not installed${NC}" >&2

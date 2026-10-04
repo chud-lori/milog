@@ -1,11 +1,5 @@
-// Package sysstat reads host metrics for MiLog's dashboard.
-//
-// CPU: sampled via /proc/stat delta — two reads 100ms apart. Memory:
-// /proc/meminfo. Disk: syscall.Statfs on the given path.
-//
-// On darwin (dev machines) the /proc-based readers return zero values
-// without error — the binary is still exercisable for development, the
-// dashboard just shows 0% until deployed on Linux.
+// Package sysstat reads CPU (/proc/stat), memory (/proc/meminfo) and disk
+// (statfs). Off Linux the /proc readers return zeros without error.
 package sysstat
 
 import (
@@ -31,9 +25,7 @@ type Disk struct {
 	TotalGB int64 // total in GiB
 }
 
-// CPU returns the instantaneous CPU-busy percentage. Two samples 100 ms
-// apart — adequate for a 3-second dashboard poll. SSE will want a
-// background sampler; that's a future refactor.
+// CPU returns busy percent from two /proc/stat reads 100 ms apart.
 func CPU() (int, error) {
 	if runtime.GOOS != "linux" {
 		return 0, nil
@@ -47,7 +39,7 @@ func CPU() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	// idle includes iowait (4th field); everything else is "busy".
+	// iowait counts as idle.
 	busyDelta := (b.total - b.idle) - (a.total - a.idle)
 	totalDelta := b.total - a.total
 	if totalDelta <= 0 {
@@ -65,8 +57,8 @@ func CPU() (int, error) {
 
 type cpuSample struct{ total, idle uint64 }
 
-// readStat reads the first `cpu ...` line of /proc/stat and sums fields.
-// Field order (Linux): user nice system idle iowait irq softirq steal guest guest_nice
+// readStat sums the first `cpu` line of /proc/stat:
+// user nice system idle iowait irq softirq steal guest guest_nice.
 func readStat() (cpuSample, error) {
 	f, err := os.Open("/proc/stat")
 	if err != nil {
@@ -89,7 +81,6 @@ func readStat() (cpuSample, error) {
 			return cpuSample{}, err
 		}
 		s.total += n
-		// idle = field 3 (0-indexed) ; include iowait (field 4) as "not busy"
 		if i == 3 || i == 4 {
 			s.idle += n
 		}
@@ -97,8 +88,7 @@ func readStat() (cpuSample, error) {
 	return s, nil
 }
 
-// Mem returns memory usage. Uses MemAvailable when available (kernel >=
-// 3.14, ubiquitous now); falls back to MemFree on older kernels.
+// Mem prefers MemAvailable (kernel 3.14+) and falls back to MemFree.
 func Mem() (Memory, error) {
 	if runtime.GOOS != "linux" {
 		return Memory{}, nil
@@ -138,8 +128,7 @@ func Mem() (Memory, error) {
 	}, nil
 }
 
-// parseMeminfoKB extracts the numeric kB value from a /proc/meminfo line
-// shaped "KeyName: 12345 kB".
+// parseMeminfoKB reads the number from a "KeyName: 12345 kB" line.
 func parseMeminfoKB(line string) int64 {
 	fields := strings.Fields(line)
 	if len(fields) < 2 {
@@ -152,8 +141,7 @@ func parseMeminfoKB(line string) int64 {
 	return n
 }
 
-// DiskAt returns disk usage for the filesystem containing `path`. Uses
-// statfs — works on both Linux and darwin without code branches.
+// DiskAt returns usage for the filesystem containing path.
 func DiskAt(path string) (Disk, error) {
 	var s syscall.Statfs_t
 	if err := syscall.Statfs(path, &s); err != nil {
