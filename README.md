@@ -52,8 +52,8 @@ server hardening.
 
 Linux, bash 4+, coreutils, `ps`, `df`, `uptime`, read access to
 `/var/log/nginx/*.access.log`. Everything else (gawk, curl, sqlite3,
-optionally mmdblookup, plus the `milog-web` / `milog-tui` Go binaries)
-is handled by `install.sh`.
+optionally mmdblookup, plus the `milog-web` / `milog-tui` / `milog-probe`
+Go binaries) is handled by `install.sh`.
 
 ## Install
 
@@ -79,8 +79,8 @@ sudo apk add --allow-untrusted ./milog.apk
 
 Replace `<VER>` with the [latest release tag](https://github.com/chud-lori/milog/releases/latest)
 (or omit the version and use the unversioned `latest` redirect manually).
-The packages drop `milog`, `milog-web`, and `milog-tui` into `/usr/bin`,
-plus shell completions and docs under `/usr/share`.
+The packages drop `milog`, `milog-web`, `milog-tui`, and `milog-probe` into
+`/usr/bin`, plus shell completions, the man page, and docs under `/usr/share`.
 
 ### Curl one-liner (Linux: apt / dnf / yum / pacman / apk)
 
@@ -167,8 +167,8 @@ milog tui          # Charm Bubble Tea TUI (richer panels, help footer, same data
 milog rate         # nginx-only req/min dashboard
 milog daemon       # headless — fire alerts, no TUI
 
-milog health       # 2xx/3xx/4xx/5xx totals per app
-milog top [N]              # top N source IPs
+milog health       # 2xx/3xx/4xx/5xx totals and AI-crawler share per app
+milog top [N]              # top N source IPs, plus AI-crawler share
 milog top-paths [N]        # top N URLs: req / 4xx / 5xx / p95 per path
 milog slow [N]             # slowest endpoints by p95
 milog stats <app>          # hourly request histogram

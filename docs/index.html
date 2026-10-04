@@ -288,6 +288,7 @@
   .kv th { color: var(--fg-3); font-weight: 600; font-size: 12.5px; font-family: var(--mono); }
   .kv td:first-child { font-family: var(--mono); font-size: 13px; color: var(--fg); white-space: nowrap; }
   .kv td:last-child { color: var(--fg-2); }
+  .kv td { overflow-wrap: anywhere; }
 
   details.more {
     margin-top: 18px; border: 1px solid var(--border);
@@ -405,10 +406,10 @@
     </p>
 
     <p class="meta-row">
-      <span>v0.5.3</span>
-      <span>GPL, single file</span>
+      <span>v0.6.0</span>
+      <span>MIT, single file</span>
       <span>bash 4+, Linux</span>
-      <span>apt / dnf / yum / pacman</span>
+      <span>apt / dnf / yum / pacman / apk</span>
     </p>
 
     <div class="run">
@@ -416,7 +417,7 @@
       <button class="copy" type="button" data-copy="install-cmd">copy</button>
     </div>
     <p class="alt">
-      Prefer to read it first? <a href="https://github.com/chud-lori/milog/blob/main/install.sh">install.sh</a> is 500 lines and does what it says.
+      Prefer to read it first? <a href="https://github.com/chud-lori/milog/blob/main/install.sh">install.sh</a> is plain bash. It runs on Linux only and exits on any other OS before installing anything.
     </p>
   </div>
 </div>
@@ -426,9 +427,11 @@
     <h2>SURFACES</h2>
     <p class="title">Six things it watches, one alert pipeline</p>
     <p class="intro">
-      Everything below fires through the same rules, with the same per-rule
-      cooldown and the same cross-rule dedup keyed on (ip, path). Turning on a
-      new surface does not mean a new place to configure alerts.
+      Everything below fires through one alert pipeline, with the same
+      per-rule cooldown, silences, routing and hooks. Request-log rules also
+      share a dedup keyed on (ip, path), so a line that matches two rules alerts
+      once. Turning on a new surface does not mean a new place to configure
+      alerts.
     </p>
 
     <div class="surfaces">
@@ -470,7 +473,7 @@
         <ul>
           <li>zgrab, masscan, nikto, sqlmap</li>
           <li>Shodan, CensysInspect, bare HTTP libraries</li>
-          <li>AI crawlers: GPTBot, Claude-Web</li>
+          <li>AI crawlers: GPTBot, ClaudeBot, CCBot</li>
         </ul>
       </div>
 
@@ -481,8 +484,8 @@
           server at all, so it works on a host that serves nothing.
         </p>
         <ul>
-          <li>FIM over /etc, binaries, cron and ~/.ssh</li>
-          <li>Persistence: services, timers, MOTD, rc.local</li>
+          <li>FIM over passwd, shadow, sudoers, crontab, sshd_config, authorized_keys</li>
+          <li>Persistence: cron dirs, systemd services and timers, rc.local, ld.so.preload</li>
           <li>Listening ports, passwd and sudoers, SSH keys</li>
           <li>YARA over the webroot, rootkit heuristics</li>
         </ul>
@@ -495,8 +498,9 @@
           tail never sees.
         </p>
         <ul>
-          <li><code>exec</code> outside the allowlist, <code>tcp</code> to non-allowlisted CIDRs (milog's own alert sends excepted)</li>
-          <li><code>file</code> writes to /etc and binaries</li>
+          <li><code>exec</code>: a shell under a web worker, a binary run from /tmp</li>
+          <li><code>tcp</code> connects to destinations outside the allowlisted CIDRs, except milog's own alert sends</li>
+          <li><code>file</code> opens of shadow, sudoers and SSH config by processes outside the allowlist</li>
           <li><code>ptrace</code>, <code>kmod</code>, <code>bpf-load</code></li>
           <li>Retransmits and syscall rate, Welford sigma</li>
         </ul>
@@ -511,7 +515,10 @@
     <p class="title">Every command</p>
     <p class="intro">
       The same list <code>milog help</code> prints. Any command takes
-      <code>--help</code> for its own detail.
+      <code>--help</code> for its own detail. Before any log source is
+      configured, only help, config, doctor, install, completions, alert,
+      alerts, silence, audit, probe and bench run; the rest exit and point at
+      <code>milog config init</code>.
     </p>
 
     <div class="filter-bar">
@@ -555,7 +562,7 @@
       <div class="group">
         <h3>ALERTING</h3>
         <dl class="cmds">
-          <div class="cmd"><dt>milog alert on [url]</dt><dd>Turn alerts on and install the systemd service.</dd></div>
+          <div class="cmd"><dt>milog alert on [url]</dt><dd>Turn alerts on and install milog.service, which runs as the user who ran sudo. <span class="hint">Discord webhook URL; sudo for the service</span></dd></div>
           <div class="cmd"><dt>milog alert off</dt><dd>Turn alerts off and stop the service.</dd></div>
           <div class="cmd"><dt>milog alert status</dt><dd>Webhook, service and recent-fire state.</dd></div>
           <div class="cmd"><dt>milog alert test</dt><dd>Send one test message now.</dd></div>
@@ -568,13 +575,13 @@
       <div class="group">
         <h3>TAILING</h3>
         <dl class="cmds">
-          <div class="cmd"><dt>milog</dt><dd>Tail every source, colour prefixed by app. <span class="hint">the default with no arguments</span></dd></div>
+          <div class="cmd"><dt>milog logs</dt><dd>Tail every source, colour prefixed by app. <span class="hint">also what bare milog does</span></dd></div>
           <div class="cmd"><dt>milog &lt;app&gt;</dt><dd>Raw tail of one source.</dd></div>
           <div class="cmd"><dt>milog grep &lt;app&gt; &lt;pattern&gt;</dt><dd>Filtered tail of one source.</dd></div>
           <div class="cmd"><dt>milog errors</dt><dd>4xx, 5xx and app-error patterns live. <span class="hint">--since for a summary instead</span></dd></div>
           <div class="cmd"><dt>milog exploits</dt><dd>LFI, RCE, SQLi, XSS and infra-probe payloads only.</dd></div>
           <div class="cmd"><dt>milog probes</dt><dd>Scanner and bot traffic only.</dd></div>
-          <div class="cmd"><dt>milog patterns</dt><dd>App error signatures: panics, OOM, stack traces.</dd></div>
+          <div class="cmd"><dt>milog patterns</dt><dd>App error signatures: panics, OOM, stack traces. <span class="hint">milog patterns list prints the catalog</span></dd></div>
         </dl>
       </div>
 
@@ -596,7 +603,7 @@
       <div class="group">
         <h3>WEB DASHBOARD</h3>
         <dl class="cmds">
-          <div class="cmd"><dt>milog web</dt><dd>Start the read-only dashboard. <span class="hint">token gated, loopback only by default</span></dd></div>
+          <div class="cmd"><dt>milog web</dt><dd>Start the read-only dashboard. <span class="hint">data routes need the token, /static does not; loopback only unless --bind ADDR --trust</span></dd></div>
           <div class="cmd"><dt>milog web stop</dt><dd>Stop it, whether systemd or foreground started it.</dd></div>
           <div class="cmd"><dt>milog web status</dt><dd>Running? On which port?</dd></div>
           <div class="cmd"><dt>milog web install-service</dt><dd>Install and start the systemd user unit.</dd></div>
@@ -616,10 +623,11 @@
           <div class="cmd"><dt>milog config dir &lt;path&gt;</dt><dd>Set LOG_DIR.</dd></div>
           <div class="cmd"><dt>milog config set &lt;k&gt; &lt;v&gt;</dt><dd>Set any variable: REFRESH, THRESH_*, and the rest.</dd></div>
           <div class="cmd"><dt>milog config edit</dt><dd>Open the config in $EDITOR.</dd></div>
-          <div class="cmd"><dt>milog doctor</dt><dd>Checklist: tools, logs, log format, webhook, history, geoip, systemd.</dd></div>
+          <div class="cmd"><dt>milog doctor</dt><dd>Checklist: tools, logs, log format, alerting, history, geoip, web, systemd. <span class="hint">counts alert deliveries that failed in the last 24h</span></dd></div>
           <div class="cmd"><dt>milog install &lt;feature&gt;</dt><dd>Add an optional feature: geoip, web, history.</dd></div>
           <div class="cmd"><dt>milog bench [--full]</dt><dd>Benchmark against synthetic fixtures.</dd></div>
           <div class="cmd"><dt>milog completions &lt;shell&gt;</dt><dd>Install or print bash, zsh or fish completions.</dd></div>
+          <div class="cmd"><dt>milog help</dt><dd>Print the command list.</dd></div>
         </dl>
       </div>
 
@@ -641,7 +649,7 @@
       nginx.
     </p>
 
-    <pre class="block"><code><span class="dim"># ~/.config/milog/config</span>
+    <pre class="block"><code><span class="dim"># ~/.config/milog/config.sh</span>
 LOGS=(
   api                                  <span class="dim"># $LOG_DIR/api.access.log</span>
   nginx:storefront                     <span class="dim"># the same thing, said explicitly</span>
@@ -658,9 +666,9 @@ LOGS=(
       <tbody>
         <tr><td>api</td><td>$LOG_DIR/api.access.log</td><td>everything</td></tr>
         <tr><td>nginx:api</td><td>the same file, explicitly</td><td>everything</td></tr>
-        <tr><td>text:name:/path</td><td>that file</td><td>tail, grep, search</td></tr>
-        <tr><td>journal:unit</td><td>journalctl -u unit -f</td><td>tail, grep, search</td></tr>
-        <tr><td>docker:name</td><td>the container JSON log</td><td>tail, grep, search</td></tr>
+        <tr><td>text:name:/path</td><td>that file</td><td>tail, grep, search, errors, patterns</td></tr>
+        <tr><td>journal:unit</td><td>journalctl -u unit -f</td><td>tail, grep, search, errors, patterns</td></tr>
+        <tr><td>docker:name</td><td>the container JSON log</td><td>tail, grep, search, errors, patterns</td></tr>
       </tbody>
     </table>
     <p class="intro" style="margin-top: 14px;">
@@ -673,8 +681,9 @@ LOGS=(
       <summary>Environment overrides, every key</summary>
       <div class="inner">
         <p style="color: var(--fg-2); font-size: 14px; margin-top: 0;">
-          Every config key has a <code>MILOG_</code> environment twin that wins
-          over the file, so one run can differ without editing anything.
+          These environment variables win over the config file, so one run can
+          differ without editing anything. <code>MILOG_APPS</code> replaces
+          <code>LOGS</code>.
         </p>
         <pre class="block"><code>MILOG_CONFIG            MILOG_LOG_DIR           MILOG_REFRESH
 MILOG_ALERTS_ENABLED    MILOG_ALERT_ROUTES      MILOG_ALERT_COOLDOWN
@@ -683,8 +692,14 @@ MILOG_DISCORD_WEBHOOK   MILOG_SLACK_WEBHOOK     MILOG_TELEGRAM_BOT_TOKEN
 MILOG_TELEGRAM_CHAT_ID  MILOG_MATRIX_HOMESERVER MILOG_MATRIX_ROOM
 MILOG_MATRIX_TOKEN      MILOG_WEBHOOK_URL       MILOG_WEBHOOK_TEMPLATE
 MILOG_WEBHOOK_CONTENT_TYPE  MILOG_HOOKS_DIR
+MILOG_APPS              MILOG_AUDIT_ENABLED     MILOG_AUDIT_FIM_INTERVAL
+MILOG_AUDIT_PERSISTENCE_INTERVAL  MILOG_AUDIT_PORTS_INTERVAL
+MILOG_AUDIT_YARA_INTERVAL  MILOG_AUDIT_YARA_PATHS  MILOG_AUDIT_YARA_RULES_DIR
+MILOG_AUDIT_ACCOUNTS_INTERVAL  MILOG_AUDIT_ACCOUNTS_PATHS
+MILOG_AUDIT_ROOTKIT_INTERVAL
 MILOG_HISTORY_ENABLED   MILOG_HISTORY_DB        MILOG_ANOMALY_ENABLED
 MILOG_ANOMALY_SIGMA     MILOG_ANOMALY_MIN_DAYS  MILOG_ANOMALY_FLOOR_REQ
+MILOG_ANOMALY_FLOOR_C5XX  MILOG_ANOMALY_FLOOR_P95
 MILOG_PATTERNS_ENABLED  MILOG_SLOW_EXCLUDE_PATHS
 MILOG_GEOIP_ENABLED     MILOG_MMDB_PATH         MILOG_DOCKER_ROOT
 MILOG_WEB_PORT          MILOG_WEB_BIND</code></pre>
@@ -710,10 +725,21 @@ MILOG_WEB_PORT          MILOG_WEB_BIND</code></pre>
         <h3>Install</h3>
         <pre class="block"><code>curl -fsSL https://raw.githubusercontent.com/chud-lori/milog/main/install.sh | sudo bash</code></pre>
         <p class="note">
-          Drops <code>milog</code> into /usr/local/bin with the
-          <code>milog-tui</code> and <code>milog-web</code> binaries, and pulls
-          gawk, curl and sqlite3 through apt, dnf, yum or pacman. It stops with
-          an error on a host with none of those.
+          Linux only. Drops <code>milog</code> into /usr/local/bin, pulls gawk,
+          curl and sqlite3 through apt, dnf, yum, pacman or apk, and stops with
+          an error on a host with none of those. The <code>milog-web</code>,
+          <code>milog-tui</code> and <code>milog-probe</code> binaries come from
+          the latest release, and each archive is checked against that
+          release's <code>checksums.txt</code> (SHA-256); a mismatch aborts the
+          install. <code>checksums.txt</code> is not signed, so this catches a
+          corrupted or swapped download, not a compromised release.
+          <code>milog.sh</code> itself is fetched from the main branch and is
+          not checksummed.
+        </p>
+        <p class="note">
+          The <a href="https://github.com/chud-lori/milog/releases/latest">release page</a>
+          also has <code>.deb</code>, <code>.rpm</code> and <code>.apk</code>
+          packages for amd64 and arm64.
         </p>
       </li>
       <li>
@@ -730,9 +756,14 @@ milog monitor    <span class="dim"># the dashboard</span></code></pre>
         <pre class="block"><code>sudo milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'
 milog alert test</code></pre>
         <p class="note">
-          Installs the systemd unit and fires one message so you know it works.
-          Slack, Telegram and Matrix are configured the same way, in
-          <a href="https://github.com/chud-lori/milog/blob/main/docs/alerts.md">docs/alerts.md</a>.
+          <code>alert on</code> writes the Discord webhook to your config and
+          installs <code>milog.service</code>, which runs as the user who ran
+          sudo. <code>alert test</code> sends one message to every configured
+          destination. Slack, Telegram, Matrix and a generic webhook are set
+          with <code>milog config set</code>, described in
+          <a href="https://github.com/chud-lori/milog/blob/main/docs/alerts.md">docs/alerts.md</a>;
+          <code>alert on</code> still wants a Discord webhook before it installs
+          the service.
         </p>
       </li>
       <li>
@@ -765,7 +796,10 @@ milog auto-tune 7</code></pre>
 sudo journalctl -u milog-probe.service -f</code></pre>
         <p class="note">
           Catches what a log tail structurally cannot: the process that started
-          and exited between two reads. Same webhooks, same cooldown. Details in
+          and exited between two reads. Same webhooks, same cooldown. The unit
+          runs the probe as root, limited by a systemd capability bounding set,
+          and the alerts it raises run as the user who ran sudo, through that
+          user's config. Details in
           <a href="https://github.com/chud-lori/milog/blob/main/docs/probe.md">docs/probe.md</a>.
         </p>
       </li>
@@ -855,9 +889,10 @@ sudo journalctl -u milog-probe.service -f</code></pre>
       </li>
       <li>
         <strong>No black boxes.</strong>
-        Every decision the daemon makes goes to stderr: fired, suppressed by
-        cooldown, collapsed by dedup.
-        <code>journalctl -u milog.service -f</code> tells the whole story.
+        Every fire is written to <code>alerts.log</code> before any destination
+        is tried, and <code>milog alerts</code> reads it back. A delivery that
+        fails goes to <code>send_failures.log</code>, and
+        <code>milog doctor</code> reports the last 24 hours of them.
       </li>
     </ul>
   </div>
