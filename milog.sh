@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-35-gfc98f82
-# MILOG_BUILT=2026-10-04T03:48:24Z
+# MILOG_VERSION=v0.6.0-38-gaac50f5
+# MILOG_BUILT=2026-10-04T03:37:53Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -114,6 +114,9 @@ SLOW_EXCLUDE_PATHS="/ws/* /socket.io/*"
 GEOIP_ENABLED=0
 MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
+# CrowdSec CTI reputation lookups; empty means milog never contacts the API.
+CROWDSEC_CTI_KEY=""
+
 # History needs sqlite3; the daemon writes one row per app per minute.
 HISTORY_ENABLED=0
 HISTORY_DB="$HOME/.local/share/milog/metrics.db"
@@ -189,6 +192,7 @@ fi
 [[ -n "${MILOG_MATRIX_ROOM:-}"        ]] && MATRIX_ROOM="$MILOG_MATRIX_ROOM"
 [[ -n "${MILOG_GEOIP_ENABLED:-}"   ]] && GEOIP_ENABLED="$MILOG_GEOIP_ENABLED"
 [[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
+[[ -n "${MILOG_CROWDSEC_CTI_KEY:-}" ]] && CROWDSEC_CTI_KEY="$MILOG_CROWDSEC_CTI_KEY"
 [[ -n "${MILOG_HISTORY_ENABLED:-}" ]] && HISTORY_ENABLED="$MILOG_HISTORY_ENABLED"
 [[ -n "${MILOG_HISTORY_DB:-}"      ]] && HISTORY_DB="$MILOG_HISTORY_DB"
 [[ -n "${MILOG_ANOMALY_ENABLED:-}"   ]] && ANOMALY_ENABLED="$MILOG_ANOMALY_ENABLED"
@@ -1289,14 +1293,6 @@ history_write_audit() {
     fi
 }
 
-# audit_event rows with ts >= since, newest first: local time, scanner, kind, subject (tab-separated).
-_history_audit_rows() {
-    [[ "$1" =~ ^[0-9]+$ ]] || return 1
-    sqlite3 -readonly -separator $'\t' "$HISTORY_DB" \
-        "SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'), scanner, kind, subject
-         FROM audit_event WHERE ts >= $1 ORDER BY ts DESC;"
-}
-
 history_prune() {
     [[ "$HISTORY_ENABLED" != "1" ]] && return 0
     [[ -f "$HISTORY_DB" ]] || return 0
@@ -1518,6 +1514,86 @@ geoip_country() {
     out=$(mmdblookup --file "$MMDB_PATH" --ip "$1" country iso_code 2>/dev/null \
           | awk -F'"' 'NF>=3 {print $2; exit}')
     printf '%s' "${out:-—}"
+}
+
+# Prints "<reputation> (<behaviors>)", or "unknown" when CTI has no record; empty when off or failing.
+# Results are cached per IP for a day; pass `cached` to skip the network. Failures land in cti.err for doctor.
+cti_lookup() {
+    local ip="${1-}" dir="$ALERT_STATE_DIR/cti"
+    [[ -n "${CROWDSEC_CTI_KEY:-}" ]] || return 0
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || ( "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:.]*[0-9a-fA-F][0-9a-fA-F:.]*$ ) ]] || return 0
+    ip=$(printf '%s' "$ip" | tr A-F a-f)
+    local f="$dir/$ip" mtime
+    if [[ -f "$f" ]]; then
+        mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+        if (( $(date +%s) - mtime < 86400 )); then
+            cat "$f"
+            return 0
+        fi
+    fi
+    [[ "${2:-}" == cached ]] && return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    # After a 429 every request would fail too, so pause lookups for 15 minutes.
+    [[ -n "$(find "$dir/.backoff" -mmin -15 2>/dev/null)" ]] && return 0
+    local err="$ALERT_STATE_DIR/cti.err"
+    # The key goes into a curl config on stdin, so a quote or newline would break out of it.
+    if [[ "$CROWDSEC_CTI_KEY" == *[\"\\[:space:]]* ]]; then
+        printf '%s\tCROWDSEC_CTI_KEY contains quotes, backslashes or whitespace\n' "$(date +%s)" > "$err"
+        return 0
+    fi
+    local resp code="" summary="" body
+    resp=$(mktemp "$dir/.resp.XXXXXX" 2>/dev/null) || return 0
+    code=$(printf 'header = "x-api-key: %s"\n' "$CROWDSEC_CTI_KEY" \
+        | curl -s -m 3 --max-filesize 65536 -K - -o "$resp" -w '%{http_code}' \
+              "https://cti.api.crowdsec.net/v2/smoke/$ip" 2>/dev/null) || true
+    case "$code" in
+        200) summary=$(tr -d '\n' < "$resp" | _cti_summary) ;;
+        # Only a JSON error object counts as "no record"; a proxy or HTML 404 is a failure.
+        404) body=$(tr -d '[:space:]' < "$resp")
+             [[ "$body" == "{"* && "$body" != *'"ip"'* ]] && summary="unknown" ;;
+        429) touch "$dir/.backoff" ;;
+    esac
+    rm -f "$resp"
+    if [[ -z "$summary" ]]; then
+        printf '%s\tHTTP %s for %s\n' "$(date +%s)" "${code:-000}" "$ip" > "$err"
+        return 0
+    fi
+    rm -f "$err"
+    printf '%s\n' "$summary" > "$f"
+    printf '%s\n' "$summary"
+}
+
+# Reads one smoke-API JSON object on a single line; output is limited to [A-Za-z0-9 :._,()/-].
+_cti_summary() {
+    awk '
+        { s = s $0 }
+        END {
+            if (!match(s, /"reputation" *: *"[a-z_]*"/)) exit
+            rep = substr(s, RSTART, RLENGTH)
+            sub(/^"reputation" *: *"/, "", rep); sub(/"$/, "", rep)
+            labels = ""; n = 0
+            if (match(s, /"behaviors" *: *\[[^]]*\]/)) {
+                b = substr(s, RSTART, RLENGTH)
+                while (n < 3 && match(b, /"label" *: *"[^"]*"/)) {
+                    l = substr(b, RSTART, RLENGTH)
+                    b = substr(b, RSTART + RLENGTH)
+                    sub(/^"label" *: *"/, "", l); sub(/"$/, "", l)
+                    labels = labels (n++ ? ", " : "") l
+                }
+            }
+            out = rep (labels != "" ? " (" labels ")" : "")
+            gsub(/[^A-Za-z0-9 :._,()\/-]/, "", out)
+            print out
+        }'
+}
+
+# Alert-body suffix for exploit and probe alerts; looks up only when alerts are on.
+cti_alert_note() {
+    [[ "${ALERTS_ENABLED:-0}" == "1" ]] || return 0
+    local s; s=$(cti_lookup "${1-}")
+    [[ -n "$s" ]] && printf '\nCrowdSec: %s' "$s"
+    return 0
 }
 
 # p95 for the monitor row, cached per app per minute so a 5s refresh doesn't rescan the log.
@@ -2383,6 +2459,8 @@ mode_attacker() {
     printf "  %-14s %s\n"  "first seen:" "${first_seen:-?}"
     printf "  %-14s %s\n"  "last seen:"  "${last_seen:-?}"
     printf "  %-14s %d of %d\n" "apps touched:" "$apps_hit" "${#LOGS[@]}"
+    local cti; cti=$(cti_lookup "$ip")
+    [[ -n "$cti" ]] && printf "  %-14s %s\n" "crowdsec:" "$cti"
 
     echo -e "\n  ${W}per-app${NC}"
     awk -F'\t' '
@@ -3865,7 +3943,9 @@ _audit_history_subcmd() {
     _history_precheck || return 1
 
     local since=$(( $(date +%s) - days * 86400 )) out
-    if ! out=$(_history_audit_rows "$since" 2>/dev/null); then
+    if ! out=$(sqlite3 -readonly -separator $'\t' "$HISTORY_DB" \
+            "SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'), scanner, kind, subject
+             FROM audit_event WHERE ts >= $since ORDER BY ts DESC;" 2>/dev/null); then
         echo -e "${Y}no audit history in $HISTORY_DB yet${NC}, the daemon creates it on start" >&2
         return 1
     fi
@@ -4340,6 +4420,9 @@ config_init() {
 # GEOIP_ENABLED=0
 # MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
+# CrowdSec CTI reputation in attacker, suspects and exploit/probe alerts. Free key at app.crowdsec.net.
+# CROWDSEC_CTI_KEY=""
+
 # Historical metrics — requires sqlite3; writes from `milog daemon` only.
 # HISTORY_ENABLED=0
 # HISTORY_DB="$HOME/.local/share/milog/metrics.db"
@@ -4494,7 +4577,7 @@ config_validate() {
         ALERT_LOG_MAX_BYTES ALERT_ROUTES
         HOOKS_DIR ALERT_HOOK_TIMEOUT
         P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
-        GEOIP_ENABLED MMDB_PATH
+        GEOIP_ENABLED MMDB_PATH CROWDSEC_CTI_KEY
         HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS HISTORY_TOP_IP_N
         WEB_PORT WEB_BIND WEB_STATE_DIR WEB_TOKEN_FILE
         THRESH_REQ_WARN THRESH_REQ_CRIT
@@ -5204,6 +5287,21 @@ mode_doctor() {
         fi
     fi
 
+    _doc_head "crowdsec cti"
+    if [[ -z "${CROWDSEC_CTI_KEY:-}" ]]; then
+        _doc_ok "off  (CROWDSEC_CTI_KEY empty, no lookups)"
+    elif [[ -s "$ALERT_STATE_DIR/cti.err" ]]; then
+        local cti_paused=""
+        [[ -n "$(find "$ALERT_STATE_DIR/cti/.backoff" -mmin -15 2>/dev/null)" ]] && cti_paused="  (lookups paused for 15 min)"
+        _doc_warn "last lookup failed: $(cut -f2 "$ALERT_STATE_DIR/cti.err")${cti_paused}" \
+                  "401/403: key rejected; 429: rate limit hit; 000: no answer within 3s"
+        warn=$(( warn + 1 ))
+    else
+        local cti_cached
+        cti_cached=$(find "$ALERT_STATE_DIR/cti" -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+        _doc_ok "on  (${cti_cached} IPs cached in $ALERT_STATE_DIR/cti)"
+    fi
+
     # Web dashboard.
     _doc_head "web dashboard"
     local web_bin
@@ -5491,7 +5589,7 @@ mode_exploits() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "exploit:$app:$cat_slug" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_fire "Exploit attempt: $app / $cat_slug" "$(_alert_fence "${line:0:1800}")" 15158332 "exploit:$app:$cat_slug" &
+                        alert_fire "Exploit attempt: $app / $cat_slug" "$(_alert_fence "${line:0:1800}")$(cti_alert_note "${line%% *}")" 15158332 "exploit:$app:$cat_slug" &
                     fi
                 done
             ) &
@@ -6427,7 +6525,7 @@ mode_probes() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_fire "Probe traffic: $app" "$(_alert_fence "${line:0:1800}")" 15844367 "probe:$app" &
+                        alert_fire "Probe traffic: $app" "$(_alert_fence "${line:0:1800}")$(cti_alert_note "${line%% *}")" 15844367 "probe:$app" &
                     fi
                 done
             ) &
@@ -6555,7 +6653,7 @@ mode_replay() {
     echo
 }
 
-# milog report [window] [--html] [-o FILE]: static traffic / attacker / alert / anomaly / audit drift summary.
+# milog report [window] [--html] [-o FILE]: static traffic / attacker / alert / anomaly summary.
 
 # Stdin records, tab-separated: T title, M meta line, H section, P note, E empty state, C header cells, R row cells.
 _report_render() {
@@ -6705,42 +6803,6 @@ _report_alerts() {
     fi
 }
 
-_report_audit() {
-    local cutoff="$1" rows total n=0 ts scanner kind subject
-    printf 'H\tAudit drift\n'
-    if [[ "$HISTORY_ENABLED" != "1" ]]; then
-        printf 'E\tHistory is off (HISTORY_ENABLED=0), so audit drift is not recorded.\n'
-        return 0
-    fi
-    if ! command -v sqlite3 >/dev/null 2>&1; then
-        printf 'E\tsqlite3 is not installed, so audit drift cannot be read.\n'
-        return 0
-    fi
-    if [[ ! -f "$HISTORY_DB" ]]; then
-        printf 'E\tNo history DB at %s.\n' "$HISTORY_DB"
-        return 0
-    fi
-    if ! rows=$(_history_audit_rows "$cutoff" 2>&1); then
-        if [[ "$rows" == *"no such table: audit_event"* ]]; then
-            printf 'E\tNo audit_event table in %s yet. The daemon creates it when it next starts.\n' "$HISTORY_DB"
-        else
-            printf 'E\tCould not read %s: %s\n' "$HISTORY_DB" "$(printf '%s' "$rows" | tr '\t\n' '  ')"
-        fi
-        return 0
-    fi
-    if [[ -z "$rows" ]]; then
-        printf 'E\tNo audit drift recorded in this window.\n'
-        return 0
-    fi
-    total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
-    if (( total > 50 )); then printf 'P\tShowing the latest 50 of %s.\n' "$total"; fi
-    printf 'C\tTime\tScanner\tKind\tSubject\n'
-    while IFS=$'\t' read -r ts scanner kind subject; do
-        (( ++n > 50 )) && break
-        printf 'R\t%s\t%s\t%s\t%s\n' "$ts" "$scanner" "$kind" "${subject//$'\t'/ }"
-    done <<< "$rows"
-}
-
 mode_report() {
     local window="7d" html=0 out="" secs now cutoff report tmp
     while (( $# )); do
@@ -6762,7 +6824,6 @@ mode_report() {
         printf 'M\t%s to %s\n' "$(_alerts_fmt_epoch "$cutoff")" "$(_alerts_fmt_epoch "$now")"
         _report_traffic "$cutoff"
         _report_alerts "$cutoff"
-        _report_audit "$cutoff"
     )
     if [[ -n "$out" ]]; then
         [[ -L "$out" ]] && { echo -e "${R}report: refusing to write through symlink: $out${NC}" >&2; return 1; }
@@ -7307,8 +7368,11 @@ mode_suspects() {
 
     [[ -z "$ranked" ]] && { echo; return 0; }
 
-    local sc ip req e4 e5 p_count flags c country
+    local sc ip req e4 e5 p_count flags c country cti
     while IFS=$'\t' read -r sc ip req e4 e5 p_count flags; do
+        # Cache only: a network lookup per row would stall the table and burn the API quota.
+        cti=$(cti_lookup "$ip" cached)
+        [[ -n "$cti" && "$cti" != unknown ]] && flags="${flags:+$flags }CS:${cti%% *}"
         c=$G
         (( sc >= 10 )) && c=$Y
         (( sc >= 30 )) && c=$R
@@ -8521,7 +8585,7 @@ _cmd_help() {
             ;;
         report)
             echo -e "${W}milog report [window] [--html] [-o FILE]${NC} — static report for sharing"
-            echo -e "  Traffic per app, top IPs by 4xx, alert fires per rule, anomalies, audit drift."
+            echo -e "  Traffic per app, top IPs by 4xx, alert fires per rule, anomalies."
             echo -e "  Markdown by default; ${C}--html${NC} writes one self-contained page. Windows as digest (default 7d)."
             ;;
         doctor)   echo -e "${W}milog doctor${NC} — diagnostic checklist" ;;
