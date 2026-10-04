@@ -40,13 +40,14 @@ while (( $# )); do
     case "$1" in
         -o) out="$2"; shift ;;
         -K) [[ "$2" == - ]] && cat > "$d/config"; shift ;;
-        -m|-w) shift ;;
+        -m|-w|--max-filesize) shift ;;
         https://*) url="$1" ;;
     esac
     shift
 done
 case "${url##*/}" in
-    203.0.113.9)  cp "$d/known.json" "$out";   printf 200 ;;
+    203.0.113.9|2001:db8::1) cp "$d/known.json" "$out"; printf 200 ;;
+    198.51.100.8) printf '<html>404 Not Found</html>' > "$out"; printf 404 ;;
     192.0.2.66)   cp "$d/hostile.json" "$out"; printf 200 ;;
     198.51.100.7) printf '{"message":"not found"}' > "$out"; printf 404 ;;
     *)            printf '{"message":"quota"}' > "$out"; printf 429 ;;
@@ -104,14 +105,18 @@ unsafe='[^A-Za-z0-9 :._,()/-]'
 [[ "$hostile" =~ $unsafe ]] && fail "unsafe characters survived: $hostile"
 
 n=$(calls)
-for bad in '1.2.3.4/../x' 'a;b' '' '-K' '1.2.3.4?x=1'; do
+for bad in '1.2.3.4/../x' 'a;b' '' '-K' '1.2.3.4?x=1' ':' ':..' '::'; do
     [[ -z "$(cti_lookup "$bad")" ]] || fail "invalid IP '$bad' returned data"
 done
 [[ "$(calls)" == "$n" ]] || fail "invalid IP reached curl"
 
-[[ -z "$(cti_lookup 192.0.2.1)" ]] || fail "429 should print nothing"
-grep -q 'HTTP 429 for 192.0.2.1' "$state/cti.err" || fail "429 not recorded in cti.err"
-[[ -f "$state/cti/192.0.2.1" ]] && fail "failed lookup was cached"
+[[ "$(cti_lookup 2001:DB8::1)" == malicious* ]] || fail "uppercase IPv6 lookup failed"
+grep -q 'smoke/2001:db8::1$' "$tmp/stub/argv.log" || fail "IPv6 not lowercased in URL"
+[[ -f "$state/cti/2001:db8::1" ]] || fail "IPv6 cache path not lowercased"
+
+[[ -z "$(cti_lookup 198.51.100.8)" ]] || fail "non-JSON 404 treated as unknown"
+grep -q 'HTTP 404 for 198.51.100.8' "$state/cti.err" || fail "non-JSON 404 not recorded in cti.err"
+[[ -f "$state/cti/198.51.100.8" ]] && fail "non-JSON 404 was cached"
 
 ALERTS_ENABLED=0
 [[ -z "$(cti_alert_note 203.0.113.9)" ]] || fail "alert note with alerts off"
@@ -124,13 +129,23 @@ rm -f "$state/cti/203.0.113.9"
 n=$(calls)
 [[ -z "$(cti_lookup 203.0.113.9)" ]] || fail "key with a quote was used"
 [[ "$(calls)" == "$n" ]] || fail "key with a quote reached curl"
+CROWDSEC_CTI_KEY="test-key-123"
+
+[[ -z "$(cti_lookup 192.0.2.1)" ]] || fail "429 should print nothing"
+grep -q 'HTTP 429 for 192.0.2.1' "$state/cti.err" || fail "429 not recorded in cti.err"
+[[ -f "$state/cti/192.0.2.1" ]] && fail "failed lookup was cached"
+
+n=$(calls)
+[[ -f "$state/cti/.backoff" ]] || fail "429 did not start a backoff"
+[[ -z "$(cti_lookup 192.0.2.2)" ]] || fail "lookup during backoff returned data"
+[[ "$(calls)" == "$n" ]] || fail "lookup during backoff reached curl"
 
 printf 'CROWDSEC_CTI_KEY="test-key-123"\n' > "$tmp/config.sh"
 MILOG_CONFIG="$tmp/config.sh" "$ROOT/milog.sh" config validate > "$tmp/validate.out" 2>&1 || true
 grep -q 'unknown key: CROWDSEC_CTI_KEY' "$tmp/validate.out" && fail "config validate flags CROWDSEC_CTI_KEY"
 
 "$ROOT/milog.sh" doctor > "$tmp/doctor.out" 2>&1 || true
-grep -q 'last lookup failed' "$tmp/doctor.out" || fail "doctor does not report the failed lookup"
+grep -q 'last lookup failed: HTTP 429.*paused' "$tmp/doctor.out" || fail "doctor does not report the 429 backoff"
 
 if (( failures )); then
     exit 1

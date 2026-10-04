@@ -240,7 +240,9 @@ mode_doctor() {
     if [[ -z "${CROWDSEC_CTI_KEY:-}" ]]; then
         _doc_ok "off  (CROWDSEC_CTI_KEY empty, no lookups)"
     elif [[ -s "$ALERT_STATE_DIR/cti.err" ]]; then
-        _doc_warn "last lookup failed: $(cut -f2 "$ALERT_STATE_DIR/cti.err")" \
+        local cti_paused=""
+        [[ -n "$(find "$ALERT_STATE_DIR/cti/.backoff" -mmin -15 2>/dev/null)" ]] && cti_paused="  (lookups paused for 15 min)"
+        _doc_warn "last lookup failed: $(cut -f2 "$ALERT_STATE_DIR/cti.err")${cti_paused}" \
                   "401/403: key rejected; 429: rate limit hit; 000: no answer within 3s"
         warn=$(( warn + 1 ))
     else

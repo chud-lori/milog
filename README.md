@@ -42,7 +42,7 @@ Everything in-depth lives under [`docs/`](docs/) — skim the
 - [**`milog daemon`**](docs/daemon.md) — headless mode, systemd service, permissions
 - [**Kernel observability (`milog probe`)**](docs/probe.md) — eBPF sidecar, the 8 probes, `install-service`, allowlist tuning
 - [**GeoIP enrichment**](docs/geoip.md) — MaxMind license + weekly auto-refresh
-- [**CrowdSec CTI enrichment**](docs/crowdsec-cti.md): opt-in IP reputation in `attacker`, `suspects` and exploit/probe alerts
+- [**CrowdSec CTI enrichment**](docs/crowdsec-cti.md) — opt-in IP reputation in `attacker`, `suspects` and exploit/probe alerts
 - [**Troubleshooting**](docs/troubleshooting.md) — `milog doctor` + common failure modes
 
 Plus: [ARCHITECTURE.md](ARCHITECTURE.md) for contributors and

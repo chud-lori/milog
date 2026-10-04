@@ -33,7 +33,10 @@ to CrowdSec.
 The summary is the `reputation` field (`malicious`, `suspicious`,
 `known`, `benign`, `safe`, `unknown`) followed by up to three behavior
 labels. An IP the API returns 404 for is shown as `unknown`, and
-`suspects` leaves it untagged.
+`suspects` leaves it untagged. The CrowdSec docs do not describe the 404
+body, so milog assumes it is a JSON object without an `ip` field; any
+other 404 (an HTML error page from a proxy, for example) counts as a
+failed lookup.
 
 ## Caching and limits
 
@@ -48,9 +51,11 @@ command or alert. The most recent failure is kept in
 `milog doctor` reports it:
 
 - `HTTP 401` or `HTTP 403`: the key was rejected.
-- `HTTP 429`: the key's rate limit was hit.
+- `HTTP 429`: the key's rate limit was hit. milog makes no further
+  requests for 15 minutes and `doctor` says so.
 - `HTTP 000`: no answer within 3 seconds.
 
 The key is passed to curl on stdin, so it does not appear in the
 process list. Only IPv4 and IPv6 addresses are ever placed in the
-request URL.
+request URL, and IPv6 addresses are lowercased first so each one has a
+single cache entry. Responses larger than 64 KiB are rejected.
