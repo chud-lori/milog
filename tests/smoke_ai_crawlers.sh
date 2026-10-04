@@ -47,7 +47,7 @@ rule() {
         THRESH_AICRAWL_WARN=$2
         alert_should_fire() { return 0; }
         alert_fire() { printf "%s|%s\n" "$4" "$2"; }
-        read -r ai tot <<< "$(nginx_ai_counts app "$3")"
+        read -r tot _ _ _ _ ai <<< "$(nginx_minute_counts app "$3")"
         nginx_check_ai_alert app "$ai" "$tot"
         wait
     ' _ "$MILOG" "$1" "$minute"

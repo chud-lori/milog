@@ -55,13 +55,12 @@ mode_daemon() {
         sys_check_alerts "$cpu" "$mem_pct" "$mem_used" "$mem_total" \
                          "$disk_pct" "$disk_used" "$disk_total" "$worker_count"
 
-        local name cnt c2 c3 c4 c5 ai tot
+        local name cnt c2 c3 c4 c5 ai
         for name in "${LOGS[@]}"; do
-            read -r cnt c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
+            read -r cnt c2 c3 c4 c5 ai <<< "$(nginx_minute_counts "$name" "$CUR_TIME")"
             cnt=${cnt:-0}; c4=${c4:-0}; c5=${c5:-0}
             nginx_check_http_alerts "$name" "$c4" "$c5"
-            read -r ai tot <<< "$(nginx_ai_counts "$name" "$CUR_TIME")"
-            nginx_check_ai_alert "$name" "${ai:-0}" "${tot:-0}"
+            nginx_check_ai_alert "$name" "${ai:-0}" "$cnt"
         done
 
         # Each scanner throttles itself by its AUDIT_*_INTERVAL and no-ops when disabled.
