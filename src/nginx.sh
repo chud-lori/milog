@@ -5,7 +5,7 @@ nginx_minute_counts() {
     local file="$LOG_DIR/$1.access.log"
     [[ -f "$file" ]] || { printf '0 0 0 0 0\n'; return; }
     awk -v t="$2" '
-        index($0, t) {
+        index($4, t) == 2 {
             n++
             # Status follows the quoted request; nginx escapes quotes inside it.
             split($0, q, "\"")
@@ -29,7 +29,7 @@ percentiles() {
     [[ -f "$file" ]] || { printf -- '— — —\n'; return; }
     local sorted
     sorted=$(awk -v t="$cur" '
-        index($0, t) && $NF ~ /^[0-9]+(\.[0-9]+)?$/ {
+        index($4, t) == 2 && $NF ~ /^[0-9]+(\.[0-9]+)?$/ {
             print int($NF * 1000 + 0.5)
         }' "$file" 2>/dev/null | sort -n)
     if [[ -z "$sorted" ]]; then

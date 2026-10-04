@@ -34,7 +34,7 @@ mode_probes() {
 
     for name in "${LOGS[@]}"; do
         local file="$LOG_DIR/$name.access.log"
-        local col="${colors[$i]}" label
+        local col="${colors[$(( i % ${#colors[@]} ))]}" label
         label=$(printf "%-8s" "$name")
         if [[ -f "$file" ]]; then
             (

@@ -247,7 +247,7 @@ mode_doctor() {
         warn=$(( warn + 1 ))
     fi
     if [[ -f "$WEB_STATE_DIR/web.pid" ]]; then
-        local wpid; wpid=$(< "$WEB_STATE_DIR/web.pid" 2>/dev/null)
+        local wpid; wpid=$(cat "$WEB_STATE_DIR/web.pid" 2>/dev/null || true)
         if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
             _doc_ok "milog web running  (pid=$wpid, $WEB_BIND:$WEB_PORT)"
         else

@@ -54,7 +54,7 @@ EOF
 
     # A foreground instance would hold the port the unit is about to bind.
     if [[ -f "$(_web_pid_file)" ]]; then
-        local old_pid; old_pid=$(< "$(_web_pid_file)" 2>/dev/null)
+        local old_pid; old_pid=$(cat "$(_web_pid_file)" 2>/dev/null || true)
         if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
             echo -e "${Y}stopping existing foreground milog web (pid=$old_pid)${NC}"
             _web_stop >/dev/null 2>&1 || true
@@ -71,7 +71,7 @@ EOF
 
     echo -e "${G}✓${NC} systemctl --user enable --now milog-web.service"
 
-    local token; token=$(_web_token_read 2>/dev/null)
+    local token; token=$(_web_token_read 2>/dev/null || true)
     [[ -n "$token" ]] || { _web_token_ensure && token=$(_web_token_read); }
     local url="http://${WEB_BIND}:${WEB_PORT}/?t=${token}"
 

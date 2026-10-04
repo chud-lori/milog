@@ -6,8 +6,8 @@ mode_stats() {
     local file="$LOG_DIR/$name.access.log"
     [[ -f "$file" ]] || { echo -e "${R}Not found: $file${NC}"; exit 1; }
     echo -e "\n${W}── MiLog: Hourly breakdown — ${name} ──${NC}\n"
-    awk '{match($4,/\[([0-9]{2}\/[A-Za-z]+\/[0-9]{4}):([0-9]{2})/,a)
-         if(a[2]!="")h[a[2]]++}
+    awk '{if(match($4,/^\[[0-9][0-9]\/[A-Za-z]+\/[0-9][0-9][0-9][0-9]:[0-9][0-9]/))
+         h[substr($4,RSTART+RLENGTH-2,2)]++}
          END{for(x in h)print x,h[x]}' "$file" | sort | \
     awk -v g="$G" -v y="$Y" -v r="$R" -v nc="$NC" '
     BEGIN{max=0}{if($2>max)max=$2;d[NR]=$0;n=NR}

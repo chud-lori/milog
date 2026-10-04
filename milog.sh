@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.3.0-104-gc12a6af
-# MILOG_BUILT=2026-10-04T02:04:47Z
+# MILOG_VERSION=v0.3.0-111-g0271a38
+# MILOG_BUILT=2026-10-04T02:06:14Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -1210,11 +1210,13 @@ history_write_minute() {
     local ts="$1" cur_time="$2"
     [[ -n "$cur_time" ]] || { _dlog "history: empty cur_time for ts=$ts; skipping"; return 0; }
 
-    local sql="" app count c2 c3 c4 c5 p50 p95 p99
+    local sql="" app name count c2 c3 c4 c5 p50 p95 p99
     for app in "${LOGS[@]}"; do
-        read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$app" "$cur_time")"
+        [[ "$(_log_type_for "$app")" == "nginx" ]] || continue
+        name=$(_log_name_for "$app")
+        read -r count c2 c3 c4 c5 <<< "$(nginx_minute_counts "$name" "$cur_time")"
         count=${count:-0}; c2=${c2:-0}; c3=${c3:-0}; c4=${c4:-0}; c5=${c5:-0}
-        read -r p50 p95 p99 <<< "$(percentiles "$app" "$cur_time")"
+        read -r p50 p95 p99 <<< "$(percentiles "$name" "$cur_time")"
         [[ "$p50" =~ ^[0-9]+$ ]] || p50="NULL"
         [[ "$p95" =~ ^[0-9]+$ ]] || p95="NULL"
         [[ "$p99" =~ ^[0-9]+$ ]] || p99="NULL"
@@ -1238,14 +1240,15 @@ history_write_hour() {
 
     local sql="" app file hits ip
     for app in "${LOGS[@]}"; do
-        file="$LOG_DIR/$app.access.log"
+        [[ "$(_log_type_for "$app")" == "nginx" ]] || continue
+        file=$(_log_path_for "$app")
         [[ -f "$file" ]] || continue
         while read -r hits ip; do
             [[ -n "$ip" ]] || continue
             sql+="INSERT OR REPLACE INTO top_ip_hour VALUES"
             sql+=" ($ts_hour, $(_sql_quote "$app"), $(_sql_quote "$ip"), $hits);"$'\n'
-        done < <(grep -F "$hour_pat" "$file" 2>/dev/null \
-                 | awk '{print $1}' | sort | uniq -c | sort -rn \
+        done < <(awk -v p="$hour_pat" 'index($4, p) == 2 {print $1}' "$file" 2>/dev/null \
+                 | sort | uniq -c | sort -rn \
                  | head -n "${HISTORY_TOP_IP_N:-50}")
     done
 
@@ -1325,7 +1328,6 @@ _anomaly_check_minute() {
     local write_ts="$1"
     [[ "$write_ts" =~ ^[0-9]+$ ]] || return 0
 
-    local minute_of_day=$(( write_ts % 86400 ))
     local min_days="${ANOMALY_MIN_DAYS:-14}"
     local since_ts=$((     write_ts - min_days * 86400 ))
     local sigma="${ANOMALY_SIGMA:-3}"
@@ -1342,7 +1344,7 @@ _anomaly_check_minute() {
 SELECT 'B', req, c5xx, IFNULL(p95_ms,-1), ts/86400
   FROM metrics_minute
   WHERE app=$(_sql_quote "$app")
-    AND (ts%86400)=$minute_of_day
+    AND strftime('%H:%M', ts, 'unixepoch', 'localtime')=strftime('%H:%M', $write_ts, 'unixepoch', 'localtime')
     AND ts>=$since_ts
     AND ts<$write_ts;
 SELECT 'C', req, c5xx, IFNULL(p95_ms,-1), 0
@@ -1420,7 +1422,7 @@ nginx_minute_counts() {
     local file="$LOG_DIR/$1.access.log"
     [[ -f "$file" ]] || { printf '0 0 0 0 0\n'; return; }
     awk -v t="$2" '
-        index($0, t) {
+        index($4, t) == 2 {
             n++
             # Status follows the quoted request; nginx escapes quotes inside it.
             split($0, q, "\"")
@@ -1444,7 +1446,7 @@ percentiles() {
     [[ -f "$file" ]] || { printf -- '— — —\n'; return; }
     local sorted
     sorted=$(awk -v t="$cur" '
-        index($0, t) && $NF ~ /^[0-9]+(\.[0-9]+)?$/ {
+        index($4, t) == 2 && $NF ~ /^[0-9]+(\.[0-9]+)?$/ {
             print int($NF * 1000 + 0.5)
         }' "$file" 2>/dev/null | sort -n)
     if [[ -z "$sorted" ]]; then
@@ -4366,7 +4368,7 @@ config_validate() {
         THRESH_4XX_WARN THRESH_5XX_WARN
     )
     # Prefixes for per-app overrides like THRESH_REQ_CRIT_finance.
-    local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ )
+    local known_prefix=( THRESH_ P95_WARN_MS_ P95_CRIT_MS_ AUDIT_ )
 
     echo -e "\n${W}── MiLog: Config validate ──${NC}\n"
     echo -e "  ${D}config: $MILOG_CONFIG${NC}"
@@ -4728,6 +4730,26 @@ _digest_window_to_secs() {
     esac
 }
 
+# Epoch math is hand-rolled because BSD awk and busybox awk lack mktime().
+_digest_in_window() {
+    awk -v cutoff="$1" '
+        BEGIN {
+            split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", m, " ")
+            for (i = 1; i <= 12; i++) mon[m[i]] = i
+        }
+        {
+            split(substr($4, 2), t, /[\/:]/)
+            if (!(t[2] in mon)) next
+            y = t[3] + 0; mo = mon[t[2]]
+            if (mo <= 2) { y--; mo += 12 }
+            days = 365*y + int(y/4) - int(y/100) + int(y/400) + int((153*(mo-3) + 2) / 5) + t[1] - 719469
+            ts = days*86400 + t[4]*3600 + t[5]*60 + t[6]
+            off = (substr($5, 2, 2)*60 + substr($5, 4, 2)) * 60
+            ts += (substr($5, 1, 1) == "-") ? off : -off
+            if (ts >= cutoff) print
+        }' "$2"
+}
+
 mode_digest() {
     local window="${1:-day}"
     local secs; secs=$(_digest_window_to_secs "$window") || { echo -e "${R}digest: invalid window: $window${NC}" >&2; return 1; }
@@ -4774,21 +4796,17 @@ mode_digest() {
         name=$(_log_name_for "$entry")
         file=$(_log_path_for "$entry")
         [[ -f "$file" ]] || continue
-        # cutoff is passed but never used, so these counts cover the whole file.
-        read -r req c4 c5 <<< "$(awk -v cutoff="$cutoff" '
+        read -r req c4 c5 <<< "$(_digest_in_window "$cutoff" "$file" 2>/dev/null | awk '
             {
-                # [24/Apr/2026:12:34:56 +0000] → crude parse: keep any row,
-                # count by status class (fields reliable in combined format).
                 n++
                 if ($9 ~ /^4/) c4++
                 else if ($9 ~ /^5/) c5++
             }
-            END { printf "%d %d %d\n", n+0, c4+0, c5+0 }' "$file" 2>/dev/null)"
+            END { printf "%d %d %d\n", n+0, c4+0, c5+0 }')"
         printf "  %-14s  %10d  ${Y}%8d${NC}  ${R}%8d${NC}\n" "$name" "${req:-0}" "${c4:-0}" "${c5:-0}"
     done
     echo
 
-    # Not windowed: reads the whole access logs.
     echo -e "${W}Top attacker IPs (this window)${NC}"
     local ip_rollup
     ip_rollup=$(
@@ -4796,7 +4814,7 @@ mode_digest() {
             [[ "$(_log_type_for "$entry")" == "nginx" ]] || continue
             file=$(_log_path_for "$entry")
             [[ -f "$file" ]] || continue
-            awk '{print $1}' "$file"
+            _digest_in_window "$cutoff" "$file" | awk '{print $1}'
         done | sort | uniq -c | sort -rn | head -10
     )
     if [[ -n "$ip_rollup" ]]; then
@@ -5076,7 +5094,7 @@ mode_doctor() {
         warn=$(( warn + 1 ))
     fi
     if [[ -f "$WEB_STATE_DIR/web.pid" ]]; then
-        local wpid; wpid=$(< "$WEB_STATE_DIR/web.pid" 2>/dev/null)
+        local wpid; wpid=$(cat "$WEB_STATE_DIR/web.pid" 2>/dev/null || true)
         if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
             _doc_ok "milog web running  (pid=$wpid, $WEB_BIND:$WEB_PORT)"
         else
@@ -6269,7 +6287,7 @@ mode_probes() {
 
     for name in "${LOGS[@]}"; do
         local file="$LOG_DIR/$name.access.log"
-        local col="${colors[$i]}" label
+        local col="${colors[$(( i % ${#colors[@]} ))]}" label
         label=$(printf "%-8s" "$name")
         if [[ -f "$file" ]]; then
             (
@@ -6854,8 +6872,8 @@ mode_stats() {
     local file="$LOG_DIR/$name.access.log"
     [[ -f "$file" ]] || { echo -e "${R}Not found: $file${NC}"; exit 1; }
     echo -e "\n${W}── MiLog: Hourly breakdown — ${name} ──${NC}\n"
-    awk '{match($4,/\[([0-9]{2}\/[A-Za-z]+\/[0-9]{4}):([0-9]{2})/,a)
-         if(a[2]!="")h[a[2]]++}
+    awk '{if(match($4,/^\[[0-9][0-9]\/[A-Za-z]+\/[0-9][0-9][0-9][0-9]:[0-9][0-9]/))
+         h[substr($4,RSTART+RLENGTH-2,2)]++}
          END{for(x in h)print x,h[x]}' "$file" | sort | \
     awk -v g="$G" -v y="$Y" -v r="$R" -v nc="$NC" '
     BEGIN{max=0}{if($2>max)max=$2;d[NR]=$0;n=NR}
@@ -7327,7 +7345,7 @@ EOF
 
     # A foreground instance would hold the port the unit is about to bind.
     if [[ -f "$(_web_pid_file)" ]]; then
-        local old_pid; old_pid=$(< "$(_web_pid_file)" 2>/dev/null)
+        local old_pid; old_pid=$(cat "$(_web_pid_file)" 2>/dev/null || true)
         if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
             echo -e "${Y}stopping existing foreground milog web (pid=$old_pid)${NC}"
             _web_stop >/dev/null 2>&1 || true
@@ -7344,7 +7362,7 @@ EOF
 
     echo -e "${G}✓${NC} systemctl --user enable --now milog-web.service"
 
-    local token; token=$(_web_token_read 2>/dev/null)
+    local token; token=$(_web_token_read 2>/dev/null || true)
     [[ -n "$token" ]] || { _web_token_ensure && token=$(_web_token_read); }
     local url="http://${WEB_BIND}:${WEB_PORT}/?t=${token}"
 

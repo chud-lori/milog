@@ -35,7 +35,6 @@ _anomaly_check_minute() {
     local write_ts="$1"
     [[ "$write_ts" =~ ^[0-9]+$ ]] || return 0
 
-    local minute_of_day=$(( write_ts % 86400 ))
     local min_days="${ANOMALY_MIN_DAYS:-14}"
     local since_ts=$((     write_ts - min_days * 86400 ))
     local sigma="${ANOMALY_SIGMA:-3}"
@@ -52,7 +51,7 @@ _anomaly_check_minute() {
 SELECT 'B', req, c5xx, IFNULL(p95_ms,-1), ts/86400
   FROM metrics_minute
   WHERE app=$(_sql_quote "$app")
-    AND (ts%86400)=$minute_of_day
+    AND strftime('%H:%M', ts, 'unixepoch', 'localtime')=strftime('%H:%M', $write_ts, 'unixepoch', 'localtime')
     AND ts>=$since_ts
     AND ts<$write_ts;
 SELECT 'C', req, c5xx, IFNULL(p95_ms,-1), 0
