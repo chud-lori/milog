@@ -72,6 +72,8 @@ Every `REFRESH` seconds (default 5):
 2. Per app: one awk pass over the access log for the current minute
    → counts req / 2xx / 3xx / 4xx / 5xx. Fires 4xx and 5xx spike
    alerts if any exceed `THRESH_4XX_WARN` / `THRESH_5XX_WARN`.
+   A second pass counts AI-crawler user-agents and fires
+   `aicrawl:<app>` at `THRESH_AICRAWL_WARN` per minute.
 
 On top of the per-tick work, two subshells run `tail -F` loops:
 

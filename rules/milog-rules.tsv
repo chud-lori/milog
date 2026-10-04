@@ -21,8 +21,9 @@ exploit	scanner-ua	dirbuster|wfuzz|l9explore|l9tcpid|hello,\s?world
 probe	protocol	SSH-2\.0|\\x16\\x03|\\x00\\x00
 probe	pentest-tools	masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag
 probe	mass-scanners	l9explore|l9tcpid|l9retrieve|leakix|libredtail|httpx|naabu|katana|subfinder|expanseinc|censysinspect|shodan|stretchoid|internet-measurement|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe
-probe	seo-crawlers	ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat|dataforseobot|bytespider|mauibot|megaindex|seznambot
-probe	ai-crawlers	claudebot|gptbot|ccbot|anthropic-ai|perplexitybot|youbot|amazonbot|applebot-extended|cohere-ai|diffbot
+probe	seo-crawlers	ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat|dataforseobot|mauibot|megaindex|seznambot
+# milog adds its AI_CRAWLER_UA_RE tokens (shared with health/top) to the probe rows at load time.
+probe	ai-crawlers	diffbot
 probe	http-libraries	python-requests|python-urllib|aiohttp|go-http-client|okhttp|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize
 probe	headless	headlesschrome|phantomjs|puppeteer|playwright|selenium
 probe	generic-bot	[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester

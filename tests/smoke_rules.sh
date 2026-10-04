@@ -12,9 +12,9 @@ export HOME="$tmp/home" TMPDIR="$tmp" MILOG_LOG_DIR="$tmp/logs" MILOG_CONFIG="$t
 # shellcheck disable=SC1091
 . "$ROOT/milog.sh" help >/dev/null
 
-# The inline patterns and classifier as they were before the rules file existed.
+# The inline patterns and classifier as they were on main before the rules file existed.
 old_exploit='\.\./|%2e%2e|/etc/passwd|/etc/shadow|/proc/self/environ|/containers/json|/actuator/|/server-status|/console(/|\?)|/druid/|/SDK/web|/cgi-bin/|/boaform/|/HNAP1|/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php|/phpmyadmin|/pma/|/mysql/admin|/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store|/config\.(php|json|yml|yaml)|/web\.config|jndi:|\$\{jndi|log4j|union[+% ]+select|select[+% ]+from|sleep\([0-9]|benchmark\(|or[+% ]+1=1|%27[+% ]*or|%27%20or|<script|%3cscript|onerror=|onload=|javascript:|base64_decode|eval\(|system\(|passthru\(|shell_exec|libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster|dirbuster|wfuzz|l9explore|l9tcpid|hello,\s?world'
-old_probe='SSH-2\.0|\\x16\\x03|\\x00\\x00|masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag|l9explore|l9tcpid|l9retrieve|leakix|libredtail|httpx|naabu|katana|subfinder|expanseinc|censysinspect|shodan|stretchoid|internet-measurement|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe|ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat|dataforseobot|bytespider|mauibot|megaindex|seznambot|claudebot|gptbot|ccbot|anthropic-ai|perplexitybot|youbot|amazonbot|applebot-extended|cohere-ai|diffbot|python-requests|python-urllib|aiohttp|go-http-client|okhttp|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize|headlesschrome|phantomjs|puppeteer|playwright|selenium|[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester|hello,\s*world'
+old_probe='SSH-2\.0|\\x16\\x03|\\x00\\x00|masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag|l9explore|l9tcpid|l9retrieve|leakix|libredtail|httpx|naabu|katana|subfinder|expanseinc|censysinspect|shodan|stretchoid|internet-measurement|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe|ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat|dataforseobot|mauibot|megaindex|seznambot|'"$AI_CRAWLER_UA_RE"'|diffbot|python-requests|python-urllib|aiohttp|go-http-client|okhttp|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize|headlesschrome|phantomjs|puppeteer|playwright|selenium|[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester|hello,\s*world'
 old_category() {
     local line="$1" cat="other"
     shopt -s nocasematch
@@ -89,12 +89,18 @@ GET / HTTP/1.1|Mozilla/5.0 (compatible; GPTBot/1.0)
 GET / HTTP/1.1|Mozilla/5.0 (compatible; Googlebot/2.1)
 GET / HTTP/1.1|Mozilla/5.0 (compatible; CensysInspect/1.1)
 GET /robots.txt HTTP/1.1|Mozilla/5.0 HeadlessChrome/120
+GET / HTTP/1.1|meta-externalagent/1.1
+GET / HTTP/1.1|Mozilla/5.0 (compatible; Bytespider)
+GET / HTTP/1.1|Mozilla/5.0 ChatGPT-User/1.0
+GET / HTTP/1.1|Mozilla/5.0 (compatible; Diffbot/2.0)
 EOF
 
 # No override: the baked-in rules reproduce the old patterns and categories exactly.
 _rules_load
 [[ "$RULES_EXPLOIT" == "$old_exploit" ]] || fail "built-in exploit pattern differs from the old inline one"
-[[ "$RULES_PROBE" == "$old_probe" ]] || fail "built-in probe pattern differs from the old inline one"
+# AI_CRAWLER_UA_RE is appended rather than inlined, so compare the probe alternatives as a set.
+[[ "$(tr '|' '\n' <<< "$RULES_PROBE" | sort)" == "$(tr '|' '\n' <<< "$old_probe" | sort)" ]] \
+    || fail "built-in probe alternatives differ from the old inline ones"
 for kind in exploit probe; do
     want="old_$kind"; got="RULES_$(tr a-z A-Z <<< "$kind")"
     grep -Ei "${!want}" "$log" > "$tmp/old.$kind" || true
@@ -113,7 +119,7 @@ done < "$log"
 mkdir -p "$HOME/.config/milog"
 printf '# version: 2\nexploit\tx\t/only-this\nprobe\tx\tonly-bot\ncategory\tmine\t/only\n' > "$RULES_FILE"
 _rules_load
-[[ "$RULES_EXPLOIT" == "/only-this" && "$RULES_PROBE" == "only-bot" ]] || fail "valid override not loaded"
+[[ "$RULES_EXPLOIT" == "/only-this" && "$RULES_PROBE" == "only-bot|$AI_CRAWLER_UA_RE" ]] || fail "valid override not loaded"
 [[ "$(_exploit_category 'GET /only-this')" == mine ]] || fail "override category not used"
 for bad in '# version: 2\nexploit\tx\t(\nprobe\tx\tb\n' \
            '# version: 2\nexploit\tx\ta|\nprobe\tx\tb\n' \

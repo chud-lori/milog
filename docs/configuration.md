@@ -75,6 +75,7 @@ default).
 | `THRESH_DISK_CRIT`    | `95`    | Disk % — red + alert                         |
 | `THRESH_4XX_WARN`     | `20`    | 4xx/min — alert fires                        |
 | `THRESH_5XX_WARN`     | `5`     | 5xx/min — alert fires                        |
+| `THRESH_AICRAWL_WARN` | `30`    | AI-crawler req/min per app — alert fires     |
 | `P95_WARN_MS`         | `500`   | Request-time p95 — yellow                    |
 | `P95_CRIT_MS`         | `1500`  | Request-time p95 — red                       |
 

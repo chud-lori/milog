@@ -154,6 +154,7 @@ the three Matrix vars — the alert would silently no-op otherwise.
 | ----------------- | ------------------------------------ | ----------------------------------------------------------------------------- |
 | 5xx spike         | `5xx:<app>`                          | last minute ≥ `THRESH_5XX_WARN` (default 5)                                  |
 | 4xx spike         | `4xx:<app>`                          | last minute ≥ `THRESH_4XX_WARN` (default 20)                                |
+| AI crawler surge  | `aicrawl:<app>`                      | AI-crawler requests in the last minute ≥ `THRESH_AICRAWL_WARN` (default 30), daemon only |
 | CPU / MEM / Disk  | `cpu` / `mem` / `disk:/`             | ≥ corresponding `THRESH_*_CRIT`                                              |
 | Workers down      | `workers`                            | zero nginx worker processes                                                  |
 | Exploit match     | `exploit:<app>:<category>`           | `mode_exploits` pattern hit                                                  |
@@ -166,7 +167,7 @@ the three Matrix vars — the alert would silently no-op otherwise.
 | Audit ports       | `audit:ports:<proto>:<port>`         | new TCP/UDP listener appeared                                                |
 | Audit YARA        | `audit:yara:<rule>:<path>`           | YARA rule hit on a webroot file                                              |
 | Audit rootkit     | `audit:rootkit:<heuristic>`          | hidden-process / `ld.so.preload` / tmp-exec heuristic                        |
-| Probe — process   | `process:shell_from_web_worker:…` `process:exec_from_tmp:<comm>` `process:suid_escalation:…` | eBPF sidecar — see [`docs/probe.md`](probe.md)        |
+| Probe — process   | `process:shell_from_web_worker:…` `process:exec_from_tmp:<comm>` `process:suid_escalation:…` `process:web_triggered_exec:…` | eBPF sidecar — see [`docs/probe.md`](probe.md)        |
 | Probe — file      | `file:sensitive_read:<comm>:<path>`  | non-allowlisted process opened a sensitive file                              |
 | Probe — net       | `net:unexpected_outbound:<comm>` `net:retrans_spike:<dst>:<port>` | outbound connect to non-allowlisted dest, or sustained TCP retransmits      |
 | Probe — kernel    | `proc:ptrace_inject:<comm>` `proc:kmod_load:<module>` `proc:bpf_load:<comm>` `process:syscall_burst:<comm>` | ptrace attach by non-debugger, kernel module load, BPF program load, per-PID syscall σ-anomaly |
@@ -185,6 +186,9 @@ The regexes behind `exploit:*` and `probe:*` live in
 case-insensitively with `grep -Ei`. `category` rows name the
 `<category>` in `exploit:<app>:<category>`: the first matching row wins,
 and a hit no row matches is `other`.
+The AI crawler tokens are not in this file: milog appends
+`AI_CRAWLER_UA_RE` (the list `health` and `top` use) to the probe
+pattern when it loads the rules.
 
 `build.sh` bakes this file into `milog.sh`. To pick up rule changes
 without upgrading milog:

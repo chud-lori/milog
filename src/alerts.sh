@@ -645,6 +645,8 @@ _rules_load() {
             category) RULES_CATEGORY_NAMES+=("$name"); RULES_CATEGORY_RES+=("$re") ;;
         esac
     done <<< "$text"
+    # The AI crawler list is shared with health/top, so it is not duplicated in the rules file.
+    RULES_PROBE+="|$AI_CRAWLER_UA_RE"
 }
 
 # First matching category row names the alert's rule key; needs _rules_load first.
