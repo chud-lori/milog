@@ -347,7 +347,7 @@ brings some noise. To tune it from what actually fired:
 2. Run `milog alert stats 7d` to see which rules fire most.
 3. Run `milog auto-tune 7`. For every rule averaging more than 10 fires
    a day that isn't silenced, it prints one command:
-   - `5xx:<app>` and `4xx:<app>`: a per-app threshold, for example
+   - `5xx:<app>`, `4xx:<app>` and `aicrawl:<app>`: a per-app threshold, for example
      `milog config set THRESH_5XX_WARN_api 36`. It reads the trigger
      value from each alert body and picks the lowest threshold that
      would have kept the window to 10 fires a day or fewer.

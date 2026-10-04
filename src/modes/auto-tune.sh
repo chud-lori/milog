@@ -48,6 +48,7 @@ _tune_alert_noise() {
         case "$key" in
             5xx:*)  var=THRESH_5XX_WARN; app="${key#5xx:}" ;;
             4xx:*)  var=THRESH_4XX_WARN; app="${key#4xx:}" ;;
+            aicrawl:*) var=THRESH_AICRAWL_WARN; app="${key#aicrawl:}" ;;
             cpu)    var=THRESH_CPU_CRIT;  pct=1 ;;
             mem)    var=THRESH_MEM_CRIT;  pct=1 ;;
             disk:/) var=THRESH_DISK_CRIT; pct=1 ;;

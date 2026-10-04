@@ -25,7 +25,7 @@ mkdir -p "$state"
 : > "$tmp/logs/api.access.log"
 
 # Over 7 days: 5xx:api fires 100 times with counts 6..105, cpu 80 times at 100%,
-# exploit 90 times, an audit rule 80 times, an eBPF rule 75 times, 4xx:api 3 times, one fire now and one older than the window.
+# exploit 90 times, an audit rule 80 times, an eBPF rule 75 times, aicrawl:api 75 times, 4xx:api 3 times, one fire now and one older than the window.
 now=$(date +%s)
 {
     for i in $(seq 1 100); do
@@ -46,6 +46,10 @@ now=$(date +%s)
     done
     for i in $(seq 1 75); do
         printf '%s\tprocess:exec_from_tmp:x\t15158332\tExec from tmp\tbody\n' "$(( now - i * 3000 ))"
+    done
+    for i in $(seq 1 75); do
+        printf '%s\taicrawl:api\t15844367\tAI crawler surge: api\t%d AI-crawler requests in the last minute, 50%% of 200 (threshold 30)\n' \
+            "$(( now - i * 3000 ))" "$(( i + 30 ))"
     done
     printf '%s\ttoday:rule\t15158332\tT\tbody\n' "$now"
     printf '%s\told:rule\t15158332\tOld\tbody\n' "$(( now - 20 * 86400 ))"
@@ -72,6 +76,8 @@ grep -q 'exploit:api:sqli.*silenced' "$tmp/stats.out" || fail "silenced rule not
 "$MILOG" auto-tune 7 > "$tmp/tune.out" 2>&1 || true
 # Top 70 fire values are 36..105, so the 71st is 35 and the new threshold is 36.
 grep -qF 'milog config set THRESH_5XX_WARN_api 36' "$tmp/tune.out" || fail "no 5xx threshold suggestion"
+# aicrawl values are 31..105; the 71st highest is 35, so the threshold is 36.
+grep -qF 'milog config set THRESH_AICRAWL_WARN_api 36' "$tmp/tune.out" || fail "no aicrawl threshold suggestion"
 grep -qF 'milog silence cpu 7d' "$tmp/tune.out" || fail "cpu at 100% should get a silence, not a threshold over 100"
 grep -qF 'exploit:api:sqli' "$tmp/tune.out" && fail "silenced rule still got a suggestion"
 grep -qF '4xx:api' "$tmp/tune.out" && fail "quiet rule got a suggestion"
