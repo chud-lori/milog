@@ -28,6 +28,12 @@ _audit_stat() {
         || stat -f '%m	%z' -- "$path" 2>/dev/null
 }
 
+# Epoch mtime, empty when the path is missing.
+_audit_mtime() {
+    local st; st=$(_audit_stat "$1")
+    printf '%s' "${st%%	*}"
+}
+
 _audit_state_dir() {
     local d="${ALERT_STATE_DIR:-$HOME/.cache/milog}/audit"
     mkdir -p "$d" 2>/dev/null
@@ -148,15 +154,17 @@ _audit_fim_tick() {
         return 0
     fi
 
-    local change path detail key body
+    local change path detail key body rows=""
     while IFS=$'\t' read -r change path detail; do
         [[ -z "$change" ]] && continue
+        rows+="$change"$'\t'"$path"$'\n'
         key="audit:fim:$change:$path"
         if alert_should_fire "$key"; then
             body="\`\`\`$change $path $detail\`\`\`"
             alert_fire "FIM drift: $change $path" "$body" 15158332 "$key" &
         fi
     done < <(_audit_fim_diff)
+    history_write_audit fim "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
 }
@@ -170,6 +178,7 @@ mode_audit() {
         yara) shift; _audit_yara_subcmd "$@" ;;
         accounts) shift; _audit_accounts_subcmd "$@" ;;
         rootkit) shift; _audit_rootkit_subcmd "$@" ;;
+        history) shift; _audit_history_subcmd "$@" ;;
         *)
             echo -e "${R}unknown audit subcommand: $1${NC}" >&2
             _audit_help; return 1 ;;
@@ -187,6 +196,7 @@ ${W}milog audit${NC} — point-in-time host integrity scans
   ${C}milog audit yara ${NC}<sub>         YARA scan over webroot (webshell + obfuscation rules)
   ${C}milog audit accounts ${NC}<sub>     line-level diff over passwd / sudoers / authorized_keys
   ${C}milog audit rootkit ${NC}<sub>      hidden-process / ld.so.preload / tmp-exec heuristics
+  ${C}milog audit history ${NC}[days]     drift the daemon recorded (default 7; needs HISTORY_ENABLED=1)
 
   Subs (fim/persistence/ports/accounts): ${C}baseline${NC} | ${C}check${NC} | ${C}status${NC}
   Subs (yara):                           ${C}init${NC} | ${C}scan${NC} | ${C}status${NC}
@@ -365,8 +375,9 @@ _audit_persistence_tick() {
         return 0
     fi
 
-    local change path key body
+    local change path key body rows=""
     while IFS=$'\t' read -r change path; do
+        rows+="$change"$'\t'"$path"$'\n'
         [[ "$change" == "APPEARED" ]] || continue
         [[ -z "$path" ]] && continue
         key="audit:persistence:APPEARED:$path"
@@ -375,6 +386,7 @@ _audit_persistence_tick() {
             alert_fire "Persistence: new $path" "$body" 15158332 "$key" &
         fi
     done < <(_audit_persistence_diff)
+    history_write_audit persistence "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
 }
@@ -550,8 +562,12 @@ _audit_ports_tick() {
         return 0
     fi
 
-    local change proto bind port key body
+    local change proto bind port key body rows=""
     while IFS=$'\t' read -r change proto bind port; do
+        case "$change" in
+            NEW)  rows+="appeared"$'\t'"$bind:$port/$proto"$'\n' ;;
+            GONE) rows+="removed"$'\t'"$bind:$port/$proto"$'\n' ;;
+        esac
         [[ "$change" == "NEW" ]] || continue
         [[ -z "$proto" || -z "$port" ]] && continue
         key="audit:ports:NEW:$proto:$port"
@@ -560,6 +576,7 @@ _audit_ports_tick() {
             alert_fire "Listener: new $proto $bind:$port" "$body" 15158332 "$key" &
         fi
     done < <(_audit_ports_diff)
+    history_write_audit ports "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
 }
@@ -813,17 +830,20 @@ _audit_yara_tick() {
 
     # _audit_yara_scan_all records matches inline — we just fire alerts
     # for what comes through (which is already deduped against the log).
-    local rule file sha key body line
+    local rule file sha key body line rows=""
     while IFS= read -r line; do
         rule="${line%%$'\t'*}"; sha="${line##*$'\t'}"
         file="${line#*$'\t'}"; file="${file%$'\t'*}"
         [[ -z "$rule" ]] && continue
+        rows+="match"$'\t'"$rule $file"$'\n'
         key="audit:yara:$rule:$file"
         if alert_should_fire "$key"; then
             body="\`\`\`yara hit: rule=$rule path=$file sha=${sha:0:16}\`\`\`"
             alert_fire "YARA: $rule on $file" "$body" 15158332 "$key" &
         fi
     done < <(_audit_yara_scan_all)
+    # scan_all only emits matches it has not seen before, so dedup only within this tick.
+    history_write_audit yara "$now" "$rows"
 
     printf '%s' "$now" > "$marker"
 }
@@ -1051,8 +1071,9 @@ _audit_accounts_tick() {
 
     # One alert per file, listing at most 5 new lines.
     local prev_file="" body="" capped=""
-    local change file line lines_count=0 key b
+    local change file line lines_count=0 key b rows=""
     while IFS=$'\t' read -r change file line; do
+        rows+="$change"$'\t'"$file"$'\n'
         [[ "$change" == "ADDED" ]] || continue
         [[ -z "$file" ]] && continue
         if [[ "$file" != "$prev_file" ]]; then
@@ -1087,6 +1108,8 @@ $body\`\`\`"
             alert_fire "Account drift: $prev_file" "$b" 15158332 "$key" &
         fi
     fi
+    # Subject is the file only, so passwd and sudoers lines stay out of the DB.
+    history_write_audit accounts "$(_audit_mtime "$dir/.encoded")" "$rows"
 
     printf '%s' "$now" > "$marker"
 }
@@ -1275,15 +1298,18 @@ _audit_rootkit_tick() {
         return 0
     fi
 
-    local heur detail key body
+    local heur detail key body rows=""
     while IFS=$'\t' read -r heur detail; do
         [[ -z "$heur" ]] && continue
+        rows+="hint"$'\t'"$heur"$'\n'
         key="audit:rootkit:$heur"
         if alert_should_fire "$key"; then
             body="\`\`\`$detail\`\`\`"
             alert_fire "Rootkit hint: $heur" "$body" 15158332 "$key" &
         fi
     done < <(_audit_rootkit_run_all)
+    # No baseline to reset against, so a hint is stored once per retention window.
+    history_write_audit rootkit 0 "$rows"
 
     printf '%s' "$now" > "$marker"
 }
@@ -1327,4 +1353,25 @@ _audit_rootkit_subcmd() {
             echo -e "${R}unknown rootkit subcommand: $1${NC}" >&2
             _audit_help; return 1 ;;
     esac
+}
+
+# Drift the daemon stored in audit_event, newest first.
+_audit_history_subcmd() {
+    local days="${1:-7}"
+    [[ "$days" =~ ^[1-9][0-9]*$ ]] \
+        || { echo -e "${R}audit history: days must be a positive integer${NC}" >&2; return 1; }
+    _history_precheck || return 1
+
+    local since=$(( $(date +%s) - days * 86400 )) out
+    if ! out=$(sqlite3 -readonly -separator $'\t' "$HISTORY_DB" \
+            "SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'), scanner, kind, subject
+             FROM audit_event WHERE ts >= $since ORDER BY ts DESC;" 2>/dev/null); then
+        echo -e "${Y}no audit history in $HISTORY_DB yet${NC}, the daemon creates it on start" >&2
+        return 1
+    fi
+    if [[ -z "$out" ]]; then
+        echo -e "${G}no drift recorded${NC} in the last ${days}d"
+        return 0
+    fi
+    printf '%s\n' "$out" | awk -F'\t' '{ printf "  %s  %-11s  %-10s  %s\n", $1, $2, $3, $4 }' | _tty_safe
 }

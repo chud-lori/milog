@@ -281,6 +281,16 @@ or
 and processes whose executable was deleted. Linux only;
 .B check
 exits 1 on other systems.
+.TP
+.B audit history " [\fIdays\fR]"
+Drift that
+.B milog daemon
+stored in the history database over the last
+.I days
+(default 7), newest first. Needs
+.B HISTORY_ENABLED=1
+and
+.BR sqlite3 (1).
 .PP
 When
 .B AUDIT_ENABLED=1
@@ -291,7 +301,12 @@ is running, each scanner runs on its
 timer and fires an
 .B audit:<scanner>:...
 alert on drift. The fim, persistence, ports, and accounts scanners
-record a baseline on their first run instead of alerting.
+record a baseline on their first run instead of alerting. With
+.B HISTORY_ENABLED=1
+each finding is also stored in the history database (a finding that
+persists across checks is stored once), for
+.B audit history
+and the TUI integrity view.
 .SS Kernel observability
 .TP
 .B probe " \fBstatus\fR | \fBinstall-service\fR | \fBuninstall-service\fR"
