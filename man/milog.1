@@ -102,7 +102,10 @@ Top \fIN\fR URLs by req / 4xx / 5xx / p95. Excludes
 .TP
 .B attacker " \fIIP\fR"
 Forensic view of one IP across apps \(em per-app requests, top paths,
-top user-agents, classification, sample lines.
+top user-agents, classification, sample lines. Adds a CrowdSec reputation
+line when
+.B CROWDSEC_CTI_KEY
+is set.
 .TP
 .BR slow " [\fIN\fR]"
 Top \fIN\fR slow endpoints by p95. Requires
@@ -174,7 +177,9 @@ shows the merged catalog (built-ins + overrides + custom).
 Filter-tail one app.
 .TP
 .BR suspects " [\fIN\fR] [\fIWINDOW\fR]"
-Heuristic bot ranking.
+Heuristic bot ranking. IPs with a cached CrowdSec reputation get a
+.BI CS: reputation
+flag.
 .SS Configuration
 .TP
 .B config
@@ -377,8 +382,12 @@ Default
 .BR alerts.state
 (cooldown timestamps),
 .B alerts.fingerprints
-(cross-rule dedup), and
-.BR alerts.silences .
+(cross-rule dedup),
+.BR alerts.silences ,
+and the CrowdSec CTI cache
+.I cti/
+with its last failure in
+.BR cti.err .
 .TP
 .I ~/.config/systemd/user/milog-web.service
 Web dashboard user unit (written by
@@ -416,6 +425,15 @@ App-error pattern detector switch (default
 .TP
 .B MILOG_DISCORD_WEBHOOK ", " MILOG_SLACK_WEBHOOK ", " MILOG_TELEGRAM_BOT_TOKEN
 Per-destination credentials.
+.TP
+.B MILOG_CROWDSEC_CTI_KEY
+CrowdSec CTI API key, overrides
+.BR CROWDSEC_CTI_KEY .
+When set,
+.BR attacker ,
+.BR suspects ,
+and exploit and probe alerts show the IP's CrowdSec reputation; lookups
+are cached for 24 hours. Empty means no requests to CrowdSec.
 .TP
 .B MILOG_DOCKER_ROOT
 Docker state dir for

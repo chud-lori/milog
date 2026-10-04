@@ -96,7 +96,7 @@ func RunKmod(ctx context.Context, out chan<- KmodEvent) error {
 			Comm:   trimNul(raw.Comm[:]),
 			Module: trimNul(raw.Name[:]),
 		}
-		ev.PPID, ev.ParentComm = lookupParent(raw.PID)
+		ev.PPID, ev.ParentComm, ev.ProcComm = lookupProc(raw.PID)
 
 		select {
 		case out <- ev:

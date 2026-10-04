@@ -499,7 +499,7 @@
         </p>
         <ul>
           <li><code>exec</code>: a shell under a web worker, a binary run from /tmp</li>
-          <li><code>tcp</code> connects to destinations outside the allowlisted CIDRs</li>
+          <li><code>tcp</code> connects to destinations outside the allowlisted CIDRs, except milog's own alert sends</li>
           <li><code>file</code> opens of shadow, sudoers and SSH config by processes outside the allowlist</li>
           <li><code>ptrace</code>, <code>kmod</code>, <code>bpf-load</code></li>
           <li>Retransmits and syscall rate, Welford sigma</li>
@@ -703,6 +703,7 @@ MILOG_ANOMALY_SIGMA     MILOG_ANOMALY_MIN_DAYS  MILOG_ANOMALY_FLOOR_REQ
 MILOG_ANOMALY_FLOOR_C5XX  MILOG_ANOMALY_FLOOR_P95
 MILOG_PATTERNS_ENABLED  MILOG_SLOW_EXCLUDE_PATHS
 MILOG_GEOIP_ENABLED     MILOG_MMDB_PATH         MILOG_DOCKER_ROOT
+MILOG_CROWDSEC_CTI_KEY
 MILOG_WEB_PORT          MILOG_WEB_BIND</code></pre>
         <p style="color: var(--fg-3); font-size: 13.5px; margin-bottom: 0;">
           Each one is described in
