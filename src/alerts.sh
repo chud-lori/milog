@@ -617,7 +617,7 @@ _rules_check() {
     for kind in exploit probe; do
         grep -q "^$kind"$'\t' "$f" || { echo "$f: no $kind rules" >&2; return 1; }
     done
-    while IFS=$'\t' read -r kind name re; do
+    while IFS=$'\t' read -r kind name re || [[ -n "$kind" ]]; do
         [[ -n "$kind" && "$kind" != \#* ]] || continue
         # Exit 2 is a bad regex; 0 means it matches an empty line and would flag every request.
         rc=0; grep -Eq -- "$re" <<< "" 2>/dev/null || rc=$?

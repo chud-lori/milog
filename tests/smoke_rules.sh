@@ -96,7 +96,7 @@ _rules_load
 [[ "$RULES_EXPLOIT" == "$old_exploit" ]] || fail "built-in exploit pattern differs from the old inline one"
 [[ "$RULES_PROBE" == "$old_probe" ]] || fail "built-in probe pattern differs from the old inline one"
 for kind in exploit probe; do
-    want="old_$kind"; got="RULES_${kind^^}"
+    want="old_$kind"; got="RULES_$(tr a-z A-Z <<< "$kind")"
     grep -Ei "${!want}" "$log" > "$tmp/old.$kind" || true
     grep -Ei "${!got}" "$log" > "$tmp/new.$kind" || true
     [[ -s "$tmp/old.$kind" ]] || fail "synthetic log has no $kind hits"
@@ -166,8 +166,33 @@ publish "$(printf '# version: 4\nexploit\tx\t(\nprobe\tx\tb')"
 if out=$(mode_update_rules 2>&1); then fail "rules with a broken regex accepted"; fi
 [[ "$out" == *"failed validation"* ]] || fail "unexpected validation error: $out"
 
+# publish() writes without a trailing newline, so these bad rows are the unterminated last line.
+for last in 'probe\tx\t(' 'probe\tx\t.*'; do
+    publish "$(printf '# version: 5\nexploit\tx\ta\n%b' "$last")"
+    if out=$(mode_update_rules 2>&1); then fail "bad unterminated last row accepted: $last"; fi
+    [[ "$out" == *"failed validation"* ]] || fail "unexpected validation error: $out"
+done
+
+rm "$rel/milog-rules.tsv"
+if out=$(mode_update_rules 2>&1); then fail "release without a rules file accepted"; fi
+[[ "$out" == *"ships no rules file"* ]] || fail "unexpected missing-file error: $out"
+
+publish "$(sed '1s/.*/# version: 6/' "$ROOT/rules/milog-rules.tsv")"
 rm "$rel/checksums.txt"
-if mode_update_rules >/dev/null 2>&1; then fail "update without checksums.txt accepted"; fi
+if out=$(mode_update_rules 2>&1); then fail "update without checksums.txt accepted"; fi
+[[ "$out" == *"could not fetch checksums.txt"* ]] || fail "unexpected missing-checksums error: $out"
 [[ "$(cat "$RULES_FILE")" == "$v2" ]] || fail "a refused update changed RULES_FILE"
+
+# A rule starting with '-' must reach the watcher's grep as a pattern, not an option.
+printf '# version: 2\nexploit\tdash\t-dash-probe\nprobe\tx\tonly-bot\n' > "$RULES_FILE"
+: > "$log"
+MILOG_APPS=app1 "$ROOT/milog.sh" exploits > "$tmp/dash.out" 2>&1 &
+pid=$!
+sleep 1
+printf '203.0.113.7 - - [03/Oct/2026:10:00:00 +0000] "GET /-dash-probe HTTP/1.1" 404 12 "-" "x"\n' >> "$log"
+sleep 2
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+grep -q -e '-dash-probe' "$tmp/dash.out" || { cat "$tmp/dash.out" >&2; fail "rule starting with '-' broke the exploits grep"; }
 
 printf 'smoke_rules: ok\n'

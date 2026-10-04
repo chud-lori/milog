@@ -15,9 +15,13 @@ mode_update_rules() {
     tmp=$(mktemp -d) || return 1
     # shellcheck disable=SC2064
     trap "rm -rf '$tmp'" RETURN
-    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/milog-rules.tsv" "${base}/milog-rules.tsv" 2>/dev/null \
-       || ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/checksums.txt" "${base}/checksums.txt" 2>/dev/null; then
-        echo -e "${R}update-rules: could not fetch milog-rules.tsv and checksums.txt from ${tag}${NC}" >&2
+    # Releases up to v0.6.0 predate the rules file, so a 404 here is expected.
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/milog-rules.tsv" "${base}/milog-rules.tsv" 2>/dev/null; then
+        echo -e "${R}update-rules: release ${tag} ships no rules file (or it could not be fetched)${NC}" >&2
+        return 1
+    fi
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/checksums.txt" "${base}/checksums.txt" 2>/dev/null; then
+        echo -e "${R}update-rules: could not fetch checksums.txt for ${tag}; refusing an unverified rules file${NC}" >&2
         return 1
     fi
 

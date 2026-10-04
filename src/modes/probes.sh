@@ -13,7 +13,7 @@ mode_probes() {
             (
                 app="$name"
                 tail -F "$file" 2>/dev/null | \
-                    grep --line-buffered -Ei "$RULES_PROBE" | \
+                    grep --line-buffered -Ei -e "$RULES_PROBE" | \
                 while IFS= read -r line; do
                     printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$(_tty_safe <<< "$line")"
                     # Dedup with exploits, which often matches the same scanner line.
