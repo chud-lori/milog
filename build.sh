@@ -16,7 +16,7 @@ for required in src/core.sh src/dispatch.sh src/modes; do
 done
 
 # install.sh and `milog doctor` read these `# MILOG_<KEY>=` lines right after the shebang.
-MILOG_VERSION=$(git describe --always --dirty 2>/dev/null || echo unknown)
+MILOG_VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)
 MILOG_BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u 2>/dev/null || echo unknown)
 
 {
