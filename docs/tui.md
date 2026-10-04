@@ -92,6 +92,10 @@ Keys (inside the TUI):
 | `P`                      | paths-cross-app view (top 12 paths summed across apps + breakdown)    |
 | `e`                      | errors view (`app:*` rule fires aggregated by pattern → source)       |
 | `t`                      | trend view (per-app 60-minute request-rate sparklines from history DB) |
+| `H`                      | alert history (the latest 500 rows of alerts.log, newest first)       |
+| `S`                      | active silences                                                       |
+| `s`                      | in alert history: silence the selected alert's rule                   |
+| `x`                      | in silences: clear the selected silence                               |
 
 Scrolling / long-view behavior is intentionally operator-oriented:
 the TUI keeps dense summaries on screen, caps the expensive top lists,
@@ -99,6 +103,20 @@ and routes deeper inspection into focused views with their own key
 footer, reload action, and Bubbles viewport scrolling. The same
 selection/back/help model applies across panes instead of introducing
 one-off keys per pane.
+
+## Alert history and silences
+
+`H` lists every fire in alerts.log, newest first. Rules covered by an
+active silence are marked `silenced`. `enter` opens one alert with its
+full body and the other fires from the same client IP (the first IP in
+the body). `s` asks for a duration (`30m`, `2h`, `1d`; empty means 1h)
+and silences that alert's exact rule key.
+
+`S` lists active silences; `x` removes the selected one. Both views read
+and write `alerts.silences` in the alert state dir, the file
+`milog silence` uses, so a silence added in the TUI shows up in
+`milog silence list` and the daemon honours it on the next fire. For
+globs such as `exploit:*`, use `milog silence` directly.
 
 ## Config
 
