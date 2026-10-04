@@ -192,7 +192,7 @@ func TestAlertsHandler_Window(t *testing.T) {
 	}{
 		{"", http.StatusOK, `"window":"24h"`},
 		{"?window=7d", http.StatusOK, `"window":"7d"`},
-		{"?window=30m", http.StatusBadRequest, "invalid window"},
+		{"?window=30m", http.StatusOK, `"window":"30m"`},
 		{"?window=bogus", http.StatusBadRequest, "invalid window"},
 	}
 	for _, c := range cases {
