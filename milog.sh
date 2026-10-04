@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-1-g8f7038c
-# MILOG_BUILT=2026-10-04T02:24:55Z
+# MILOG_VERSION=v0.6.0-3-g60eefe8
+# MILOG_BUILT=2026-10-04T02:37:50Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -6438,7 +6438,7 @@ mode_replay() {
     echo
 }
 
-# milog report [window] [--html] [-o FILE]: static traffic / attacker / alert / anomaly / audit summary.
+# milog report [window] [--html] [-o FILE]: static traffic / attacker / alert / anomaly summary.
 
 # Stdin records, tab-separated: T title, M meta line, H section, P note, E empty state, C header cells, R row cells.
 _report_render() {
@@ -6509,10 +6509,14 @@ _report_traffic() {
         name=$(_log_name_for "$entry")
         file=$(_log_path_for "$entry")
         [[ -f "$file" ]] || continue
+        if [[ ! -r "$file" ]]; then
+            printf 'A\t%s\tunreadable\n' "$name"
+            continue
+        fi
         printf 'A\t%s\n' "$name"
         _digest_in_window "$cutoff" "$file" | awk -v app="$name" '{ print "L\t" app "\t" $1 "\t" $9 }'
     done | awk -F'\t' '
-        $1 == "A" { apps[++na] = $2; next }
+        $1 == "A" { apps[++na] = $2; if ($3 != "") bad[$2] = 1; next }
         {
             req[$2]++; ipreq[$3]++
             if ($4 ~ /^4/) { c4[$2]++; ip4[$3]++ }
@@ -6523,10 +6527,15 @@ _report_traffic() {
             if (!na) print "E\tNo nginx access log found for any configured app."
             else {
                 print "C\tApp\tRequests\t4xx\t5xx"
-                for (i = 1; i <= na; i++) { a = apps[i]; printf "R\t%s\t%d\t%d\t%d\n", a, req[a], c4[a], c5[a] }
+                for (i = 1; i <= na; i++) {
+                    a = apps[i]
+                    if (a in bad) printf "R\t%s\tlog not readable\t-\t-\n", a
+                    else printf "R\t%s\t%d\t%d\t%d\n", a, req[a], c4[a], c5[a]
+                }
             }
             print "H\tTop attacker IPs"
-            print "P\tRanked by 4xx responses across all apps."
+            m = 0; for (ip in ip4) m++
+            print "P\tRanked by 4xx responses across all apps." (m > 10 ? " Showing 10 of " m "." : "")
             for (n = 0; n < 10; n++) {
                 best = ""
                 for (ip in ip4) if (!(ip in done) && (best == "" || ip4[ip] > ip4[best] || (ip4[ip] == ip4[best] && ipreq[ip] > ipreq[best]))) best = ip
@@ -6540,10 +6549,10 @@ _report_traffic() {
 }
 
 _report_alerts() {
-    local cutoff="$1" alog="$ALERT_STATE_DIR/alerts.log" tab=$'\t' rows="" n last rule ts body
+    local cutoff="$1" alog="$ALERT_STATE_DIR/alerts.log" tab=$'\t' rows="" total=0 n last rule ts body
     printf 'H\tAlert fires per rule\n'
     if [[ ! -f "$alog" ]]; then
-        printf 'E\tNo alerts.log at %s, so no alert has fired on this host.\n' "$alog"
+        printf 'E\tNo alerts.log at %s.\n' "$alog"
     else
         rows=$(awk -F'\t' -v c="$cutoff" '$1 >= c { n[$2]++; if ($1 > last[$2]) last[$2] = $1 }
             END { for (r in n) printf "%d\t%s\t%s\n", n[r], last[r], r }' "$alog" | sort -t "$tab" -k1,1rn -k3,3)
@@ -6556,7 +6565,11 @@ _report_alerts() {
             done <<< "$rows"
         fi
         rows=$(awk -F'\t' -v c="$cutoff" '$1 >= c && $2 ~ /^anomaly:/ { print $1 "\t" $2 "\t" $5 }' "$alog" \
-            | sort -t "$tab" -k1,1rn | head -50)
+            | sort -t "$tab" -k1,1rn)
+        if [[ -n "$rows" ]]; then
+            total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+            rows=$(printf '%s\n' "$rows" | head -50)
+        fi
     fi
 
     printf 'H\tAnomalies\n'
@@ -6567,6 +6580,7 @@ _report_alerts() {
             printf 'E\tNo anomalies fired in this window. Anomaly detection is off (ANOMALY_ENABLED=0).\n'
         fi
     else
+        if (( total > 50 )); then printf 'P\tShowing the latest 50 of %s.\n' "$total"; fi
         printf 'C\tTime\tRule\tDetail\n'
         while IFS=$'\t' read -r ts rule body; do
             printf 'R\t%s\t%s\t%s\n' "$(_alerts_fmt_epoch "$ts")" "$rule" "${body//\`/}"
@@ -6574,37 +6588,8 @@ _report_alerts() {
     fi
 }
 
-# Prints nothing unless the history DB has an audit* table with a ts column; other columns are shown as stored.
-_report_audit() {
-    local cutoff="$1" table cols col select="" has_ts=0 out
-    command -v sqlite3 >/dev/null 2>&1 && [[ -f "$HISTORY_DB" ]] || return 0
-    table=$(sqlite3 "$HISTORY_DB" "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'audit%' ORDER BY name LIMIT 1;" 2>/dev/null) || return 0
-    [[ "$table" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 0
-    cols=$(sqlite3 "$HISTORY_DB" "SELECT name FROM pragma_table_info('$table');" 2>/dev/null) || return 0
-    while IFS= read -r col; do
-        [[ "$col" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-        [[ -n "$select" ]] && select+=", "
-        if [[ "$col" == "ts" ]]; then
-            has_ts=1
-            select+="datetime(ts, 'unixepoch') AS ts"
-        else
-            select+="replace(replace(CAST($col AS TEXT), char(9), ' '), char(10), ' ') AS $col"
-        fi
-    done <<< "$cols"
-    (( has_ts )) || return 0
-
-    out=$(sqlite3 -header -separator $'\t' "$HISTORY_DB" \
-        "SELECT $select FROM $table WHERE ts >= $cutoff ORDER BY ts DESC LIMIT 100;" 2>/dev/null) || return 0
-    printf 'H\tAudit drift\n'
-    if [[ -z "$out" ]]; then
-        printf 'E\tNo audit results recorded in this window.\n'
-    else
-        printf '%s\n' "$out" | awk 'NR == 1 { print "C\t" $0; next } { print "R\t" $0 }'
-    fi
-}
-
 mode_report() {
-    local window="7d" html=0 out="" secs now cutoff report
+    local window="7d" html=0 out="" secs now cutoff report tmp
     while (( $# )); do
         case "$1" in
             --html) html=1 ;;
@@ -6624,10 +6609,16 @@ mode_report() {
         printf 'M\t%s to %s\n' "$(_alerts_fmt_epoch "$cutoff")" "$(_alerts_fmt_epoch "$now")"
         _report_traffic "$cutoff"
         _report_alerts "$cutoff"
-        _report_audit "$cutoff"
     )
     if [[ -n "$out" ]]; then
-        printf '%s\n' "$report" | _report_render "$html" | _tty_safe > "$out"
+        [[ -L "$out" ]] && { echo -e "${R}report: refusing to write through symlink: $out${NC}" >&2; return 1; }
+        tmp=$(mktemp "$(dirname "$out")/.milog-report.XXXXXX") || return 1
+        if printf '%s\n' "$report" | _report_render "$html" | _tty_safe > "$tmp"; then
+            mv -f "$tmp" "$out"
+        else
+            rm -f "$tmp"
+            return 1
+        fi
     else
         printf '%s\n' "$report" | _report_render "$html" | _tty_safe
     fi
@@ -7940,6 +7931,7 @@ _milog_complete() {
     local silence_subs="list clear"
     local web_subs="start stop status install-service uninstall-service rotate-token"
     local window_vals="today yesterday 1h 6h 12h 24h 7d 30d all"
+    local digest_window_vals="day week 1h 6h 12h 24h 7d 30d"
 
     case $cword in
         1)
@@ -7976,9 +7968,14 @@ _milog_complete() {
                 2) COMPREPLY=($(compgen -W "$web_subs" -- "$cur")) ;;
             esac
             ;;
-        alerts|digest|report)
+        alerts)
             case $cword in
                 2) COMPREPLY=($(compgen -W "$window_vals" -- "$cur")) ;;
+            esac
+            ;;
+        digest|report)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "$digest_window_vals" -- "$cur")) ;;
             esac
             ;;
     esac
@@ -7995,7 +7992,7 @@ _completions_payload_zsh() {
 # Install to /usr/share/zsh/site-functions/_milog (system) or any dir in $fpath.
 
 _milog() {
-    local -a commands config_subs config_keys alert_subs silence_subs web_subs window_vals
+    local -a commands config_subs config_keys alert_subs silence_subs web_subs window_vals digest_window_vals
 
     commands=(
         'monitor:bash dashboard (nginx + system)'
@@ -8062,6 +8059,7 @@ _milog() {
     silence_subs=(list clear)
     web_subs=(start stop status install-service uninstall-service rotate-token)
     window_vals=(today yesterday 1h 6h 12h 24h 7d 30d all)
+    digest_window_vals=(day week 1h 6h 12h 24h 7d 30d)
 
     if (( CURRENT == 2 )); then
         _describe -t commands 'milog subcommand' commands
@@ -8080,7 +8078,8 @@ _milog() {
         alert)    (( CURRENT == 3 )) && _describe 'alert subcommand' alert_subs ;;
         silence)  (( CURRENT == 3 )) && _describe 'silence subcommand' silence_subs ;;
         web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
-        alerts|digest|report) (( CURRENT == 3 )) && _describe 'window' window_vals ;;
+        alerts)   (( CURRENT == 3 )) && _describe 'window' window_vals ;;
+        digest|report) (( CURRENT == 3 )) && _describe 'window' digest_window_vals ;;
     esac
 }
 
@@ -8168,7 +8167,12 @@ end
 
 set -l window_vals today yesterday 1h 6h 12h 24h 7d 30d all
 for v in $window_vals
-    complete -c milog -n "__milog_seen_cmd alerts; or __milog_seen_cmd digest; or __milog_seen_cmd report" -a "$v"
+    complete -c milog -n "__milog_seen_cmd alerts" -a "$v"
+end
+
+set -l digest_window_vals day week 1h 6h 12h 24h 7d 30d
+for v in $digest_window_vals
+    complete -c milog -n "__milog_seen_cmd digest; or __milog_seen_cmd report" -a "$v"
 end
 MILOG_COMPLETION_EOF
 }
@@ -8357,7 +8361,7 @@ _cmd_help() {
             ;;
         report)
             echo -e "${W}milog report [window] [--html] [-o FILE]${NC} — static report for sharing"
-            echo -e "  Traffic per app, top IPs by 4xx, alert fires per rule, anomalies, audit drift."
+            echo -e "  Traffic per app, top IPs by 4xx, alert fires per rule, anomalies."
             echo -e "  Markdown by default; ${C}--html${NC} writes one self-contained page. Windows as digest (default 7d)."
             ;;
         doctor)   echo -e "${W}milog doctor${NC} — diagnostic checklist" ;;
