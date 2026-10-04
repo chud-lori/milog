@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-17-g9341c14
-# MILOG_BUILT=2026-10-04T02:44:23Z
+# MILOG_VERSION=v0.6.0-24-g58e9f05
+# MILOG_BUILT=2026-10-04T02:59:44Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -553,34 +553,22 @@ ${body}"
 # Silences: explicit mutes that outrank cooldown and dedup.
 # alerts.silences rows: key-or-glob, until, added, added_by, message. Expired rows are pruned lazily.
 
-# 30s / 5m / 2h / 1d (or bare seconds) -> seconds; returns 1 on bad input.
+# 30s / 5m / 2h / 1d (or bare seconds) -> seconds, up to 3650d; returns 1 on bad input.
 alert_silence_parse_duration() {
-    local s="${1:-}"
-    [[ -n "$s" ]] || return 1
-    local n="${s%[smhdSMHD]}" unit="${s: -1}"
-    if [[ "$s" =~ ^[0-9]+$ ]]; then
-        printf '%s' "$s"
-        return 0
-    fi
-    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    local s="${1:-}" n unit=1
     # `${unit,,}` is bash 4+ only.
-    case "$unit" in
-        s|S) printf '%s' "$n" ;;
-        m|M) printf '%s' $(( n * 60 )) ;;
-        h|H) printf '%s' $(( n * 3600 )) ;;
-        d|D) printf '%s' $(( n * 86400 )) ;;
-        *) return 1 ;;
+    case "$s" in
+        *[sS]) n="${s%?}" ;;
+        *[mM]) n="${s%?}" unit=60 ;;
+        *[hH]) n="${s%?}" unit=3600 ;;
+        *[dD]) n="${s%?}" unit=86400 ;;
+        *)     n="$s" ;;
     esac
-}
-
-alert_silence_prune() {
-    local f="$ALERT_STATE_DIR/alerts.silences"
-    [[ -f "$f" ]] || return 0
-    local now; now=$(date +%s)
-    local tmp
-    tmp=$(mktemp "$f.prune.XXXXXX" 2>/dev/null) || return 0
-    awk -F'\t' -v now="$now" 'BEGIN{OFS="\t"} $2+0 > now' "$f" 2>/dev/null > "$tmp"
-    mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+    # At most nine significant digits, so the multiply can't overflow.
+    [[ "$n" =~ ^0*([0-9]{1,9})$ ]] || return 1
+    n=$(( 10#${BASH_REMATCH[1]} * unit ))
+    (( n <= 3650 * 86400 )) || return 1
+    printf '%s' "$n"
 }
 
 # Prints the matching row; `[[ == $key ]]` is a glob match, so `exploit:*` covers every exploit rule.
@@ -1832,8 +1820,11 @@ _alert_read_webhook() {
 }
 
 _alert_read_routes() {
-    local file="$1"
-    [[ -r "$file" ]] || return 0
+    local file="$1" size
+    # Root may be the reader, so skip symlinks, FIFOs and anything over 1 MiB.
+    [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 0
+    size=$(stat -c '%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null) || return 0
+    (( size <= 1048576 )) || return 0
     # Parsed, never sourced: under sudo this is another user's file and we're root.
     awk '
         !on && /^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/ {
@@ -1914,11 +1905,21 @@ alert_on() {
     fi
     _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=1" || return 1
 
-    local current_webhook
-    current_webhook=$(_alert_read_webhook "$target_config")
-    if [[ -z "$current_webhook" ]]; then
-        echo -e "${R}no DISCORD_WEBHOOK configured in $target_config${NC}" >&2
-        echo "  pass one:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+    local d_url s_url wh_url tg_token tg_chat mx_hs mx_token mx_room
+    d_url=$(_alert_read_webhook "$target_config")
+    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    wh_url=$(  _alert_read_key "$target_config" "WEBHOOK_URL")
+    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+    if [[ -z "$d_url$s_url$wh_url" ]] \
+        && [[ -z "$tg_token" || -z "$tg_chat" ]] \
+        && [[ -z "$mx_hs" || -z "$mx_token" || -z "$mx_room" ]]; then
+        echo -e "${R}no alert destination configured in $target_config${NC}" >&2
+        echo "  pass a Discord webhook:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+        echo "  or set SLACK_WEBHOOK, TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID, MATRIX_* or WEBHOOK_URL there" >&2
         return 1
     fi
 
@@ -2161,7 +2162,7 @@ mode_alert() {
 
 # milog alerts [window]: what fired, read from alerts.log.
 
-# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; there is no upper bound, so `yesterday` includes today.
+# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; _alerts_window_end_epoch supplies the upper bound.
 _alerts_window_to_epoch() {
     local w="$1"
     local now; now=$(date +%s)
@@ -2514,7 +2515,7 @@ _audit_fim_expand_paths() {
         fi
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    printf '%s\n' ${out[@]+"${out[@]}"} | sort -u
 }
 
 # Overwrites the baseline without alerting.
@@ -2764,7 +2765,7 @@ _audit_persistence_expand() {
         # Unmatched globs add nothing, but nullglob leaves literal paths in place even when they don't exist.
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    printf '%s\n' ${out[@]+"${out[@]}"} | sort -u
 }
 
 _audit_persistence_baseline() {
@@ -3442,7 +3443,7 @@ _audit_accounts_expand() {
         fi
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    printf '%s\n' ${out[@]+"${out[@]}"} | sort -u
 }
 
 # Prints `<count> <dir>`.
@@ -4027,7 +4028,7 @@ ${W}MEASURES${NC}
 }
 # milog completions install | bash | zsh | fish.
 
-# Bodies come from completions/ in a repo clone, else from _completions_payload_<shell>, which build.sh does not generate.
+# Bodies come from completions/ in a repo clone, else from the _completions_payload_<shell> functions build.sh bakes in.
 
 _completions_src_dir() {
     local me self_dir
@@ -4610,7 +4611,6 @@ mode_daemon() {
         _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
         exit 1
     fi
-    # rc=2 means warnings only → continue, user's been told.
 
     local hook_state
     hook_state="disabled"
@@ -5907,8 +5907,8 @@ _patterns_collect() {
         if [[ -z "$v" ]]; then
             if (( found >= 0 )); then
                 unset "out_names[$found]" "out_regex[$found]"
-                out_names=("${out_names[@]}")
-                out_regex=("${out_regex[@]}")
+                out_names=(${out_names[@]+"${out_names[@]}"})
+                out_regex=(${out_regex[@]+"${out_regex[@]}"})
             fi
             continue
         fi
@@ -6905,7 +6905,7 @@ _silence_add() {
     local seconds
     seconds=$(alert_silence_parse_duration "$duration") || {
         echo -e "${R}invalid duration:${NC} $duration" >&2
-        echo -e "${D}  use N<s|m|h|d> — e.g. 30s, 5m, 2h, 1d${NC}" >&2
+        echo -e "${D}  use N<s|m|h|d> up to 3650d — e.g. 30s, 5m, 2h, 1d${NC}" >&2
         return 1
     }
     if (( seconds < 1 )); then
