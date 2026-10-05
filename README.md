@@ -202,6 +202,8 @@ milog silence <rule_or_glob> <duration> [msg]
 milog config [init|add|rm|dir|set|edit]
 milog update-rules         # newer exploit/probe rules from the latest release
 milog doctor               # diagnostic checklist
+milog version              # milog + companion binary versions
+milog update [--check]     # install the latest release (checksum-verified)
 milog help
 ```
 

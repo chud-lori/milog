@@ -40,6 +40,8 @@ ${W}ALERTING${NC}
 
 ${W}DIAGNOSTICS${NC}
   ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
+  ${C}version${NC}            milog and companion binary versions
+  ${C}update [--check]${NC}   install the latest GitHub release over this milog
 
 ${W}WEB UI${NC} ${D}(read-only, token-gated, loopback-only by default)${NC}
   ${C}web${NC}                start the local HTTP dashboard (foreground)
@@ -190,6 +192,13 @@ _cmd_help() {
             echo -e "  Markdown by default; ${C}--html${NC} writes one self-contained page. Windows as digest (default 7d)."
             ;;
         doctor)   echo -e "${W}milog doctor${NC} — diagnostic checklist" ;;
+        version|--version|-V) echo -e "${W}milog version${NC} — build stamp of milog and the version of each companion binary found" ;;
+        update)
+            echo -e "${W}milog update [--check]${NC} — replace milog and its installed companion binaries with the latest release"
+            echo -e "  Verifies the tarball against the release's checksums.txt. Refuses package-managed installs."
+            echo -e "  ${C}--check${NC}  report only; exit 0 when up to date, 10 when an update exists"
+            echo -e "  ${D}Release repo: MILOG_RELEASE_REPO (default chud-lori/milog)${NC}"
+            ;;
         web)
             echo -e "${W}milog web${NC} — read-only local HTTP dashboard"
             echo -e "  Subs: start stop status install-service uninstall-service rotate-token"
@@ -241,7 +250,7 @@ fi
 # Setup and host-level commands must work before any app is configured.
 if [[ ${#LOGS[@]} -eq 0 ]]; then
     case "${1:-}" in
-        -h|--help|help|config|doctor|completions|install|update-rules|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
+        -h|--help|help|config|doctor|version|--version|-V|update|completions|install|update-rules|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
         *)
             echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
             echo "  Run 'milog config init', set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
@@ -289,6 +298,8 @@ case "${1:-}" in
     update-rules) mode_update_rules ;;
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
+    version|--version|-V) mode_version ;;
+    update)   shift; mode_update "$@" ;;
     web)      shift; mode_web "$@" ;;
     probe)    shift; mode_probe "$@" ;;
     # Hidden: milog-probe calls this per rule hit with <rule_key> <title> <body> [color] so the full alert path applies.

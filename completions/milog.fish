@@ -41,6 +41,8 @@ set -l cmds \
     "digest:exec-summary view last day / week" \
     "report:static markdown / HTML report" \
     "doctor:diagnostic checklist" \
+    "version:milog and companion binary versions" \
+    "update:install the latest release" \
     "web:start/stop/status web UI" \
     "install:add optional features" \
     "update-rules:fetch newer detection rules" \
@@ -85,3 +87,5 @@ set -l digest_window_vals day week 1h 6h 12h 24h 7d 30d
 for v in $digest_window_vals
     complete -c milog -n "__milog_seen_cmd digest; or __milog_seen_cmd report" -a "$v"
 end
+
+complete -c milog -n "__milog_seen_cmd update" -l check -d "report only; exit 10 when an update exists"

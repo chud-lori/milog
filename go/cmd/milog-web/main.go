@@ -40,6 +40,10 @@ var webFS embed.FS
 var buildVersion = "unknown"
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Println("milog-web v=" + buildVersion)
+		return
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("milog-web: config: %v", err)

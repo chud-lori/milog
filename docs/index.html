@@ -516,8 +516,8 @@
     <p class="intro">
       The same list <code>milog help</code> prints. Any command takes
       <code>--help</code> for its own detail. Before any log source is
-      configured, only help, config, doctor, install, completions, alert,
-      alerts, silence, audit, probe and bench run; the rest exit and point at
+      configured, only help, config, doctor, version, update, install,
+      completions, alert, alerts, silence, audit, probe and bench run; the rest exit and point at
       <code>milog config init</code>.
     </p>
 
@@ -626,6 +626,8 @@
           <div class="cmd"><dt>milog config set &lt;k&gt; &lt;v&gt;</dt><dd>Set any variable: REFRESH, THRESH_*, and the rest.</dd></div>
           <div class="cmd"><dt>milog config edit</dt><dd>Open the config in $EDITOR.</dd></div>
           <div class="cmd"><dt>milog doctor</dt><dd>Checklist: tools, logs, log format, alerting, history, geoip, web, systemd. <span class="hint">counts alert deliveries that failed in the last 24h</span></dd></div>
+          <div class="cmd"><dt>milog version</dt><dd>Version stamp of milog and of each companion binary found.</dd></div>
+          <div class="cmd"><dt>milog update [--check]</dt><dd>Replace milog and its installed companion binaries with the latest GitHub release. <span class="hint">checksum-verified · --check exits 10 when an update exists</span></dd></div>
           <div class="cmd"><dt>milog install &lt;feature&gt;</dt><dd>Add an optional feature: geoip, web, history.</dd></div>
           <div class="cmd"><dt>milog update-rules</dt><dd>Fetch newer exploit and probe rules from the latest release.</dd></div>
           <div class="cmd"><dt>milog bench [--full]</dt><dd>Benchmark against synthetic fixtures.</dd></div>
