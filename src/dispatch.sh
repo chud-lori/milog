@@ -9,7 +9,7 @@ ${W}DASHBOARDS${NC}
                      ${D}keys: q=quit  p=pause  r=refresh  +/-=rate${NC}
   ${C}tui${NC}                rich Charm TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
   ${C}rate${NC}               nginx-only req/min dashboard
-  ${C}daemon${NC}             headless alerter — no TUI, fires Discord webhooks
+  ${C}daemon${NC}             headless alerter — no TUI, fires every configured destination
 
 ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
@@ -28,10 +28,10 @@ ${W}ANALYSIS${NC}
   ${C}search <pat> ...${NC}   grep across all apps (flags: --since/--app/--path/--regex/--archives)
 
 ${W}ALERTING${NC}
-  ${C}alert on [URL]${NC}     enable Discord alerts + install systemd service
+  ${C}alert on [URL]${NC}     enable alerts + install systemd service
   ${C}alert off${NC}          disable alerts + stop service
   ${C}alert status${NC}       webhook / service / recent-fire state
-  ${C}alert test${NC}         send a test Discord embed right now
+  ${C}alert test${NC}         send a test alert to every destination
   ${C}alert stats [W]${NC}    fires per rule ${D}(default 7d)${NC}
   ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
   ${C}silence ...${NC}        mute a rule while on-call works the fix ${D}(milog silence --help)${NC}

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-104-g2d661d7
-# MILOG_BUILT=2026-10-05T01:58:30Z
+# MILOG_VERSION=v0.6.0-124-g73b4796
+# MILOG_BUILT=2026-10-05T02:00:30Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -576,34 +576,22 @@ ${body}"
 # Silences: explicit mutes that outrank cooldown and dedup.
 # alerts.silences rows: key-or-glob, until, added, added_by, message. Expired rows are pruned lazily.
 
-# 30s / 5m / 2h / 1d (or bare seconds) -> seconds; returns 1 on bad input.
+# 30s / 5m / 2h / 1d (or bare seconds) -> seconds, up to 3650d; returns 1 on bad input.
 alert_silence_parse_duration() {
-    local s="${1:-}"
-    [[ -n "$s" ]] || return 1
-    local n="${s%[smhdSMHD]}" unit="${s: -1}"
-    if [[ "$s" =~ ^[0-9]+$ ]]; then
-        printf '%s' "$s"
-        return 0
-    fi
-    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    local s="${1:-}" n unit=1
     # `${unit,,}` is bash 4+ only.
-    case "$unit" in
-        s|S) printf '%s' "$n" ;;
-        m|M) printf '%s' $(( n * 60 )) ;;
-        h|H) printf '%s' $(( n * 3600 )) ;;
-        d|D) printf '%s' $(( n * 86400 )) ;;
-        *) return 1 ;;
+    case "$s" in
+        *[sS]) n="${s%?}" ;;
+        *[mM]) n="${s%?}" unit=60 ;;
+        *[hH]) n="${s%?}" unit=3600 ;;
+        *[dD]) n="${s%?}" unit=86400 ;;
+        *)     n="$s" ;;
     esac
-}
-
-alert_silence_prune() {
-    local f="$ALERT_STATE_DIR/alerts.silences"
-    [[ -f "$f" ]] || return 0
-    local now; now=$(date +%s)
-    local tmp
-    tmp=$(mktemp "$f.prune.XXXXXX" 2>/dev/null) || return 0
-    awk -F'\t' -v now="$now" 'BEGIN{OFS="\t"} $2+0 > now' "$f" 2>/dev/null > "$tmp"
-    mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+    # At most nine significant digits, so the multiply can't overflow.
+    [[ "$n" =~ ^0*([0-9]{1,9})$ ]] || return 1
+    n=$(( 10#${BASH_REMATCH[1]} * unit ))
+    (( n <= 3650 * 86400 )) || return 1
+    printf '%s' "$n"
 }
 
 # Prints the matching row; `[[ == $key ]]` is a glob match, so `exploit:*` covers every exploit rule.
@@ -879,6 +867,12 @@ _alert_redact_webhook() {
     else
         printf '%.40s…' "$w"
     fi
+}
+
+# Succeeds when at least one destination has every setting it needs; same args as _alert_destinations_status.
+_alert_any_destination() {
+    local d="${1:-}" s="${2:-}" tt="${3:-}" tc="${4:-}" mh="${5:-}" mt="${6:-}" mr="${7:-}" wh="${8:-}"
+    [[ -n "$d$s$wh" ]] || [[ -n "$tt" && -n "$tc" ]] || [[ -n "$mh" && -n "$mt" && -n "$mr" ]]
 }
 
 # Takes values as args so `alert status` can pass ones read from another user's config file.
@@ -1995,10 +1989,28 @@ _alert_write_config() {
     fi
 }
 
+# Regular file up to 1 MiB; root also refuses symlinks, since it may be reading another user's file.
+_alert_config_readable() {
+    local file="$1" size
+    [[ -f "$file" && -r "$file" ]] || return 1
+    (( EUID != 0 )) || [[ ! -L "$file" ]] || return 1
+    size=$(stat -L -c '%s' "$file" 2>/dev/null || stat -L -f '%z' "$file" 2>/dev/null) || return 1
+    (( size <= 1048576 ))
+}
+
+# Stops before any read or write when the target config exists but the readers would skip it.
+_alert_check_config() {
+    local file="$1"
+    [[ -e "$file" || -L "$file" ]] || return 0
+    _alert_config_readable "$file" && return 0
+    echo -e "${R}refusing to use $file:${NC} needs a regular file under 1 MiB (not a symlink when run as root)" >&2
+    return 1
+}
+
 # Always returns 0, printing nothing when the file or key is missing, to stay safe under `set -e`.
 _alert_read_webhook() {
     local file="$1"
-    [[ -f "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     {
         grep -E '^[[:space:]]*DISCORD_WEBHOOK=' "$file" 2>/dev/null \
             | head -1 \
@@ -2009,7 +2021,7 @@ _alert_read_webhook() {
 
 _alert_read_routes() {
     local file="$1"
-    [[ -r "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     # Parsed, never sourced: under sudo this is another user's file and we're root.
     awk '
         !on && /^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/ {
@@ -2028,7 +2040,7 @@ _alert_read_routes() {
 
 _alert_read_key() {
     local file="$1" key="$2"
-    [[ -f "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     {
         grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null \
             | head -1 \
@@ -2078,6 +2090,7 @@ alert_on() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     if [[ -n "$webhook_arg" ]]; then
         case "$webhook_arg" in
@@ -2090,11 +2103,19 @@ alert_on() {
     fi
     _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=1" || return 1
 
-    local current_webhook
-    current_webhook=$(_alert_read_webhook "$target_config")
-    if [[ -z "$current_webhook" ]]; then
-        echo -e "${R}no DISCORD_WEBHOOK configured in $target_config${NC}" >&2
-        echo "  pass one:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+    local d_url s_url wh_url tg_token tg_chat mx_hs mx_token mx_room
+    d_url=$(_alert_read_webhook "$target_config")
+    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    wh_url=$(  _alert_read_key "$target_config" "WEBHOOK_URL")
+    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+    if ! _alert_any_destination "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room" "$wh_url"; then
+        echo -e "${R}no alert destination configured in $target_config${NC}" >&2
+        echo "  pass a Discord webhook:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+        echo "  or set SLACK_WEBHOOK, TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID, MATRIX_* or WEBHOOK_URL there" >&2
         return 1
     fi
 
@@ -2122,6 +2143,7 @@ alert_off() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=0" \
         && echo -e "${G}✓${NC} ALERTS_ENABLED=0 in $target_config"
@@ -2146,6 +2168,7 @@ alert_status() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     # Read from the target config, not env, so `sudo milog alert status` shows the user's settings rather than root's.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url
@@ -2231,6 +2254,7 @@ alert_test() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     # Target user's config, not this process's env, for the same sudo reason as alert_status.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url wh_template wh_ctype
@@ -2300,7 +2324,7 @@ alert_help() {
 ${W}milog alert${NC} — toggle alerting and manage the systemd service
 
 ${W}USAGE${NC}
-  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts (Discord); install + start systemd
+  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts; install + start systemd
   ${C}milog alert off${NC}                disable alerts; stop + disable service
   ${C}milog alert status${NC}             show destinations/service/recent-fire state
   ${C}milog alert test${NC}               fire one test alert to EVERY configured
@@ -2752,7 +2776,7 @@ _audit_fim_expand_paths() {
         fi
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    (( ${#out[@]} == 0 )) || printf '%s\n' "${out[@]}" | sort -u
 }
 
 # Overwrites the baseline without alerting.
@@ -3006,7 +3030,7 @@ _audit_persistence_expand() {
         # Unmatched globs add nothing, but nullglob leaves literal paths in place even when they don't exist.
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    (( ${#out[@]} == 0 )) || printf '%s\n' "${out[@]}" | sort -u
 }
 
 _audit_persistence_baseline() {
@@ -3694,7 +3718,7 @@ _audit_accounts_expand() {
         fi
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    (( ${#out[@]} == 0 )) || printf '%s\n' "${out[@]}" | sort -u
 }
 
 # Prints `<count> <dir>`.
@@ -4363,7 +4387,7 @@ ${W}MEASURES${NC}
 }
 # milog completions install | bash | zsh | fish.
 
-# Bodies come from completions/ in a repo clone, else from _completions_payload_<shell>, which build.sh does not generate.
+# Bodies come from completions/ in a repo clone, else from the _completions_payload_<shell> functions build.sh bakes in.
 
 _completions_src_dir() {
     local me self_dir
@@ -4949,14 +4973,14 @@ mode_daemon() {
         _dlog "ABORT: config validate reported errors — fix them or run \`milog config validate\`"
         exit 1
     fi
-    # rc=2 means warnings only → continue, user's been told.
 
-    local hook_state
-    hook_state="disabled"
-    [[ "$ALERTS_ENABLED" == "1" && -n "$DISCORD_WEBHOOK" ]] && hook_state="enabled"
+    local hook_state="disabled" have_dest=0
+    _alert_any_destination "$DISCORD_WEBHOOK" "$SLACK_WEBHOOK" "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" \
+        "$MATRIX_HOMESERVER" "$MATRIX_TOKEN" "$MATRIX_ROOM" "$WEBHOOK_URL" && have_dest=1
+    [[ "$ALERTS_ENABLED" == "1" ]] && (( have_dest )) && hook_state="enabled"
     _dlog "milog daemon starting — refresh=${REFRESH}s alerts=${hook_state} history=${HISTORY_ENABLED} apps=(${LOGS[*]})"
     [[ "$ALERTS_ENABLED" != "1" ]] && _dlog "WARNING: ALERTS_ENABLED=0 — rules will log but no webhooks will be fired"
-    [[ -z "$DISCORD_WEBHOOK"    ]] && _dlog "WARNING: DISCORD_WEBHOOK empty — no webhooks will be fired"
+    (( have_dest )) || _dlog "WARNING: no alert destination configured — no webhooks will be fired"
 
     history_init   # no-op when HISTORY_ENABLED=0; disables itself on error
 
@@ -6251,8 +6275,8 @@ _patterns_collect() {
         if [[ -z "$v" ]]; then
             if (( found >= 0 )); then
                 unset "out_names[$found]" "out_regex[$found]"
-                out_names=("${out_names[@]}")
-                out_regex=("${out_regex[@]}")
+                out_names=(${out_names[@]+"${out_names[@]}"})
+                out_regex=(${out_regex[@]+"${out_regex[@]}"})
             fi
             continue
         fi
@@ -7224,7 +7248,7 @@ _silence_add() {
     local seconds
     seconds=$(alert_silence_parse_duration "$duration") || {
         echo -e "${R}invalid duration:${NC} $duration" >&2
-        echo -e "${D}  use N<s|m|h|d> — e.g. 30s, 5m, 2h, 1d${NC}" >&2
+        echo -e "${D}  use N<s|m|h|d> up to 3650d — e.g. 30s, 5m, 2h, 1d${NC}" >&2
         return 1
     }
     if (( seconds < 1 )); then
@@ -7239,7 +7263,7 @@ _silence_add() {
     local until_fmt; until_fmt=$(_silence_fmt_epoch "$until_epoch")
     local rem_fmt;   rem_fmt=$(_silence_fmt_remaining "$until_epoch")
     echo -e "${G}✓${NC} silenced ${Y}$key${NC} until ${W}$until_fmt${NC} (${rem_fmt})"
-    [[ -n "$message" ]] && echo -e "${D}  note: $message${NC}"
+    [[ -z "$message" ]] || echo -e "${D}  note: $message${NC}"
 }
 
 _silence_clear() {
@@ -8662,7 +8686,7 @@ ${W}DASHBOARDS${NC}
                      ${D}keys: q=quit  p=pause  r=refresh  +/-=rate${NC}
   ${C}tui${NC}                rich Charm TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
   ${C}rate${NC}               nginx-only req/min dashboard
-  ${C}daemon${NC}             headless alerter — no TUI, fires Discord webhooks
+  ${C}daemon${NC}             headless alerter — no TUI, fires every configured destination
 
 ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
@@ -8681,10 +8705,10 @@ ${W}ANALYSIS${NC}
   ${C}search <pat> ...${NC}   grep across all apps (flags: --since/--app/--path/--regex/--archives)
 
 ${W}ALERTING${NC}
-  ${C}alert on [URL]${NC}     enable Discord alerts + install systemd service
+  ${C}alert on [URL]${NC}     enable alerts + install systemd service
   ${C}alert off${NC}          disable alerts + stop service
   ${C}alert status${NC}       webhook / service / recent-fire state
-  ${C}alert test${NC}         send a test Discord embed right now
+  ${C}alert test${NC}         send a test alert to every destination
   ${C}alert stats [W]${NC}    fires per rule ${D}(default 7d)${NC}
   ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
   ${C}silence ...${NC}        mute a rule while on-call works the fix ${D}(milog silence --help)${NC}

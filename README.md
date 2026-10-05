@@ -227,8 +227,10 @@ scroll, `f`/page-down and `b`/page-up page through longer output, and
 ## Uninstall
 
 ```bash
-sudo rm /usr/local/bin/milog
-sudo rm -f /etc/systemd/system/milog.service
+sudo systemctl disable --now milog.service milog-probe.service
+systemctl --user disable --now milog-web.service
+sudo rm -f /usr/local/bin/milog /usr/local/bin/milog-web /usr/local/bin/milog-tui /usr/local/bin/milog-probe
+sudo rm -f /etc/systemd/system/milog.service /etc/systemd/system/milog-probe.service
 rm -f ~/.config/systemd/user/milog-web.service
 rm -rf ~/.config/milog ~/.cache/milog ~/.local/share/milog
 sudo rm -rf /opt/milog   # if cloned

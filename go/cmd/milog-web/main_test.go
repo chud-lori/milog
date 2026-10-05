@@ -182,3 +182,24 @@ func TestStreamHandler_outlivesWriteTimeout(t *testing.T) {
 		t.Fatalf("stream closed after %d summary events (err=%v); want 2", events, sc.Err())
 	}
 }
+
+func TestAlertsHandler_Window(t *testing.T) {
+	cfg := &config.Config{AlertStateDir: t.TempDir()}
+	cases := []struct {
+		query string
+		code  int
+		body  string
+	}{
+		{"", http.StatusOK, `"window":"24h"`},
+		{"?window=7d", http.StatusOK, `"window":"7d"`},
+		{"?window=30m", http.StatusOK, `"window":"30m"`},
+		{"?window=bogus", http.StatusBadRequest, "invalid window"},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		alertsHandler(cfg)(rec, httptest.NewRequest(http.MethodGet, "/api/alerts.json"+c.query, nil))
+		if rec.Code != c.code || !strings.Contains(rec.Body.String(), c.body) {
+			t.Errorf("alerts%s: got %d %q, want %d containing %q", c.query, rec.Code, rec.Body.String(), c.code, c.body)
+		}
+	}
+}

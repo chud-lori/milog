@@ -144,7 +144,7 @@ func summaryHandler(cfg *config.Config) http.HandlerFunc {
 }
 
 // alertsHandler returns up to 100 alerts.log rows for `window` (default
-// 24h, parsed by alertlog.WindowToCutoff):
+// 24h, parsed by alertlog.WindowToRange; 400 when unparseable):
 //
 //	{"window":"24h","alerts":[{"ts":…,"rule":…,"sev":…,"title":…,"body":…}, …]}
 func alertsHandler(cfg *config.Config) http.HandlerFunc {
@@ -155,8 +155,8 @@ func alertsHandler(cfg *config.Config) http.HandlerFunc {
 		}
 		cutoff, until, err := alertlog.WindowToRange(window, time.Now())
 		if err != nil {
-			// Bad values only come from URL fiddling, so fall back to 24h.
-			cutoff, _ = alertlog.WindowToCutoff("24h", time.Now())
+			http.Error(w, "invalid window", http.StatusBadRequest)
+			return
 		}
 		rows, err := alertlog.LoadRange(filepath.Join(cfg.AlertStateDir, "alerts.log"), cutoff, until, 100)
 		if err != nil {
