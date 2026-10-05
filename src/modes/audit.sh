@@ -1363,9 +1363,7 @@ _audit_history_subcmd() {
     _history_precheck || return 1
 
     local since=$(( $(date +%s) - days * 86400 )) out
-    if ! out=$(sqlite3 -readonly -separator $'\t' "$HISTORY_DB" \
-            "SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'), scanner, kind, subject
-             FROM audit_event WHERE ts >= $since ORDER BY ts DESC;" 2>/dev/null); then
+    if ! out=$(_history_audit_rows "$since" 2>/dev/null); then
         echo -e "${Y}no audit history in $HISTORY_DB yet${NC}, the daemon creates it on start" >&2
         return 1
     fi
