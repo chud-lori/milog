@@ -120,7 +120,8 @@ _web_go_binary() {
     local candidate
     for candidate in \
         /usr/local/libexec/milog/milog-web \
-        /usr/local/bin/milog-web; do
+        /usr/local/bin/milog-web \
+        /usr/bin/milog-web; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
     local self="${BASH_SOURCE[0]}"
@@ -156,6 +157,7 @@ Search path checked (in order):
   \$MILOG_WEB_BIN
   /usr/local/libexec/milog/milog-web
   /usr/local/bin/milog-web
+  /usr/bin/milog-web
   <script-dir>/go/bin/milog-web        (clone / dev)
   <script-dir>/../go/bin/milog-web
 
