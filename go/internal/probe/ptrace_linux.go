@@ -94,7 +94,7 @@ func RunPtrace(ctx context.Context, out chan<- PtraceEvent) error {
 			Request:   raw.Request,
 			Comm:      trimNul(raw.Comm[:]),
 		}
-		ev.PPID, ev.ParentComm = lookupParent(raw.PID)
+		ev.PPID, ev.ParentComm, ev.ProcComm = lookupProc(raw.PID)
 
 		select {
 		case out <- ev:

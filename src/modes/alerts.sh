@@ -1,6 +1,6 @@
 # milog alerts [window]: what fired, read from alerts.log.
 
-# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; there is no upper bound, so `yesterday` includes today.
+# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; pair with _alerts_window_end_epoch for the upper bound.
 _alerts_window_to_epoch() {
     local w="$1"
     local now; now=$(date +%s)
@@ -120,4 +120,56 @@ mode_alerts() {
         | awk -F'\t' '{printf "    %5d  %s\n", $1, $2}'
 
     echo -e "\n  ${D}total: $total alert(s) in window — log at $log_file${NC}\n"
+}
+
+# TSV per rule key in alerts.log from epoch $1 to before $2 (0 = open): fires, key, last fire epoch; busiest first.
+_alerts_counts_since() {
+    awk -F'\t' -v cutoff="$1" -v end="${2:-0}" '
+        $1 >= cutoff && (end == 0 || $1 < end) && $2 != "" { c[$2]++; if ($1 > last[$2]) last[$2] = $1 }
+        END { for (k in c) printf "%d\t%s\t%d\n", c[k], k, last[k] }
+    ' "$ALERT_STATE_DIR/alerts.log" | sort -t "$(printf '\t')" -k1,1rn -k2,2
+}
+
+# milog alert stats [window]: fires per rule key over the window.
+alert_stats() {
+    local window="${1:-7d}"
+    local log_file="$ALERT_STATE_DIR/alerts.log"
+
+    if [[ ! -f "$log_file" ]]; then
+        echo -e "${D}No alerts logged yet at $log_file${NC}"
+        return 0
+    fi
+
+    local cutoff end rows
+    cutoff=$(_alerts_window_to_epoch "$window") || return 1
+    end=$(_alerts_window_end_epoch "$window")
+    rows=$(_alerts_counts_since "$cutoff" "$end")
+    (( end == 0 )) && end=$(date +%s)
+
+    echo -e "\n${W}── MiLog: alert stats since $(_alerts_fmt_epoch "$cutoff") (window=$window) ──${NC}\n"
+
+    if [[ -z "$rows" ]]; then
+        echo -e "  ${D}no alerts in window${NC}\n"
+        return 0
+    fi
+
+    # `all` has no window length, so the per-day rate runs from the oldest fire.
+    (( cutoff == 0 )) && cutoff=$(awk -F'\t' '{ print $1; exit }' "$log_file")
+    # Floor of one day so a short window like `today` just after midnight doesn't extrapolate.
+    local span=$(( end - cutoff ))
+    (( span >= 86400 )) || span=86400
+
+    printf "  %6s  %7s  %-16s  %s\n" "FIRES" "PER DAY" "LAST" "RULE"
+    printf "  %6s  %7s  %-16s  %s\n" "──────" "───────" "────────────────" "────"
+    local count key last per_day note total=0
+    while IFS=$'\t' read -r count key last; do
+        per_day=$(awk -v c="$count" -v s="$span" 'BEGIN { printf "%.1f", c * 86400 / s }')
+        note=""
+        alert_is_silenced "$key" >/dev/null && note="  ${D}(silenced)${NC}"
+        printf "  %6d  %7s  %-16s  %s%b\n" "$count" "$per_day" "$(_alerts_fmt_epoch "$last")" "$key" "$note"
+        total=$(( total + count ))
+    done < <(printf '%s\n' "$rows" | _tty_safe)
+
+    echo -e "\n  ${D}total: $total fire(s); silenced and deduped fires are never written to alerts.log, so they are not counted.${NC}"
+    echo -e "  ${D}milog auto-tune suggests fixes for rules firing more than 10 times a day.${NC}\n"
 }

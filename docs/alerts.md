@@ -177,6 +177,45 @@ Alerts fire from the interactive modes (`monitor`, `exploits`,
 stable strings — you can grep `$ALERT_STATE_DIR/alerts.state` to see
 the most recent fire time for any rule.
 
+## Detection rules
+
+The regexes behind `exploit:*` and `probe:*` live in
+[`rules/milog-rules.tsv`](../rules/milog-rules.tsv). Each line is
+`<kind><TAB><name><TAB><regex>`, and the first line is `# version: N`.
+`exploit` and `probe` rows are joined with `|` and matched
+case-insensitively with `grep -Ei`. `category` rows name the
+`<category>` in `exploit:<app>:<category>`: the first matching row wins,
+and a hit no row matches is `other`.
+The AI crawler tokens are not in this file: milog appends
+`AI_CRAWLER_UA_RE` (the list `health` and `top` use) to the probe
+pattern when it loads the rules.
+
+`build.sh` bakes this file into `milog.sh`. To pick up rule changes
+without upgrading milog:
+
+```bash
+milog update-rules
+```
+
+It downloads `milog-rules.tsv` from the latest GitHub release of
+`MILOG_RELEASE_REPO` (default `chud-lori/milog`) and checks its SHA-256
+against that release's `checksums.txt`. It then checks that the version
+line is present, that every regex compiles with `grep -E`, and that no
+regex matches an empty line. It refuses a version lower than the
+active rules, and writes `RULES_FILE` (default
+`~/.config/milog/rules.tsv`) through a temp file and `mv`. Restart
+`milog daemon` and any running `exploits`/`probes` afterwards: rules
+load when those modes start.
+
+`checksums.txt` is published by the same release as the rules file, so
+the check catches a corrupted or truncated download. It is not a
+signature: anyone who can modify the release can also modify the
+checksum.
+
+You can also write `RULES_FILE` by hand. milog loads it when it passes
+the same checks; when it doesn't, milog prints a warning and uses the
+built-in rules.
+
 ## Dedup: two layers
 
 Every alert passes through two gates before delivery:
@@ -282,10 +321,11 @@ chmod +x ~/.config/milog/hooks/on_alert.d/10-log
 | ------------------ | ---------------------------------------------- |
 | `MILOG_RULE_KEY`   | `5xx:api`, `exploit:api:sqli`, `cpu`, ...      |
 | `MILOG_TITLE`      | alert title (`"5xx spike: api"`)               |
-| `MILOG_BODY`       | alert body (newlines stripped to spaces)       |
+| `MILOG_BODY`       | alert body, verbatim (may contain newlines and log text) |
 | `MILOG_SEV`        | `crit` / `warn` / `info`                       |
 | `MILOG_COLOR`      | raw Discord color int (for custom severity maps) |
 | `MILOG_TS`         | fire epoch seconds                             |
+| `MILOG_IP`         | client IP for `exploit:*` and `probe:*` fires, empty otherwise ([ban-hooks.md](ban-hooks.md)) |
 
 Run order is deterministic alphabetical, so name with a priority
 prefix (`10-log`, `20-notify`, `99-cleanup`) — classic
@@ -330,6 +370,39 @@ milog alerts yesterday
 
 Output shows a chronological timeline + a "top rules" summary. Colors
 match severity (red for crit, yellow for warn, green for info).
+
+`milog alert stats [window]` counts fires per rule key over the window
+(default `7d`, same window grammar as `milog alerts`), busiest first,
+with a per-day rate and the last fire time. Rules under an active
+silence are marked. Silenced fires and fires dropped by cooldown or
+dedup are never written to `alerts.log`, so they are not in the counts.
+
+## First week: learn mode
+
+Default thresholds don't know your traffic, so the first week usually
+brings some noise. To tune it from what actually fired:
+
+1. Run `milog daemon` (or `milog alert on`) for about a week with
+   alerts enabled.
+2. Run `milog alert stats 7d` to see which rules fire most.
+3. Run `milog auto-tune 7`. For every rule averaging more than 10 fires
+   a day that isn't silenced, it prints one command:
+   - `5xx:<app>`, `4xx:<app>` and `aicrawl:<app>`: a per-app threshold, for example
+     `milog config set THRESH_5XX_WARN_api 36`. It reads the trigger
+     value from each alert body and picks the lowest threshold that
+     would have kept the window to 10 fires a day or fewer.
+   - `cpu`, `mem`, `disk:/`: the matching `THRESH_*_CRIT`, worked out
+     the same way, unless it would have to go above 100.
+   - Any other rule, or a percentage that can't go high enough:
+     `milog silence <rule> 7d 'noisy rule'`.
+   - `exploit:*`, `audit:*` and the eBPF probe keys (`process:*`,
+     `proc:*`, `net:*`, `file:*`) are never offered a silence, because
+     an attacker controls how often they fire and what the key says.
+     They are listed for review.
+4. Run the lines you agree with. auto-tune never changes the config or
+   adds silences itself. With `HISTORY_ENABLED=1` it also prints the
+   history-based threshold table described in
+   [Historical metrics](historical-metrics.md#milog-auto-tune-days).
 
 ## Troubleshooting alerts
 

@@ -184,6 +184,8 @@ type NetEvent struct {
 	DAddr      string // destination IP, already stringified
 	DPort      uint16
 	IsIPv6     bool
+	Exe        string // /proc/<pid>/exe target
+	Cgroup     string // systemd cgroup path, see cgroupPath
 }
 
 // MatchNet runs every network rule against e.
@@ -199,6 +201,9 @@ func MatchNet(e NetEvent) []Hit {
 // loopback, DNS, NTP and private ranges). Keyed by comm so one process
 // hitting many destinations is one cooldown group.
 func matchUnexpectedOutbound(e NetEvent) (Hit, bool) {
+	if isMilogDelivery(e) {
+		return Hit{}, false
+	}
 	allow := loadNetAllowlist()
 	if allow.permits(e.DAddr, e.DPort) {
 		return Hit{}, false
@@ -211,6 +216,50 @@ func matchUnexpectedOutbound(e NetEvent) (Hit, bool) {
 			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
 			" parent=" + e.ParentComm + " dst=" + dest + "```",
 	}, true
+}
+
+// milogUnitCgroups are the system units milog installs; only root can move a
+// process into them.
+var milogUnitCgroups = map[string]struct{}{
+	"/system.slice/milog.service":       {},
+	"/system.slice/milog-probe.service": {},
+}
+
+// curlExes are root-owned paths, so a renamed binary or a prctl'd comm
+// doesn't pass.
+var curlExes = map[string]struct{}{
+	"/usr/bin/curl":       {},
+	"/bin/curl":           {},
+	"/usr/local/bin/curl": {},
+}
+
+// isMilogDelivery reports milog's own alert sends: curl running inside one of
+// milog's systemd units. Any other process in those units still alerts.
+func isMilogDelivery(e NetEvent) bool {
+	if _, ok := milogUnitCgroups[e.Cgroup]; !ok {
+		return false
+	}
+	_, ok := curlExes[e.Exe]
+	return ok
+}
+
+// cgroupPath picks the systemd cgroup path out of /proc/<pid>/cgroup: the
+// unified "0::" line, else the v1 "name=systemd" line.
+func cgroupPath(procCgroup string) string {
+	var legacy string
+	for _, line := range strings.Split(procCgroup, "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		if parts[0] == "0" && parts[1] == "" {
+			return parts[2]
+		}
+		if parts[1] == "name=systemd" {
+			legacy = parts[2]
+		}
+	}
+	return legacy
 }
 
 // netAllowlist matches `:port` (any IP), `cidr` (any port) or `cidr:port`.
@@ -365,6 +414,7 @@ type FileEvent struct {
 	UID        uint32
 	Flags      uint32 // openat(2) flags — O_RDONLY, O_WRONLY, O_RDWR plus O_CREAT etc.
 	Comm       string
+	ProcComm   string // process name; Comm is the thread's
 	ParentComm string
 	Filename   string
 }
@@ -511,7 +561,7 @@ const openWriteFlags = 0x1 | 0x2 | 0x200 | 0x400
 
 func matchSensitiveRead(e FileEvent) (Hit, bool) {
 	rules := loadFileRules()
-	if rules.commAllowed(e.Comm) {
+	if rules.commAllowed(e.Comm) || rules.commAllowed(e.ProcComm) {
 		return Hit{}, false
 	}
 	if !rules.isSensitive(e.Filename) {
@@ -525,10 +575,19 @@ func matchSensitiveRead(e FileEvent) (Hit, bool) {
 		RuleKey: "file:sensitive_read:" + e.Comm + ":" + e.Filename,
 		Title:   "Sensitive file read: " + e.Comm + " → " + e.Filename,
 		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
-			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm + procField(e.Comm, e.ProcComm) +
 			" parent=" + e.ParentComm + " path=" + e.Filename +
 			" flags=0x" + uhex(e.Flags) + "```",
 	}, true
+}
+
+// procField names the process when a thread renamed itself, so the alert
+// shows which name to allowlist.
+func procField(comm, procComm string) string {
+	if procComm == "" || procComm == comm {
+		return ""
+	}
+	return " proc=" + procComm
 }
 
 // uhex formats v in lowercase hex.
@@ -554,6 +613,7 @@ type PtraceEvent struct {
 	PPID       uint32
 	UID        uint32
 	Comm       string
+	ProcComm   string // process name; Comm is the thread's
 	ParentComm string
 	TargetPID  uint32
 	Request    uint32 // PTRACE_TRACEME=0, PTRACE_ATTACH=16, PTRACE_SEIZE=0x4206
@@ -644,7 +704,7 @@ func ptraceRequestName(req uint32) string {
 // pair alerts separately.
 func matchPtraceInject(e PtraceEvent) (Hit, bool) {
 	rules := loadPtraceRules()
-	if rules.isDebugger(e.Comm) {
+	if rules.isDebugger(e.Comm) || rules.isDebugger(e.ProcComm) {
 		return Hit{}, false
 	}
 	req := ptraceRequestName(e.Request)
@@ -652,7 +712,7 @@ func matchPtraceInject(e PtraceEvent) (Hit, bool) {
 		RuleKey: "proc:ptrace_inject:" + e.Comm + ":" + uitoa(e.TargetPID),
 		Title:   "Process injection via ptrace: " + e.Comm + " → pid " + uitoa(e.TargetPID) + " (" + req + ")",
 		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
-			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm + procField(e.Comm, e.ProcComm) +
 			" parent=" + e.ParentComm + " target_pid=" + uitoa(e.TargetPID) +
 			" request=" + req + "```",
 	}, true
@@ -665,6 +725,7 @@ type KmodEvent struct {
 	PPID       uint32
 	UID        uint32
 	Comm       string
+	ProcComm   string // process name; Comm is the thread's
 	ParentComm string
 	Module     string // module name, e.g. "nf_conntrack"
 }
@@ -742,7 +803,7 @@ func parseKmodRules(src string) kmodRules {
 // matchKmodLoad keys on comm and module.
 func matchKmodLoad(e KmodEvent) (Hit, bool) {
 	rules := loadKmodRules()
-	if rules.isAllowedLoader(e.Comm) {
+	if rules.isAllowedLoader(e.Comm) || rules.isAllowedLoader(e.ProcComm) {
 		return Hit{}, false
 	}
 	mod := e.Module
@@ -753,7 +814,7 @@ func matchKmodLoad(e KmodEvent) (Hit, bool) {
 		RuleKey: "proc:kmod_load:" + e.Comm + ":" + mod,
 		Title:   "Kernel module loaded: " + mod + " by " + e.Comm,
 		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
-			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm + procField(e.Comm, e.ProcComm) +
 			" parent=" + e.ParentComm + " module=" + mod + "```",
 	}, true
 }
@@ -957,6 +1018,7 @@ type BpfLoadEvent struct {
 	UID        uint32
 	Cmd        uint32 // always BPF_PROG_LOAD (5) given current BPF-side filter
 	Comm       string
+	ProcComm   string // process name; Comm is the thread's
 	ParentComm string
 }
 
@@ -1041,14 +1103,14 @@ func parseBpfLoadRules(src string) bpfLoadRules {
 // matchBpfLoad keys on comm.
 func matchBpfLoad(e BpfLoadEvent) (Hit, bool) {
 	rules := loadBpfLoadRules()
-	if rules.isAllowed(e.Comm) {
+	if rules.isAllowed(e.Comm) || rules.isAllowed(e.ProcComm) {
 		return Hit{}, false
 	}
 	return Hit{
 		RuleKey: "proc:bpf_load:" + e.Comm,
 		Title:   "BPF program loaded by non-allowlisted process: " + e.Comm,
 		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
-			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
+			" uid=" + uitoa(e.UID) + " comm=" + e.Comm + procField(e.Comm, e.ProcComm) +
 			" parent=" + e.ParentComm + " cmd=BPF_PROG_LOAD```",
 	}, true
 }

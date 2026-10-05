@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.6.0-38-gc327b19
-# MILOG_BUILT=2026-10-04T03:37:43Z
+# MILOG_VERSION=v0.6.0-39-g4dbb87c-dirty
+# MILOG_BUILT=2026-10-05T01:50:40Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -91,6 +91,9 @@ ALERT_LOG_MAX_BYTES=10485760  # 10 MB
 HOOKS_DIR="$HOME/.config/milog/hooks"
 ALERT_HOOK_TIMEOUT=10
 
+# Detection regexes for exploits/probes; `milog update-rules` writes this file, and without it the built-in copy applies.
+RULES_FILE="$HOME/.config/milog/rules.tsv"
+
 # Per-rule destinations, one `key: dest ...` per line; lookup is exact rule, then prefix before `:`, then `default`.
 # Destinations: discord slack telegram matrix webhook, or `skip`; empty fans out to everything.
 #   ALERT_ROUTES="
@@ -113,6 +116,9 @@ SLOW_EXCLUDE_PATHS="/ws/* /socket.io/*"
 # GeoIP needs mmdblookup and a GeoLite2-Country MMDB.
 GEOIP_ENABLED=0
 MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
+
+# CrowdSec CTI reputation lookups; empty means milog never contacts the API.
+CROWDSEC_CTI_KEY=""
 
 # History needs sqlite3; the daemon writes one row per app per minute.
 HISTORY_ENABLED=0
@@ -189,6 +195,7 @@ fi
 [[ -n "${MILOG_MATRIX_ROOM:-}"        ]] && MATRIX_ROOM="$MILOG_MATRIX_ROOM"
 [[ -n "${MILOG_GEOIP_ENABLED:-}"   ]] && GEOIP_ENABLED="$MILOG_GEOIP_ENABLED"
 [[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
+[[ -n "${MILOG_CROWDSEC_CTI_KEY:-}" ]] && CROWDSEC_CTI_KEY="$MILOG_CROWDSEC_CTI_KEY"
 [[ -n "${MILOG_HISTORY_ENABLED:-}" ]] && HISTORY_ENABLED="$MILOG_HISTORY_ENABLED"
 [[ -n "${MILOG_HISTORY_DB:-}"      ]] && HISTORY_DB="$MILOG_HISTORY_DB"
 [[ -n "${MILOG_ANOMALY_ENABLED:-}"   ]] && ANOMALY_ENABLED="$MILOG_ANOMALY_ENABLED"
@@ -722,12 +729,12 @@ _alert_route_for() {
 }
 
 # Runs every executable in HOOKS_DIR/on_alert.d/ in the background with MILOG_RULE_KEY, MILOG_TITLE, MILOG_BODY,
-# MILOG_SEV, MILOG_COLOR and MILOG_TS set. Non-zero exits are logged to hooks.log, never propagated.
+# MILOG_SEV, MILOG_COLOR, MILOG_TS and MILOG_IP set. Non-zero exits are logged to hooks.log, never propagated.
 _alert_run_hooks() {
     local hook_dir="${HOOKS_DIR:-$HOME/.config/milog/hooks}/on_alert.d"
     [[ -d "$hook_dir" ]] || return 0
 
-    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}" ip="${5:-}"
     local sev
     case "$color" in
         15158332|16711680)  sev=crit ;;
@@ -755,6 +762,7 @@ _alert_run_hooks() {
                       MILOG_SEV="$sev"           \
                       MILOG_COLOR="$color"       \
                       MILOG_TS="$ts"             \
+                      MILOG_IP="$ip"             \
                       timeout "$timeout_s" "$hook" 2>&1)
                 rc=$?
             else
@@ -764,6 +772,7 @@ _alert_run_hooks() {
                       MILOG_SEV="$sev"           \
                       MILOG_COLOR="$color"       \
                       MILOG_TS="$ts"             \
+                      MILOG_IP="$ip"             \
                       "$hook" 2>&1)
                 rc=$?
             fi
@@ -778,10 +787,10 @@ _alert_run_hooks() {
     done
 }
 
-# alert_fire <title> <body> [color] [rule_key]. Each destination is sent in the background.
+# alert_fire <title> <body> [color] [rule_key] [ip]. Each destination is sent in the background; ip only reaches hooks.
 alert_fire() {
     [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
-    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}" ip="${5:-}"
     # Silenced fires are not recorded either; the silence row is the audit trail.
     if [[ -n "$rule_key" ]] && alert_is_silenced "$rule_key" >/dev/null; then
         return 0
@@ -790,7 +799,7 @@ alert_fire() {
     _alert_record "$rule_key" "$title" "$body" "$color"
 
     # Hooks run before the curl check; they don't need it.
-    _alert_run_hooks "$title" "$body" "$color" "$rule_key"
+    _alert_run_hooks "$title" "$body" "$color" "$rule_key" "$ip"
 
     command -v curl >/dev/null 2>&1 || return 0
 
@@ -977,23 +986,63 @@ alert_fingerprint_from_line() {
     printf '%s:%s' "$ip" "$path"
 }
 
-# Rough substring classification, only used to group alerts by rule key.
+# Prints the `# version: N` from the first line of a rules file on stdin.
+_rules_version() {
+    sed -n '1s/^# version: \([0-9][0-9]*\)$/\1/p'
+}
+
+# Prints the version of a valid rules file; otherwise prints the reason to stderr and fails.
+_rules_check() {
+    local f="$1" version bad kind name re rc
+    version=$(_rules_version < "$f")
+    [[ -n "$version" ]] || { echo "$f: first line must be '# version: N'" >&2; return 1; }
+    bad=$(awk -F'\t' '!/^#/ && NF && !(NF == 3 && $1 ~ /^(exploit|probe|category)$/ && $2 != "" && $3 != "") { print NR; exit }' "$f")
+    [[ -z "$bad" ]] || { echo "$f:$bad: want <exploit|probe|category><TAB><name><TAB><regex>" >&2; return 1; }
+    for kind in exploit probe; do
+        grep -q "^$kind"$'\t' "$f" || { echo "$f: no $kind rules" >&2; return 1; }
+    done
+    while IFS=$'\t' read -r kind name re || [[ -n "$kind" ]]; do
+        [[ -n "$kind" && "$kind" != \#* ]] || continue
+        # Exit 2 is a bad regex; 0 means it matches an empty line and would flag every request.
+        rc=0; grep -Eq -- "$re" <<< "" 2>/dev/null || rc=$?
+        (( rc == 1 )) || { echo "$f: $kind/$name: regex does not compile or matches everything: $re" >&2; return 1; }
+    done < "$f"
+    printf '%s' "$version"
+}
+
+# RULES_FILE wins when it passes _rules_check; otherwise the rules baked in by build.sh apply.
+_rules_load() {
+    local text="" kind name re
+    if [[ -f "$RULES_FILE" ]]; then
+        if _rules_check "$RULES_FILE" >/dev/null; then
+            text=$(cat "$RULES_FILE")
+        else
+            echo "milog: ignoring $RULES_FILE, using the built-in rules" >&2
+        fi
+    fi
+    [[ -n "$text" ]] || text=$(_rules_default)
+    RULES_EXPLOIT="" RULES_PROBE="" RULES_CATEGORY_NAMES=() RULES_CATEGORY_RES=()
+    while IFS=$'\t' read -r kind name re; do
+        case "$kind" in
+            exploit)  RULES_EXPLOIT+="${RULES_EXPLOIT:+|}$re" ;;
+            probe)    RULES_PROBE+="${RULES_PROBE:+|}$re" ;;
+            category) RULES_CATEGORY_NAMES+=("$name"); RULES_CATEGORY_RES+=("$re") ;;
+        esac
+    done <<< "$text"
+    # The AI crawler list is shared with health/top, so it is not duplicated in the rules file.
+    RULES_PROBE+="|$AI_CRAWLER_UA_RE"
+}
+
+# First matching category row names the alert's rule key; needs _rules_load first.
 _exploit_category() {
-    local line="$1" cat="other"
+    local line="$1" cat="other" i
     shopt -s nocasematch
-    case "$line" in
-        *'${jndi'*|*'jndi:'*|*log4j*)                                            cat=log4shell ;;
-        *union*select*|*select*from*|*'sleep('*|*'benchmark('*|*' or 1=1'*|*%27*or*) cat=sqli ;;
-        *'<script'*|*%3cscript*|*'onerror='*|*'onload='*|*'javascript:'*)        cat=xss ;;
-        *base64_decode*|*'eval('*|*'system('*|*'passthru('*|*shell_exec*)         cat=rce ;;
-        *'../'*|*%2e%2e*|*/etc/passwd*|*/etc/shadow*|*/proc/self*)               cat=traversal ;;
-        */containers/*|*/actuator/*|*/server-status*|*/console*|*/druid/*)       cat=infra ;;
-        */SDK/web*|*/cgi-bin/*|*/boaform/*|*/HNAP1*)                             cat=device ;;
-        */wp-admin*|*/wp-login*|*/wp-content/plugins*|*/xmlrpc.php*)             cat=wordpress ;;
-        */phpmyadmin*|*/pma/*|*/mysql/admin*)                                    cat=phpmyadmin ;;
-        */.env*|*/.git/*|*/.aws/*|*/.ssh/*|*/.DS_Store*|*/config.php*|*/config.json*|*/config.yml*|*/config.yaml*|*/web.config*) cat=dotfile ;;
-        *libredtail*|*nikto*|*masscan*|*zgrab*|*sqlmap*|*nuclei*|*gobuster*|*dirbuster*|*wfuzz*|*l9explore*|*l9tcpid*|*'hello, world'*|*'hello,world'*) cat=scanner ;;
-    esac
+    for i in "${!RULES_CATEGORY_RES[@]}"; do
+        if [[ "$line" =~ ${RULES_CATEGORY_RES[$i]} ]]; then
+            cat="${RULES_CATEGORY_NAMES[$i]}"
+            break
+        fi
+    done
     shopt -u nocasematch
     printf '%s' "$cat"
 }
@@ -1528,6 +1577,86 @@ geoip_country() {
     printf '%s' "${out:-—}"
 }
 
+# Prints "<reputation> (<behaviors>)", or "unknown" when CTI has no record; empty when off or failing.
+# Results are cached per IP for a day; pass `cached` to skip the network. Failures land in cti.err for doctor.
+cti_lookup() {
+    local ip="${1-}" dir="$ALERT_STATE_DIR/cti"
+    [[ -n "${CROWDSEC_CTI_KEY:-}" ]] || return 0
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || ( "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:.]*[0-9a-fA-F][0-9a-fA-F:.]*$ ) ]] || return 0
+    ip=$(printf '%s' "$ip" | tr A-F a-f)
+    local f="$dir/$ip" mtime
+    if [[ -f "$f" ]]; then
+        mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+        if (( $(date +%s) - mtime < 86400 )); then
+            cat "$f"
+            return 0
+        fi
+    fi
+    [[ "${2:-}" == cached ]] && return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    # After a 429 every request would fail too, so pause lookups for 15 minutes.
+    [[ -n "$(find "$dir/.backoff" -mmin -15 2>/dev/null)" ]] && return 0
+    local err="$ALERT_STATE_DIR/cti.err"
+    # The key goes into a curl config on stdin, so a quote or newline would break out of it.
+    if [[ "$CROWDSEC_CTI_KEY" == *[\"\\[:space:]]* ]]; then
+        printf '%s\tCROWDSEC_CTI_KEY contains quotes, backslashes or whitespace\n' "$(date +%s)" > "$err"
+        return 0
+    fi
+    local resp code="" summary="" body
+    resp=$(mktemp "$dir/.resp.XXXXXX" 2>/dev/null) || return 0
+    code=$(printf 'header = "x-api-key: %s"\n' "$CROWDSEC_CTI_KEY" \
+        | curl -s -m 3 --max-filesize 65536 -K - -o "$resp" -w '%{http_code}' \
+              "https://cti.api.crowdsec.net/v2/smoke/$ip" 2>/dev/null) || true
+    case "$code" in
+        200) summary=$(tr -d '\n' < "$resp" | _cti_summary) ;;
+        # Only a JSON error object counts as "no record"; a proxy or HTML 404 is a failure.
+        404) body=$(tr -d '[:space:]' < "$resp")
+             [[ "$body" == "{"* && "$body" != *'"ip"'* ]] && summary="unknown" ;;
+        429) touch "$dir/.backoff" ;;
+    esac
+    rm -f "$resp"
+    if [[ -z "$summary" ]]; then
+        printf '%s\tHTTP %s for %s\n' "$(date +%s)" "${code:-000}" "$ip" > "$err"
+        return 0
+    fi
+    rm -f "$err"
+    printf '%s\n' "$summary" > "$f"
+    printf '%s\n' "$summary"
+}
+
+# Reads one smoke-API JSON object on a single line; output is limited to [A-Za-z0-9 :._,()/-].
+_cti_summary() {
+    awk '
+        { s = s $0 }
+        END {
+            if (!match(s, /"reputation" *: *"[a-z_]*"/)) exit
+            rep = substr(s, RSTART, RLENGTH)
+            sub(/^"reputation" *: *"/, "", rep); sub(/"$/, "", rep)
+            labels = ""; n = 0
+            if (match(s, /"behaviors" *: *\[[^]]*\]/)) {
+                b = substr(s, RSTART, RLENGTH)
+                while (n < 3 && match(b, /"label" *: *"[^"]*"/)) {
+                    l = substr(b, RSTART, RLENGTH)
+                    b = substr(b, RSTART + RLENGTH)
+                    sub(/^"label" *: *"/, "", l); sub(/"$/, "", l)
+                    labels = labels (n++ ? ", " : "") l
+                }
+            }
+            out = rep (labels != "" ? " (" labels ")" : "")
+            gsub(/[^A-Za-z0-9 :._,()\/-]/, "", out)
+            print out
+        }'
+}
+
+# Alert-body suffix for exploit and probe alerts; looks up only when alerts are on.
+cti_alert_note() {
+    [[ "${ALERTS_ENABLED:-0}" == "1" ]] || return 0
+    local s; s=$(cti_lookup "${1-}")
+    [[ -n "$s" ]] && printf '\nCrowdSec: %s' "$s"
+    return 0
+}
+
 # p95 for the monitor row, cached per app per minute so a 5s refresh doesn't rescan the log.
 # Apps found without $request_time are never scanned again until MiLog restarts.
 _p95_cached() {
@@ -1828,7 +1957,7 @@ _web_stop() {
     fi
     rm -f "$pf"
 }
-# milog alert on|off|status|test: toggle alerting and the systemd service.
+# milog alert on|off|status|test|stats: toggle alerting and the systemd service.
 # Under sudo, config goes to SUDO_USER's home and the service runs as that user, not root.
 
 _alert_target_user() {
@@ -2176,6 +2305,7 @@ ${W}USAGE${NC}
   ${C}milog alert status${NC}             show destinations/service/recent-fire state
   ${C}milog alert test${NC}               fire one test alert to EVERY configured
                               destination (Discord + Slack + Telegram + Matrix)
+  ${C}milog alert stats [WINDOW]${NC}     fires per rule from alerts.log (default 7d)
 
 ${W}EXAMPLES${NC}
   ${D}# First-time setup in one command (Discord):${NC}
@@ -2201,6 +2331,7 @@ mode_alert() {
         off)            alert_off ;;
         status|'')      alert_status ;;
         test)           alert_test ;;
+        stats)          alert_stats "${1:-7d}" ;;
         -h|--help|help) alert_help ;;
         *) echo -e "${R}Unknown alert subcommand:${NC} $sub"; alert_help; exit 1 ;;
     esac
@@ -2208,7 +2339,7 @@ mode_alert() {
 
 # milog alerts [window]: what fired, read from alerts.log.
 
-# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; there is no upper bound, so `yesterday` includes today.
+# today | yesterday | all | Nm | Nh | Nd | Nw -> cutoff epoch; pair with _alerts_window_end_epoch for the upper bound.
 _alerts_window_to_epoch() {
     local w="$1"
     local now; now=$(date +%s)
@@ -2329,6 +2460,58 @@ mode_alerts() {
 
     echo -e "\n  ${D}total: $total alert(s) in window — log at $log_file${NC}\n"
 }
+
+# TSV per rule key in alerts.log from epoch $1 to before $2 (0 = open): fires, key, last fire epoch; busiest first.
+_alerts_counts_since() {
+    awk -F'\t' -v cutoff="$1" -v end="${2:-0}" '
+        $1 >= cutoff && (end == 0 || $1 < end) && $2 != "" { c[$2]++; if ($1 > last[$2]) last[$2] = $1 }
+        END { for (k in c) printf "%d\t%s\t%d\n", c[k], k, last[k] }
+    ' "$ALERT_STATE_DIR/alerts.log" | sort -t "$(printf '\t')" -k1,1rn -k2,2
+}
+
+# milog alert stats [window]: fires per rule key over the window.
+alert_stats() {
+    local window="${1:-7d}"
+    local log_file="$ALERT_STATE_DIR/alerts.log"
+
+    if [[ ! -f "$log_file" ]]; then
+        echo -e "${D}No alerts logged yet at $log_file${NC}"
+        return 0
+    fi
+
+    local cutoff end rows
+    cutoff=$(_alerts_window_to_epoch "$window") || return 1
+    end=$(_alerts_window_end_epoch "$window")
+    rows=$(_alerts_counts_since "$cutoff" "$end")
+    (( end == 0 )) && end=$(date +%s)
+
+    echo -e "\n${W}── MiLog: alert stats since $(_alerts_fmt_epoch "$cutoff") (window=$window) ──${NC}\n"
+
+    if [[ -z "$rows" ]]; then
+        echo -e "  ${D}no alerts in window${NC}\n"
+        return 0
+    fi
+
+    # `all` has no window length, so the per-day rate runs from the oldest fire.
+    (( cutoff == 0 )) && cutoff=$(awk -F'\t' '{ print $1; exit }' "$log_file")
+    # Floor of one day so a short window like `today` just after midnight doesn't extrapolate.
+    local span=$(( end - cutoff ))
+    (( span >= 86400 )) || span=86400
+
+    printf "  %6s  %7s  %-16s  %s\n" "FIRES" "PER DAY" "LAST" "RULE"
+    printf "  %6s  %7s  %-16s  %s\n" "──────" "───────" "────────────────" "────"
+    local count key last per_day note total=0
+    while IFS=$'\t' read -r count key last; do
+        per_day=$(awk -v c="$count" -v s="$span" 'BEGIN { printf "%.1f", c * 86400 / s }')
+        note=""
+        alert_is_silenced "$key" >/dev/null && note="  ${D}(silenced)${NC}"
+        printf "  %6d  %7s  %-16s  %s%b\n" "$count" "$per_day" "$(_alerts_fmt_epoch "$last")" "$key" "$note"
+        total=$(( total + count ))
+    done < <(printf '%s\n' "$rows" | _tty_safe)
+
+    echo -e "\n  ${D}total: $total fire(s); silenced and deduped fires are never written to alerts.log, so they are not counted.${NC}"
+    echo -e "  ${D}milog auto-tune suggests fixes for rules firing more than 10 times a day.${NC}\n"
+}
 # milog attacker <IP>: everything one IP did across all apps' current access logs (rotated logs are not read).
 mode_attacker() {
     local ip="${1:-}"
@@ -2391,6 +2574,8 @@ mode_attacker() {
     printf "  %-14s %s\n"  "first seen:" "${first_seen:-?}"
     printf "  %-14s %s\n"  "last seen:"  "${last_seen:-?}"
     printf "  %-14s %d of %d\n" "apps touched:" "$apps_hit" "${#LOGS[@]}"
+    local cti; cti=$(cti_lookup "$ip")
+    [[ -n "$cti" ]] && printf "  %-14s %s\n" "crowdsec:" "$cti"
 
     echo -e "\n  ${W}per-app${NC}"
     awk -F'\t' '
@@ -3886,6 +4071,7 @@ _audit_history_subcmd() {
     printf '%s\n' "$out" | awk -F'\t' '{ printf "  %s  %-11s  %-10s  %s\n", $1, $2, $3, substr($0, length($1 $2 $3) + 4) }' | _tty_safe
 }
 # milog auto-tune [days]: suggests HTTP thresholds from percentiles of metrics_minute. CPU/MEM/DISK aren't in the DB.
+# Also suggests threshold raises or silences for rules that fire too often in alerts.log.
 
 # p-th percentile (1..100) of newline-separated numbers on stdin.
 _pct_from_stdin() {
@@ -3918,10 +4104,66 @@ _tune_row() {
         "$metric" "$current" "$suggested" "$delta"
 }
 
+# Rules averaging more than 10 fires a day in alerts.log get a printed fix; nothing is applied.
+_tune_alert_noise() {
+    local days="$1" log_file="$ALERT_STATE_DIR/alerts.log"
+    [[ -f "$log_file" ]] || return 0
+    local cutoff=$(( $(date +%s) - days * 86400 )) max=$(( days * 10 ))
+
+    echo -e "\n${W}── MiLog: auto-tune noisy alerts (window=${days}d, over 10 fires/day) ──${NC}\n"
+    local count key var app pct current kept suggested found=0
+    while IFS=$'\t' read -r count key _; do
+        (( count > max )) || break
+        alert_is_silenced "$key" >/dev/null && continue
+        found=1
+        var="" app="" pct=0
+        case "$key" in
+            5xx:*)  var=THRESH_5XX_WARN; app="${key#5xx:}" ;;
+            4xx:*)  var=THRESH_4XX_WARN; app="${key#4xx:}" ;;
+            aicrawl:*) var=THRESH_AICRAWL_WARN; app="${key#aicrawl:}" ;;
+            cpu)    var=THRESH_CPU_CRIT;  pct=1 ;;
+            mem)    var=THRESH_MEM_CRIT;  pct=1 ;;
+            disk:/) var=THRESH_DISK_CRIT; pct=1 ;;
+        esac
+        if [[ -n "$var" ]]; then
+            current=$(_thresh "$var" "$app")
+            # The body's first number is the value that tripped the rule; the new threshold lets only the top $max through.
+            kept=$(MILOG_KEY="$key" awk -F'\t' -v cutoff="$cutoff" '
+                $1 >= cutoff && $2 == ENVIRON["MILOG_KEY"] && match($5, /[0-9]+/) { print substr($5, RSTART, RLENGTH) }
+            ' "$log_file" | sort -rn | sed -n "$(( max + 1 ))p")
+            suggested=$(( kept + 1 ))
+            (( suggested > current )) || suggested=$(( current + 1 ))
+            if (( ! pct || suggested <= 100 )); then
+                [[ -n "$app" ]] && var="${var}_${app//[^A-Za-z0-9_]/_}"
+                printf "  ${W}%s${NC}  ${D}%s fires, threshold %s${NC}\n" "$key" "$count" "$current"
+                printf "    milog config set %s %s\n" "$var" "$suggested"
+                continue
+            fi
+        fi
+        # Attackers drive these counts, so muting them would mute attack detection.
+        case "$key" in
+            exploit:*|audit:*|process:*|proc:*|net:*|file:*)
+                printf "  ${W}%s${NC}  ${D}%s fires, high volume: review the source, not silenced${NC}\n" "$key" "$count"
+                continue
+                ;;
+        esac
+        printf "  ${W}%s${NC}  ${D}%s fires, a threshold raise can't quiet it${NC}\n" "$key" "$count"
+        printf "    milog silence %q 7d 'noisy rule'\n" "$key"
+    done < <(_alerts_counts_since "$cutoff" | _tty_safe)
+
+    if (( found == 0 )); then
+        echo -e "  ${D}no unsilenced rule fired more than 10 times a day${NC}"
+    else
+        echo -e "\n  ${D}nothing was applied; run the lines you agree with. Per-rule counts: milog alert stats ${days}d${NC}"
+    fi
+}
+
 mode_auto_tune() {
     local days="${1:-7}"
     [[ "$days" =~ ^[1-9][0-9]*$ ]] \
         || { echo -e "${R}auto-tune: days must be a positive integer${NC}" >&2; return 1; }
+
+    _tune_alert_noise "$days"
 
     _history_precheck || return 1
 
@@ -4350,6 +4592,9 @@ config_init() {
 # GEOIP_ENABLED=0
 # MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
+# CrowdSec CTI reputation in attacker, suspects and exploit/probe alerts. Free key at app.crowdsec.net.
+# CROWDSEC_CTI_KEY=""
+
 # Historical metrics — requires sqlite3; writes from `milog daemon` only.
 # HISTORY_ENABLED=0
 # HISTORY_DB="$HOME/.local/share/milog/metrics.db"
@@ -4502,9 +4747,9 @@ config_validate() {
         WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE
         ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR
         ALERT_LOG_MAX_BYTES ALERT_ROUTES
-        HOOKS_DIR ALERT_HOOK_TIMEOUT
+        HOOKS_DIR ALERT_HOOK_TIMEOUT RULES_FILE
         P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
-        GEOIP_ENABLED MMDB_PATH
+        GEOIP_ENABLED MMDB_PATH CROWDSEC_CTI_KEY
         HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS HISTORY_TOP_IP_N
         WEB_PORT WEB_BIND WEB_STATE_DIR WEB_TOKEN_FILE
         THRESH_REQ_WARN THRESH_REQ_CRIT
@@ -5218,6 +5463,21 @@ mode_doctor() {
         fi
     fi
 
+    _doc_head "crowdsec cti"
+    if [[ -z "${CROWDSEC_CTI_KEY:-}" ]]; then
+        _doc_ok "off  (CROWDSEC_CTI_KEY empty, no lookups)"
+    elif [[ -s "$ALERT_STATE_DIR/cti.err" ]]; then
+        local cti_paused=""
+        [[ -n "$(find "$ALERT_STATE_DIR/cti/.backoff" -mmin -15 2>/dev/null)" ]] && cti_paused="  (lookups paused for 15 min)"
+        _doc_warn "last lookup failed: $(cut -f2 "$ALERT_STATE_DIR/cti.err")${cti_paused}" \
+                  "401/403: key rejected; 429: rate limit hit; 000: no answer within 3s"
+        warn=$(( warn + 1 ))
+    else
+        local cti_cached
+        cti_cached=$(find "$ALERT_STATE_DIR/cti" -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+        _doc_ok "on  (${cti_cached} IPs cached in $ALERT_STATE_DIR/cti)"
+    fi
+
     # Web dashboard.
     _doc_head "web dashboard"
     local web_bin
@@ -5472,22 +5732,7 @@ mode_exploits() {
     echo -e "${D}Watching exploit attempts across all apps... (Ctrl+C)${NC}\n"
     local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
 
-    # ERE, matched case-insensitively.
-    local pat='\.\./|%2e%2e'                                                   # path traversal
-    pat+='|/etc/passwd|/etc/shadow|/proc/self/environ'                         # target files
-    pat+='|/containers/json|/actuator/|/server-status|/console(/|\?)|/druid/'  # infra probes
-    pat+='|/SDK/web|/cgi-bin/|/boaform/|/HNAP1'                                # embedded-device probes
-    pat+='|/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php'               # wordpress
-    pat+='|/phpmyadmin|/pma/|/mysql/admin'                                     # phpmyadmin
-    pat+='|/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store'                         # dotfiles / secrets
-    pat+='|/config\.(php|json|yml|yaml)|/web\.config'                          # config files
-    pat+='|jndi:|\$\{jndi|log4j'                                               # log4shell
-    pat+='|union[+% ]+select|select[+% ]+from|sleep\([0-9]|benchmark\('        # sqli
-    pat+='|or[+% ]+1=1|%27[+% ]*or|%27%20or'                                  # sqli
-    pat+='|<script|%3cscript|onerror=|onload=|javascript:'                     # xss
-    pat+='|base64_decode|eval\(|system\(|passthru\(|shell_exec'                # rce fn
-    pat+='|libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster'              # scanner UAs
-    pat+='|dirbuster|wfuzz|l9explore|l9tcpid|hello,\s?world'                   # scanner UAs
+    _rules_load
 
     for name in "${LOGS[@]}"; do
         local file="$LOG_DIR/$name.access.log"
@@ -5497,7 +5742,7 @@ mode_exploits() {
             (
                 app="$name"
                 tail -F "$file" 2>/dev/null | \
-                    grep --line-buffered -Ei "$pat" | \
+                    grep --line-buffered -Ei -e "$RULES_EXPLOIT" | \
                 while IFS= read -r line; do
                     printf '%b[%s]%b %b[EXPLOIT]%b %s\n' "$col" "$label" "$NC" "$R" "$NC" "$(_tty_safe <<< "$line")"
                     cat_slug=$(_exploit_category "$line")
@@ -5505,7 +5750,7 @@ mode_exploits() {
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "exploit:$app:$cat_slug" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_fire "Exploit attempt: $app / $cat_slug" "$(_alert_fence "${line:0:1800}")" 15158332 "exploit:$app:$cat_slug" &
+                        alert_fire "Exploit attempt: $app / $cat_slug" "$(_alert_fence "${line:0:1800}")$(cti_alert_note "${line%% *}")" 15158332 "exploit:$app:$cat_slug" "${line%% *}" &
                     fi
                 done
             ) &
@@ -6398,33 +6643,7 @@ mode_probes() {
     echo -e "${D}Watching scanner/bot traffic across all apps... (Ctrl+C)${NC}\n"
     local pids=() colors=("$B" "$C" "$G" "$M" "$Y" "$R") i=0
 
-    # SSH banners and TLS ClientHellos sent to plain HTTP; nginx logs the bytes as literal \xNN.
-    local pat='SSH-2\.0|\\x16\\x03|\\x00\\x00'
-    # Security / pentest tools
-    pat+='|masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster'
-    pat+='|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan'
-    pat+='|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag'
-    # Mass internet scanners / research crawlers
-    pat+='|l9explore|l9tcpid|l9retrieve|leakix'
-    pat+='|libredtail|httpx|naabu|katana|subfinder'
-    pat+='|expanseinc|censysinspect|shodan|stretchoid|internet-measurement'
-    pat+='|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey'
-    pat+='|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe'
-    # SEO / advertising crawlers (often unwanted)
-    pat+='|ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat'
-    pat+='|dataforseobot|mauibot|megaindex|seznambot'
-    # AI crawlers
-    pat+="|$AI_CRAWLER_UA_RE|diffbot"
-    # Generic HTTP libraries (legit use exists but often scripted)
-    pat+='|python-requests|python-urllib|aiohttp|go-http-client|okhttp'
-    pat+='|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2'
-    pat+='|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize'
-    # Headless / automation
-    pat+='|headlesschrome|phantomjs|puppeteer|playwright|selenium'
-    # Generic bot / crawler hints in UA
-    pat+='|[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester'
-    # Known payloads
-    pat+='|hello,\s*world'
+    _rules_load
 
     for name in "${LOGS[@]}"; do
         local file="$LOG_DIR/$name.access.log"
@@ -6434,14 +6653,14 @@ mode_probes() {
             (
                 app="$name"
                 tail -F "$file" 2>/dev/null | \
-                    grep --line-buffered -Ei "$pat" | \
+                    grep --line-buffered -Ei -e "$RULES_PROBE" | \
                 while IFS= read -r line; do
                     printf '%b[%s]%b %s\n' "$col" "$label" "$NC" "$(_tty_safe <<< "$line")"
                     # Dedup with exploits, which often matches the same scanner line.
                     fp=$(alert_fingerprint_from_line "$line")
                     if alert_should_fire "probe:$app" \
                        && alert_fingerprint_fresh "$fp"; then
-                        alert_fire "Probe traffic: $app" "$(_alert_fence "${line:0:1800}")" 15844367 "probe:$app" &
+                        alert_fire "Probe traffic: $app" "$(_alert_fence "${line:0:1800}")$(cti_alert_note "${line%% *}")" 15844367 "probe:$app" "${line%% *}" &
                     fi
                 done
             ) &
@@ -7284,8 +7503,11 @@ mode_suspects() {
 
     [[ -z "$ranked" ]] && { echo; return 0; }
 
-    local sc ip req e4 e5 p_count flags c country
+    local sc ip req e4 e5 p_count flags c country cti
     while IFS=$'\t' read -r sc ip req e4 e5 p_count flags; do
+        # Cache only: a network lookup per row would stall the table and burn the API quota.
+        cti=$(cti_lookup "$ip" cached)
+        [[ -n "$cti" && "$cti" != unknown ]] && flags="${flags:+$flags }CS:${cti%% *}"
         c=$G
         (( sc >= 10 )) && c=$Y
         (( sc >= 30 )) && c=$R
@@ -7623,6 +7845,72 @@ mode_trend() {
     done
 }
 
+# milog update-rules: installs the detection rules from the latest release as RULES_FILE.
+# checksums.txt comes from the same release, so it catches corruption, not a compromised release.
+mode_update_rules() {
+    local repo="${MILOG_RELEASE_REPO:-chud-lori/milog}" loc tag base tmp want got new cur dst_tmp
+    # /releases/latest redirects to /releases/tag/<tag>.
+    loc=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+        "https://github.com/${repo}/releases/latest" 2>/dev/null) || loc=""
+    if [[ ! "$loc" =~ /tag/([^/?#]+) ]]; then
+        echo -e "${R}update-rules: no release found for ${repo}${NC}" >&2
+        return 1
+    fi
+    tag="${BASH_REMATCH[1]}"
+    base="https://github.com/${repo}/releases/download/${tag}"
+
+    tmp=$(mktemp -d) || return 1
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" RETURN
+    # Releases up to v0.6.0 predate the rules file, so a 404 here is expected.
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/milog-rules.tsv" "${base}/milog-rules.tsv" 2>/dev/null; then
+        echo -e "${R}update-rules: release ${tag} ships no rules file (or it could not be fetched)${NC}" >&2
+        return 1
+    fi
+    if ! curl -fsSL --retry 2 --retry-delay 1 --max-time 60 -o "$tmp/checksums.txt" "${base}/checksums.txt" 2>/dev/null; then
+        echo -e "${R}update-rules: could not fetch checksums.txt for ${tag}; refusing an unverified rules file${NC}" >&2
+        return 1
+    fi
+
+    want=$(awk '$2 == "milog-rules.tsv" {print $1; exit}' "$tmp/checksums.txt")
+    if [[ -z "$want" ]]; then
+        echo -e "${R}update-rules: milog-rules.tsv is not listed in checksums.txt for ${tag}${NC}" >&2
+        return 1
+    fi
+    got=$(_audit_sha256 "$tmp/milog-rules.tsv")
+    if [[ -z "$got" ]]; then
+        echo -e "${R}update-rules: need sha256sum or shasum to verify the download${NC}" >&2
+        return 1
+    fi
+    if [[ "$got" != "$want" ]]; then
+        echo -e "${R}update-rules: checksum mismatch for milog-rules.tsv from ${tag} (expected ${want}, got ${got})${NC}" >&2
+        return 1
+    fi
+    if ! new=$(_rules_check "$tmp/milog-rules.tsv"); then
+        echo -e "${R}update-rules: rules from ${tag} failed validation; keeping the current rules${NC}" >&2
+        return 1
+    fi
+
+    cur=$(_rules_check "$RULES_FILE" 2>/dev/null) || cur=$(_rules_default | _rules_version)
+    if (( new < cur )); then
+        echo -e "${R}update-rules: ${tag} ships rules version ${new}, older than the active version ${cur}; not downgrading${NC}" >&2
+        return 1
+    fi
+    if (( new == cur )); then
+        echo "Rules already at version ${cur}."
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$RULES_FILE")" || return 1
+    dst_tmp=$(mktemp "${RULES_FILE}.XXXXXX") || return 1
+    if ! cp "$tmp/milog-rules.tsv" "$dst_tmp" || ! chmod 0644 "$dst_tmp" || ! mv -f "$dst_tmp" "$RULES_FILE"; then
+        rm -f "$dst_tmp"
+        echo -e "${R}update-rules: could not write ${RULES_FILE}${NC}" >&2
+        return 1
+    fi
+    echo -e "${G}✓${NC} rules version ${cur} → ${new} (${tag}) written to ${RULES_FILE}"
+    echo "Running exploits/probes watchers and the daemon load rules at start; restart them to pick this up."
+}
 # milog web: start/stop/status and the systemd user unit for the milog-web binary.
 _WEB_SYSTEMD_UNIT="${HOME}/.config/systemd/user/milog-web.service"
 
@@ -8045,6 +8333,51 @@ mode_ws() {
     done <<< "$rows"
     echo
 }
+_rules_default() {
+    cat <<'MILOG_RULES_EOF'
+# version: 1
+# <kind>\t<name>\t<ERE>, matched case-insensitively. Rows of one kind are OR-ed in file order.
+# exploit: URL payloads for `milog exploits`. probe: scanner/bot traffic for `milog probes`.
+# category: classifies exploit hits for the alert key; the first matching row wins, none gives "other".
+exploit	traversal	\.\./|%2e%2e
+exploit	target-files	/etc/passwd|/etc/shadow|/proc/self/environ
+exploit	infra	/containers/json|/actuator/|/server-status|/console(/|\?)|/druid/
+exploit	device	/SDK/web|/cgi-bin/|/boaform/|/HNAP1
+exploit	wordpress	/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php
+exploit	phpmyadmin	/phpmyadmin|/pma/|/mysql/admin
+exploit	dotfiles	/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store
+exploit	config-files	/config\.(php|json|yml|yaml)|/web\.config
+exploit	log4shell	jndi:|\$\{jndi|log4j
+exploit	sqli	union[+% ]+select|select[+% ]+from|sleep\([0-9]|benchmark\(
+exploit	sqli	or[+% ]+1=1|%27[+% ]*or|%27%20or
+exploit	xss	<script|%3cscript|onerror=|onload=|javascript:
+exploit	rce	base64_decode|eval\(|system\(|passthru\(|shell_exec
+exploit	scanner-ua	libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster
+exploit	scanner-ua	dirbuster|wfuzz|l9explore|l9tcpid|hello,\s?world
+# SSH banners and TLS ClientHellos sent to plain HTTP; nginx logs the bytes as literal \xNN.
+probe	protocol	SSH-2\.0|\\x16\\x03|\\x00\\x00
+probe	pentest-tools	masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag
+probe	mass-scanners	l9explore|l9tcpid|l9retrieve|leakix|libredtail|httpx|naabu|katana|subfinder|expanseinc|censysinspect|shodan|stretchoid|internet-measurement|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe
+probe	seo-crawlers	ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat|dataforseobot|mauibot|megaindex|seznambot
+# milog adds its AI_CRAWLER_UA_RE tokens (shared with health/top) to the probe rows at load time.
+probe	ai-crawlers	diffbot
+probe	http-libraries	python-requests|python-urllib|aiohttp|go-http-client|okhttp|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize
+probe	headless	headlesschrome|phantomjs|puppeteer|playwright|selenium
+probe	generic-bot	[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester
+probe	payloads	hello,\s*world
+category	log4shell	\$\{jndi|jndi:|log4j
+category	sqli	union.*select|select.*from|sleep\(|benchmark\(| or 1=1|%27.*or
+category	xss	<script|%3cscript|onerror=|onload=|javascript:
+category	rce	base64_decode|eval\(|system\(|passthru\(|shell_exec
+category	traversal	\.\./|%2e%2e|/etc/passwd|/etc/shadow|/proc/self
+category	infra	/containers/|/actuator/|/server-status|/console|/druid/
+category	device	/SDK/web|/cgi-bin/|/boaform/|/HNAP1
+category	wordpress	/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php
+category	phpmyadmin	/phpmyadmin|/pma/|/mysql/admin
+category	dotfile	/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store|/config\.php|/config\.json|/config\.yml|/config\.yaml|/web\.config
+category	scanner	libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster|dirbuster|wfuzz|l9explore|l9tcpid|hello, world|hello,world
+MILOG_RULES_EOF
+}
 _completions_payload_bash() {
     cat <<'MILOG_COMPLETION_EOF'
 # bash-completion for milog.
@@ -8060,10 +8393,10 @@ _milog_complete() {
         cword=$COMP_CWORD
     }
 
-    local cmds="monitor tui daemon rate health top top-ip-by-app top-paths attacker slow ws stats trend replay search diff auto-tune logs grep errors exploits probes patterns suspects config alert alerts silence digest report doctor web install audit probe bench completions help"
+    local cmds="monitor tui daemon rate health top top-ip-by-app top-paths attacker slow ws stats trend replay search diff auto-tune logs grep errors exploits probes patterns suspects config alert alerts silence digest report doctor web install update-rules audit probe bench completions help"
     local config_subs="show path init edit add rm dir set validate"
     local config_keys="LOG_DIR LOGS REFRESH SPARK_LEN DISCORD_WEBHOOK SLACK_WEBHOOK TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR ALERT_LOG_MAX_BYTES ALERT_ROUTES HOOKS_DIR ALERT_HOOK_TIMEOUT P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS GEOIP_ENABLED MMDB_PATH HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS WEB_PORT WEB_BIND THRESH_REQ_WARN THRESH_REQ_CRIT THRESH_CPU_WARN THRESH_CPU_CRIT THRESH_MEM_WARN THRESH_MEM_CRIT THRESH_DISK_WARN THRESH_DISK_CRIT THRESH_4XX_WARN THRESH_5XX_WARN"
-    local alert_subs="on off status test"
+    local alert_subs="on off status test stats"
     local silence_subs="list clear"
     local web_subs="start stop status install-service uninstall-service rotate-token"
     local window_vals="today yesterday 1h 6h 12h 24h 7d 30d all"
@@ -8164,6 +8497,7 @@ _milog() {
         'doctor:diagnostic checklist'
         'web:start/stop/status web UI'
         'install:add optional features: geoip / web / history'
+        'update-rules:fetch newer exploit/probe rules from the latest release'
         'audit:host integrity scans (fim / persistence / ports / yara / accounts / rootkit)'
         'probe:eBPF probe sidecar service'
         'bench:benchmark harness against synthetic fixtures'
@@ -8191,7 +8525,7 @@ _milog() {
         THRESH_DISK_WARN THRESH_DISK_CRIT
         THRESH_4XX_WARN THRESH_5XX_WARN
     )
-    alert_subs=(on off status test)
+    alert_subs=(on off status test stats)
     silence_subs=(list clear)
     web_subs=(start stop status install-service uninstall-service rotate-token)
     window_vals=(today yesterday 1h 6h 12h 24h 7d 30d all)
@@ -8269,6 +8603,7 @@ set -l cmds \
     "doctor:diagnostic checklist" \
     "web:start/stop/status web UI" \
     "install:add optional features" \
+    "update-rules:fetch newer detection rules" \
     "audit:host integrity scans" \
     "probe:eBPF probe sidecar service" \
     "bench:benchmark harness" \
@@ -8286,7 +8621,7 @@ for s in $config_subs
     complete -c milog -n "__milog_seen_cmd config" -a "$s"
 end
 
-set -l alert_subs on off status test
+set -l alert_subs on off status test stats
 for s in $alert_subs
     complete -c milog -n "__milog_seen_cmd alert" -a "$s"
 end
@@ -8337,7 +8672,7 @@ ${W}ANALYSIS${NC}
   ${C}suspects [N] [W]${NC}   heuristic bot ranking ${D}(top N=20, window=2000 lines/app)${NC}
   ${C}trend [app] [H]${NC}    sparkline of req/min from history ${D}(default: all apps, 24h)${NC}
   ${C}diff${NC}               per-app req: now vs 1d ago vs 7d ago
-  ${C}auto-tune [D]${NC}      suggest thresholds from history  ${D}(default: 7 days)${NC}
+  ${C}auto-tune [D]${NC}      suggest thresholds from history + alert noise  ${D}(default: 7 days)${NC}
   ${C}replay <file>${NC}      postmortem summary for one archived log file
   ${C}search <pat> ...${NC}   grep across all apps (flags: --since/--app/--path/--regex/--archives)
 
@@ -8346,6 +8681,7 @@ ${W}ALERTING${NC}
   ${C}alert off${NC}          disable alerts + stop service
   ${C}alert status${NC}       webhook / service / recent-fire state
   ${C}alert test${NC}         send a test Discord embed right now
+  ${C}alert stats [W]${NC}    fires per rule ${D}(default 7d)${NC}
   ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
   ${C}silence ...${NC}        mute a rule while on-call works the fix ${D}(milog silence --help)${NC}
   ${C}digest [window]${NC}     exec-summary (day / week / Nh / Nd)
@@ -8383,6 +8719,7 @@ ${W}TAILING${NC}
 
 ${W}OPS${NC}
   ${C}install <feature>${NC}  add optional features: geoip / web / history
+  ${C}update-rules${NC}       fetch newer exploit/probe rules from the latest release
   ${C}audit fim${NC}           file integrity monitor (baseline + drift)
   ${C}audit persistence${NC}   re-entry surface diff (new cron / systemd / rc.local)
   ${C}audit ports${NC}         listening-port baseline (new TCP/UDP listeners)
@@ -8488,7 +8825,7 @@ _cmd_help() {
             ;;
         alert)
             echo -e "${W}milog alert <sub>${NC} — toggle alerting + systemd service"
-            echo -e "  Subs: on off status test"
+            echo -e "  Subs: on off status test stats"
             ;;
         alerts)   echo -e "${W}milog alerts [window]${NC} — fire history (today / Nh / Nd / Nw / all)" ;;
         silence)  echo -e "${W}milog silence <rule> <duration> [message]${NC} — mute a rule"; echo -e "  Also: ${C}milog silence list${NC} · ${C}milog silence clear <rule>${NC}" ;;
@@ -8517,6 +8854,12 @@ _cmd_help() {
             echo -e "${W}milog install <feature>${NC} — on-demand feature installer"
             echo -e "  Subs: list, <feature>, remove <feature>"
             echo -e "  Features: geoip / web / history"
+            ;;
+        update-rules)
+            echo -e "${W}milog update-rules${NC}: fetch exploit/probe detection rules from the latest release"
+            echo -e "  Checks the SHA-256 against the release's checksums.txt, then that every regex compiles."
+            echo -e "  Refuses an older version than the active one; writes ${C}RULES_FILE${NC} atomically."
+            echo -e "  ${D}checksums.txt is not a signature: it comes from the same release as the rules.${NC}"
             ;;
         audit)
             echo -e "${W}milog audit <sub>${NC} — point-in-time host integrity scans"
@@ -8547,7 +8890,7 @@ fi
 # Setup and host-level commands must work before any app is configured.
 if [[ ${#LOGS[@]} -eq 0 ]]; then
     case "${1:-}" in
-        -h|--help|help|config|doctor|completions|install|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
+        -h|--help|help|config|doctor|completions|install|update-rules|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
         *)
             echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
             echo "  Run 'milog config init', set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
@@ -8592,6 +8935,7 @@ case "${1:-}" in
     completions) shift; mode_completions "$@" ;;
     bench)    shift; mode_bench "$@" ;;
     install)  shift; mode_install "$@" ;;
+    update-rules) mode_update_rules ;;
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;
