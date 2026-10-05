@@ -110,6 +110,9 @@ config_init() {
 # GEOIP_ENABLED=0
 # MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
+# CrowdSec CTI reputation in attacker, suspects and exploit/probe alerts. Free key at app.crowdsec.net.
+# CROWDSEC_CTI_KEY=""
+
 # Historical metrics — requires sqlite3; writes from `milog daemon` only.
 # HISTORY_ENABLED=0
 # HISTORY_DB="$HOME/.local/share/milog/metrics.db"
@@ -262,9 +265,9 @@ config_validate() {
         WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE
         ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR
         ALERT_LOG_MAX_BYTES ALERT_ROUTES
-        HOOKS_DIR ALERT_HOOK_TIMEOUT
+        HOOKS_DIR ALERT_HOOK_TIMEOUT RULES_FILE
         P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
-        GEOIP_ENABLED MMDB_PATH
+        GEOIP_ENABLED MMDB_PATH CROWDSEC_CTI_KEY
         HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS HISTORY_TOP_IP_N
         WEB_PORT WEB_BIND WEB_STATE_DIR WEB_TOKEN_FILE
         THRESH_REQ_WARN THRESH_REQ_CRIT

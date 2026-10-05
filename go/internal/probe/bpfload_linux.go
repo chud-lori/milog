@@ -92,7 +92,7 @@ func RunBpfLoad(ctx context.Context, out chan<- BpfLoadEvent) error {
 			Cmd:  raw.Cmd,
 			Comm: trimNul(raw.Comm[:]),
 		}
-		ev.PPID, ev.ParentComm = lookupParent(raw.PID)
+		ev.PPID, ev.ParentComm, ev.ProcComm = lookupProc(raw.PID)
 
 		select {
 		case out <- ev:

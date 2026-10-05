@@ -1,0 +1,41 @@
+# version: 1
+# <kind>\t<name>\t<ERE>, matched case-insensitively. Rows of one kind are OR-ed in file order.
+# exploit: URL payloads for `milog exploits`. probe: scanner/bot traffic for `milog probes`.
+# category: classifies exploit hits for the alert key; the first matching row wins, none gives "other".
+exploit	traversal	\.\./|%2e%2e
+exploit	target-files	/etc/passwd|/etc/shadow|/proc/self/environ
+exploit	infra	/containers/json|/actuator/|/server-status|/console(/|\?)|/druid/
+exploit	device	/SDK/web|/cgi-bin/|/boaform/|/HNAP1
+exploit	wordpress	/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php
+exploit	phpmyadmin	/phpmyadmin|/pma/|/mysql/admin
+exploit	dotfiles	/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store
+exploit	config-files	/config\.(php|json|yml|yaml)|/web\.config
+exploit	log4shell	jndi:|\$\{jndi|log4j
+exploit	sqli	union[+% ]+select|select[+% ]+from|sleep\([0-9]|benchmark\(
+exploit	sqli	or[+% ]+1=1|%27[+% ]*or|%27%20or
+exploit	xss	<script|%3cscript|onerror=|onload=|javascript:
+exploit	rce	base64_decode|eval\(|system\(|passthru\(|shell_exec
+exploit	scanner-ua	libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster
+exploit	scanner-ua	dirbuster|wfuzz|l9explore|l9tcpid|hello,\s?world
+# SSH banners and TLS ClientHellos sent to plain HTTP; nginx logs the bytes as literal \xNN.
+probe	protocol	SSH-2\.0|\\x16\\x03|\\x00\\x00
+probe	pentest-tools	masscan|zmap|zgrab|nmap|nikto|sqlmap|nuclei|gobuster|dirbuster|dirb|ffuf|wfuzz|feroxbuster|nessus|openvas|acunetix|wpscan|joomscan|burp|zaproxy|owasp|metasploit|meterpreter|w3af|webshag
+probe	mass-scanners	l9explore|l9tcpid|l9retrieve|leakix|libredtail|httpx|naabu|katana|subfinder|expanseinc|censysinspect|shodan|stretchoid|internet-measurement|greenbone|qualys|rapid7|detectify|intruder\.io|netcraftsurvey|netsystemsresearch|paloalto|projectdiscovery|odin\.ai|onyphe
+probe	seo-crawlers	ahrefsbot|semrushbot|dotbot|mj12bot|blexbot|petalbot|serpstat|dataforseobot|mauibot|megaindex|seznambot
+# milog adds its AI_CRAWLER_UA_RE tokens (shared with health/top) to the probe rows at load time.
+probe	ai-crawlers	diffbot
+probe	http-libraries	python-requests|python-urllib|aiohttp|go-http-client|okhttp|libwww-perl|java/1\.|apache-httpclient|restsharp|http_request2|guzzlehttp|node-fetch|axios|got\(|scrapy|mechanize
+probe	headless	headlesschrome|phantomjs|puppeteer|playwright|selenium
+probe	generic-bot	[Ss]canner|[Bb]ot/|[Cc]rawler|[Ss]pider|probe-|fuzzer|harvester
+probe	payloads	hello,\s*world
+category	log4shell	\$\{jndi|jndi:|log4j
+category	sqli	union.*select|select.*from|sleep\(|benchmark\(| or 1=1|%27.*or
+category	xss	<script|%3cscript|onerror=|onload=|javascript:
+category	rce	base64_decode|eval\(|system\(|passthru\(|shell_exec
+category	traversal	\.\./|%2e%2e|/etc/passwd|/etc/shadow|/proc/self
+category	infra	/containers/|/actuator/|/server-status|/console|/druid/
+category	device	/SDK/web|/cgi-bin/|/boaform/|/HNAP1
+category	wordpress	/wp-admin|/wp-login|/wp-content/plugins|/xmlrpc\.php
+category	phpmyadmin	/phpmyadmin|/pma/|/mysql/admin
+category	dotfile	/\.env|/\.git/|/\.aws/|/\.ssh/|/\.DS_Store|/config\.php|/config\.json|/config\.yml|/config\.yaml|/web\.config
+category	scanner	libredtail|nikto|masscan|zgrab|sqlmap|nuclei|gobuster|dirbuster|wfuzz|l9explore|l9tcpid|hello, world|hello,world

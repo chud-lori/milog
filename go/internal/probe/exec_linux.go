@@ -134,13 +134,23 @@ func trimNul(b []byte) string {
 // either is gone; parent-based rules then don't match. The parent may
 // already have exited, leaving ppid 1, which only costs alert context.
 func lookupParent(pid uint32) (uint32, string) {
+	ppid, parentComm, _ := lookupProc(pid)
+	return ppid, parentComm
+}
+
+// lookupProc is lookupParent plus the process name. BPF reports the TGID, so
+// /proc/<pid>/status names the thread-group leader, not the calling thread.
+func lookupProc(pid uint32) (ppid uint32, parentComm, procComm string) {
 	statusPath := "/proc/" + strconv.FormatUint(uint64(pid), 10) + "/status"
 	data, err := os.ReadFile(statusPath)
 	if err != nil {
-		return 0, ""
+		return 0, "", ""
 	}
-	var ppid uint32
 	for _, line := range strings.Split(string(data), "\n") {
+		if name, ok := strings.CutPrefix(line, "Name:"); ok {
+			procComm = strings.TrimSpace(name)
+			continue
+		}
 		if !strings.HasPrefix(line, "PPid:") {
 			continue
 		}
@@ -156,12 +166,12 @@ func lookupParent(pid uint32) (uint32, string) {
 		break
 	}
 	if ppid == 0 {
-		return 0, ""
+		return 0, "", procComm
 	}
 	commPath := "/proc/" + strconv.FormatUint(uint64(ppid), 10) + "/comm"
 	commBytes, err := os.ReadFile(commPath)
 	if err != nil {
-		return ppid, ""
+		return ppid, "", procComm
 	}
-	return ppid, strings.TrimSpace(string(commBytes))
+	return ppid, strings.TrimSpace(string(commBytes)), procComm
 }

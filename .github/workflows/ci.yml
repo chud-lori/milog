@@ -68,14 +68,19 @@ jobs:
           bash tests/smoke_audit_tempfiles.sh
           bash tests/smoke_audit_history.sh
           bash tests/smoke_alert_payloads.sh
+          bash tests/smoke_alert_retry.sh
           bash tests/smoke_docs_drift.sh
           bash tests/smoke_installer_checksums.sh
           bash tests/smoke_install_completions.sh
           bash tests/smoke_tty_escapes.sh
           bash tests/smoke_mode_scripts.sh
           bash tests/smoke_followups.sh
+          bash tests/smoke_alert_stats.sh
+          bash tests/smoke_rules.sh
           bash tests/smoke_ai_crawlers.sh
           bash tests/smoke_report.sh
+          bash tests/smoke_crowdsec_cti.sh
+          bash tests/smoke_ban_hooks.sh
           bash tests/smoke_probe_unit.sh
           bash tests/smoke_audit_integrity.sh
           bash tests/smoke_no_apps.sh

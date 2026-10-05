@@ -1,0 +1,28 @@
+#!/bin/bash
+# milog-ban-nft <rule_key> <ip>: adds the source IP of an exploit:* alert to the nftables set inet milog banned4/banned6.
+set -euo pipefail
+# sudo without secure_path keeps the caller's PATH.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+rule="${1:-}" ip="${2:-}"
+[[ "$rule" == exploit:* ]] || exit 0
+
+octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+if [[ "$ip" =~ ^$octet\.$octet\.$octet\.$octet$ ]]; then
+    set_name=banned4
+elif [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]]; then
+    set_name=banned6
+else
+    echo "invalid IP: $ip" >&2
+    exit 1
+fi
+# A loopback or private source is usually a reverse proxy; banning it would cut off every client.
+# The second test rejects all of ::/96, which covers every spelling of ::1 and of IPv4-mapped addresses.
+if [[ "$ip" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|::1$|[fF][cdCD]|[fF][eE][89abAB]) \
+   || "$ip" =~ ^[0:]*(:[fF]{4})?(:[0-9a-fA-F]{0,4}){1,2}$ ]]; then
+    echo "refusing to ban local address $ip" >&2
+    exit 1
+fi
+
+# The set's own timeout applies; adding an element that is already there is not an error.
+nft add element inet milog "$set_name" "{ $ip }"

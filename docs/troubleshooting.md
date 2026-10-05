@@ -110,6 +110,12 @@ curl -v "$(grep DISCORD_WEBHOOK ~/.config/milog/config.sh | cut -d= -f2- | tr -d
 Expect a 200 with `{"type":1}`-like response. 401 / 404 = webhook
 deleted in Discord; regenerate.
 
+Failed deliveries land in `~/.cache/milog/send_failures.log` as
+`<epoch>\t<destination>\t<HTTP status>` (`000` = no response). A burst
+of `429` rows means the destination rate-limited a flood of alerts.
+MiLog retries a 429 once when the server asks to wait 5s or less;
+longer waits are dropped and logged.
+
 ### 3. Is a cooldown holding it?
 
 ```bash

@@ -13,6 +13,8 @@ quick start; this directory has everything else.
   nginx `log_format` recipe, permissions on `/var/log/nginx`
 - [**Alerts**](alerts.md) — Discord / Slack / Telegram / Matrix setup,
   cooldown + dedup, rule catalog, how `milog alerts` history works
+- [**Ban hooks**](ban-hooks.md) — on_alert hook recipes that pass exploit
+  source IPs to fail2ban or an nftables set
 - [**Host integrity audits**](audit.md) — `milog audit` modes (fim,
   rootkit, persistence, ports, accounts, yara), provocations to verify
   detection, known false positives
@@ -33,6 +35,8 @@ quick start; this directory has everything else.
   tuning, anomaly detector
 - [**GeoIP enrichment**](geoip.md) — MaxMind license + `geoipupdate`
   weekly timer + the COUNTRY column
+- [**CrowdSec CTI enrichment**](crowdsec-cti.md) — opt-in IP reputation
+  in `attacker`, `suspects` and exploit/probe alerts, cached per IP
 - [**Troubleshooting**](troubleshooting.md) — `milog doctor`, common
   failure modes, where to look when something's wrong
 

@@ -1,4 +1,4 @@
-# milog alert on|off|status|test: toggle alerting and the systemd service.
+# milog alert on|off|status|test|stats: toggle alerting and the systemd service.
 # Under sudo, config goes to SUDO_USER's home and the service runs as that user, not root.
 
 _alert_target_user() {
@@ -376,6 +376,7 @@ ${W}USAGE${NC}
   ${C}milog alert status${NC}             show destinations/service/recent-fire state
   ${C}milog alert test${NC}               fire one test alert to EVERY configured
                               destination (Discord + Slack + Telegram + Matrix)
+  ${C}milog alert stats [WINDOW]${NC}     fires per rule from alerts.log (default 7d)
 
 ${W}EXAMPLES${NC}
   ${D}# First-time setup in one command (Discord):${NC}
@@ -401,6 +402,7 @@ mode_alert() {
         off)            alert_off ;;
         status|'')      alert_status ;;
         test)           alert_test ;;
+        stats)          alert_stats "${1:-7d}" ;;
         -h|--help|help) alert_help ;;
         *) echo -e "${R}Unknown alert subcommand:${NC} $sub"; alert_help; exit 1 ;;
     esac

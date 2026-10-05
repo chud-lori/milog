@@ -89,6 +89,9 @@ ALERT_LOG_MAX_BYTES=10485760  # 10 MB
 HOOKS_DIR="$HOME/.config/milog/hooks"
 ALERT_HOOK_TIMEOUT=10
 
+# Detection regexes for exploits/probes; `milog update-rules` writes this file, and without it the built-in copy applies.
+RULES_FILE="$HOME/.config/milog/rules.tsv"
+
 # Per-rule destinations, one `key: dest ...` per line; lookup is exact rule, then prefix before `:`, then `default`.
 # Destinations: discord slack telegram matrix webhook, or `skip`; empty fans out to everything.
 #   ALERT_ROUTES="
@@ -111,6 +114,9 @@ SLOW_EXCLUDE_PATHS="/ws/* /socket.io/*"
 # GeoIP needs mmdblookup and a GeoLite2-Country MMDB.
 GEOIP_ENABLED=0
 MMDB_PATH="/var/lib/GeoIP/GeoLite2-Country.mmdb"
+
+# CrowdSec CTI reputation lookups; empty means milog never contacts the API.
+CROWDSEC_CTI_KEY=""
 
 # History needs sqlite3; the daemon writes one row per app per minute.
 HISTORY_ENABLED=0
@@ -187,6 +193,7 @@ fi
 [[ -n "${MILOG_MATRIX_ROOM:-}"        ]] && MATRIX_ROOM="$MILOG_MATRIX_ROOM"
 [[ -n "${MILOG_GEOIP_ENABLED:-}"   ]] && GEOIP_ENABLED="$MILOG_GEOIP_ENABLED"
 [[ -n "${MILOG_MMDB_PATH:-}"       ]] && MMDB_PATH="$MILOG_MMDB_PATH"
+[[ -n "${MILOG_CROWDSEC_CTI_KEY:-}" ]] && CROWDSEC_CTI_KEY="$MILOG_CROWDSEC_CTI_KEY"
 [[ -n "${MILOG_HISTORY_ENABLED:-}" ]] && HISTORY_ENABLED="$MILOG_HISTORY_ENABLED"
 [[ -n "${MILOG_HISTORY_DB:-}"      ]] && HISTORY_DB="$MILOG_HISTORY_DB"
 [[ -n "${MILOG_ANOMALY_ENABLED:-}"   ]] && ANOMALY_ENABLED="$MILOG_ANOMALY_ENABLED"

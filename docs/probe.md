@@ -114,11 +114,14 @@ The eBPF features it relies on:
 
 ## Tuning the file allowlist
 
-The file probe is the chattiest by far — every `ps`, every Docker
-container init reads `/etc/passwd`, every `curl` invokes glibc's NSS
-which also reads it. Default allowlist covers the obvious system
-tools (`sshd`, `sudo`, `systemd*`, etc.) but not the noisier real-world
-sources observed during smoke testing.
+The file probe is the chattiest by far. `/etc/passwd` alerts only when
+it is opened for writing (`O_WRONLY`, `O_RDWR`, `O_TRUNC` or
+`O_APPEND`): it is world-readable and every `ps`, `getent`, `apt-get`
+or `curl` reads it through glibc's NSS. A tool that writes a temp file
+and renames it over `/etc/passwd` is not caught here; the audit FIM
+check covers that when `AUDIT_ENABLED=1`. The default comm allowlist
+covers the obvious system tools (`sshd`, `sudo`, `systemd*`, etc.) but
+not the noisier real-world sources observed during smoke testing.
 
 Edit the unit's `Environment=MILOG_PROBE_FILE_ALLOWLIST=…` line:
 
@@ -131,7 +134,7 @@ Default list (set at install time, replaceable as a comma-separated
 list of `comm` names):
 
 ```
-sshd,sshd-session,sudo,su,login,getty,agetty,
+sshd,sshd-session,sshd-socket-gen,sudo,su,login,getty,agetty,
 cron,crond,anacron,
 systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,
 auditd,audisp-syslog,
@@ -145,6 +148,14 @@ The `MILOG_PROBE_FILE_ALLOWLIST` env var **replaces** (does not extend)
 the default — paste the whole list and add to it. The same applies to
 `MILOG_PROBE_NET_ALLOWLIST` (CIDRs + bare ports) and the kmod /
 syscall / bpf-load allowlists.
+
+An entry in the file, ptrace, kmod or bpf-load allowlist matches either
+the thread name or its process name. Multi-threaded agents name their
+threads: Tencent's `YDService` reads files from a thread called
+`ParseLoop`, and the `YDService` entry covers it. When the two differ,
+the alert body shows both (`comm=ParseLoop proc=YDService`). Rule keys
+keep the thread name, so a silence still needs
+`file:sensitive_read:ParseLoop:…`.
 
 ## Net allowlist + per-comm silences
 
@@ -161,6 +172,23 @@ milog silence 'net:unexpected_outbound:node'       365d "node app outbound; revi
 
 `milog silence list` shows what's muted; `milog silence clear …`
 removes early.
+
+### milog's own alert delivery
+
+milog sends Discord / Slack / Telegram / Matrix / webhook alerts with
+`curl`. The probe skips `net:unexpected_outbound` for a connect only
+when both hold:
+
+- the process is in `milog.service` or `milog-probe.service` (cgroup
+  `/system.slice/<unit>`, which only root can place a process in)
+- its executable is `/usr/bin/curl`, `/bin/curl` or `/usr/local/bin/curl`
+
+Without this, every alert's delivery fired a new
+`net:unexpected_outbound:curl` alert, whose delivery fired another.
+`curl` anywhere else still alerts, and so does any other binary inside
+milog's units, such as a shell spawned from the daemon. A manual
+`milog alert test` from a login shell is not in either unit and still
+alerts once.
 
 ## Foreground / dry-run modes
 
@@ -198,7 +226,7 @@ lines. To change one: `sudoedit` the unit, `daemon-reload`, restart.
 | `MILOG_CONFIG`                   | `$HOME/.config/milog/config.sh`               | Bash-side config the probe-spawned milog reads               |
 | `MILOG_PROBE_ALERT_USER`         | (unset → alerts run as root)                  | User the probe-spawned milog runs as. Without it, milog running as root only sources a root-owned, non-group/other-writable `MILOG_CONFIG`. |
 | `MILOG_PROBE_FILE_ALLOWLIST`     | conservative system-tools list                | Comma-separated `comm` names exempt from `file:sensitive_read` |
-| `MILOG_PROBE_FILE_SENSITIVE`     | `/etc/shadow`, `/etc/sudoers`, `/root/.ssh/`, etc. | Comma-separated paths the probe watches                |
+| `MILOG_PROBE_FILE_SENSITIVE`     | `/etc/shadow`, `/etc/sudoers`, `/root/.ssh/`, etc. (`/etc/passwd` on writes only) | Comma-separated paths the probe watches; replaces the defaults |
 | `MILOG_PROBE_NET_ALLOWLIST`      | loopback + private CIDRs + DNS / NTP          | CIDR list + bare port (`:53`) entries; CIDR+port (`10.0.0.0/8:443`) supported |
 | `MILOG_PROBE_PTRACE_DEBUGGERS`   | `gdb,lldb,strace,…`                           | Allowlist of legitimate ptracers (replaces, not extends)     |
 | `MILOG_PROBE_KMOD_ALLOWLIST`     | conservative module set                       | Set to `""` (explicit empty) to alert on **every** module load |
@@ -243,7 +271,7 @@ silence as appropriate:
 | `whoami`                                 | one-shot UID lookup                                               | already in default file allowlist          |
 | `watchtower`                             | Docker image-update polling GHCR/Docker Hub                       | silence `net:unexpected_outbound:watchtower` |
 | App-level `node` / `python` / `curl`     | normal API calls to external services                             | silence `net:unexpected_outbound:<comm>` (lose attribution for that comm) or extend `MILOG_PROBE_NET_ALLOWLIST` with concrete CIDRs |
-| Tencent / AWS / GCP cloud agents (`barad_agent`, `YDService`) | shell-out + `/var/log/auth.log` read | allowlist comm if the agent isn't going to be removed |
+| Tencent / AWS / GCP cloud agents (`barad_agent`, `YDService`) | shell-out and file reads from threads such as `ParseLoop` | add the process name (`YDService`) to the allowlist if the agent stays; it covers the agent's threads |
 
 If you hit a recurring source not in this table, the easiest path is
 `milog silence <full-rule-key> 1d "investigating"` while you decide.

@@ -8,7 +8,8 @@ _tui_go_binary() {
     local candidate
     for candidate in \
         /usr/local/libexec/milog/milog-tui \
-        /usr/local/bin/milog-tui; do
+        /usr/local/bin/milog-tui \
+        /usr/bin/milog-tui; do
         [[ -x "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     done
     local self="${BASH_SOURCE[0]}"

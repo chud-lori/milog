@@ -69,8 +69,11 @@ mode_suspects() {
 
     [[ -z "$ranked" ]] && { echo; return 0; }
 
-    local sc ip req e4 e5 p_count flags c country
+    local sc ip req e4 e5 p_count flags c country cti
     while IFS=$'\t' read -r sc ip req e4 e5 p_count flags; do
+        # Cache only: a network lookup per row would stall the table and burn the API quota.
+        cti=$(cti_lookup "$ip" cached)
+        [[ -n "$cti" && "$cti" != unknown ]] && flags="${flags:+$flags }CS:${cti%% *}"
         c=$G
         (( sc >= 10 )) && c=$Y
         (( sc >= 30 )) && c=$R
