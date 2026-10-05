@@ -19,7 +19,8 @@ src/
 │                   # Everything here executes at source time — not just
 │                   # function definitions. Must come first.
 ├── alerts.sh       # Discord alert helpers: alert_discord, alert_should_fire,
-│                   # _exploit_category, json_escape.
+│                   # _exploit_category, json_escape, _rules_load (exploit/probe
+│                   # regexes from RULES_FILE or the baked-in rules/milog-rules.tsv).
 ├── ui.sh           # TUI geometry: box rules, draw_row, trow, hdr_row,
 │                   # milog_update_geometry (reflow to terminal width).
 ├── system.sh       # /proc-based metrics: cpu_usage, mem_info, disk_info,

@@ -1,6 +1,6 @@
 # milog completions install | bash | zsh | fish.
 
-# Bodies come from completions/ in a repo clone, else from _completions_payload_<shell>, which build.sh does not generate.
+# Bodies come from completions/ in a repo clone, else from the _completions_payload_<shell> functions build.sh bakes in.
 
 _completions_src_dir() {
     local me self_dir

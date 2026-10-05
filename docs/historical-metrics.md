@@ -114,6 +114,11 @@ Ready to apply (copy-paste to set):
 Re-run whenever traffic patterns change (new service, traffic source
 shift, seasonal change).
 
+When `alerts.log` exists, auto-tune first lists rules that averaged more
+than 10 fires a day over the same window, each with a threshold or
+silence command to copy. See
+[First week: learn mode](alerts.md#first-week-learn-mode).
+
 ## Anomaly detection
 
 Once you've banked **at least 14 days** of `HISTORY_ENABLED=1` data,

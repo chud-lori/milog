@@ -16,7 +16,7 @@ for required in src/core.sh src/dispatch.sh src/modes; do
 done
 
 # install.sh and `milog doctor` read these `# MILOG_<KEY>=` lines right after the shebang.
-MILOG_VERSION=$(git describe --always --dirty 2>/dev/null || echo unknown)
+MILOG_VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)
 MILOG_BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u 2>/dev/null || echo unknown)
 
 {
@@ -36,6 +36,15 @@ MILOG_BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u 2>/dev/null || 
     for f in src/modes/*.sh; do
         cat "$f"
     done
+    # The default detection rules; RULES_FILE overrides them at runtime.
+    f=rules/milog-rules.tsv
+    [[ -s "$f" ]] || { echo "build.sh: missing $f" >&2; exit 1; }
+    if grep -qx 'MILOG_RULES_EOF' "$f"; then
+        echo "build.sh: $f contains the heredoc delimiter" >&2; exit 1
+    fi
+    printf "_rules_default() {\n    cat <<'MILOG_RULES_EOF'\n"
+    cat "$f"
+    printf 'MILOG_RULES_EOF\n}\n'
     # completions/* baked in as _completions_payload_<shell> for installs
     # that have no completions/ dir next to the binary.
     for shell in bash zsh fish; do

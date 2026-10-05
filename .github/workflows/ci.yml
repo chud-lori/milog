@@ -1,13 +1,4 @@
-# CI workflow — runs on every PR and push to main.
-#
-# Catches the regressions release.yml can't (it only runs on tag push):
-#   - milog.sh drift   — someone edited src/ but forgot `bash build.sh`
-#   - Go test / vet    — a refactor breaks an internal package
-#   - goreleaser check — `.goreleaser.yaml` syntax / deprecation
-#
-# Kept tight on purpose: ~2 min wall time on ubuntu-latest. The release
-# workflow runs the same Go build + goreleaser pipeline at tag time, so
-# we don't double-build artifacts here.
+# Bundle drift, smoke tests, Go vet/test and a goreleaser config check; release.yml builds artifacts at tag time.
 
 name: ci
 
@@ -77,15 +68,22 @@ jobs:
           bash tests/smoke_audit_tempfiles.sh
           bash tests/smoke_audit_history.sh
           bash tests/smoke_alert_payloads.sh
+          bash tests/smoke_alert_retry.sh
           bash tests/smoke_docs_drift.sh
           bash tests/smoke_installer_checksums.sh
           bash tests/smoke_install_completions.sh
           bash tests/smoke_tty_escapes.sh
           bash tests/smoke_mode_scripts.sh
           bash tests/smoke_followups.sh
+          bash tests/smoke_alert_stats.sh
+          bash tests/smoke_rules.sh
           bash tests/smoke_ai_crawlers.sh
           bash tests/smoke_report.sh
           bash tests/smoke_crowdsec_cti.sh
+          bash tests/smoke_ban_hooks.sh
+          bash tests/smoke_probe_unit.sh
+          bash tests/smoke_audit_integrity.sh
+          bash tests/smoke_no_apps.sh
 
       - name: Go vet
         working-directory: go
@@ -96,17 +94,7 @@ jobs:
         run: go test -race -count=1 ./...
 
       - name: Probe kernel-load smoke (sudo)
-        # The non-sudo Go test above runs the structural BPF spec
-        # tests (parses each .bpf.o, asserts program/map names) —
-        # that catches ~95% of probe regressions. The remaining 5%
-        # is "compiles clean but the BPF verifier rejects on this
-        # kernel," which only surfaces when you actually load the
-        # program. CAP_BPF isn't granted to the runner user by
-        # default, so this step bumps to root via sudo. The kernel-
-        # load tests self-skip when EUID != 0, so this is the only
-        # place they ever run in CI. Pattern matches every
-        # *KernelLoad test so adding a third probe (file/syscall
-        # layer) requires no CI yaml change.
+        # Kernel-load tests need CAP_BPF and self-skip unless run as root.
         working-directory: go
         run: |
           sudo --preserve-env=PATH,HOME \

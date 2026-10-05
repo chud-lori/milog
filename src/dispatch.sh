@@ -9,7 +9,7 @@ ${W}DASHBOARDS${NC}
                      ${D}keys: q=quit  p=pause  r=refresh  +/-=rate${NC}
   ${C}tui${NC}                rich Charm TUI ${D}(needs milog-tui Go binary; build.sh builds it)${NC}
   ${C}rate${NC}               nginx-only req/min dashboard
-  ${C}daemon${NC}             headless alerter — no TUI, fires Discord webhooks
+  ${C}daemon${NC}             headless alerter — no TUI, fires every configured destination
 
 ${W}ANALYSIS${NC}
   ${C}health${NC}             2xx/3xx/4xx/5xx per app
@@ -23,15 +23,16 @@ ${W}ANALYSIS${NC}
   ${C}suspects [N] [W]${NC}   heuristic bot ranking ${D}(top N=20, window=2000 lines/app)${NC}
   ${C}trend [app] [H]${NC}    sparkline of req/min from history ${D}(default: all apps, 24h)${NC}
   ${C}diff${NC}               per-app req: now vs 1d ago vs 7d ago
-  ${C}auto-tune [D]${NC}      suggest thresholds from history  ${D}(default: 7 days)${NC}
+  ${C}auto-tune [D]${NC}      suggest thresholds from history + alert noise  ${D}(default: 7 days)${NC}
   ${C}replay <file>${NC}      postmortem summary for one archived log file
   ${C}search <pat> ...${NC}   grep across all apps (flags: --since/--app/--path/--regex/--archives)
 
 ${W}ALERTING${NC}
-  ${C}alert on [URL]${NC}     enable Discord alerts + install systemd service
+  ${C}alert on [URL]${NC}     enable alerts + install systemd service
   ${C}alert off${NC}          disable alerts + stop service
   ${C}alert status${NC}       webhook / service / recent-fire state
-  ${C}alert test${NC}         send a test Discord embed right now
+  ${C}alert test${NC}         send a test alert to every destination
+  ${C}alert stats [W]${NC}    fires per rule ${D}(default 7d)${NC}
   ${C}alerts [window]${NC}    local fire history ${D}(today / Nh / Nd / Nw / all)${NC}
   ${C}silence ...${NC}        mute a rule while on-call works the fix ${D}(milog silence --help)${NC}
   ${C}digest [window]${NC}     exec-summary (day / week / Nh / Nd)
@@ -69,6 +70,7 @@ ${W}TAILING${NC}
 
 ${W}OPS${NC}
   ${C}install <feature>${NC}  add optional features: geoip / web / history
+  ${C}update-rules${NC}       fetch newer exploit/probe rules from the latest release
   ${C}audit fim${NC}           file integrity monitor (baseline + drift)
   ${C}audit persistence${NC}   re-entry surface diff (new cron / systemd / rc.local)
   ${C}audit ports${NC}         listening-port baseline (new TCP/UDP listeners)
@@ -174,7 +176,7 @@ _cmd_help() {
             ;;
         alert)
             echo -e "${W}milog alert <sub>${NC} — toggle alerting + systemd service"
-            echo -e "  Subs: on off status test"
+            echo -e "  Subs: on off status test stats"
             ;;
         alerts)   echo -e "${W}milog alerts [window]${NC} — fire history (today / Nh / Nd / Nw / all)" ;;
         silence)  echo -e "${W}milog silence <rule> <duration> [message]${NC} — mute a rule"; echo -e "  Also: ${C}milog silence list${NC} · ${C}milog silence clear <rule>${NC}" ;;
@@ -203,6 +205,12 @@ _cmd_help() {
             echo -e "${W}milog install <feature>${NC} — on-demand feature installer"
             echo -e "  Subs: list, <feature>, remove <feature>"
             echo -e "  Features: geoip / web / history"
+            ;;
+        update-rules)
+            echo -e "${W}milog update-rules${NC}: fetch exploit/probe detection rules from the latest release"
+            echo -e "  Checks the SHA-256 against the release's checksums.txt, then that every regex compiles."
+            echo -e "  Refuses an older version than the active one; writes ${C}RULES_FILE${NC} atomically."
+            echo -e "  ${D}checksums.txt is not a signature: it comes from the same release as the rules.${NC}"
             ;;
         audit)
             echo -e "${W}milog audit <sub>${NC} — point-in-time host integrity scans"
@@ -233,7 +241,7 @@ fi
 # Setup and host-level commands must work before any app is configured.
 if [[ ${#LOGS[@]} -eq 0 ]]; then
     case "${1:-}" in
-        -h|--help|help|config|doctor|completions|install|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
+        -h|--help|help|config|doctor|completions|install|update-rules|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
         *)
             echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
             echo "  Run 'milog config init', set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
@@ -278,6 +286,7 @@ case "${1:-}" in
     completions) shift; mode_completions "$@" ;;
     bench)    shift; mode_bench "$@" ;;
     install)  shift; mode_install "$@" ;;
+    update-rules) mode_update_rules ;;
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
     web)      shift; mode_web "$@" ;;

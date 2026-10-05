@@ -29,6 +29,7 @@ curl() {
         [[ "$1" == -d ]] && printf '%s' "$2" > "$tmp/out/$dest"
         shift
     done
+    (( curl_rc )) && printf '\n000' || printf '\n204'
     return "$curl_rc"
 }
 
@@ -70,7 +71,7 @@ ticks="${fenced//[^\`]/}"
 # Delivery failures are recorded, not swallowed.
 curl_rc=22 dest=discord
 _alert_send_discord "t" "b"
-grep -q $'\tdiscord$' "$ALERT_STATE_DIR/send_failures.log" 2>/dev/null \
+grep -q $'\tdiscord\t000$' "$ALERT_STATE_DIR/send_failures.log" 2>/dev/null \
     || fail "failed send was not recorded"
 
 # Dedup keys holding nginx \xHH escapes must match their stored row.

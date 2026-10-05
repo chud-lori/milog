@@ -1,4 +1,4 @@
-# milog alert on|off|status|test: toggle alerting and the systemd service.
+# milog alert on|off|status|test|stats: toggle alerting and the systemd service.
 # Under sudo, config goes to SUDO_USER's home and the service runs as that user, not root.
 
 _alert_target_user() {
@@ -36,10 +36,28 @@ _alert_write_config() {
     fi
 }
 
+# Regular file up to 1 MiB; root also refuses symlinks, since it may be reading another user's file.
+_alert_config_readable() {
+    local file="$1" size
+    [[ -f "$file" && -r "$file" ]] || return 1
+    (( EUID != 0 )) || [[ ! -L "$file" ]] || return 1
+    size=$(stat -L -c '%s' "$file" 2>/dev/null || stat -L -f '%z' "$file" 2>/dev/null) || return 1
+    (( size <= 1048576 ))
+}
+
+# Stops before any read or write when the target config exists but the readers would skip it.
+_alert_check_config() {
+    local file="$1"
+    [[ -e "$file" || -L "$file" ]] || return 0
+    _alert_config_readable "$file" && return 0
+    echo -e "${R}refusing to use $file:${NC} needs a regular file under 1 MiB (not a symlink when run as root)" >&2
+    return 1
+}
+
 # Always returns 0, printing nothing when the file or key is missing, to stay safe under `set -e`.
 _alert_read_webhook() {
     local file="$1"
-    [[ -f "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     {
         grep -E '^[[:space:]]*DISCORD_WEBHOOK=' "$file" 2>/dev/null \
             | head -1 \
@@ -50,7 +68,7 @@ _alert_read_webhook() {
 
 _alert_read_routes() {
     local file="$1"
-    [[ -r "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     # Parsed, never sourced: under sudo this is another user's file and we're root.
     awk '
         !on && /^[[:space:]]*(export[[:space:]]+)?ALERT_ROUTES=/ {
@@ -69,7 +87,7 @@ _alert_read_routes() {
 
 _alert_read_key() {
     local file="$1" key="$2"
-    [[ -f "$file" ]] || return 0
+    _alert_config_readable "$file" || return 0
     {
         grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null \
             | head -1 \
@@ -119,6 +137,7 @@ alert_on() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     if [[ -n "$webhook_arg" ]]; then
         case "$webhook_arg" in
@@ -131,11 +150,19 @@ alert_on() {
     fi
     _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=1" || return 1
 
-    local current_webhook
-    current_webhook=$(_alert_read_webhook "$target_config")
-    if [[ -z "$current_webhook" ]]; then
-        echo -e "${R}no DISCORD_WEBHOOK configured in $target_config${NC}" >&2
-        echo "  pass one:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+    local d_url s_url wh_url tg_token tg_chat mx_hs mx_token mx_room
+    d_url=$(_alert_read_webhook "$target_config")
+    s_url=$(   _alert_read_key "$target_config" "SLACK_WEBHOOK")
+    wh_url=$(  _alert_read_key "$target_config" "WEBHOOK_URL")
+    tg_token=$(_alert_read_key "$target_config" "TELEGRAM_BOT_TOKEN")
+    tg_chat=$( _alert_read_key "$target_config" "TELEGRAM_CHAT_ID")
+    mx_hs=$(   _alert_read_key "$target_config" "MATRIX_HOMESERVER")
+    mx_token=$(_alert_read_key "$target_config" "MATRIX_TOKEN")
+    mx_room=$( _alert_read_key "$target_config" "MATRIX_ROOM")
+    if ! _alert_any_destination "$d_url" "$s_url" "$tg_token" "$tg_chat" "$mx_hs" "$mx_token" "$mx_room" "$wh_url"; then
+        echo -e "${R}no alert destination configured in $target_config${NC}" >&2
+        echo "  pass a Discord webhook:  milog alert on 'https://discord.com/api/webhooks/ID/TOKEN'" >&2
+        echo "  or set SLACK_WEBHOOK, TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID, MATRIX_* or WEBHOOK_URL there" >&2
         return 1
     fi
 
@@ -163,6 +190,7 @@ alert_off() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     _alert_write_config "$target_user" "$target_home" "ALERTS_ENABLED=0" \
         && echo -e "${G}✓${NC} ALERTS_ENABLED=0 in $target_config"
@@ -187,6 +215,7 @@ alert_status() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     # Read from the target config, not env, so `sudo milog alert status` shows the user's settings rather than root's.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url
@@ -272,6 +301,7 @@ alert_test() {
     target_user=$(_alert_target_user)
     target_home=$(_alert_target_home "$target_user")
     target_config="$target_home/.config/milog/config.sh"
+    _alert_check_config "$target_config" || return 1
 
     # Target user's config, not this process's env, for the same sudo reason as alert_status.
     local d_url s_url tg_token tg_chat mx_hs mx_token mx_room wh_url wh_template wh_ctype
@@ -341,11 +371,12 @@ alert_help() {
 ${W}milog alert${NC} — toggle alerting and manage the systemd service
 
 ${W}USAGE${NC}
-  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts (Discord); install + start systemd
+  ${C}milog alert on [WEBHOOK_URL]${NC}  enable alerts; install + start systemd
   ${C}milog alert off${NC}                disable alerts; stop + disable service
   ${C}milog alert status${NC}             show destinations/service/recent-fire state
   ${C}milog alert test${NC}               fire one test alert to EVERY configured
                               destination (Discord + Slack + Telegram + Matrix)
+  ${C}milog alert stats [WINDOW]${NC}     fires per rule from alerts.log (default 7d)
 
 ${W}EXAMPLES${NC}
   ${D}# First-time setup in one command (Discord):${NC}
@@ -371,6 +402,7 @@ mode_alert() {
         off)            alert_off ;;
         status|'')      alert_status ;;
         test)           alert_test ;;
+        stats)          alert_stats "${1:-7d}" ;;
         -h|--help|help) alert_help ;;
         *) echo -e "${R}Unknown alert subcommand:${NC} $sub"; alert_help; exit 1 ;;
     esac

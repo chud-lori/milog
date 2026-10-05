@@ -362,7 +362,8 @@ func TestMatchFile_AllowlistedCommsSilent(t *testing.T) {
 		{Comm: "sshd", Filename: "/root/.ssh/authorized_keys"},
 		{Comm: "sudo", Filename: "/etc/sudoers"},
 		{Comm: "cron", Filename: "/etc/shadow"},
-		{Comm: "systemd", Filename: "/etc/passwd"},
+		{Comm: "systemd", Filename: "/etc/shadow"},
+		{Comm: "sshd-socket-gen", Filename: "/etc/ssh/sshd_config.d/50-cloud-init.conf"},
 		{Comm: "auditd", Filename: "/etc/shadow"},
 		{Comm: "milog-probe", Filename: "/etc/shadow"},
 	}
@@ -388,6 +389,25 @@ func TestMatchFile_NonSensitivePathSilent(t *testing.T) {
 	for _, ev := range cases {
 		if hits := MatchFile(ev); len(hits) != 0 {
 			t.Errorf("non-sensitive path should not fire: %+v → %+v", ev, hits)
+		}
+	}
+}
+
+func TestMatchFile_PasswdWritesOnly(t *testing.T) {
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	// O_RDONLY, O_RDONLY|O_CLOEXEC.
+	for _, flags := range []uint32{0, 0x80000} {
+		if hits := MatchFile(FileEvent{Comm: "getent", Filename: "/etc/passwd", Flags: flags}); len(hits) != 0 {
+			t.Errorf("read of /etc/passwd (flags 0x%x) should be silent, got %+v", flags, hits)
+		}
+	}
+	// O_WRONLY|O_APPEND, O_RDWR, O_WRONLY|O_CREAT|O_TRUNC.
+	for _, flags := range []uint32{0x401, 0x2, 0x241} {
+		if hits := MatchFile(FileEvent{Comm: "bash", Filename: "/etc/passwd", Flags: flags}); len(hits) != 1 {
+			t.Errorf("write to /etc/passwd (flags 0x%x) should fire, got %d hits", flags, len(hits))
 		}
 	}
 }

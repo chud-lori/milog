@@ -36,6 +36,7 @@ Everything in-depth lives under [`docs/`](docs/) — skim the
 
 - [**Configuration**](docs/configuration.md) — variables, env overrides, nginx `log_format`
 - [**Alerts**](docs/alerts.md) — Discord / Slack / Telegram / Matrix setup, rule catalog, history
+- [**Ban hooks**](docs/ban-hooks.md) — pass exploit source IPs to fail2ban or an nftables set
 - [**Host integrity audits**](docs/audit.md) — `milog audit` (fim / rootkit / persistence / ports / accounts / yara), provocations to verify detection
 - [**Web dashboard**](docs/web-dashboard.md) — `milog web`, systemd user service, SSH / Tailscale / Cloudflare Tunnel exposure patterns
 - [**Historical metrics**](docs/historical-metrics.md) — SQLite time series, `trend` / `diff` / `auto-tune`
@@ -76,6 +77,9 @@ sudo dnf install ./milog.rpm
 # Alpine
 curl -fsSL -o milog.apk https://github.com/chud-lori/milog/releases/latest/download/milog_<VER>_linux_amd64.apk
 sudo apk add --allow-untrusted ./milog.apk
+
+# Arch Linux (builds packaging/aur/PKGBUILD from the release tarball)
+git clone https://github.com/chud-lori/milog && cd milog/packaging/aur && makepkg -si
 ```
 
 Replace `<VER>` with the [latest release tag](https://github.com/chud-lori/milog/releases/latest)
@@ -182,6 +186,7 @@ milog diff                 # per-app: now vs 1d / 7d ago
 milog auto-tune [D]        # suggest thresholds from history
 milog replay <file>        # postmortem for one archived log
 milog alerts [window]      # local fire history
+milog alert stats [window] # fires per rule, busiest first
 
 milog errors               # live 4xx/5xx tail
 milog exploits             # LFI / RCE / SQLi / XSS / infra-probe live tail
@@ -191,10 +196,11 @@ milog <app>                # raw tail of one app
 
 milog web [install-service|stop|status]
 milog probe [status|install-service|uninstall-service]   # Linux only — eBPF sidecar
-milog alert [on|off|status|test]
+milog alert [on|off|status|test|stats]
 milog audit [fim|persistence|ports|yara|accounts|rootkit] [baseline|check|status]
 milog silence <rule_or_glob> <duration> [msg]
 milog config [init|add|rm|dir|set|edit]
+milog update-rules         # newer exploit/probe rules from the latest release
 milog doctor               # diagnostic checklist
 milog help
 ```
@@ -221,8 +227,10 @@ scroll, `f`/page-down and `b`/page-up page through longer output, and
 ## Uninstall
 
 ```bash
-sudo rm /usr/local/bin/milog
-sudo rm -f /etc/systemd/system/milog.service
+sudo systemctl disable --now milog.service milog-probe.service
+systemctl --user disable --now milog-web.service
+sudo rm -f /usr/local/bin/milog /usr/local/bin/milog-web /usr/local/bin/milog-tui /usr/local/bin/milog-probe
+sudo rm -f /etc/systemd/system/milog.service /etc/systemd/system/milog-probe.service
 rm -f ~/.config/systemd/user/milog-web.service
 rm -rf ~/.config/milog ~/.cache/milog ~/.local/share/milog
 sudo rm -rf /opt/milog   # if cloned
