@@ -84,15 +84,33 @@ _alert_record() {
     _alert_rotate_if_big "$log_file"
 }
 
-# Log a failed delivery (network or HTTP >= 400) for `milog doctor`.
+# Log a failed delivery (network or HTTP >= 400) for `milog doctor`; status 000 means no HTTP response.
 _alert_send_failed() {
     local log_file="$ALERT_STATE_DIR/send_failures.log"
     mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
-    printf '%s\t%s\n' "$(date +%s)" "${1:-unknown}" >> "$log_file" 2>/dev/null || true
+    printf '%s\t%s\t%s\n' "$(date +%s)" "${1:-unknown}" "${2:-000}" >> "$log_file" 2>/dev/null || true
     _alert_rotate_if_big "$log_file"
 }
 
-# Senders return 0 when unconfigured and record failures with _alert_send_failed.
+# _alert_post <dest> <curl args...>. A 429 is retried once when the server asks to wait 5s or less.
+_alert_post() {
+    local dest="$1"; shift
+    local out code wait try
+    for try in 1 2; do
+        out=$(curl -sS -m 5 -i -w '\n%{http_code}' "$@" 2>/dev/null) || :
+        code="${out##*$'\n'}"
+        [[ "$code" == 429 && "$try" == 1 ]] || break
+        wait=$(printf '%s\n' "$out" | sed -n -E \
+            -e '/"retry_after": *[0-9]/{s/.*"retry_after": *([0-9][0-9.]*).*/\1/p;q;}' \
+            -e '/^[Rr]etry-[Aa]fter: *[0-9]/{s/^[^:]*: *([0-9][0-9.]*).*/\1/p;q;}') || :
+        # A string match, since arithmetic on a server-supplied number can overflow.
+        [[ "$wait" =~ ^([0-4](\.[0-9]+)?|5(\.0+)?)$ ]] || break
+        sleep "$wait" || break
+    done
+    [[ "$code" =~ ^[1-3][0-9][0-9]$ ]] || _alert_send_failed "$dest" "$code"
+}
+
+# Senders return 0 when unconfigured and post through _alert_post, which records failures.
 # The body carries attacker-controlled log text, so each sender escapes it and disables mentions where the API allows.
 
 # allowed_mentions.parse=[] stops @everyone / role pings.
@@ -102,8 +120,8 @@ _alert_send_discord() {
     local payload
     payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")
-    curl -sS -f -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed discord
+    _alert_post discord -H "Content-Type: application/json" \
+         -d "$payload" "$DISCORD_WEBHOOK"
 }
 
 # link_names=0 keeps `<@channel>` literal; the body goes in a code block with backticks swapped for single quotes.
@@ -115,8 +133,8 @@ _alert_send_slack() {
     local payload
     payload=$(printf '{"text":%s,"mrkdwn":true,"link_names":0}' \
         "$(json_escape "$text")")
-    curl -sS -f -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed slack
+    _alert_post slack -H "Content-Type: application/json" \
+         -d "$payload" "$SLACK_WEBHOOK"
 }
 
 # parse_mode=HTML, so every value goes through html_escape.
@@ -131,9 +149,8 @@ _alert_send_telegram() {
     local payload
     payload=$(printf '{"chat_id":%s,"text":%s,"parse_mode":"HTML","disable_web_page_preview":true,"disable_notification":false}' \
         "$(json_escape "$TELEGRAM_CHAT_ID")" "$(json_escape "$text")")
-    curl -sS -f -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-         >/dev/null 2>&1 || _alert_send_failed telegram
+    _alert_post telegram -H "Content-Type: application/json" \
+         -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
 }
 
 # Free-form POST driven by WEBHOOK_TEMPLATE; the color-to-severity mapping matches alerts.log.
@@ -161,8 +178,8 @@ _alert_send_webhook() {
     done
     payload+="$rest"
     local ctype="${WEBHOOK_CONTENT_TYPE:-application/json}"
-    curl -sS -f -m 5 -H "Content-Type: ${ctype}" \
-         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || _alert_send_failed webhook
+    _alert_post webhook -H "Content-Type: ${ctype}" \
+         -d "$payload" "$WEBHOOK_URL"
 }
 
 # Room IDs are percent-encoded; the txn id only needs to be unique within the server's dedup window.
@@ -183,45 +200,32 @@ ${body}"
     room_enc=$(_url_encode "$MATRIX_ROOM")
     txn_id="milog-$(date +%s)-$RANDOM"
     local hs="${MATRIX_HOMESERVER%/}"
-    curl -sS -f -m 5 -X PUT \
+    _alert_post matrix -X PUT \
          -H "Authorization: Bearer ${MATRIX_TOKEN}" \
          -H "Content-Type: application/json" \
          -d "$payload" \
-         "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}" \
-         >/dev/null 2>&1 || _alert_send_failed matrix
+         "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}"
 }
 
 # Silences: explicit mutes that outrank cooldown and dedup.
 # alerts.silences rows: key-or-glob, until, added, added_by, message. Expired rows are pruned lazily.
 
-# 30s / 5m / 2h / 1d (or bare seconds) -> seconds; returns 1 on bad input.
+# 30s / 5m / 2h / 1d (or bare seconds) -> seconds, up to 3650d; returns 1 on bad input.
 alert_silence_parse_duration() {
-    local s="${1:-}"
-    [[ -n "$s" ]] || return 1
-    local n="${s%[smhdSMHD]}" unit="${s: -1}"
-    if [[ "$s" =~ ^[0-9]+$ ]]; then
-        printf '%s' "$s"
-        return 0
-    fi
-    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    local s="${1:-}" n unit=1
     # `${unit,,}` is bash 4+ only.
-    case "$unit" in
-        s|S) printf '%s' "$n" ;;
-        m|M) printf '%s' $(( n * 60 )) ;;
-        h|H) printf '%s' $(( n * 3600 )) ;;
-        d|D) printf '%s' $(( n * 86400 )) ;;
-        *) return 1 ;;
+    case "$s" in
+        *[sS]) n="${s%?}" ;;
+        *[mM]) n="${s%?}" unit=60 ;;
+        *[hH]) n="${s%?}" unit=3600 ;;
+        *[dD]) n="${s%?}" unit=86400 ;;
+        *)     n="$s" ;;
     esac
-}
-
-alert_silence_prune() {
-    local f="$ALERT_STATE_DIR/alerts.silences"
-    [[ -f "$f" ]] || return 0
-    local now; now=$(date +%s)
-    local tmp
-    tmp=$(mktemp "$f.prune.XXXXXX" 2>/dev/null) || return 0
-    awk -F'\t' -v now="$now" 'BEGIN{OFS="\t"} $2+0 > now' "$f" 2>/dev/null > "$tmp"
-    mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+    # At most nine significant digits, so the multiply can't overflow.
+    [[ "$n" =~ ^0*([0-9]{1,9})$ ]] || return 1
+    n=$(( 10#${BASH_REMATCH[1]} * unit ))
+    (( n <= 3650 * 86400 )) || return 1
+    printf '%s' "$n"
 }
 
 # Prints the matching row; `[[ == $key ]]` is a glob match, so `exploit:*` covers every exploit rule.
@@ -347,12 +351,12 @@ _alert_route_for() {
 }
 
 # Runs every executable in HOOKS_DIR/on_alert.d/ in the background with MILOG_RULE_KEY, MILOG_TITLE, MILOG_BODY,
-# MILOG_SEV, MILOG_COLOR and MILOG_TS set. Non-zero exits are logged to hooks.log, never propagated.
+# MILOG_SEV, MILOG_COLOR, MILOG_TS and MILOG_IP set. Non-zero exits are logged to hooks.log, never propagated.
 _alert_run_hooks() {
     local hook_dir="${HOOKS_DIR:-$HOME/.config/milog/hooks}/on_alert.d"
     [[ -d "$hook_dir" ]] || return 0
 
-    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}" ip="${5:-}"
     local sev
     case "$color" in
         15158332|16711680)  sev=crit ;;
@@ -380,6 +384,7 @@ _alert_run_hooks() {
                       MILOG_SEV="$sev"           \
                       MILOG_COLOR="$color"       \
                       MILOG_TS="$ts"             \
+                      MILOG_IP="$ip"             \
                       timeout "$timeout_s" "$hook" 2>&1)
                 rc=$?
             else
@@ -389,6 +394,7 @@ _alert_run_hooks() {
                       MILOG_SEV="$sev"           \
                       MILOG_COLOR="$color"       \
                       MILOG_TS="$ts"             \
+                      MILOG_IP="$ip"             \
                       "$hook" 2>&1)
                 rc=$?
             fi
@@ -403,10 +409,10 @@ _alert_run_hooks() {
     done
 }
 
-# alert_fire <title> <body> [color] [rule_key]. Each destination is sent in the background.
+# alert_fire <title> <body> [color] [rule_key] [ip]. Each destination is sent in the background; ip only reaches hooks.
 alert_fire() {
     [[ "${ALERTS_ENABLED:-0}" != "1" ]] && return 0
-    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}"
+    local title="$1" body="$2" color="${3:-15158332}" rule_key="${4:-}" ip="${5:-}"
     # Silenced fires are not recorded either; the silence row is the audit trail.
     if [[ -n "$rule_key" ]] && alert_is_silenced "$rule_key" >/dev/null; then
         return 0
@@ -415,7 +421,7 @@ alert_fire() {
     _alert_record "$rule_key" "$title" "$body" "$color"
 
     # Hooks run before the curl check; they don't need it.
-    _alert_run_hooks "$title" "$body" "$color" "$rule_key"
+    _alert_run_hooks "$title" "$body" "$color" "$rule_key" "$ip"
 
     command -v curl >/dev/null 2>&1 || return 0
 
@@ -495,6 +501,12 @@ _alert_redact_webhook() {
     else
         printf '%.40s…' "$w"
     fi
+}
+
+# Succeeds when at least one destination has every setting it needs; same args as _alert_destinations_status.
+_alert_any_destination() {
+    local d="${1:-}" s="${2:-}" tt="${3:-}" tc="${4:-}" mh="${5:-}" mt="${6:-}" mr="${7:-}" wh="${8:-}"
+    [[ -n "$d$s$wh" ]] || [[ -n "$tt" && -n "$tc" ]] || [[ -n "$mh" && -n "$mt" && -n "$mr" ]]
 }
 
 # Takes values as args so `alert status` can pass ones read from another user's config file.
@@ -602,23 +614,63 @@ alert_fingerprint_from_line() {
     printf '%s:%s' "$ip" "$path"
 }
 
-# Rough substring classification, only used to group alerts by rule key.
+# Prints the `# version: N` from the first line of a rules file on stdin.
+_rules_version() {
+    sed -n '1s/^# version: \([0-9][0-9]*\)$/\1/p'
+}
+
+# Prints the version of a valid rules file; otherwise prints the reason to stderr and fails.
+_rules_check() {
+    local f="$1" version bad kind name re rc
+    version=$(_rules_version < "$f")
+    [[ -n "$version" ]] || { echo "$f: first line must be '# version: N'" >&2; return 1; }
+    bad=$(awk -F'\t' '!/^#/ && NF && !(NF == 3 && $1 ~ /^(exploit|probe|category)$/ && $2 != "" && $3 != "") { print NR; exit }' "$f")
+    [[ -z "$bad" ]] || { echo "$f:$bad: want <exploit|probe|category><TAB><name><TAB><regex>" >&2; return 1; }
+    for kind in exploit probe; do
+        grep -q "^$kind"$'\t' "$f" || { echo "$f: no $kind rules" >&2; return 1; }
+    done
+    while IFS=$'\t' read -r kind name re || [[ -n "$kind" ]]; do
+        [[ -n "$kind" && "$kind" != \#* ]] || continue
+        # Exit 2 is a bad regex; 0 means it matches an empty line and would flag every request.
+        rc=0; grep -Eq -- "$re" <<< "" 2>/dev/null || rc=$?
+        (( rc == 1 )) || { echo "$f: $kind/$name: regex does not compile or matches everything: $re" >&2; return 1; }
+    done < "$f"
+    printf '%s' "$version"
+}
+
+# RULES_FILE wins when it passes _rules_check; otherwise the rules baked in by build.sh apply.
+_rules_load() {
+    local text="" kind name re
+    if [[ -f "$RULES_FILE" ]]; then
+        if _rules_check "$RULES_FILE" >/dev/null; then
+            text=$(cat "$RULES_FILE")
+        else
+            echo "milog: ignoring $RULES_FILE, using the built-in rules" >&2
+        fi
+    fi
+    [[ -n "$text" ]] || text=$(_rules_default)
+    RULES_EXPLOIT="" RULES_PROBE="" RULES_CATEGORY_NAMES=() RULES_CATEGORY_RES=()
+    while IFS=$'\t' read -r kind name re; do
+        case "$kind" in
+            exploit)  RULES_EXPLOIT+="${RULES_EXPLOIT:+|}$re" ;;
+            probe)    RULES_PROBE+="${RULES_PROBE:+|}$re" ;;
+            category) RULES_CATEGORY_NAMES+=("$name"); RULES_CATEGORY_RES+=("$re") ;;
+        esac
+    done <<< "$text"
+    # The AI crawler list is shared with health/top, so it is not duplicated in the rules file.
+    RULES_PROBE+="|$AI_CRAWLER_UA_RE"
+}
+
+# First matching category row names the alert's rule key; needs _rules_load first.
 _exploit_category() {
-    local line="$1" cat="other"
+    local line="$1" cat="other" i
     shopt -s nocasematch
-    case "$line" in
-        *'${jndi'*|*'jndi:'*|*log4j*)                                            cat=log4shell ;;
-        *union*select*|*select*from*|*'sleep('*|*'benchmark('*|*' or 1=1'*|*%27*or*) cat=sqli ;;
-        *'<script'*|*%3cscript*|*'onerror='*|*'onload='*|*'javascript:'*)        cat=xss ;;
-        *base64_decode*|*'eval('*|*'system('*|*'passthru('*|*shell_exec*)         cat=rce ;;
-        *'../'*|*%2e%2e*|*/etc/passwd*|*/etc/shadow*|*/proc/self*)               cat=traversal ;;
-        */containers/*|*/actuator/*|*/server-status*|*/console*|*/druid/*)       cat=infra ;;
-        */SDK/web*|*/cgi-bin/*|*/boaform/*|*/HNAP1*)                             cat=device ;;
-        */wp-admin*|*/wp-login*|*/wp-content/plugins*|*/xmlrpc.php*)             cat=wordpress ;;
-        */phpmyadmin*|*/pma/*|*/mysql/admin*)                                    cat=phpmyadmin ;;
-        */.env*|*/.git/*|*/.aws/*|*/.ssh/*|*/.DS_Store*|*/config.php*|*/config.json*|*/config.yml*|*/config.yaml*|*/web.config*) cat=dotfile ;;
-        *libredtail*|*nikto*|*masscan*|*zgrab*|*sqlmap*|*nuclei*|*gobuster*|*dirbuster*|*wfuzz*|*l9explore*|*l9tcpid*|*'hello, world'*|*'hello,world'*) cat=scanner ;;
-    esac
+    for i in "${!RULES_CATEGORY_RES[@]}"; do
+        if [[ "$line" =~ ${RULES_CATEGORY_RES[$i]} ]]; then
+            cat="${RULES_CATEGORY_NAMES[$i]}"
+            break
+        fi
+    done
     shopt -u nocasematch
     printf '%s' "$cat"
 }

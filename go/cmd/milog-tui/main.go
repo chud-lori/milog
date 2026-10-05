@@ -29,7 +29,7 @@
 //	H / S       open alert history / active silences
 //	s / x       silence the selected alert's rule / clear the selected silence
 //	i           open the integrity view
-//	esc / h     leave drill-down / alerts / paths / errors / trend / history / silences / integrity → overview
+//	esc / h     leave any view → overview (closes the history detail first)
 package main
 
 import (

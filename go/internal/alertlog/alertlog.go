@@ -20,9 +20,8 @@ type Row struct {
 	Body  string `json:"body"`
 }
 
-// WindowToCutoff turns today | yesterday | all | Nh | Nd | Nw into the
-// oldest epoch to include; all is 0. There's no upper bound, so yesterday
-// includes today.
+// WindowToCutoff turns today | yesterday | all | Nm | Nh | Nd | Nw into the
+// oldest epoch to include; all is 0. WindowToRange adds yesterday's end.
 func WindowToCutoff(w string, now time.Time) (int64, error) {
 	if w == "" {
 		w = "today"
@@ -36,6 +35,8 @@ func WindowToCutoff(w string, now time.Time) (int64, error) {
 		return nowU - (nowU % 86400) - 86400, nil
 	case w == "all":
 		return 0, nil
+	case strings.HasSuffix(w, "m") || strings.HasSuffix(w, "M"):
+		return relative(w, 60)
 	case strings.HasSuffix(w, "h") || strings.HasSuffix(w, "H"):
 		return relative(w, 3600)
 	case strings.HasSuffix(w, "d") || strings.HasSuffix(w, "D"):

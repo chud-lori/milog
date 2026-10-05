@@ -129,7 +129,9 @@ Sparkline from history (requires
 Per-app: now vs 1d ago vs 7d ago.
 .TP
 .BR auto-tune " [\fIDAYS\fR]"
-Suggest threshold values from history data.
+Suggest threshold values from history data, plus a threshold raise or a
+silence for each rule averaging more than 10 fires a day in alerts.log.
+Prints commands; applies nothing.
 .TP
 .B replay " \fIFILE\fR"
 Postmortem for one archived log file.
@@ -191,7 +193,8 @@ Subs: \fBshow\fR, \fBpath\fR, \fBinit\fR, \fBedit\fR, \fBadd\fR \fINAME\fR,
 .TP
 .B alert " \fISUB\fR"
 Toggle alerting + systemd service. Subs: \fBon\fR, \fBoff\fR, \fBstatus\fR,
-\fBtest\fR.
+\fBtest\fR, \fBstats\fR [\fIWINDOW\fR] (fires per rule from alerts.log,
+default \fB7d\fR).
 .TP
 .BR alerts " [\fIWINDOW\fR]"
 Fire history reader. Window grammar: \fBtoday\fR, \fByesterday\fR,
@@ -207,7 +210,8 @@ Exec-summary for the period.
 .BR report " [\fIWINDOW\fR] [\fB\-\-html\fR] [\fB\-o\fR \fIFILE\fR]"
 Static report for the window (default \fB7d\fR; same grammar as
 \fBdigest\fR): requests, 4xx and 5xx per app, the top 10 IPs by 4xx
-responses, alert fires per rule, and anomaly alerts. Markdown by default;
+responses, alert fires per rule, anomaly alerts, and audit drift from the
+history DB. Markdown by default;
 \fB\-\-html\fR prints one self-contained HTML page with no scripts. Writes to stdout, or
 to \fIFILE\fR with \fB\-o\fR.
 .TP
@@ -373,6 +377,19 @@ On-demand feature installer. Features:
 .B install list
 shows installed state.
 .TP
+.B update-rules
+Download
+.B milog-rules.tsv
+from the latest release of
+.B MILOG_RELEASE_REPO
+(default chud-lori/milog), check its SHA-256 against that release's
+.BR checksums.txt ,
+check that every regex compiles, and write it to
+.B RULES_FILE
+atomically. Refuses a version lower than the active rules. The checksum
+file comes from the same release, so this detects corruption, not a
+compromised release; it is not a signature.
+.TP
 .B completions " <\fBinstall\fR | \fBbash\fR | \fBzsh\fR | \fBfish\fR>"
 Install / print shell completion script.
 .TP
@@ -392,6 +409,13 @@ User config file (sourced as bash). Override path with
 .BR MILOG_CONFIG .
 Template via
 .BR "milog config init" .
+.TP
+.I ~/.config/milog/rules.tsv
+Default
+.BR RULES_FILE :
+exploit and probe detection regexes written by
+.BR "milog update-rules" .
+When absent or invalid, the rules built into milog apply.
 .TP
 .I ~/.cache/milog/
 Default

@@ -73,6 +73,7 @@ md=$("$ROOT/milog.sh" report 1h)
 grep -qF 'No IP got a 4xx response in this window.' <<< "$md" || fail "empty attacker section: $md"
 grep -qF "No alerts.log at $HOME/.cache/milog/alerts.log." <<< "$md" || fail "missing alerts.log not stated: $md"
 grep -qF 'Anomaly detection is off' <<< "$md" || fail "anomaly empty state: $md"
+grep -qF 'History is off (HISTORY_ENABLED=0)' <<< "$md" || fail "history-off audit state: $md"
 
 # -o refuses a symlink and leaves its target alone.
 echo keep > "$tmp/target"
@@ -88,6 +89,53 @@ for i in $(seq 1 12); do line "10.1.0.$i" "$recent" /x 404; done >> "$tmp/logs/a
 md=$("$ROOT/milog.sh" report 7d)
 grep -qF 'Showing the latest 50 of 55.' <<< "$md" || fail "anomaly cap not stated: $md"
 grep -qF 'Showing 10 of 14.' <<< "$md" || fail "attacker cap not stated: $md"
+
+export MILOG_HISTORY_ENABLED=1
+db="$MILOG_HISTORY_DB"
+md=$("$ROOT/milog.sh" report 7d)
+grep -qF "No history DB at $db." <<< "$md" || fail "missing history DB not stated: $md"
+
+mkdir -p "$tmp/bin"
+for d in /usr/local/bin /usr/bin /bin; do
+    for f in "$d"/*; do
+        name=${f##*/}
+        [[ "$name" == sqlite3 || -e "$tmp/bin/$name" ]] && continue
+        ln -s "$f" "$tmp/bin/$name"
+    done
+done
+md=$(PATH="$tmp/bin" "$ROOT/milog.sh" report 7d)
+grep -qF 'sqlite3 is not installed' <<< "$md" || fail "missing sqlite3 not stated: $md"
+
+sqlite3 "$db" "CREATE TABLE metrics_minute (ts INTEGER);"
+md=$("$ROOT/milog.sh" report 7d)
+grep -qF "No audit_event table in $db yet." <<< "$md" || fail "missing audit_event table not stated: $md"
+
+sqlite3 "$db" "CREATE TABLE audit_event (ts INTEGER NOT NULL, scanner TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL);"
+md=$("$ROOT/milog.sh" report 7d)
+grep -qF 'No audit drift recorded in this window.' <<< "$md" || fail "empty audit window not stated: $md"
+
+sqlite3 "$db" "INSERT INTO audit_event VALUES
+    ($old, 'fim', 'modified', '/etc/old-drift'),
+    ($(( recent - 60 )), 'ports', 'appeared', '0.0.0.0:4444/tcp'),
+    ($recent, 'fim', 'modified', '/srv/<script>x</script> a|b it''s' || char(9) || 't');"
+md=$("$ROOT/milog.sh" report 7d)
+grep -qF '## Audit drift' <<< "$md" || fail "markdown missing audit section: $md"
+grep -qF '| fim | modified | /srv/&lt;script&gt;x&lt;/script&gt; a&#124;b it'"'"'s t |' <<< "$md" \
+    || fail "markdown audit subject not escaped: $md"
+grep -qF '/etc/old-drift' <<< "$md" && fail "out-of-window audit row listed"
+first=$(grep -nF '/srv/&lt;script' <<< "$md" | cut -d: -f1)
+second=$(grep -nF '0.0.0.0:4444/tcp' <<< "$md" | cut -d: -f1)
+(( first < second )) || fail "audit rows not newest first: $md"
+html=$("$ROOT/milog.sh" report 7d --html)
+grep -qF '<td>/srv/&lt;script&gt;x&lt;/script&gt; a|b it&#39;s t</td>' <<< "$html" || fail "html audit subject not escaped: $html"
+grep -qi '<script' <<< "$html" && fail "html audit subject kept a script tag"
+md=$("$ROOT/milog.sh" report 99999d)
+grep -qF '| fim | modified | /etc/old-drift |' <<< "$md" || fail "window past the epoch dropped audit rows: $md"
+
+for i in $(seq 1 55); do printf "INSERT INTO audit_event VALUES ($recent, 'ports', 'appeared', 'p$i');\n"; done | sqlite3 "$db"
+md=$("$ROOT/milog.sh" report 7d)
+grep -qF 'Showing the latest 50 of 57.' <<< "$md" || fail "audit cap not stated: $md"
+unset MILOG_HISTORY_ENABLED
 
 # Root can read mode-000 files, so this only bites as a normal user.
 if (( $(id -u) != 0 )); then

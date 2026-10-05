@@ -188,6 +188,9 @@ nfpms:
 
 checksum:
   name_template: checksums.txt
+  # `milog update-rules` verifies the rules file against this list.
+  extra_files:
+    - glob: rules/milog-rules.tsv
 
 snapshot:
   version_template: "{{ incpatch .Version }}-snapshot"
@@ -208,3 +211,5 @@ changelog:
 release:
   draft: true
   prerelease: auto
+  extra_files:
+    - glob: rules/milog-rules.tsv

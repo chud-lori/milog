@@ -45,6 +45,7 @@ set -l cmds \
     "update:install the latest release" \
     "web:start/stop/status web UI" \
     "install:add optional features" \
+    "update-rules:fetch newer detection rules" \
     "audit:host integrity scans" \
     "probe:eBPF probe sidecar service" \
     "bench:benchmark harness" \
@@ -62,7 +63,7 @@ for s in $config_subs
     complete -c milog -n "__milog_seen_cmd config" -a "$s"
 end
 
-set -l alert_subs on off status test
+set -l alert_subs on off status test stats
 for s in $alert_subs
     complete -c milog -n "__milog_seen_cmd alert" -a "$s"
 end

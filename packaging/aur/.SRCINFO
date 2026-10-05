@@ -1,0 +1,24 @@
+pkgbase = milog-bin
+	pkgdesc = Single-host nginx + system + app-error monitor with alerts
+	pkgver = 0.6.0
+	pkgrel = 1
+	url = https://github.com/chud-lori/milog
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = bash
+	depends = coreutils
+	depends = curl
+	depends = gawk
+	depends = sqlite
+	provides = milog
+	conflicts = milog
+	options = !debug
+	source = milog-0.6.0-src.tar.gz::https://github.com/chud-lori/milog/archive/refs/tags/v0.6.0.tar.gz
+	sha256sums = 75f6f9aaf198b033da12e6724d796df0a1388abd0b99f9a967b185c054824d22
+	source_x86_64 = https://github.com/chud-lori/milog/releases/download/v0.6.0/milog_0.6.0_linux_amd64.tar.gz
+	sha256sums_x86_64 = 63839179a8ce6a5c42966cc8353251eacdd44fea27800e0e7db849dfe2afe560
+	source_aarch64 = https://github.com/chud-lori/milog/releases/download/v0.6.0/milog_0.6.0_linux_arm64.tar.gz
+	sha256sums_aarch64 = cba5c1a15cbad4790b686a2132e147c054ff5214ef87226c16dec9830878049d
+
+pkgname = milog-bin

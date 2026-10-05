@@ -100,6 +100,8 @@ ticks
 out=$("$ROOT/milog.sh" audit history)
 [[ "$out" == *persistence*appeared*"$tmp/watch/cronjob"* ]] || fail "audit history missing the persistence row: $out"
 [[ "$out" == *"$odd"* ]] || fail "audit history truncated a subject with a tab: $out"
+out=$("$ROOT/milog.sh" audit history 99999) || fail "audit history failed for a window past the epoch"
+[[ "$out" == *persistence*appeared*"$tmp/watch/cronjob"* ]] || fail "audit history 99999 missing rows: $out"
 
 sqlite3 "$db" "INSERT INTO audit_event VALUES (1, 'ports', 'appeared', 'old');"
 bash -c '. "$1" help >/dev/null; _dlog() { :; }; HISTORY_RETAIN_DAYS=1 history_prune' _ "$ROOT/milog.sh"

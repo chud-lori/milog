@@ -67,7 +67,8 @@ milog audit history        # last 7 days, newest first
 milog audit history 30     # last 30 days
 ```
 
-`milog tui` shows the same rows in its integrity view (`i`). Rows older
+`milog tui` shows the same rows in its integrity view (`i`), and
+`milog report` lists the latest 50 in the report window. Rows older
 than `HISTORY_RETAIN_DAYS` are pruned with the rest of the history DB.
 
 ## Verify it actually catches things

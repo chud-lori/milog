@@ -57,7 +57,7 @@ _audit_fim_expand_paths() {
         fi
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    (( ${#out[@]} == 0 )) || printf '%s\n' "${out[@]}" | sort -u
 }
 
 # Overwrites the baseline without alerting.
@@ -311,7 +311,7 @@ _audit_persistence_expand() {
         # Unmatched globs add nothing, but nullglob leaves literal paths in place even when they don't exist.
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    (( ${#out[@]} == 0 )) || printf '%s\n' "${out[@]}" | sort -u
 }
 
 _audit_persistence_baseline() {
@@ -999,7 +999,7 @@ _audit_accounts_expand() {
         fi
     done
     shopt -u nullglob
-    printf '%s\n' "${out[@]}" | sort -u
+    (( ${#out[@]} == 0 )) || printf '%s\n' "${out[@]}" | sort -u
 }
 
 # Prints `<count> <dir>`.
@@ -1363,9 +1363,7 @@ _audit_history_subcmd() {
     _history_precheck || return 1
 
     local since=$(( $(date +%s) - days * 86400 )) out
-    if ! out=$(sqlite3 -readonly -separator $'\t' "$HISTORY_DB" \
-            "SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'), scanner, kind, subject
-             FROM audit_event WHERE ts >= $since ORDER BY ts DESC;" 2>/dev/null); then
+    if ! out=$(_history_audit_rows "$since" 2>/dev/null); then
         echo -e "${Y}no audit history in $HISTORY_DB yet${NC}, the daemon creates it on start" >&2
         return 1
     fi

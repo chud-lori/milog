@@ -42,9 +42,9 @@ func TestWindowToCutoff(t *testing.T) {
 		}
 	}
 
-	// N<h/d/w> — tolerate uppercase and relative-to-real-now (no strict
+	// N<m/h/d/w> — tolerate uppercase and relative-to-real-now (no strict
 	// equality — just ensure cutoff < now).
-	for _, w := range []string{"1h", "24h", "7D", "2w"} {
+	for _, w := range []string{"30m", "1h", "24h", "7D", "2w"} {
 		got, err := WindowToCutoff(w, time.Now())
 		if err != nil {
 			t.Errorf("%s: %v", w, err)
