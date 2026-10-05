@@ -84,15 +84,33 @@ _alert_record() {
     _alert_rotate_if_big "$log_file"
 }
 
-# Log a failed delivery (network or HTTP >= 400) for `milog doctor`.
+# Log a failed delivery (network or HTTP >= 400) for `milog doctor`; status 000 means no HTTP response.
 _alert_send_failed() {
     local log_file="$ALERT_STATE_DIR/send_failures.log"
     mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
-    printf '%s\t%s\n' "$(date +%s)" "${1:-unknown}" >> "$log_file" 2>/dev/null || true
+    printf '%s\t%s\t%s\n' "$(date +%s)" "${1:-unknown}" "${2:-000}" >> "$log_file" 2>/dev/null || true
     _alert_rotate_if_big "$log_file"
 }
 
-# Senders return 0 when unconfigured and record failures with _alert_send_failed.
+# _alert_post <dest> <curl args...>. A 429 is retried once when the server asks to wait 5s or less.
+_alert_post() {
+    local dest="$1"; shift
+    local out code wait try
+    for try in 1 2; do
+        out=$(curl -sS -m 5 -i -w '\n%{http_code}' "$@" 2>/dev/null) || :
+        code="${out##*$'\n'}"
+        [[ "$code" == 429 && "$try" == 1 ]] || break
+        wait=$(printf '%s\n' "$out" | sed -n -E \
+            -e '/"retry_after": *[0-9]/{s/.*"retry_after": *([0-9][0-9.]*).*/\1/p;q;}' \
+            -e '/^[Rr]etry-[Aa]fter: *[0-9]/{s/^[^:]*: *([0-9][0-9.]*).*/\1/p;q;}') || :
+        # A string match, since arithmetic on a server-supplied number can overflow.
+        [[ "$wait" =~ ^([0-4](\.[0-9]+)?|5(\.0+)?)$ ]] || break
+        sleep "$wait" || break
+    done
+    [[ "$code" =~ ^[1-3][0-9][0-9]$ ]] || _alert_send_failed "$dest" "$code"
+}
+
+# Senders return 0 when unconfigured and post through _alert_post, which records failures.
 # The body carries attacker-controlled log text, so each sender escapes it and disables mentions where the API allows.
 
 # allowed_mentions.parse=[] stops @everyone / role pings.
@@ -102,8 +120,8 @@ _alert_send_discord() {
     local payload
     payload=$(printf '{"embeds":[{"title":%s,"description":%s,"color":%d}],"allowed_mentions":{"parse":[]}}' \
         "$(json_escape "$title")" "$(json_escape "$body")" "$color")
-    curl -sS -f -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed discord
+    _alert_post discord -H "Content-Type: application/json" \
+         -d "$payload" "$DISCORD_WEBHOOK"
 }
 
 # link_names=0 keeps `<@channel>` literal; the body goes in a code block with backticks swapped for single quotes.
@@ -115,8 +133,8 @@ _alert_send_slack() {
     local payload
     payload=$(printf '{"text":%s,"mrkdwn":true,"link_names":0}' \
         "$(json_escape "$text")")
-    curl -sS -f -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "$SLACK_WEBHOOK" >/dev/null 2>&1 || _alert_send_failed slack
+    _alert_post slack -H "Content-Type: application/json" \
+         -d "$payload" "$SLACK_WEBHOOK"
 }
 
 # parse_mode=HTML, so every value goes through html_escape.
@@ -131,9 +149,8 @@ _alert_send_telegram() {
     local payload
     payload=$(printf '{"chat_id":%s,"text":%s,"parse_mode":"HTML","disable_web_page_preview":true,"disable_notification":false}' \
         "$(json_escape "$TELEGRAM_CHAT_ID")" "$(json_escape "$text")")
-    curl -sS -f -m 5 -H "Content-Type: application/json" \
-         -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-         >/dev/null 2>&1 || _alert_send_failed telegram
+    _alert_post telegram -H "Content-Type: application/json" \
+         -d "$payload" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
 }
 
 # Free-form POST driven by WEBHOOK_TEMPLATE; the color-to-severity mapping matches alerts.log.
@@ -161,8 +178,8 @@ _alert_send_webhook() {
     done
     payload+="$rest"
     local ctype="${WEBHOOK_CONTENT_TYPE:-application/json}"
-    curl -sS -f -m 5 -H "Content-Type: ${ctype}" \
-         -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 || _alert_send_failed webhook
+    _alert_post webhook -H "Content-Type: ${ctype}" \
+         -d "$payload" "$WEBHOOK_URL"
 }
 
 # Room IDs are percent-encoded; the txn id only needs to be unique within the server's dedup window.
@@ -183,12 +200,11 @@ ${body}"
     room_enc=$(_url_encode "$MATRIX_ROOM")
     txn_id="milog-$(date +%s)-$RANDOM"
     local hs="${MATRIX_HOMESERVER%/}"
-    curl -sS -f -m 5 -X PUT \
+    _alert_post matrix -X PUT \
          -H "Authorization: Bearer ${MATRIX_TOKEN}" \
          -H "Content-Type: application/json" \
          -d "$payload" \
-         "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}" \
-         >/dev/null 2>&1 || _alert_send_failed matrix
+         "${hs}/_matrix/client/v3/rooms/${room_enc}/send/m.room.message/${txn_id}"
 }
 
 # Silences: explicit mutes that outrank cooldown and dedup.

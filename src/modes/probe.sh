@@ -23,7 +23,7 @@
 _PROBE_SYSTEMD_UNIT="/etc/systemd/system/milog-probe.service"
 
 # File-probe comm allowlist written into the unit; override with MILOG_PROBE_FILE_ALLOWLIST at install time.
-_PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,milog,milog-probe,ps,runc,runc:[2:INIT],watchtower,whoami"
+_PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sshd-socket-gen,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,milog,milog-probe,ps,runc,runc:[2:INIT],watchtower,whoami"
 
 _probe_service_active() {
     command -v systemctl >/dev/null 2>&1 || return 1

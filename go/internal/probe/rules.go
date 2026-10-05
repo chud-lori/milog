@@ -433,6 +433,7 @@ func MatchFile(e FileEvent) []Hit {
 var defaultSensitiveCommAllowlist = []string{
 	"sshd",
 	"sshd-session",
+	"sshd-socket-gen",
 	"sudo",
 	"su",
 	"login",
@@ -465,7 +466,6 @@ var defaultSensitiveCommAllowlist = []string{
 }
 
 // defaultSensitivePaths match exactly, or by prefix when they end in `/`.
-// They mirror the audit FIM defaults.
 var defaultSensitivePaths = []string{
 	"/etc/passwd",
 	"/etc/shadow",
@@ -556,12 +556,19 @@ func parseFileRules(pathsSrc, commsSrc string) fileRules {
 }
 
 // matchSensitiveRead keys on comm and path, so each pair has its own cooldown.
+// openWriteFlags is O_WRONLY|O_RDWR|O_TRUNC|O_APPEND with Linux values; this file also builds on macOS.
+const openWriteFlags = 0x1 | 0x2 | 0x200 | 0x400
+
 func matchSensitiveRead(e FileEvent) (Hit, bool) {
 	rules := loadFileRules()
 	if rules.commAllowed(e.Comm) || rules.commAllowed(e.ProcComm) {
 		return Hit{}, false
 	}
 	if !rules.isSensitive(e.Filename) {
+		return Hit{}, false
+	}
+	// Every NSS lookup reads the world-readable /etc/passwd, so only writes alert.
+	if e.Filename == "/etc/passwd" && e.Flags&openWriteFlags == 0 {
 		return Hit{}, false
 	}
 	return Hit{
