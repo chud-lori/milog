@@ -156,6 +156,29 @@ func TestAICrawlerTokensMatchBash(t *testing.T) {
 	t.Fatal("AI_CRAWLER_UA_RE not found in src/nginx.sh")
 }
 
+// milog adds AI_CRAWLER_UA_RE to the probe rules at load time, so the rules file must not carry its own copy.
+func TestRulesFileHasNoAICrawlerTokens(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "..", "rules", "milog-rules.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := map[string]bool{}
+	for _, tok := range AICrawlerTokens {
+		tokens[tok] = true
+	}
+	for i, line := range strings.Split(string(src), "\n") {
+		fields := strings.Split(line, "\t")
+		if strings.HasPrefix(line, "#") || len(fields) != 3 {
+			continue
+		}
+		for _, alt := range strings.Split(fields[2], "|") {
+			if tokens[strings.ToLower(alt)] {
+				t.Errorf("rules/milog-rules.tsv:%d duplicates AI crawler token %q", i+1, alt)
+			}
+		}
+	}
+}
+
 func TestParseLine_MalformedReturnsZero(t *testing.T) {
 	cases := []string{
 		`garbage without quotes`,

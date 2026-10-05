@@ -19,7 +19,8 @@ src/
 │                   # Everything here executes at source time — not just
 │                   # function definitions. Must come first.
 ├── alerts.sh       # Discord alert helpers: alert_discord, alert_should_fire,
-│                   # _exploit_category, json_escape.
+│                   # _exploit_category, json_escape, _rules_load (exploit/probe
+│                   # regexes from RULES_FILE or the baked-in rules/milog-rules.tsv).
 ├── ui.sh           # TUI geometry: box rules, draw_row, trow, hdr_row,
 │                   # milog_update_geometry (reflow to terminal width).
 ├── system.sh       # /proc-based metrics: cpu_usage, mem_info, disk_info,
@@ -29,7 +30,7 @@ src/
 │                   # _history_precheck, _sql_quote.
 ├── nginx.sh        # Log-parsing helpers called by many modes:
 │                   # nginx_minute_counts, nginx_check_http_alerts, nginx_row,
-│                   # sys_check_alerts, geoip_country, color_prefix, wait_or_key.
+│                   # sys_check_alerts, geoip_country, cti_lookup, color_prefix, wait_or_key.
 ├── web.sh          # Token + lifecycle helpers for `milog web`. The
 │                   # dashboard server itself is the milog-web Go binary
 │                   # (see go/cmd/milog-web/). bash side: _web_token_*,
