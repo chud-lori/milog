@@ -40,6 +40,7 @@ ${W}ALERTING${NC}
 
 ${W}DIAGNOSTICS${NC}
   ${C}doctor${NC}             checklist: tools, logs, log format, webhook, history, geoip, systemd
+  ${C}bottleneck [--json]${NC} one-shot host-slowdown audit: saturated resource + culprit processes
   ${C}version${NC}            milog and companion binary versions
   ${C}update [--check]${NC}   install the latest GitHub release over this milog
 
@@ -192,6 +193,7 @@ _cmd_help() {
             echo -e "  Markdown by default; ${C}--html${NC} writes one self-contained page. Windows as digest (default 7d)."
             ;;
         doctor)   echo -e "${W}milog doctor${NC} — diagnostic checklist" ;;
+        bottleneck) echo -e "${W}milog bottleneck${NC}: one-shot host-slowdown audit" ;;
         version|--version|-V) echo -e "${W}milog version${NC} — build stamp of milog and the version of each companion binary found" ;;
         update)
             echo -e "${W}milog update [--check]${NC} — replace milog and its installed companion binaries with the latest release"
@@ -250,7 +252,7 @@ fi
 # Setup and host-level commands must work before any app is configured.
 if [[ ${#LOGS[@]} -eq 0 ]]; then
     case "${1:-}" in
-        -h|--help|help|config|doctor|version|--version|-V|update|completions|install|update-rules|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
+        -h|--help|help|config|doctor|bottleneck|version|--version|-V|update|completions|install|update-rules|audit|probe|alert|alerts|silence|bench|_internal_alert) ;;
         *)
             echo "MiLog: no apps configured and none found in $LOG_DIR" >&2
             echo "  Run 'milog config init', set MILOG_APPS=\"a b c\", edit $MILOG_CONFIG, or drop *.access.log into $LOG_DIR" >&2
@@ -298,6 +300,7 @@ case "${1:-}" in
     update-rules) mode_update_rules ;;
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
+    bottleneck) mode_bottleneck "${@:2}" ;;
     version|--version|-V) mode_version ;;
     update)   shift; mode_update "$@" ;;
     web)      shift; mode_web "$@" ;;

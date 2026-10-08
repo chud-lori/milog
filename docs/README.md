@@ -18,6 +18,7 @@ quick start; this directory has everything else.
 - [**Host integrity audits**](audit.md) — `milog audit` modes (fim,
   rootkit, persistence, ports, accounts, yara), provocations to verify
   detection, known false positives
+- [**Host slowdown audit (`milog bottleneck`)**](troubleshooting.md#server-feels-slow-milog-bottleneck): names the saturated resource (CPU, disk I/O, memory, disk space, inodes, fd) and the processes behind it, PSI-first with a fallback on older kernels
 - [**Web dashboard**](web-dashboard.md) — `milog web`, systemd user
   service, three exposure patterns (SSH tunnel, Tailscale, Cloudflare)
 - [**TUI (`milog tui`)**](tui.md) — Charm Bubble Tea Go binary,
