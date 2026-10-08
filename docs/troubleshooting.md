@@ -195,6 +195,29 @@ apply — each invocation exec's the fresh binary.
 `HISTORY_ENABLED` is off, or the daemon hasn't written anything yet
 (wait ~1 minute after starting). `milog doctor` will tell you which.
 
+## Server feels slow (`milog bottleneck`)
+
+When the box is sluggish and you want one answer, run `milog bottleneck`.
+It names the single most-saturated resource first, then shows one line per
+resource (CPU, disk I/O, memory, disk space, inodes, fd and process table)
+and the processes or paths behind each flagged one.
+
+Saturation comes from the kernel's Pressure Stall Information
+(`/proc/pressure/*`) when the kernel is 4.20 or newer. On older kernels it
+falls back to load average against core count, CPU iowait, and swap rate.
+Disk space and inodes always use their usage figures, and a full mountpoint
+lists its largest directories.
+
+```
+milog bottleneck          # verdict plus per-resource lines
+milog bottleneck --json   # same findings as JSON, for scripts or alerts
+```
+
+It is read-only and needs no root for the default checks. A missing input
+(no PSI, no `dmesg` access) prints a `limited:` line and the rest still
+runs. Thresholds are env-overridable, see
+[Configuration](configuration.md).
+
 ## Other weirdness — where to look
 
 - **Alert fire log**: `~/.cache/milog/alerts.log` (or
