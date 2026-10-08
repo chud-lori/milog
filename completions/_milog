@@ -37,6 +37,7 @@ _milog() {
         'digest:exec-summary view over last day / week'
         'report:static markdown / HTML report'
         'doctor:diagnostic checklist'
+        'bottleneck:one-shot host-slowdown audit'
         'version:milog and companion binary versions'
         'update:install the latest release'
         'web:start/stop/status web UI'
@@ -95,6 +96,7 @@ _milog() {
         alerts)   (( CURRENT == 3 )) && _describe 'window' window_vals ;;
         digest|report) (( CURRENT == 3 )) && _describe 'window' digest_window_vals ;;
         update)   (( CURRENT == 3 )) && compadd -- --check ;;
+        bottleneck) (( CURRENT == 3 )) && compadd -- --json ;;
     esac
 }
 

@@ -219,6 +219,13 @@ to \fIFILE\fR with \fB\-o\fR.
 Diagnostic checklist \(em flags every degraded optional capability with a
 one-line fix.
 .TP
+.BR bottleneck " [\fB\-\-json\fR]"
+One-shot host-slowdown audit. Names the saturated resource (CPU, disk I/O,
+memory, disk space, inodes, fd/process-table) and the culprit processes or
+paths behind it. Reads host state only, no nginx logs, no sudo.
+.B \-\-json
+emits the findings as a JSON object.
+.TP
 .B version
 Prints the \fBMILOG_VERSION\fR and \fBMILOG_BUILT\fR stamp of the running
 milog, then one line per companion binary found (\fBmilog\-web\fR,

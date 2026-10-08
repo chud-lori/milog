@@ -104,6 +104,23 @@ App names with `-` or `.` map to `_` for the variable name lookup
 `P95_*_MS` variables; **system-wide thresholds** (CPU / MEM / DISK) have
 no per-app form — they're not app-scoped.
 
+### Bottleneck audit
+
+Host-global thresholds for `milog bottleneck`. These are not app-scoped and
+have no per-app form. Pressure values read the `avg10` of the PSI `some` line
+under `/proc/pressure/`; the rest use a direct signal.
+
+| Variable             | Default | Purpose                                            |
+| -------------------- | ------- | -------------------------------------------------- |
+| `CPU_PRESSURE_WARN`  | `30`    | CPU pressure (avg10 %) that flags CPU saturation   |
+| `IO_PRESSURE_WARN`   | `30`    | I/O pressure (avg10 %) that flags disk I/O         |
+| `MEM_PRESSURE_WARN`  | `20`    | Memory pressure (avg10 %) that flags memory        |
+| `DISK_WARN`          | `90`    | Disk-space use (%) that flags a mount              |
+| `INODE_WARN`         | `90`    | Inode use (%) that flags a mount                   |
+| `IOWAIT_WARN`        | `30`    | `%iowait` fallback when PSI is absent              |
+| `LOAD_PER_CORE_WARN` | `1.5`   | Load-avg per core fallback when PSI is absent      |
+| `SWAP_WARN`          | `50`    | Swap in/out rate (pages/s) that flags memory       |
+
 ### Alerts
 
 | Variable              | Default             | Purpose                                   |

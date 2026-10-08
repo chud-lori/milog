@@ -84,6 +84,7 @@ jobs:
           bash tests/smoke_probe_unit.sh
           bash tests/smoke_audit_integrity.sh
           bash tests/smoke_no_apps.sh
+          bash tests/smoke_bottleneck.sh
           bash tests/smoke_version_update.sh
 
       - name: Go vet

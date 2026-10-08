@@ -41,6 +41,7 @@ set -l cmds \
     "digest:exec-summary view last day / week" \
     "report:static markdown / HTML report" \
     "doctor:diagnostic checklist" \
+    "bottleneck:one-shot host-slowdown audit" \
     "version:milog and companion binary versions" \
     "update:install the latest release" \
     "web:start/stop/status web UI" \
@@ -89,3 +90,4 @@ for v in $digest_window_vals
 end
 
 complete -c milog -n "__milog_seen_cmd update" -l check -d "report only; exit 10 when an update exists"
+complete -c milog -n "__milog_seen_cmd bottleneck" -l json -d "machine-readable output"
