@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.7.0-3-g18060f8
-# MILOG_BUILT=2026-10-08T08:07:46Z
+# MILOG_VERSION=v0.8.0-2-g037de20
+# MILOG_BUILT=2026-10-08T08:24:34Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -4486,21 +4486,28 @@ _bn_inode_mounts() {
     }'
 }
 
-# Top processes by %cpu as "name<TAB>detail".
+# Process group pgrp from /proc/<pid>/stat, parsed past a comm that may hold ") ".
+_bn_pgrp_of() {
+    awk '{ s=$0; sub(/.*\) /, "", s); split(s, f, " "); print f[3] }' "$1/stat" 2>/dev/null
+}
+
+# Top processes by %cpu as "name<TAB>detail", excluding milog's own group.
 _bn_cpu_offenders() {
     command -v ps >/dev/null 2>&1 || return 1
     local pid pct rest
-    ps -eo pid,%cpu,comm --sort=-%cpu 2>/dev/null | awk 'NR>1 && NR<=6' | while read -r pid pct rest; do
+    ps -eo pid,pgid,%cpu,comm --sort=-%cpu 2>/dev/null \
+        | awk -v own="$_BN_OWN_PGID" 'NR>1 && $2!=own' | head -5 | while read -r pid _ pct rest; do
         [[ -n "$rest" ]] || rest="?"
         printf '%s\t%s\n' "$rest" "pid $pid, ${pct}% cpu"
     done
 }
 
-# Top processes by RSS as "name<TAB>detail".
+# Top processes by RSS as "name<TAB>detail", excluding milog's own group.
 _bn_mem_offenders() {
     command -v ps >/dev/null 2>&1 || return 1
     local pid rss rest
-    ps -eo pid,rss,comm --sort=-rss 2>/dev/null | awk 'NR>1 && NR<=6' | while read -r pid rss rest; do
+    ps -eo pid,pgid,rss,comm --sort=-rss 2>/dev/null \
+        | awk -v own="$_BN_OWN_PGID" 'NR>1 && $2!=own' | head -5 | while read -r pid _ rss rest; do
         [[ "$rss" =~ ^[0-9]+$ ]] || continue
         [[ -n "$rest" ]] || rest="?"
         printf '%s\t%s\n' "$rest" "pid $pid, $(fmt_bytes $(( rss * 1024 ))) rss"
@@ -4518,6 +4525,7 @@ _bn_io_offenders() {
         total=$(( rb + wb ))
         (( total > 0 )) || continue
         pid="${d#/proc/}"
+        [[ -n "$_BN_OWN_PGID" ]] && [[ "$(_bn_pgrp_of "$d")" == "$_BN_OWN_PGID" ]] && continue
         comm=$(tr -d '\n' < "$d/comm" 2>/dev/null) || comm="?"
         lines+="${total}	${pid}	${comm:-?}"$'\n'
         any=1
@@ -4537,6 +4545,7 @@ _bn_fd_offenders() {
         [[ "$n" =~ ^[0-9]+$ ]] || continue
         (( n > 0 )) || continue
         pid="${d#/proc/}"
+        [[ -n "$_BN_OWN_PGID" ]] && [[ "$(_bn_pgrp_of "$d")" == "$_BN_OWN_PGID" ]] && continue
         comm=$(tr -d '\n' < "$d/comm" 2>/dev/null) || comm="?"
         lines+="${n}	${pid}	${comm:-?}"$'\n'
     done
@@ -4694,9 +4703,14 @@ _bn_check_fd() {
     if [[ -r /proc/sys/fs/file-nr ]]; then
         read -r alloc _ max < /proc/sys/fs/file-nr 2>/dev/null || { alloc=0; max=0; }
         if [[ "$alloc" =~ ^[0-9]+$ && "$max" =~ ^[0-9]+$ ]] && (( max > 0 )); then
-            fdpct=$(( alloc * 100 / max ))
-            parts="open files ${fdpct}% (${alloc}/${max})"
-            if (( fdpct >= 90 )); then sat=1; fi
+            # Above ~2^53 file-max is the kernel "no limit" sentinel, so a percent is meaningless.
+            if (( max >= 9007199254740992 )); then
+                parts="open files ${alloc}"
+            else
+                fdpct=$(( alloc * 100 / max ))
+                parts="open files ${fdpct}% (${alloc}/${max})"
+                if (( fdpct >= 90 )); then sat=1; fi
+            fi
         fi
     fi
     if [[ -r /proc/sys/kernel/pid_max ]]; then
@@ -4801,6 +4815,11 @@ mode_bottleneck() {
     local SWAP_WARN="${SWAP_WARN:-50}"
 
     local -a RES_KEY=() RES_LABEL=() RES_SAT=() RES_SIGNAL=() RES_OFF=() LIMITED=()
+
+    # Own process group, so offenders can skip the audit's own ps and shells.
+    local _BN_OWN_PGID
+    _BN_OWN_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+    [[ "$_BN_OWN_PGID" =~ ^[0-9]+$ ]] || _BN_OWN_PGID=""
 
     _bn_check_cpu
     _bn_check_io
