@@ -1078,25 +1078,42 @@ func TestMatchFile_TitleCarriesUID(t *testing.T) {
 	}
 }
 
-func resetOutboundSrcCache() {
-	cachedOutboundSrc = nil
-	outboundSrcReady = false
+func resetOutboundExeCache() {
+	cachedOutboundExe = nil
+	outboundExeReady = false
 }
 
-func TestMatchNet_SourceAllowlistSilent(t *testing.T) {
+func TestMatchNet_ExeAllowlistSilent(t *testing.T) {
 	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", "")
 	t.Setenv("MILOG_PROBE_NET_SRC_ALLOWLIST", "")
 	allowlistReady = false
-	resetOutboundSrcCache()
+	resetOutboundExeCache()
 
 	cases := []NetEvent{
-		{Comm: "rclone", ParentComm: "sudo", DAddr: "172.64.66.1", DPort: 443, UID: 0},
-		{Comm: "https", ParentComm: "apt-get", DAddr: "18.155.68.17", DPort: 443, UID: 42},
+		{Comm: "rclone", ParentComm: "sudo", Exe: "/usr/bin/rclone", DAddr: "172.64.66.1", DPort: 443, UID: 0},
+		{Comm: "https", ParentComm: "apt-get", Exe: "/usr/lib/apt/methods/https", DAddr: "18.155.68.17", DPort: 443, UID: 42},
 	}
 	for _, e := range cases {
 		if hits := MatchNet(e); len(hits) != 0 {
-			t.Errorf("source %q/%q should be silent, got %+v", e.Comm, e.ParentComm, hits)
+			t.Errorf("exe %q should be silent, got %+v", e.Exe, hits)
 		}
+	}
+}
+
+func TestMatchNet_SpoofedCommStillAlerts(t *testing.T) {
+	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", "")
+	t.Setenv("MILOG_PROBE_NET_SRC_ALLOWLIST", "")
+	allowlistReady = false
+	resetOutboundExeCache()
+
+	// A dropped binary named "rclone" must not inherit the allowlist.
+	ev := NetEvent{Comm: "rclone", ParentComm: "bash", Exe: "/tmp/rclone", DAddr: "203.0.113.5", DPort: 443, UID: 1001}
+	hits := MatchNet(ev)
+	if len(hits) != 1 {
+		t.Fatalf("spoofed rclone should alert, got %d hits", len(hits))
+	}
+	if hits[0].Color != colorRed {
+		t.Errorf("tmp exe color = %q, want red", hits[0].Color)
 	}
 }
 
@@ -1104,9 +1121,9 @@ func TestMatchNet_SuspiciousSourceIsRed(t *testing.T) {
 	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", "")
 	t.Setenv("MILOG_PROBE_NET_SRC_ALLOWLIST", "")
 	allowlistReady = false
-	resetOutboundSrcCache()
+	resetOutboundExeCache()
 
-	ev := NetEvent{Comm: "curl", ParentComm: "nginx", DAddr: "203.0.113.5", DPort: 443, UID: 33}
+	ev := NetEvent{Comm: "curl", ParentComm: "nginx", Exe: "/usr/bin/curl", DAddr: "203.0.113.5", DPort: 443, UID: 33}
 	hits := MatchNet(ev)
 	if len(hits) != 1 {
 		t.Fatalf("expected 1 hit, got %d", len(hits))
@@ -1120,9 +1137,9 @@ func TestMatchNet_OrdinarySourceIsAmber(t *testing.T) {
 	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", "")
 	t.Setenv("MILOG_PROBE_NET_SRC_ALLOWLIST", "")
 	allowlistReady = false
-	resetOutboundSrcCache()
+	resetOutboundExeCache()
 
-	ev := NetEvent{Comm: "myapp", ParentComm: "systemd", DAddr: "203.0.113.5", DPort: 443, UID: 1001}
+	ev := NetEvent{Comm: "myapp", ParentComm: "systemd", Exe: "/usr/bin/myapp", DAddr: "203.0.113.5", DPort: 443, UID: 1001}
 	hits := MatchNet(ev)
 	if len(hits) != 1 {
 		t.Fatalf("expected 1 hit, got %d", len(hits))

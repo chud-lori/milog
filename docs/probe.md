@@ -188,13 +188,15 @@ milog silence 'net:unexpected_outbound:node'       365d "node app outbound; revi
 `milog silence list` shows what's muted; `milog silence clear …`
 removes early.
 
-Processes that routinely talk to the internet (package tools and backup
-agents) are silent by default through a source allowlist:
-`rclone`, `apt`, `apt-get`, `dpkg`, `unattended-upgr`, `snapd`,
-`packagekitd`, `needrestart`, `do-agent`. A non-empty
-`MILOG_PROBE_NET_SRC_ALLOWLIST` (comma-separated comms) replaces that
-list. The check matches the connecting comm or its parent, so apt's
-`http` and `https` fetch methods are covered by the `apt-get` parent.
+Root-owned binaries that routinely talk to the internet (package tools
+and backup agents) are silent by default through an exe-path allowlist:
+`/usr/bin/rclone`, `/usr/bin/apt`, `/usr/bin/apt-get`, `/usr/bin/dpkg`,
+`/usr/bin/unattended-upgrade`, `/usr/bin/snap`, `/usr/sbin/needrestart`,
+`/usr/bin/do-agent`, plus anything under `/usr/lib/apt/methods/`. The
+match is on the executable path, not the comm, so a dropped binary
+named `rclone` does not inherit the allowlist: a non-root attacker
+cannot write to those paths. A non-empty `MILOG_PROBE_NET_SRC_ALLOWLIST`
+(comma-separated paths) replaces the list.
 
 ### milog's own alert delivery
 

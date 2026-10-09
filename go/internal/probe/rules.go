@@ -221,30 +221,41 @@ func MatchNet(e NetEvent) []Hit {
 	return hits
 }
 
-// defaultOutboundSrcAllowlist lists processes that talk to the internet as
-// part of normal operation, so package and backup traffic stays quiet.
-// MILOG_PROBE_NET_SRC_ALLOWLIST replaces it.
-var defaultOutboundSrcAllowlist = []string{
-	"rclone",
-	"apt",
-	"apt-get",
-	"unattended-upgr",
-	"dpkg",
-	"packagekitd",
-	"snapd",
-	"needrestart",
-	"do-agent",
+// defaultOutboundExeAllowlist lists root-owned binaries that talk to the
+// internet as part of normal operation, so package and backup traffic stays
+// quiet. Matching the exe path, not the comm, denies the obvious bypass of
+// naming a dropped binary "rclone": a non-root attacker cannot occupy these
+// paths. MILOG_PROBE_NET_SRC_ALLOWLIST (paths) replaces it.
+var defaultOutboundExeAllowlist = []string{
+	"/usr/bin/rclone",
+	"/usr/local/bin/rclone",
+	"/usr/bin/apt",
+	"/usr/bin/apt-get",
+	"/usr/bin/dpkg",
+	"/usr/bin/unattended-upgrade",
+	"/usr/bin/snap",
+	"/usr/lib/snapd/snapd",
+	"/usr/sbin/needrestart",
+	"/usr/bin/needrestart",
+	"/usr/bin/do-agent",
+	"/opt/digitalocean/bin/do-agent",
 }
 
+// aptMethodPrefix is where apt keeps its http/https fetch helpers.
+const aptMethodPrefix = "/usr/lib/apt/methods/"
+
 var (
-	cachedOutboundSrc map[string]struct{}
-	outboundSrcReady  bool
+	cachedOutboundExe map[string]struct{}
+	outboundExeReady  bool
 )
 
-func outboundSrcAllowed(comm string) bool {
-	if !outboundSrcReady {
-		cachedOutboundSrc = map[string]struct{}{}
-		src := defaultOutboundSrcAllowlist
+func outboundExeAllowed(exe string) bool {
+	if exe == "" {
+		return false
+	}
+	if !outboundExeReady {
+		cachedOutboundExe = map[string]struct{}{}
+		src := defaultOutboundExeAllowlist
 		if v := strings.TrimSpace(os.Getenv("MILOG_PROBE_NET_SRC_ALLOWLIST")); v != "" {
 			src = nil
 			for _, raw := range strings.Split(v, ",") {
@@ -254,11 +265,14 @@ func outboundSrcAllowed(comm string) bool {
 			}
 		}
 		for _, c := range src {
-			cachedOutboundSrc[c] = struct{}{}
+			cachedOutboundExe[c] = struct{}{}
 		}
-		outboundSrcReady = true
+		outboundExeReady = true
 	}
-	_, ok := cachedOutboundSrc[comm]
+	if strings.HasPrefix(exe, aptMethodPrefix) {
+		return true
+	}
+	_, ok := cachedOutboundExe[exe]
 	return ok
 }
 
@@ -291,7 +305,7 @@ func matchUnexpectedOutbound(e NetEvent) (Hit, bool) {
 	if allow.permits(e.DAddr, e.DPort) {
 		return Hit{}, false
 	}
-	if outboundSrcAllowed(e.Comm) || outboundSrcAllowed(e.ParentComm) {
+	if outboundExeAllowed(e.Exe) {
 		return Hit{}, false
 	}
 	color := colorAmber
