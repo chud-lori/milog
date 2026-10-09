@@ -1077,3 +1077,108 @@ func TestMatchFile_TitleCarriesUID(t *testing.T) {
 		t.Errorf("title missing uid: %q", hits[0].Title)
 	}
 }
+
+func resetOutboundSrcCache() {
+	cachedOutboundSrc = nil
+	outboundSrcReady = false
+}
+
+func TestMatchNet_SourceAllowlistSilent(t *testing.T) {
+	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", "")
+	t.Setenv("MILOG_PROBE_NET_SRC_ALLOWLIST", "")
+	allowlistReady = false
+	resetOutboundSrcCache()
+
+	cases := []NetEvent{
+		{Comm: "rclone", ParentComm: "sudo", DAddr: "172.64.66.1", DPort: 443, UID: 0},
+		{Comm: "https", ParentComm: "apt-get", DAddr: "18.155.68.17", DPort: 443, UID: 42},
+	}
+	for _, e := range cases {
+		if hits := MatchNet(e); len(hits) != 0 {
+			t.Errorf("source %q/%q should be silent, got %+v", e.Comm, e.ParentComm, hits)
+		}
+	}
+}
+
+func TestMatchNet_SuspiciousSourceIsRed(t *testing.T) {
+	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", "")
+	t.Setenv("MILOG_PROBE_NET_SRC_ALLOWLIST", "")
+	allowlistReady = false
+	resetOutboundSrcCache()
+
+	ev := NetEvent{Comm: "curl", ParentComm: "nginx", DAddr: "203.0.113.5", DPort: 443, UID: 33}
+	hits := MatchNet(ev)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d", len(hits))
+	}
+	if hits[0].Color != colorRed {
+		t.Errorf("web-worker child outbound color = %q, want red", hits[0].Color)
+	}
+}
+
+func TestMatchNet_OrdinarySourceIsAmber(t *testing.T) {
+	t.Setenv("MILOG_PROBE_NET_ALLOWLIST", "")
+	t.Setenv("MILOG_PROBE_NET_SRC_ALLOWLIST", "")
+	allowlistReady = false
+	resetOutboundSrcCache()
+
+	ev := NetEvent{Comm: "myapp", ParentComm: "systemd", DAddr: "203.0.113.5", DPort: 443, UID: 1001}
+	hits := MatchNet(ev)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d", len(hits))
+	}
+	if hits[0].Color != colorAmber {
+		t.Errorf("ordinary outbound color = %q, want amber", hits[0].Color)
+	}
+}
+
+func TestMatchFile_SuspiciousReaderIsRed(t *testing.T) {
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	ev := FileEvent{Comm: "cat", ParentComm: "php-fpm8.2", Filename: "/etc/shadow", UID: 33, Flags: 0}
+	hits := MatchFile(ev)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d", len(hits))
+	}
+	if hits[0].Color != colorRed {
+		t.Errorf("web-worker-child read color = %q, want red", hits[0].Color)
+	}
+}
+
+func TestMatchFile_OrdinaryReaderIsAmber(t *testing.T) {
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	ev := FileEvent{Comm: "bash", ParentComm: "bash", Filename: "/etc/sudoers.d/90-x", UID: 1000}
+	hits := MatchFile(ev)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d", len(hits))
+	}
+	if hits[0].Color != colorAmber {
+		t.Errorf("ordinary read color = %q, want amber", hits[0].Color)
+	}
+}
+
+func TestMatchFile_DpkgPreconfigureSilent(t *testing.T) {
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	ev := FileEvent{Comm: "dpkg-preconfigu", ParentComm: "sh", Filename: "/etc/shadow", UID: 0, Flags: 0x80000}
+	if hits := MatchFile(ev); len(hits) != 0 {
+		t.Errorf("dpkg-preconfigure read should be silent, got %+v", hits)
+	}
+}
+
+func TestMatchRateAnomaly_ProbeExcludesItself(t *testing.T) {
+	ev := RateAnomalyEvent{
+		Comm: "milog-probe", Count: 1000000, Mean: 100, Stddev: 10,
+		Window: time.Minute, Samples: 1000,
+	}
+	if hits := MatchRateAnomaly(ev); len(hits) != 0 {
+		t.Errorf("milog-probe should not alert on itself, got %+v", hits)
+	}
+}
