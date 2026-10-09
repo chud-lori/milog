@@ -15,13 +15,16 @@ once they reach Discord.
 ### Severity colors
 
 The color carries severity, so a routine event does not look like a
-compromise. Context-dependent rules (`file:sensitive_read`,
-`net:unexpected_outbound`, `net:retrans_spike`, `process:syscall_burst`)
-fire **amber**: worth a glance, judged by who did it. The tamper rules
-(shell from a web worker, exec from tmp, SUID escalation, ptrace
-inject, kernel-module load, bpf prog-load) fire **red**. A sensitive
-read names the reader in the title (`comm (uid=N)`) so you can judge it
-without opening the body.
+compromise. The tamper rules (shell from a web worker, exec from tmp,
+SUID escalation, ptrace inject, kernel-module load, bpf prog-load) fire
+**red**. The anomaly rules (`net:retrans_spike`, `process:syscall_burst`)
+fire **amber**.
+
+`file:sensitive_read` and `net:unexpected_outbound` judge severity by who
+acted. A read or connect from a web-worker child, a `/tmp` binary, or a
+shell opening a raw socket is **red**; anything else is **amber**. A
+sensitive read names the reader in the title (`comm (uid=N)`) so you can
+judge it without opening the body.
 
 ## What it watches
 
@@ -184,6 +187,16 @@ milog silence 'net:unexpected_outbound:node'       365d "node app outbound; revi
 
 `milog silence list` shows what's muted; `milog silence clear …`
 removes early.
+
+Root-owned binaries that routinely talk to the internet (package tools
+and backup agents) are silent by default through an exe-path allowlist:
+`/usr/bin/rclone`, `/usr/bin/apt`, `/usr/bin/apt-get`, `/usr/bin/dpkg`,
+`/usr/bin/unattended-upgrade`, `/usr/bin/snap`, `/usr/sbin/needrestart`,
+`/usr/bin/do-agent`, plus anything under `/usr/lib/apt/methods/`. The
+match is on the executable path, not the comm, so a dropped binary
+named `rclone` does not inherit the allowlist: a non-root attacker
+cannot write to those paths. A non-empty `MILOG_PROBE_NET_SRC_ALLOWLIST`
+(comma-separated paths) replaces the list.
 
 ### milog's own alert delivery
 

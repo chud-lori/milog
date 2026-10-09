@@ -26,10 +26,13 @@ type Event struct {
 }
 
 // Hit is one rule firing. RuleKey is what milog's cooldown groups by.
+// Color overrides the key-based severity when a rule judges severity from
+// context; empty means fall back to ColorFor.
 type Hit struct {
 	RuleKey string
 	Title   string
 	Body    string
+	Color   string
 }
 
 // Discord embed colors milog maps to severity: red is crit, amber is warn.
@@ -218,9 +221,82 @@ func MatchNet(e NetEvent) []Hit {
 	return hits
 }
 
+// defaultOutboundExeAllowlist lists root-owned binaries that talk to the
+// internet as part of normal operation, so package and backup traffic stays
+// quiet. Matching the exe path, not the comm, denies the obvious bypass of
+// naming a dropped binary "rclone": a non-root attacker cannot occupy these
+// paths. MILOG_PROBE_NET_SRC_ALLOWLIST (paths) replaces it.
+var defaultOutboundExeAllowlist = []string{
+	"/usr/bin/rclone",
+	"/usr/local/bin/rclone",
+	"/usr/bin/apt",
+	"/usr/bin/apt-get",
+	"/usr/bin/dpkg",
+	"/usr/bin/unattended-upgrade",
+	"/usr/bin/snap",
+	"/usr/lib/snapd/snapd",
+	"/usr/sbin/needrestart",
+	"/usr/bin/needrestart",
+	"/usr/bin/do-agent",
+	"/opt/digitalocean/bin/do-agent",
+}
+
+// aptMethodPrefix is where apt keeps its http/https fetch helpers.
+const aptMethodPrefix = "/usr/lib/apt/methods/"
+
+var (
+	cachedOutboundExe map[string]struct{}
+	outboundExeReady  bool
+)
+
+func outboundExeAllowed(exe string) bool {
+	if exe == "" {
+		return false
+	}
+	if !outboundExeReady {
+		cachedOutboundExe = map[string]struct{}{}
+		src := defaultOutboundExeAllowlist
+		if v := strings.TrimSpace(os.Getenv("MILOG_PROBE_NET_SRC_ALLOWLIST")); v != "" {
+			src = nil
+			for _, raw := range strings.Split(v, ",") {
+				if c := strings.TrimSpace(raw); c != "" {
+					src = append(src, c)
+				}
+			}
+		}
+		for _, c := range src {
+			cachedOutboundExe[c] = struct{}{}
+		}
+		outboundExeReady = true
+	}
+	if strings.HasPrefix(exe, aptMethodPrefix) {
+		return true
+	}
+	_, ok := cachedOutboundExe[exe]
+	return ok
+}
+
+// isSuspiciousNetSource is true when the connecting process is one an attacker
+// typically controls: a web-worker child, a binary under tmp, or a shell
+// opening a raw socket.
+func isSuspiciousNetSource(e NetEvent) bool {
+	if _, ok := webWorkerComms[e.ParentComm]; ok {
+		return true
+	}
+	if _, ok := shellComms[e.Comm]; ok {
+		return true
+	}
+	for _, prefix := range tmpExecPrefixes {
+		if strings.HasPrefix(e.Exe, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // matchUnexpectedOutbound flags connects outside the allowlist (default:
-// loopback, DNS, NTP and private ranges). Keyed by comm so one process
-// hitting many destinations is one cooldown group.
+// loopback, DNS, NTP and private ranges) from a non-allowlisted source.
+// A suspicious source is red; anything else is an amber heads-up.
 func matchUnexpectedOutbound(e NetEvent) (Hit, bool) {
 	if isMilogDelivery(e) {
 		return Hit{}, false
@@ -229,6 +305,13 @@ func matchUnexpectedOutbound(e NetEvent) (Hit, bool) {
 	if allow.permits(e.DAddr, e.DPort) {
 		return Hit{}, false
 	}
+	if outboundExeAllowed(e.Exe) {
+		return Hit{}, false
+	}
+	color := colorAmber
+	if isSuspiciousNetSource(e) {
+		color = colorRed
+	}
 	dest := e.DAddr + ":" + uitoa(uint32(e.DPort))
 	return Hit{
 		RuleKey: "net:unexpected_outbound:" + e.Comm,
@@ -236,6 +319,7 @@ func matchUnexpectedOutbound(e NetEvent) (Hit, bool) {
 		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
 			" uid=" + uitoa(e.UID) + " comm=" + e.Comm +
 			" parent=" + e.ParentComm + " dst=" + dest + "```",
+		Color: color,
 	}, true
 }
 
@@ -480,6 +564,7 @@ var defaultSensitiveCommAllowlist = []string{
 	"apt",
 	"apt-get",
 	"dpkg",
+	"dpkg-preconfigu",
 	"needrestart",
 	"adduser",
 	"useradd",
@@ -603,6 +688,10 @@ func matchSensitiveRead(e FileEvent) (Hit, bool) {
 	if e.Filename == "/etc/passwd" && e.Flags&openWriteFlags == 0 {
 		return Hit{}, false
 	}
+	color := colorAmber
+	if _, web := webWorkerComms[e.ParentComm]; web {
+		color = colorRed
+	}
 	return Hit{
 		RuleKey: "file:sensitive_read:" + e.Comm + ":" + e.Filename,
 		Title:   "Sensitive file read: " + e.Comm + " (uid=" + uitoa(e.UID) + ") → " + e.Filename,
@@ -610,6 +699,7 @@ func matchSensitiveRead(e FileEvent) (Hit, bool) {
 			" uid=" + uitoa(e.UID) + " comm=" + e.Comm + procField(e.Comm, e.ProcComm) +
 			" parent=" + e.ParentComm + " path=" + e.Filename +
 			" flags=0x" + uhex(e.Flags) + "```",
+		Color: color,
 	}, true
 }
 
@@ -1008,6 +1098,10 @@ func syscallBurnIn() uint64 {
 // matchSyscallBurst needs count > mean+3σ, the floor and the burn-in.
 // A reused PID can inherit an old baseline; the loader's age-out limits that.
 func matchSyscallBurst(e RateAnomalyEvent) (Hit, bool) {
+	// The probe is the busiest syscall source on the box, so skip itself.
+	if e.Comm == "milog-probe" {
+		return Hit{}, false
+	}
 	if e.Count < syscallFloor() {
 		return Hit{}, false
 	}
