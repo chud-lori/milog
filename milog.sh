@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.0-2-g037de20
-# MILOG_BUILT=2026-10-08T08:24:34Z
+# MILOG_VERSION=v0.8.1-1-gc0fea1a
+# MILOG_BUILT=2026-10-09T03:20:55Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -3109,6 +3109,10 @@ _audit_persistence_tick() {
         rows+="$change"$'\t'"$path"$'\n'
         [[ "$change" == "APPEARED" ]] || continue
         [[ -z "$path" ]] && continue
+        # milog's own units appear after install, so they are not re-entry.
+        case "$path" in
+            /etc/systemd/system/milog.service|/etc/systemd/system/milog-probe.service) continue ;;
+        esac
         key="audit:persistence:APPEARED:$path"
         if alert_should_fire "$key"; then
             body="\`\`\`new file in re-entry surface: $path\`\`\`"
