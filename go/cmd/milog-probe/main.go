@@ -457,11 +457,10 @@ func emitBpfLoadJSON(ev probe.BpfLoadEvent, hits []probe.Hit) {
 	_ = enc.Encode(wire{BpfLoadEvent: ev, Hits: hits})
 }
 
-// fireAlert runs `milog _internal_alert` with Discord red and doesn't wait,
-// so a slow milog can't stall the event loop.
+// fireAlert runs `milog _internal_alert` at the rule's severity color and
+// doesn't wait, so a slow milog can't stall the event loop.
 func fireAlert(h probe.Hit, milogBin string) {
-	const color = "15158332"
-	cmd := exec.Command(milogBin, "_internal_alert", h.RuleKey, h.Title, h.Body, color)
+	cmd := exec.Command(milogBin, "_internal_alert", h.RuleKey, h.Title, h.Body, probe.ColorFor(h.RuleKey))
 	// Pass the env through so MILOG_CONFIG reaches milog.
 	cmd.Env = os.Environ()
 	if alertCred != nil {

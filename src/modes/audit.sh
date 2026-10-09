@@ -380,6 +380,10 @@ _audit_persistence_tick() {
         rows+="$change"$'\t'"$path"$'\n'
         [[ "$change" == "APPEARED" ]] || continue
         [[ -z "$path" ]] && continue
+        # milog's own units appear after install, so they are not re-entry.
+        case "$path" in
+            /etc/systemd/system/milog.service|/etc/systemd/system/milog-probe.service) continue ;;
+        esac
         key="audit:persistence:APPEARED:$path"
         if alert_should_fire "$key"; then
             body="\`\`\`new file in re-entry surface: $path\`\`\`"

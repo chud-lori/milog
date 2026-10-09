@@ -12,6 +12,17 @@ bash daemon you already run, with the same cooldown, silence, dedup,
 routing, and hooks. Probe alerts and bash alerts are indistinguishable
 once they reach Discord.
 
+### Severity colors
+
+The color carries severity, so a routine event does not look like a
+compromise. Context-dependent rules (`file:sensitive_read`,
+`net:unexpected_outbound`, `net:retrans_spike`, `process:syscall_burst`)
+fire **amber**: worth a glance, judged by who did it. The tamper rules
+(shell from a web worker, exec from tmp, SUID escalation, ptrace
+inject, kernel-module load, bpf prog-load) fire **red**. A sensitive
+read names the reader in the title (`comm (uid=N)`) so you can judge it
+without opening the body.
+
 ## What it watches
 
 Eight independent eBPF programs, each in its own ring buffer with its
@@ -120,8 +131,9 @@ it is opened for writing (`O_WRONLY`, `O_RDWR`, `O_TRUNC` or
 or `curl` reads it through glibc's NSS. A tool that writes a temp file
 and renames it over `/etc/passwd` is not caught here; the audit FIM
 check covers that when `AUDIT_ENABLED=1`. The default comm allowlist
-covers the obvious system tools (`sshd`, `sudo`, `systemd*`, etc.) but
-not the noisier real-world sources observed during smoke testing.
+covers the obvious system tools (`sshd`, `sudo`, `systemd*`, `mandb`,
+`logrotate`, `apt`, `dpkg`, `unattended-upgr`, etc.). Add your own
+noisy-but-benign readers with the env var below.
 
 Edit the unit's `Environment=MILOG_PROBE_FILE_ALLOWLIST=…` line:
 
