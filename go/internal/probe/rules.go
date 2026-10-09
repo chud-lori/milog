@@ -32,6 +32,27 @@ type Hit struct {
 	Body    string
 }
 
+// Discord embed colors milog maps to severity: red is crit, amber is warn.
+const (
+	colorRed   = "15158332"
+	colorAmber = "16753920"
+)
+
+// ColorFor returns the alert color for a rule key. Context-dependent anomalies
+// are amber so a routine read or connect does not render like a confirmed
+// compromise; the tamper rules stay red.
+func ColorFor(ruleKey string) string {
+	switch {
+	case strings.HasPrefix(ruleKey, "file:sensitive_read:"),
+		strings.HasPrefix(ruleKey, "net:unexpected_outbound:"),
+		strings.HasPrefix(ruleKey, "net:retrans_spike:"),
+		strings.HasPrefix(ruleKey, "process:syscall_burst:"):
+		return colorAmber
+	default:
+		return colorRed
+	}
+}
+
 // webWorkerComms are servers whose shell children are a strong RCE signal.
 // Hosts running cgi-bin can silence process:shell_from_web_worker:*.
 var webWorkerComms = map[string]struct{}{
@@ -442,6 +463,7 @@ var defaultSensitiveCommAllowlist = []string{
 	"cron",
 	"crond",
 	"anacron",
+	"run-parts",
 	"systemd",
 	"systemd-logind",
 	"systemd-userdb",
@@ -449,6 +471,16 @@ var defaultSensitiveCommAllowlist = []string{
 	"systemd-resolve",
 	"auditd",
 	"audisp-syslog",
+	"mandb",
+	"man",
+	"updatedb.mlocat",
+	"updatedb",
+	"logrotate",
+	"unattended-upgr",
+	"apt",
+	"apt-get",
+	"dpkg",
+	"needrestart",
 	"adduser",
 	"useradd",
 	"usermod",
@@ -573,7 +605,7 @@ func matchSensitiveRead(e FileEvent) (Hit, bool) {
 	}
 	return Hit{
 		RuleKey: "file:sensitive_read:" + e.Comm + ":" + e.Filename,
-		Title:   "Sensitive file read: " + e.Comm + " → " + e.Filename,
+		Title:   "Sensitive file read: " + e.Comm + " (uid=" + uitoa(e.UID) + ") → " + e.Filename,
 		Body: "```pid=" + uitoa(e.PID) + " ppid=" + uitoa(e.PPID) +
 			" uid=" + uitoa(e.UID) + " comm=" + e.Comm + procField(e.Comm, e.ProcComm) +
 			" parent=" + e.ParentComm + " path=" + e.Filename +

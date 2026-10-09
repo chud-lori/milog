@@ -1028,3 +1028,52 @@ func TestProcCommMatchesAllowlists(t *testing.T) {
 		t.Errorf("proc= should be omitted when it equals comm: %+v", hits)
 	}
 }
+
+func TestColorFor(t *testing.T) {
+	cases := []struct {
+		key  string
+		want string
+	}{
+		{"file:sensitive_read:cat:/etc/shadow", colorAmber},
+		{"net:unexpected_outbound:curl", colorAmber},
+		{"net:retrans_spike:1.2.3.4:443", colorAmber},
+		{"process:syscall_burst:systemd:1", colorAmber},
+		{"process:shell_from_web_worker:nginx:bash", colorRed},
+		{"process:exec_from_tmp:x", colorRed},
+		{"process:suid_escalation:nginx:id", colorRed},
+		{"proc:ptrace_inject:gdb:42", colorRed},
+		{"proc:kmod_load:insmod:evil", colorRed},
+		{"proc:bpf_load:loader", colorRed},
+	}
+	for _, c := range cases {
+		if got := ColorFor(c.key); got != c.want {
+			t.Errorf("ColorFor(%q) = %q, want %q", c.key, got, c.want)
+		}
+	}
+}
+
+func TestMatchFile_MandbAllowlisted(t *testing.T) {
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	ev := FileEvent{Comm: "mandb", ParentComm: "systemd", Filename: "/etc/ld.so.preload", UID: 6}
+	if hits := MatchFile(ev); len(hits) != 0 {
+		t.Errorf("mandb reading ld.so.preload should be silent, got %+v", hits)
+	}
+}
+
+func TestMatchFile_TitleCarriesUID(t *testing.T) {
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	ev := FileEvent{Comm: "bash", Filename: "/etc/sudoers.d/90-extra", UID: 1000}
+	hits := MatchFile(ev)
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d", len(hits))
+	}
+	if !strings.Contains(hits[0].Title, "uid=1000") {
+		t.Errorf("title missing uid: %q", hits[0].Title)
+	}
+}
