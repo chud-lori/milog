@@ -25,6 +25,10 @@ _PROBE_SYSTEMD_UNIT="/etc/systemd/system/milog-probe.service"
 # File-probe comm allowlist written into the unit; override with MILOG_PROBE_FILE_ALLOWLIST at install time.
 _PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sshd-socket-gen,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,milog,milog-probe,ps,runc,runc:[2:INIT],watchtower,whoami"
 
+# Net-probe destination allowlist (CIDR / :port / cidr:port) written into the unit; override with MILOG_PROBE_NET_ALLOWLIST at install time.
+# The env value replaces this default wholesale (it mirrors the probe binary's built-in), so re-list these entries when overriding.
+_PROBE_DEFAULT_NET_ALLOWLIST="127.0.0.0/8,::1/128,:53,:123,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10"
+
 _probe_service_active() {
     command -v systemctl >/dev/null 2>&1 || return 1
     systemctl is-active --quiet milog-probe.service 2>/dev/null
@@ -86,7 +90,7 @@ disk for the systemd unit to start. Pick one:
 " >&2
 }
 
-# Args: probe_bin target_user target_home target_config allowlist caps
+# Args: probe_bin target_user target_home target_config file_allowlist caps net_allowlist
 _probe_unit() {
     cat <<EOF
 [Unit]
@@ -106,6 +110,7 @@ RestartSec=5s
 Environment=HOME=${3}
 Environment=MILOG_CONFIG=${4}
 Environment=MILOG_PROBE_FILE_ALLOWLIST=${5}
+Environment=MILOG_PROBE_NET_ALLOWLIST=${7}
 # Alerts run as this user so their config and hooks never execute as root.
 Environment=MILOG_PROBE_ALERT_USER=${2}
 
@@ -168,7 +173,12 @@ _probe_service_install() {
         echo -e "${D}    milog config set DISCORD_WEBHOOK \"https://...\"${NC}" >&2
     fi
 
+    # _ALLOWLIST replaces the default wholesale; _ALLOWLIST_EXTRA appends host-specific
+    # entries (e.g. a cloud agent's comm, a CDN CIDR) without re-listing the default.
     local allowlist="${MILOG_PROBE_FILE_ALLOWLIST:-$_PROBE_DEFAULT_FILE_ALLOWLIST}"
+    [[ -n "${MILOG_PROBE_FILE_ALLOWLIST_EXTRA:-}" ]] && allowlist="${allowlist},${MILOG_PROBE_FILE_ALLOWLIST_EXTRA}"
+    local net_allowlist="${MILOG_PROBE_NET_ALLOWLIST:-$_PROBE_DEFAULT_NET_ALLOWLIST}"
+    [[ -n "${MILOG_PROBE_NET_ALLOWLIST_EXTRA:-}" ]] && net_allowlist="${net_allowlist},${MILOG_PROBE_NET_ALLOWLIST_EXTRA}"
 
     # CAP_BPF / CAP_PERFMON only exist from 5.8; older kernels gate eBPF on CAP_SYS_ADMIN.
     local caps="CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID"
@@ -178,7 +188,7 @@ _probe_service_install() {
         caps="$caps CAP_SYS_ADMIN"
     fi
 
-    _probe_unit "$probe_bin" "$target_user" "$target_home" "$target_config" "$allowlist" "$caps" \
+    _probe_unit "$probe_bin" "$target_user" "$target_home" "$target_config" "$allowlist" "$caps" "$net_allowlist" \
         > "$_PROBE_SYSTEMD_UNIT"
 
     echo -e "${G}✓${NC} wrote $_PROBE_SYSTEMD_UNIT"
@@ -204,8 +214,8 @@ ${W}milog-probe.service${NC} installed and running.
     sudo journalctl -u milog-probe.service -f      ${D}# live log stream${NC}
     sudo milog probe uninstall-service             ${D}# remove the unit${NC}
 
-  ${W}retune the file allowlist:${NC}
-    sudoedit ${_PROBE_SYSTEMD_UNIT}                 ${D}# edit Environment=MILOG_PROBE_FILE_ALLOWLIST${NC}
+  ${W}retune the allowlists:${NC}
+    sudoedit ${_PROBE_SYSTEMD_UNIT}                 ${D}# MILOG_PROBE_FILE_ALLOWLIST (comms) / MILOG_PROBE_NET_ALLOWLIST (dest CIDRs)${NC}
     sudo systemctl daemon-reload && sudo systemctl restart milog-probe.service
 
 "
