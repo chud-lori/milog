@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.2-4-g32f4df8-dirty
-# MILOG_BUILT=2026-11-03T08:46:29Z
+# MILOG_VERSION=v0.8.2-9-g91b7fcb
+# MILOG_BUILT=2026-11-03T09:15:39Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -3783,6 +3783,31 @@ _audit_accounts_diff() {
     done < <(_audit_accounts_expand)
 }
 
+# A tracked file that exists and is readable but has no baseline makes the diff replay its whole
+# content as new — happens on a cache wipe or when a path is added to the watchlist after bootstrap.
+# Adopt the current content as the baseline for just those files. Unreadable files (e.g. /etc/sudoers
+# under a non-root daemon) are skipped: they get no baseline and the diff already emits nothing.
+_audit_accounts_heal_missing() {
+    local dir; dir=$(_audit_accounts_state_dir)
+    local path safe baseline tmp
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        [[ -r "$path" ]] || continue
+        safe=$(_audit_accounts_sanitise "$path")
+        baseline="$dir/$safe.baseline"
+        if [[ ! -f "$baseline" && ! -f "$dir/.encoded" ]]; then
+            baseline="$dir/$(_audit_accounts_legacy_name "$path").baseline"
+        fi
+        [[ -f "$baseline" ]] && continue
+        tmp=$(mktemp "$dir/.baseline.tmp.XXXXXX") || continue
+        if cat "$path" 2>/dev/null > "$tmp"; then
+            mv -f "$tmp" "$dir/$safe.baseline"
+        else
+            rm -f "$tmp"
+        fi
+    done < <(_audit_accounts_expand)
+}
+
 _audit_accounts_tick() {
     [[ "${AUDIT_ENABLED:-0}" == "1" ]] || return 0
     local dir; dir=$(_audit_accounts_state_dir)
@@ -3801,6 +3826,8 @@ _audit_accounts_tick() {
         printf '%s' "$now" > "$marker"
         return 0
     fi
+
+    _audit_accounts_heal_missing
 
     # One alert per file, listing at most 5 new lines.
     local prev_file="" body="" capped=""
