@@ -21,13 +21,14 @@ fail() { printf 'smoke_probe_unit: %s\n' "$1" >&2; exit 1; }
 
 bash -c '
     . "$1" help >/dev/null
-    _probe_unit /usr/local/bin/milog-probe alice /home/alice /home/alice/.config/milog/config.sh "sshd,cron" "CAP_BPF CAP_PERFMON"
+    _probe_unit /usr/local/bin/milog-probe alice /home/alice /home/alice/.config/milog/config.sh "sshd,cron" "CAP_BPF CAP_PERFMON" "127.0.0.0/8,:53"
 ' _ "$ROOT/milog.sh" > "$tmp/unit"
 
 for want in \
     "ExecStart=/usr/local/bin/milog-probe" \
     "Environment=MILOG_PROBE_ALERT_USER=alice" \
     "Environment=MILOG_CONFIG=/home/alice/.config/milog/config.sh" \
+    "Environment=MILOG_PROBE_NET_ALLOWLIST=127.0.0.0/8,:53" \
     "CapabilityBoundingSet=CAP_BPF CAP_PERFMON" \
     "NoNewPrivileges=yes" \
     "ProtectSystem=full" \
