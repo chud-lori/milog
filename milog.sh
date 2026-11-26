@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.3-12-g3fa48ab
-# MILOG_BUILT=2026-11-26T09:01:43Z
+# MILOG_VERSION=v0.8.3-13-g94b2b6d-dirty
+# MILOG_BUILT=2026-11-26T09:04:17Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -154,9 +154,14 @@ _root_trusted_path() {
 }
 
 if [[ -f "$MILOG_CONFIG" ]]; then
-    if [[ $EUID -ne 0 ]] || _root_trusted_path "$MILOG_CONFIG"; then
+    _milog_config_real=$(readlink -f -- "$MILOG_CONFIG" 2>/dev/null)
+    if [[ $EUID -ne 0 ]]; then
         # shellcheck disable=SC1090
         . "$MILOG_CONFIG"
+    elif [[ -n "$_milog_config_real" ]] && _root_trusted_path "$_milog_config_real"; then
+        # Root sources the resolved file so a symlink in the chain can't be swapped after the check.
+        # shellcheck disable=SC1090
+        . "$_milog_config_real"
     else
         echo "milog: running as root, refusing to source $MILOG_CONFIG (not root-owned or group/other-writable)" >&2
     fi
