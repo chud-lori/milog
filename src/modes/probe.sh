@@ -29,6 +29,23 @@ _PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sshd-socket-gen,sudo,su,login,g
 # The env value replaces this default wholesale (it mirrors the probe binary's built-in), so re-list these entries when overriding.
 _PROBE_DEFAULT_NET_ALLOWLIST="127.0.0.0/8,::1/128,:53,:123,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10"
 
+# MILOG_KERNEL_RELEASE and MILOG_BTF_PATH stand in for uname -r and /sys/kernel/btf/vmlinux in tests.
+_probe_kernel_release() { printf '%s' "${MILOG_KERNEL_RELEASE:-$(uname -r 2>/dev/null)}"; }
+
+_probe_kernel_summary() {
+    local state=absent
+    [[ -e "${MILOG_BTF_PATH:-/sys/kernel/btf/vmlinux}" ]] && state=present
+    printf 'kernel %s, BTF %s' "$(_probe_kernel_release)" "$state"
+}
+
+# True below 5.8, where mainline has neither CAP_BPF nor BPF ring buffers.
+_probe_kernel_before_5_8() {
+    local kver kmaj kmin
+    kver=$(_probe_kernel_release)
+    kmaj="${kver%%.*}"; kmin="${kver#*.}"; kmin="${kmin%%[!0-9]*}"
+    [[ "$kmaj" =~ ^[0-9]+$ && "$kmin" =~ ^[0-9]+$ ]] && (( kmaj < 5 || (kmaj == 5 && kmin < 8) ))
+}
+
 _probe_service_active() {
     command -v systemctl >/dev/null 2>&1 || return 1
     systemctl is-active --quiet milog-probe.service 2>/dev/null
@@ -180,13 +197,23 @@ _probe_service_install() {
     local net_allowlist="${MILOG_PROBE_NET_ALLOWLIST:-$_PROBE_DEFAULT_NET_ALLOWLIST}"
     [[ -n "${MILOG_PROBE_NET_ALLOWLIST_EXTRA:-}" ]] && net_allowlist="${net_allowlist},${MILOG_PROBE_NET_ALLOWLIST_EXTRA}"
 
+    # The probe exits once every program fails to load, so a unit here would only crash-loop.
+    local check_out check_rc=0
+    check_out=$("$probe_bin" --check 2>&1) || check_rc=$?
+    if (( check_rc == 2 )) && [[ "$check_out" == *"flag provided but not defined"* ]]; then
+        echo -e "${D}  ${probe_bin} predates --check; skipping the load check${NC}" >&2
+    elif (( check_rc != 0 )); then
+        echo -e "${R}milog-probe could not load any eBPF program ($(_probe_kernel_summary)); not installing the unit${NC}" >&2
+        printf '%s\n' "$check_out" | sed 's/^/  /' >&2
+        echo -e "${D}  the probe is optional: every other milog feature works without it${NC}" >&2
+        return 1
+    else
+        printf '%s\n' "$check_out" | sed 's/^/  /'
+    fi
+
     # CAP_BPF / CAP_PERFMON only exist from 5.8; older kernels gate eBPF on CAP_SYS_ADMIN.
     local caps="CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID"
-    local kver; kver=$(uname -r 2>/dev/null)
-    local kmaj="${kver%%.*}" kmin; kmin="${kver#*.}"; kmin="${kmin%%[!0-9]*}"
-    if [[ "$kmaj" =~ ^[0-9]+$ && "$kmin" =~ ^[0-9]+$ ]] && (( kmaj < 5 || (kmaj == 5 && kmin < 8) )); then
-        caps="$caps CAP_SYS_ADMIN"
-    fi
+    _probe_kernel_before_5_8 && caps="$caps CAP_SYS_ADMIN"
 
     _probe_unit "$probe_bin" "$target_user" "$target_home" "$target_config" "$allowlist" "$caps" "$net_allowlist" \
         > "$_PROBE_SYSTEMD_UNIT"

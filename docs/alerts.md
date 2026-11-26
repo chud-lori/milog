@@ -212,6 +212,16 @@ the check catches a corrupted or truncated download. It is not a
 signature: anyone who can modify the release can also modify the
 checksum.
 
+Each run that reaches a release, whether it installs or finds the rules
+current or newer, writes the time and the active rules version to
+`RULES_FILE.checked`. `milog update-rules --check` and `milog doctor`
+read it and warn when that is more than `RULES_MAX_AGE_DAYS` (default
+60) days ago. The stamp counts only while that version is still the
+active one, so a broken or deleted `RULES_FILE` is not reported as
+freshly checked. Without a matching stamp the age
+comes from `RULES_FILE`'s mtime, or for the built-in rules from when
+milog itself was installed. milog never updates the rules on its own.
+
 You can also write `RULES_FILE` by hand. milog loads it when it passes
 the same checks; when it doesn't, milog prints a warning and uses the
 built-in rules.

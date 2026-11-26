@@ -95,7 +95,7 @@ _milog() {
         web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
         alerts)   (( CURRENT == 3 )) && _describe 'window' window_vals ;;
         digest|report) (( CURRENT == 3 )) && _describe 'window' digest_window_vals ;;
-        update)   (( CURRENT == 3 )) && compadd -- --check ;;
+        update|update-rules) (( CURRENT == 3 )) && compadd -- --check ;;
         bottleneck) (( CURRENT == 3 )) && compadd -- --json ;;
     esac
 }
