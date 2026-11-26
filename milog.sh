@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.2-9-g91b7fcb
-# MILOG_BUILT=2026-11-03T09:15:39Z
+# MILOG_VERSION=v0.8.3-2-gc3dc05e-dirty
+# MILOG_BUILT=2026-11-26T08:37:32Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -2769,6 +2769,130 @@ _audit_state_dir() {
     printf '%s' "$d"
 }
 
+# Epoch -> "YYYY-MM-DD HH:MM (<age> ago)".
+_audit_when() {
+    local ts="$1" now d age
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 0
+    now=$(date +%s)
+    d=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null)
+    age=$(( now - ts )); (( age < 0 )) && age=0
+    if   (( age < 7200 ));   then age="$(( age / 60 ))m"
+    elif (( age < 172800 )); then age="$(( age / 3600 ))h"
+    else                          age="$(( age / 86400 ))d"
+    fi
+    printf '%s (%s ago)' "$d" "$age"
+}
+
+# mtime is settable with touch, ctime is not, so both are shown.
+_audit_age_line() {
+    local st m c o
+    st=$(stat -c '%Y %Z %U' -- "$1" 2>/dev/null || stat -f '%m %c %Su' -- "$1" 2>/dev/null) || return 0
+    read -r m c o <<< "$st"
+    printf 'mtime %s, ctime %s, owner %s' "$(_audit_when "$m")" "$(_audit_when "$c")" "${o:-?}"
+}
+
+# Owning process and start time of a listener; ss only shows other users' sockets to root.
+_audit_listener_owner() {
+    local proto="$1" port="$2" flag m comm pid et
+    case "$proto" in tcp) flag=-t ;; udp) flag=-u ;; *) return 0 ;; esac
+    [[ "$port" =~ ^[0-9]+$ ]] || return 0
+    command -v ss >/dev/null 2>&1 || { printf 'process unknown, ss is not installed'; return 0; }
+    m=$(ss -Hlnp "$flag" "sport = :$port" 2>/dev/null | grep -o 'users:(("[^"]*",pid=[0-9]*' | head -n 1 || true)
+    if [[ -z "$m" ]]; then
+        printf 'process not visible (ss -p needs root for other users)'
+        return 0
+    fi
+    pid="${m##*pid=}"
+    comm="${m#users:((\"}"; comm="${comm%%\",pid=*}"
+    comm=$(printf '%s' "$comm" | tr -d '`[:cntrl:]' | cut -c1-32)
+    et=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [[ "$et" =~ ^[0-9]+$ ]]; then
+        printf 'process %s pid %s, started %s' "$comm" "$pid" "$(_audit_when $(( $(date +%s) - et )))"
+    else
+        printf 'process %s pid %s' "$comm" "$pid"
+    fi
+}
+
+# Files whose content is never snapshotted or summarised beyond size.
+_audit_fim_sensitive() {
+    case "$1" in
+        */shadow|*/shadow-|*/gshadow|*/gshadow-|*/sudoers|*/sudoers-|*/sudoers.d/*) return 0 ;;
+        *_key|*.key|*.pem|*.p12|*.pfx) return 0 ;;
+    esac
+    return 1
+}
+
+_audit_fim_snap_dir() {
+    local d; d=$(_audit_state_dir)/fim.snap
+    ( umask 077; mkdir -p "$d" ) 2>/dev/null
+    printf '%s' "$d"
+}
+
+# Copies a non-sensitive regular text file of at most 256 KiB to $2 without following symlinks or blocking on FIFOs.
+_audit_fim_read_capped() {
+    local src="$1" dst="$2" max=262144 size text
+    _audit_fim_sensitive "$src" && return 1
+    [[ -f "$src" && ! -L "$src" ]] || return 1
+    if ! ( umask 077; dd if="$src" of="$dst" iflag=nofollow,nonblock,fullblock bs=$(( max + 1 )) count=1 status=none ) 2>/dev/null; then
+        rm -f "$dst"; return 1
+    fi
+    size=$(wc -c < "$dst" | tr -d ' ')
+    text=$(tr -d '\000' < "$dst" | wc -c | tr -d ' ')
+    if (( size > max || text != size )); then
+        rm -f "$dst"; return 1
+    fi
+}
+
+# Keeps a private copy of a watched file so later drift can be summarised; stale copies are dropped.
+_audit_fim_snap_write() {
+    local path="$1" snap tmp
+    snap="$(_audit_fim_snap_dir)/$(_audit_accounts_sanitise "$path")"
+    tmp=$(mktemp "$snap.tmp.XXXXXX") || return 0
+    if _audit_fim_read_capped "$path" "$tmp"; then
+        mv -f "$tmp" "$snap"
+    else
+        rm -f "$tmp" "$snap"
+    fi
+}
+
+# Bounded summary of a FIM change: line counts, and key fingerprints for authorized_keys. Never file contents.
+_audit_fim_detail() {
+    local change="$1" path="$2"
+    local dir; dir=$(_audit_state_dir)
+    local row old_sha old_size new_size st snap old cur added removed out=""
+    case "$change" in MODIFIED|APPEARED) ;; *) return 0 ;; esac
+    row=$(P="$path" awk -F'\t' '$1 == ENVIRON["P"] { print $2 "\t" $4; exit }' "$dir/fim.baseline" 2>/dev/null)
+    old_sha="${row%%$'\t'*}"; old_size="${row#*$'\t'}"
+    [[ "$old_sha" == MISSING || "$old_sha" == UNREADABLE ]] && old_size=0
+    st=$(_audit_stat "$path"); new_size="${st##*	}"
+    out="size ${old_size:-0} -> ${new_size:-0} bytes"
+    if _audit_fim_sensitive "$path"; then
+        printf '%s, contents withheld\n' "$out"
+        return 0
+    fi
+    snap="$(_audit_fim_snap_dir)/$(_audit_accounts_sanitise "$path")"
+    old=$(mktemp "$dir/fim.old.XXXXXX") || return 0
+    cur=$(mktemp "$dir/fim.cur.XXXXXX") || { rm -f "$old"; return 0; }
+    if [[ "$old_sha" == MISSING || "$old_sha" == UNREADABLE ]] \
+        || { [[ -f "$snap" ]] && [[ "$(_audit_sha256 "$snap")" == "$old_sha" ]] && cat "$snap" > "$old"; }; then
+        if _audit_fim_read_capped "$path" "$cur"; then
+            added=$(comm -13 <(sort "$old") <(sort "$cur") | grep -c . || true)
+            removed=$(comm -23 <(sort "$old") <(sort "$cur") | grep -c . || true)
+            out="+${added} -${removed} lines, $out"
+            if [[ "${path##*/}" == authorized_keys* ]] && command -v ssh-keygen >/dev/null 2>&1; then
+                out+=$'\n'$(
+                    { comm -13 <(ssh-keygen -lf "$old" 2>/dev/null | sort -u) <(ssh-keygen -lf "$cur" 2>/dev/null | sort -u) | sed 's/^/+ key /'
+                      comm -23 <(ssh-keygen -lf "$old" 2>/dev/null | sort -u) <(ssh-keygen -lf "$cur" 2>/dev/null | sort -u) | sed 's/^/- key /'
+                    } | awk '{ gsub(/[[:cntrl:]`]/, ""); s = substr($0, 1, 1); n[s]++; if (n[s] <= 5) print substr($0, 1, 160) }
+                        END { if (n["+"] > 5) print "+ " n["+"] - 5 " more keys"; if (n["-"] > 5) print "- " n["-"] - 5 " more keys" }'
+                )
+            fi
+        fi
+    fi
+    rm -f "$old" "$cur"
+    printf '%s\n' "${out:0:2000}"
+}
+
 # Watchlist globs expanded to a sorted, deduped path list.
 _audit_fim_expand_paths() {
     local pat path
@@ -2799,8 +2923,9 @@ _audit_fim_baseline() {
     local out="$dir/fim.baseline"
     local tmp; tmp=$(mktemp "$dir/fim.baseline.tmp.XXXXXX") || return 1
     local now; now=$(date +%s)
-    local path sha mtime size st
+    local path sha mtime size st f snapdir kept="/"
     local count=0 missing=0
+    snapdir=$(_audit_fim_snap_dir)
 
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
@@ -2811,6 +2936,8 @@ _audit_fim_baseline() {
             size="${st##*	}"
             [[ -z "$sha" ]] && sha="UNREADABLE"
             (( count++ )) || true
+            _audit_fim_snap_write "$path"
+            kept+="$(_audit_accounts_sanitise "$path")/"
         else
             sha="MISSING"; mtime=0; size=0
             (( missing++ )) || true
@@ -2819,6 +2946,9 @@ _audit_fim_baseline() {
     done < <(_audit_fim_expand_paths)
 
     mv "$tmp" "$out"
+    for f in "$snapdir"/*; do
+        [[ -e "$f" && "$kept" != */"${f##*/}"/* ]] && rm -f "$f"
+    done
     # One "<present> <missing> <path>" line so callers can `read` it; globals don't survive $(...).
     printf '%d %d %s\n' "$count" "$missing" "$out"
 }
@@ -2889,7 +3019,7 @@ _audit_fim_tick() {
         rows+="$change"$'\t'"$path"$'\n'
         key="audit:fim:$change:$path"
         if alert_should_fire "$key"; then
-            body="\`\`\`$change $path $detail\`\`\`"
+            body="\`\`\`$change $path $detail"$'\n'"$(_audit_fim_detail "$change" "$path")\`\`\`"
             alert_fire "FIM drift: $change $path" "$body" 15158332 "$key" &
         fi
     done < <(_audit_fim_diff)
@@ -2908,6 +3038,7 @@ mode_audit() {
         accounts) shift; _audit_accounts_subcmd "$@" ;;
         rootkit) shift; _audit_rootkit_subcmd "$@" ;;
         history) shift; _audit_history_subcmd "$@" ;;
+        accept) shift; _audit_accept_subcmd "$@" ;;
         *)
             echo -e "${R}unknown audit subcommand: $1${NC}" >&2
             _audit_help; return 1 ;;
@@ -2926,6 +3057,7 @@ ${W}milog audit${NC} — point-in-time host integrity scans
   ${C}milog audit accounts ${NC}<sub>     line-level diff over passwd / sudoers / authorized_keys
   ${C}milog audit rootkit ${NC}<sub>      hidden-process / ld.so.preload / tmp-exec heuristics
   ${C}milog audit history ${NC}[days]     drift the daemon recorded (default 7; needs HISTORY_ENABLED=1)
+  ${C}milog audit accept ${NC}[check item] accept one drifted item into its baseline; no args lists drift
 
   Subs (fim/persistence/ports/accounts): ${C}baseline${NC} | ${C}check${NC} | ${C}status${NC}
   Subs (yara):                           ${C}init${NC} | ${C}scan${NC} | ${C}status${NC}
@@ -3115,7 +3247,7 @@ _audit_persistence_tick() {
         esac
         key="audit:persistence:APPEARED:$path"
         if alert_should_fire "$key"; then
-            body="\`\`\`new file in re-entry surface: $path\`\`\`"
+            body="\`\`\`new file in re-entry surface: $path"$'\n'"$(_audit_age_line "$path")\`\`\`"
             alert_fire "Persistence: new $path" "$body" 15158332 "$key" &
         fi
     done < <(_audit_persistence_diff)
@@ -3305,7 +3437,7 @@ _audit_ports_tick() {
         [[ -z "$proto" || -z "$port" ]] && continue
         key="audit:ports:NEW:$proto:$port"
         if alert_should_fire "$key"; then
-            body="\`\`\`new listener: $proto $bind:$port\`\`\`"
+            body="\`\`\`new listener: $proto $bind:$port"$'\n'"$(_audit_listener_owner "$proto" "$port")\`\`\`"
             alert_fire "Listener: new $proto $bind:$port" "$body" 15158332 "$key" &
         fi
     done < <(_audit_ports_diff)
@@ -4132,6 +4264,174 @@ _audit_history_subcmd() {
         return 0
     fi
     printf '%s\n' "$out" | awk -F'\t' '{ printf "  %s  %-11s  %-10s  %s\n", $1, $2, $3, substr($0, length($1 $2 $3) + 4) }' | _tty_safe
+}
+
+# The accepting user and time land in audit_event as kind "accepted".
+_audit_accept_record() {
+    local check="$1" item="$2" who
+    who="${SUDO_USER:-$(id -un 2>/dev/null)}"
+    echo -e "${G}accepted${NC} $check ${C}$item${NC} into the baseline"
+    [[ "${HISTORY_ENABLED:-0}" == "1" && -f "${HISTORY_DB:-}" ]] || return 0
+    history_write_audit "$check" "$(date +%s)" "accepted"$'\t'"$item by ${who:-?}"
+}
+
+_audit_fim_accept() {
+    local path="$1" dir baseline row old_sha sha st mtime=0 size=0 tmp now
+    dir=$(_audit_state_dir); baseline="$dir/fim.baseline"
+    [[ -f "$baseline" ]] || { echo -e "${Y}no fim baseline yet — run \`milog audit fim baseline\` first${NC}" >&2; return 1; }
+    _audit_have_sha256 || { echo -e "${R}no sha256sum or shasum on PATH${NC}" >&2; return 1; }
+    row=$(P="$path" awk -F'\t' '$1 == ENVIRON["P"] { print $2; exit }' "$baseline")
+    [[ -n "$row" ]] || { echo -e "${R}$path is not in the fim baseline${NC}" >&2; return 1; }
+    old_sha="$row"
+    if [[ -e "$path" ]]; then
+        sha=$(_audit_sha256 "$path"); [[ -z "$sha" ]] && sha="UNREADABLE"
+        st=$(_audit_stat "$path"); mtime="${st%%	*}"; size="${st##*	}"
+    else
+        sha="MISSING"
+    fi
+    if [[ "$sha" == "$old_sha" ]]; then
+        echo -e "${G}no drift${NC} for $path, nothing to accept"
+        return 0
+    fi
+    now=$(date +%s)
+    tmp=$(mktemp "$dir/fim.baseline.tmp.XXXXXX") || return 1
+    if [[ "$sha" == MISSING ]]; then
+        rm -f "$(_audit_fim_snap_dir)/$(_audit_accounts_sanitise "$path")"
+    else
+        _audit_fim_snap_write "$path"
+    fi
+    if ! P="$path" R="$path"$'\t'"$sha"$'\t'"$mtime"$'\t'"$size"$'\t'"$now" \
+        awk -F'\t' '$1 == ENVIRON["P"] { print ENVIRON["R"]; next } { print }' "$baseline" > "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    mv -f "$tmp" "$baseline" || { rm -f "$tmp"; return 1; }
+    _audit_accept_record fim "$path"
+}
+
+_audit_persistence_accept() {
+    local path="$1" dir baseline in_base=0 in_cur=0 st tmp
+    dir=$(_audit_state_dir); baseline="$dir/persistence.baseline"
+    [[ -f "$baseline" ]] || { echo -e "${Y}no persistence baseline yet — run \`milog audit persistence baseline\` first${NC}" >&2; return 1; }
+    P="$path" awk -F'\t' '$1 == ENVIRON["P"] { f = 1; exit } END { exit !f }' "$baseline" && in_base=1
+    grep -Fxq -- "$path" < <(_audit_persistence_expand) && in_cur=1
+    if (( in_base == in_cur )); then
+        echo -e "${G}no drift${NC} for $path, nothing to accept"
+        return 0
+    fi
+    tmp=$(mktemp "$dir/persistence.baseline.tmp.XXXXXX") || return 1
+    if ! P="$path" awk -F'\t' '$1 != ENVIRON["P"]' "$baseline" > "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    if (( in_cur )); then
+        st=$(_audit_stat "$path")
+        printf '%s\t%s\t%s\t%s\n' "$path" "${st##*	}" "${st%%	*}" "$(date +%s)" >> "$tmp"
+    fi
+    mv -f "$tmp" "$baseline" || { rm -f "$tmp"; return 1; }
+    _audit_accept_record persistence "$path"
+}
+
+# Item is <proto>:<port>; every bind address on that port is set to what is listening now.
+_audit_ports_accept() {
+    local item="$1" proto port dir baseline cur tmp
+    proto="${item%%:*}"; port="${item##*:}"
+    if [[ ! "$proto" =~ ^(tcp|udp)$ || ! "$port" =~ ^[0-9]+$ || "$item" != "$proto:$port" ]]; then
+        echo -e "${R}ports item must be <tcp|udp>:<port>, e.g. tcp:443${NC}" >&2
+        return 1
+    fi
+    dir=$(_audit_state_dir); baseline="$dir/ports.baseline"
+    [[ -f "$baseline" ]] || { echo -e "${Y}no ports baseline yet — run \`milog audit ports baseline\` first${NC}" >&2; return 1; }
+    cur=$(mktemp "$dir/ports.current.XXXXXX") || return 1
+    tmp=$(mktemp "$dir/ports.baseline.tmp.XXXXXX") || { rm -f "$cur"; return 1; }
+    _audit_ports_capture | awk -F'\t' -v pr="$proto" -v po="$port" '$1 == pr && $3 == po' > "$cur"
+    local rc=0
+    awk -F'\t' -v OFS='\t' -v pr="$proto" -v po="$port" -v now="$(date +%s)" '
+        FILENAME == ARGV[1] { cur[$1 FS $2 FS $3] = 1; next }
+        $1 == pr && $3 == po { k = $1 FS $2 FS $3; if (k in cur) { print; seen[k] = 1 } else changed = 1; next }
+        { print }
+        END { for (k in cur) if (!(k in seen)) { print k, now; changed = 1 }; exit !changed }
+    ' "$cur" "$baseline" > "$tmp" || rc=$?
+    rm -f "$cur"
+    if (( rc != 0 )); then
+        rm -f "$tmp"
+        echo -e "${G}no drift${NC} for $item, nothing to accept"
+        return 0
+    fi
+    mv -f "$tmp" "$baseline" || { rm -f "$tmp"; return 1; }
+    _audit_accept_record ports "$item"
+}
+
+_audit_accounts_accept() {
+    local path="$1" dir safe tmp
+    dir=$(_audit_accounts_state_dir)
+    [[ -f "$dir/.lastcheck" ]] || { echo -e "${Y}no accounts baseline yet — run \`milog audit accounts baseline\` first${NC}" >&2; return 1; }
+    grep -Fxq -- "$path" < <(_audit_accounts_expand) \
+        || { echo -e "${R}$path is not a file in AUDIT_ACCOUNTS_PATHS${NC}" >&2; return 1; }
+    if ! grep -Fxq -- "$path" < <(_audit_accounts_diff | awk -F'\t' '{ print $2 }'); then
+        echo -e "${G}no drift${NC} for $path, nothing to accept"
+        return 0
+    fi
+    safe=$(_audit_accounts_sanitise "$path")
+    tmp=$(mktemp "$dir/.baseline.tmp.XXXXXX") || return 1
+    if ! cat "$path" 2>/dev/null > "$tmp"; then
+        rm -f "$tmp"; echo -e "${R}cannot read $path${NC}" >&2; return 1
+    fi
+    mv -f "$tmp" "$dir/$safe.baseline" || { rm -f "$tmp"; return 1; }
+    _audit_accept_record accounts "$path"
+}
+
+# What is drifting in one check, each with the command that accepts it.
+_audit_accept_list() {
+    local check="$1" dir out
+    dir=$(_audit_state_dir)
+    case "$check" in
+        fim)
+            [[ -f "$dir/fim.baseline" ]] && _audit_have_sha256 || return 0
+            out=$(_audit_fim_diff | awk -F'\t' '{ print $1 "\t" $2 }') ;;
+        persistence)
+            [[ -f "$dir/persistence.baseline" ]] || return 0
+            out=$(_audit_persistence_diff) ;;
+        ports)
+            [[ -f "$dir/ports.baseline" ]] || return 0
+            out=$(_audit_ports_diff | awk -F'\t' '{ print $1 "\t" $2 ":" $4 }' | sort -u) ;;
+        accounts)
+            [[ -f "$dir/accounts/.lastcheck" ]] || return 0
+            out=$(_audit_accounts_diff | awk -F'\t' '{ f[$2] = 1; c[$2 FS $1]++ }
+                END { for (p in f) printf "+%d -%d lines\t%s\n", c[p FS "ADDED"], c[p FS "REMOVED"], p }' | sort -t$'\t' -k2) ;;
+    esac
+    [[ -n "$out" ]] || return 0
+    echo -e "${W}$check${NC}"
+    local change item
+    while IFS=$'\t' read -r change item; do
+        [[ -n "$item" ]] || continue
+        printf '  %-14s %q\n' "$change" "$item"
+        printf "    ${D}milog audit accept %s %q${NC}\n" "$check" "$item"
+    done <<< "$out"
+}
+
+_audit_accept_subcmd() {
+    local check="${1:-}" item="${2:-}"
+    case "$check" in
+        "")
+            local listing c
+            listing=$(for c in fim persistence ports accounts; do _audit_accept_list "$c"; done)
+            if [[ -z "$listing" ]]; then
+                echo -e "${G}no drift${NC} in any baselined check"
+            else
+                printf '%s\n' "$listing"
+            fi
+            ;;
+        fim|persistence|ports|accounts)
+            if [[ -z "$item" ]]; then
+                local listing; listing=$(_audit_accept_list "$check")
+                [[ -n "$listing" ]] && printf '%s\n' "$listing" || echo -e "${G}no drift${NC} in $check"
+                return 0
+            fi
+            "_audit_${check}_accept" "$item"
+            ;;
+        *)
+            echo -e "${R}usage: milog audit accept [fim|persistence|ports|accounts] [path|proto:port]${NC}" >&2
+            return 1 ;;
+    esac
 }
 # milog auto-tune [days]: suggests HTTP thresholds from percentiles of metrics_minute. CPU/MEM/DISK aren't in the DB.
 # Also suggests threshold raises or silences for rules that fire too often in alerts.log.
@@ -9267,6 +9567,8 @@ _milog_complete() {
     local alert_subs="on off status test stats"
     local silence_subs="list clear"
     local web_subs="start stop status install-service uninstall-service rotate-token"
+    local audit_subs="fim persistence ports yara accounts rootkit history accept"
+    local audit_accept_checks="fim persistence ports accounts"
     local window_vals="today yesterday 1h 6h 12h 24h 7d 30d all"
     local digest_window_vals="day week 1h 6h 12h 24h 7d 30d"
 
@@ -9303,6 +9605,24 @@ _milog_complete() {
         web)
             case $cword in
                 2) COMPREPLY=($(compgen -W "$web_subs" -- "$cur")) ;;
+            esac
+            ;;
+        audit)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "$audit_subs" -- "$cur")) ;;
+                3)
+                    case "${words[2]}" in
+                        fim|persistence|ports|accounts) COMPREPLY=($(compgen -W "baseline check status" -- "$cur")) ;;
+                        yara) COMPREPLY=($(compgen -W "init scan status" -- "$cur")) ;;
+                        rootkit) COMPREPLY=($(compgen -W "check status" -- "$cur")) ;;
+                        accept) COMPREPLY=($(compgen -W "$audit_accept_checks" -- "$cur")) ;;
+                    esac
+                    ;;
+                4)
+                    case "${words[2]}:${words[3]}" in
+                        accept:fim|accept:persistence|accept:accounts) COMPREPLY=($(compgen -f -- "$cur")) ;;
+                    esac
+                    ;;
             esac
             ;;
         alerts)
@@ -9409,6 +9729,8 @@ _milog() {
     alert_subs=(on off status test stats)
     silence_subs=(list clear)
     web_subs=(start stop status install-service uninstall-service rotate-token)
+    audit_subs=(fim persistence ports yara accounts rootkit history accept)
+    audit_accept_checks=(fim persistence ports accounts)
     window_vals=(today yesterday 1h 6h 12h 24h 7d 30d all)
     digest_window_vals=(day week 1h 6h 12h 24h 7d 30d)
 
@@ -9429,6 +9751,19 @@ _milog() {
         alert)    (( CURRENT == 3 )) && _describe 'alert subcommand' alert_subs ;;
         silence)  (( CURRENT == 3 )) && _describe 'silence subcommand' silence_subs ;;
         web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
+        audit)
+            if   (( CURRENT == 3 )); then _describe 'audit subcommand' audit_subs
+            elif (( CURRENT == 4 )); then
+                case "${words[3]}" in
+                    fim|persistence|ports|accounts) compadd -- baseline check status ;;
+                    yara) compadd -- init scan status ;;
+                    rootkit) compadd -- check status ;;
+                    accept) _describe 'check' audit_accept_checks ;;
+                esac
+            elif (( CURRENT == 5 )) && [[ "${words[3]}" == accept && "${words[4]}" != ports ]]; then
+                _files
+            fi
+            ;;
         alerts)   (( CURRENT == 3 )) && _describe 'window' window_vals ;;
         digest|report) (( CURRENT == 3 )) && _describe 'window' digest_window_vals ;;
         update)   (( CURRENT == 3 )) && compadd -- --check ;;
@@ -9521,6 +9856,23 @@ set -l web_subs start stop status install-service uninstall-service rotate-token
 for s in $web_subs
     complete -c milog -n "__milog_seen_cmd web" -a "$s"
 end
+
+function __milog_audit_at
+    set -l tokens (commandline -opc)
+    test (count $tokens) -eq (math (count $argv) + 2); and test $tokens[2] = audit; or return 1
+    for i in (seq (count $argv))
+        test $tokens[(math $i + 2)] = $argv[$i]; or return 1
+    end
+end
+
+complete -c milog -n "__milog_audit_at" -f -a "fim persistence ports yara accounts rootkit history accept"
+for s in fim persistence ports accounts
+    complete -c milog -n "__milog_audit_at $s" -f -a "baseline check status"
+end
+complete -c milog -n "__milog_audit_at yara" -f -a "init scan status"
+complete -c milog -n "__milog_audit_at rootkit" -f -a "check status"
+complete -c milog -n "__milog_audit_at accept" -f -a "fim persistence ports accounts"
+complete -c milog -n "__milog_audit_at accept fim; or __milog_audit_at accept persistence; or __milog_audit_at accept accounts" -F
 
 set -l window_vals today yesterday 1h 6h 12h 24h 7d 30d all
 for v in $window_vals
