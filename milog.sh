@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.3-13-g77967a6
-# MILOG_BUILT=2026-11-26T08:48:52Z
+# MILOG_VERSION=v0.8.3-20-gfd363ea
+# MILOG_BUILT=2026-11-26T09:12:25Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -156,9 +156,14 @@ _root_trusted_path() {
 }
 
 if [[ -f "$MILOG_CONFIG" ]]; then
-    if [[ $EUID -ne 0 ]] || _root_trusted_path "$MILOG_CONFIG"; then
+    _milog_config_real=$(readlink -f -- "$MILOG_CONFIG" 2>/dev/null)
+    if [[ $EUID -ne 0 ]]; then
         # shellcheck disable=SC1090
         . "$MILOG_CONFIG"
+    elif [[ -n "$_milog_config_real" ]] && _root_trusted_path "$_milog_config_real"; then
+        # Root sources the resolved file so a symlink in the chain can't be swapped after the check.
+        # shellcheck disable=SC1090
+        . "$_milog_config_real"
     else
         echo "milog: running as root, refusing to source $MILOG_CONFIG (not root-owned or group/other-writable)" >&2
     fi
@@ -455,10 +460,12 @@ _alert_record() {
 }
 
 # Log a failed delivery (network or HTTP >= 400) for `milog doctor`; status 000 means no HTTP response.
+# Rows are epoch, dest, status, plus the rule key as a fourth column when one is known.
 _alert_send_failed() {
-    local log_file="$ALERT_STATE_DIR/send_failures.log"
+    local log_file="$ALERT_STATE_DIR/send_failures.log" rule="${3:-}"
     mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
-    printf '%s\t%s\t%s\n' "$(date +%s)" "${1:-unknown}" "${2:-000}" >> "$log_file" 2>/dev/null || true
+    rule="${rule//[$'\t\r\n']/ }"
+    printf '%s\t%s\t%s%s\n' "$(date +%s)" "${1:-unknown}" "${2:-000}" "${rule:+$'\t'$rule}" >> "$log_file" 2>/dev/null || true
     _alert_rotate_if_big "$log_file"
 }
 
@@ -482,7 +489,7 @@ _alert_backoff_secs() {
 }
 
 # _alert_post <dest> <curl args...>. A 429 is retried once when the server asks to wait 5s or less.
-# With _ALERT_HOLD_429=1 a final 429 sets backoff.<dest> and returns 2 instead of logging a failure.
+# With _ALERT_HOLD_429=1 the caller logs failures: a final 429 sets backoff.<dest> and returns 2, any other failure returns 1.
 _alert_post() {
     local dest="$1"; shift
     local out code wait try
@@ -495,11 +502,16 @@ _alert_post() {
         [[ "$wait" =~ ^([0-4](\.[0-9]+)?|5(\.0+)?)$ ]] || break
         sleep "$wait" || break
     done
-    if [[ "$code" == 429 && "${_ALERT_HOLD_429:-0}" == 1 ]]; then
-        wait=$(printf '%s\n' "$out" | _alert_retry_after) || :
-        _alert_state_write "$ALERT_STATE_DIR/backoff.$dest" \
-            "$(( $(date +%s) + $(_alert_backoff_secs "$wait") ))" || :
-        return 2
+    _ALERT_LAST_CODE="$code"
+    if [[ "${_ALERT_HOLD_429:-0}" == 1 ]]; then
+        if [[ "$code" == 429 ]]; then
+            wait=$(printf '%s\n' "$out" | _alert_retry_after) || :
+            _alert_state_write "$ALERT_STATE_DIR/backoff.$dest" \
+                "$(( $(date +%s) + $(_alert_backoff_secs "$wait") ))" || :
+            return 2
+        fi
+        [[ "$code" =~ ^[1-3][0-9][0-9]$ ]] && return 0
+        return 1
     fi
     [[ "$code" =~ ^[1-3][0-9][0-9]$ ]] || _alert_send_failed "$dest" "$code"
     return 0
@@ -521,13 +533,28 @@ _alert_enqueue() {
     local q="$ALERT_STATE_DIR/queue.$dest" n=0
     [[ -f "$q" ]] && n=$(wc -l < "$q" | tr -d ' ')
     if (( n >= 1000 )); then
-        _alert_send_failed "$dest" 429
+        _alert_send_failed "$dest" 429 "$rule_key"
         return 0
     fi
     title="${title//[$'\t\r\n']/ }"
+    title="${title:0:200}"
     rule_key="${rule_key//[$'\t\r\n']/ }"
-    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$color" "$rule_key" "${title:0:200}" >> "$q" 2>/dev/null \
-        || _alert_send_failed "$dest" 429
+    # One invalid UTF-8 title would get the whole coalesced summary rejected.
+    if command -v iconv >/dev/null 2>&1; then
+        title=$(printf '%s' "$title" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null) || :
+    else
+        title=$(printf '%s' "$title" | LC_ALL=C tr -cd '\40-\176') || :
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$color" "$rule_key" "$title" >> "$q" 2>/dev/null \
+        || _alert_send_failed "$dest" 429 "$rule_key"
+}
+
+# Logs one failure per queue row on stdin, keeping each row's rule key.
+_alert_fail_rows() {
+    local dest="$1" code="$2" rule
+    awk -F'\t' '{print $3}' | while IFS= read -r rule; do
+        _alert_send_failed "$dest" "$code" "$rule"
+    done
 }
 
 # Sends everything queued for $1 as one summary once its backoff ends; one flusher per destination.
@@ -535,13 +562,14 @@ _alert_flush() {
     local dest="$1"
     local q="$ALERT_STATE_DIR/queue.$dest" lock="$ALERT_STATE_DIR/queue.$dest.lock"
     local bo="$ALERT_STATE_DIR/backoff.$dest"
-    local tries=0 hold now batch rc n color lines
+    local tries retried hold now batch rc n color lines _ALERT_LAST_CODE=000
     # A flusher killed mid-wait leaves its lock; the longest legitimate hold is 5 x 300s.
     find "$lock" -maxdepth 0 -mmin +30 -exec rmdir {} \; 2>/dev/null || :
     while [[ -s "$q" ]] && mkdir "$lock" 2>/dev/null; do
+        tries=0 retried=0
         while [[ -s "$q" ]] && (( tries < 5 )); do
             hold=$(cat "$bo" 2>/dev/null) || hold=0
-            [[ "$hold" =~ ^[0-9]+$ ]] || hold=0
+            [[ "$hold" =~ ^[0-9]{1,12}$ ]] || hold=0
             now=$(date +%s)
             (( hold > now + 300 )) && hold=$(( now + 300 ))
             (( hold > now )) && sleep $(( hold - now ))
@@ -554,16 +582,22 @@ _alert_flush() {
             rc=0
             _ALERT_HOLD_429=1 "_alert_send_$dest" "Rate limited: $n alerts held" \
                 "$(_alert_fence "$lines")" "$color" "milog:coalesced" || rc=$?
-            if (( rc == 2 )); then
-                cat "$batch" >> "$q"
-                (( tries++ )) || true
-            fi
+            case "$rc" in
+                0)  rm -f "$bo" ;;
+                2)  cat "$batch" >> "$q"; (( tries++ )) || true ;;
+                *)  if (( retried )); then
+                        _alert_fail_rows "$dest" "$_ALERT_LAST_CODE" < "$batch"
+                    else
+                        retried=1
+                        cat "$batch" >> "$q"
+                    fi ;;
+            esac
             rm -f "$batch"
         done
-        if [[ -s "$q" ]] && (( tries >= 5 )); then
-            n=$(wc -l < "$q" | tr -d ' ')
-            while (( n-- > 0 )); do _alert_send_failed "$dest" 429; done
-            rm -f "$q"
+        # Renamed first so alerts queued during the dump are not deleted with it.
+        if [[ -s "$q" ]] && (( tries >= 5 )) && mv "$q" "$q.drop" 2>/dev/null; then
+            _alert_fail_rows "$dest" 429 < "$q.drop"
+            rm -f "$q.drop"
         fi
         rmdir "$lock" 2>/dev/null || :
     done
@@ -573,14 +607,19 @@ _alert_flush() {
 # Per-destination send from alert_fire: while the destination is backing off, alerts queue for one summary.
 _alert_deliver() {
     local dest="$1"; shift
-    local hold=0 rc=0
+    local hold=0 rc=0 now _ALERT_LAST_CODE=000
+    now=$(date +%s)
     hold=$(cat "$ALERT_STATE_DIR/backoff.$dest" 2>/dev/null) || hold=0
-    [[ "$hold" =~ ^[0-9]+$ ]] || hold=0
-    if (( hold > $(date +%s) )); then
+    [[ "$hold" =~ ^[0-9]{1,12}$ ]] || hold=0
+    (( hold > now + 300 )) && hold=$(( now + 300 ))
+    if (( hold > now )); then
         _alert_enqueue "$dest" "$@"
     else
         _ALERT_HOLD_429=1 "_alert_send_$dest" "$@" || rc=$?
-        (( rc == 2 )) && _alert_enqueue "$dest" "$@"
+        case "$rc" in
+            2) _alert_enqueue "$dest" "$@" ;;
+            1) _alert_send_failed "$dest" "$_ALERT_LAST_CODE" "${4:-}" ;;
+        esac
     fi
     [[ -s "$ALERT_STATE_DIR/queue.$dest" ]] && _alert_flush "$dest"
     return 0
@@ -1100,6 +1139,8 @@ _alert_cond_put() {
 # alert_condition_open <key> <title> <body> [color] [fingerprint]: fires on open or fingerprint change, else once per ALERT_REMINDER_INTERVAL.
 alert_condition_open() {
     [[ "${ALERTS_ENABLED:-0}" == "1" ]] || return 0
+    # No row while silenced, so the condition still alerts once the silence ends.
+    if alert_is_silenced "${1:-}" >/dev/null; then return 0; fi
     local key="${1//[$'\t\r\n']/ }" title="$2" body="$3" color="${4:-15158332}" fp="${5:-}"
     local f="$ALERT_STATE_DIR/alerts.conditions" now row opened notified seen old_fp
     local reminder="${ALERT_REMINDER_INTERVAL:-86400}"
@@ -1153,9 +1194,19 @@ alert_condition_close() {
 }
 
 # Logs and alerts when send_failures.log grew since the last call; send_failures.seen holds the line count.
+# Also requeues batches a dead flusher left mid-send and restarts flushing for anything still held.
 _alert_delivery_check() {
     local flog="$ALERT_STATE_DIR/send_failures.log" seen_f="$ALERT_STATE_DIR/send_failures.seen"
-    local total=0 seen=0 new summary
+    local total=0 seen=0 new summary f dest
+    for f in "$ALERT_STATE_DIR"/queue.*.send.*; do
+        [[ -f "$f" && -n "$(find "$f" -mmin +5 2>/dev/null)" ]] || continue
+        dest="${f##*/queue.}"; dest="${dest%%.send.*}"
+        case "$dest" in discord|slack|telegram|matrix|webhook) ;; *) continue ;; esac
+        cat "$f" >> "$ALERT_STATE_DIR/queue.$dest" && rm -f "$f"
+    done
+    for dest in discord slack telegram matrix webhook; do
+        if [[ -s "$ALERT_STATE_DIR/queue.$dest" ]]; then _alert_flush "$dest" & fi
+    done
     [[ -f "$flog" ]] && total=$(wc -l < "$flog" | tr -d ' ')
     seen=$(cat "$seen_f" 2>/dev/null) || seen=0
     [[ "$seen" =~ ^[0-9]+$ ]] || seen=0
@@ -1163,8 +1214,11 @@ _alert_delivery_check() {
     (( total < seen )) && seen=0
     (( total > seen )) || return 0
     _alert_state_write "$seen_f" "$total" || return 0
-    new=$(( total - seen ))
-    summary=$(tail -n "$new" "$flog" | awk -F'\t' '{c[$2 " HTTP " ($3 == "" ? "000" : $3)]++} END {for (k in c) printf "%s x%d\n", k, c[k]}' | sort)
+    # The delivery alert's own failures don't count, or a dead destination would re-alert every hour.
+    summary=$(tail -n "$(( total - seen ))" "$flog" | awk -F'\t' '$4 != "milog:delivery"')
+    [[ -n "$summary" ]] || return 0
+    new=$(printf '%s\n' "$summary" | wc -l | tr -d ' ')
+    summary=$(printf '%s\n' "$summary" | awk -F'\t' '{c[$2 " HTTP " ($3 == "" ? "000" : $3)]++} END {for (k in c) printf "%s x%d\n", k, c[k]}' | sort)
     _dlog "WARNING: $new alert deliveries failed since the last check: ${summary//$'\n'/, }"
     alert_fire "MiLog: $new alert deliveries failed" "$(_alert_fence "$summary")" 16753920 "milog:delivery"
 }
@@ -3086,15 +3140,17 @@ _audit_fim_tick() {
         return 0
     fi
 
-    local change path detail key body rows=""
+    local change path detail key body rows="" out ok=1
+    # A failed diff must not read as every condition clearing.
+    out=$(_audit_fim_diff) || ok=0
     while IFS=$'\t' read -r change path detail; do
         [[ -z "$change" ]] && continue
         rows+="$change"$'\t'"$path"$'\n'
         key="audit:fim:$change:$path"
         body="\`\`\`$change $path $detail\`\`\`"
         alert_condition_open "$key" "FIM drift: $change $path" "$body" 15158332 "$detail"
-    done < <(_audit_fim_diff)
-    alert_condition_sweep audit:fim: "$now"
+    done <<< "$out"
+    (( ok )) && alert_condition_sweep audit:fim: "$now"
     history_write_audit fim "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
@@ -3135,7 +3191,7 @@ ${W}milog audit${NC} — point-in-time host integrity scans
 
 The watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC} —
 auto-baselines on first run, then fires ${C}audit:fim:<change>:<path>${NC},
-${C}audit:persistence:APPEARED:<path>${NC}, ${C}audit:ports:NEW:<proto>:<port>${NC},
+${C}audit:persistence:APPEARED:<path>${NC}, ${C}audit:ports:NEW:<proto>:<bind>:<port>${NC},
 ${C}audit:yara:<rule>:<path>${NC}, ${C}audit:accounts:NEW:<path>${NC}, or
 ${C}audit:rootkit:<heuristic>${NC} on every subsequent drift.
 
@@ -3307,8 +3363,10 @@ _audit_persistence_tick() {
         return 0
     fi
 
-    local change path key body rows=""
+    local change path key body rows="" out ok=1
+    out=$(_audit_persistence_diff) || ok=0
     while IFS=$'\t' read -r change path; do
+        [[ -z "$change" ]] && continue
         rows+="$change"$'\t'"$path"$'\n'
         [[ "$change" == "APPEARED" ]] || continue
         [[ -z "$path" ]] && continue
@@ -3319,8 +3377,8 @@ _audit_persistence_tick() {
         key="audit:persistence:APPEARED:$path"
         body="\`\`\`new file in re-entry surface: $path\`\`\`"
         alert_condition_open "$key" "Persistence: new $path" "$body" 15158332
-    done < <(_audit_persistence_diff)
-    alert_condition_sweep audit:persistence: "$now"
+    done <<< "$out"
+    (( ok )) && alert_condition_sweep audit:persistence: "$now"
     history_write_audit persistence "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
@@ -3474,6 +3532,8 @@ _audit_ports_diff() {
 
     _audit_ports_capture > "$current"
     awk -F'\t' '{print $1 "\t" $2 "\t" $3}' "$baseline" | sort -u > "$sorted_baseline"
+    # No listeners at all means ss/netstat failed, not that every port closed.
+    [[ -s "$current" || ! -s "$sorted_baseline" ]] || return 1
 
     comm -23 "$current" "$sorted_baseline" | awk -F'\t' '{print "NEW\t" $0}'
     comm -13 "$current" "$sorted_baseline" | awk -F'\t' '{print "GONE\t" $0}'
@@ -3498,7 +3558,8 @@ _audit_ports_tick() {
         return 0
     fi
 
-    local change proto bind port key body rows=""
+    local change proto bind port key body rows="" out ok=1
+    out=$(_audit_ports_diff) || ok=0
     while IFS=$'\t' read -r change proto bind port; do
         case "$change" in
             NEW)  rows+="appeared"$'\t'"$bind:$port/$proto"$'\n' ;;
@@ -3506,11 +3567,11 @@ _audit_ports_tick() {
         esac
         [[ "$change" == "NEW" ]] || continue
         [[ -z "$proto" || -z "$port" ]] && continue
-        key="audit:ports:NEW:$proto:$port"
+        key="audit:ports:NEW:$proto:$bind:$port"
         body="\`\`\`new listener: $proto $bind:$port\`\`\`"
         alert_condition_open "$key" "Listener: new $proto $bind:$port" "$body" 15158332
-    done < <(_audit_ports_diff)
-    alert_condition_sweep audit:ports: "$now"
+    done <<< "$out"
+    (( ok )) && alert_condition_sweep audit:ports: "$now"
     history_write_audit ports "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
@@ -4034,8 +4095,10 @@ _audit_accounts_tick() {
 
     # One alert per file, listing at most 5 new lines.
     local prev_file="" body="" capped=""
-    local change file line lines_count=0 key b rows=""
+    local change file line lines_count=0 key b rows="" out ok=1
+    out=$(_audit_accounts_diff | sort) || ok=0
     while IFS=$'\t' read -r change file line; do
+        [[ -z "$change" ]] && continue
         rows+="$change"$'\t'"$file"$'\n'
         [[ "$change" == "ADDED" ]] || continue
         [[ -z "$file" ]] && continue
@@ -4058,7 +4121,7 @@ ${line}"
                 capped="… (and $((lines_count - 5)) more)"
             fi
         fi
-    done < <(_audit_accounts_diff | sort)   # sort groups ADDED rows by file
+    done <<< "$out"   # sort groups ADDED rows by file
     if [[ -n "$prev_file" ]]; then
         [[ -n "$capped" ]] && body="${body}
 ${capped}"
@@ -4067,7 +4130,7 @@ ${capped}"
 $body\`\`\`"
         alert_condition_open "$key" "Account drift: $prev_file" "$b" 15158332 "$b"
     fi
-    alert_condition_sweep audit:accounts: "$now"
+    (( ok )) && alert_condition_sweep audit:accounts: "$now"
     # Subject is the file only, so passwd and sudoers lines stay out of the DB.
     history_write_audit accounts "$(_audit_mtime "$dir/.encoded")" "$rows"
 
@@ -4258,15 +4321,21 @@ _audit_rootkit_tick() {
         return 0
     fi
 
-    local heur detail key body rows=""
+    local heur detail key body rows="" out ok=1
+    out=$(_audit_rootkit_run_all) || ok=0
     while IFS=$'\t' read -r heur detail; do
         [[ -z "$heur" ]] && continue
         rows+="hint"$'\t'"$heur"$'\n'
         key="audit:rootkit:$heur"
         body="\`\`\`$detail\`\`\`"
-        alert_condition_open "$key" "Rootkit hint: $heur" "$body" 15158332
-    done < <(_audit_rootkit_run_all)
-    alert_condition_sweep audit:rootkit: "$now"
+        # New ld.so.preload content is new information; the other hints carry pids or counts that churn.
+        if [[ "$heur" == ld_preload_present ]]; then
+            alert_condition_open "$key" "Rootkit hint: $heur" "$body" 15158332 "$detail"
+        else
+            alert_condition_open "$key" "Rootkit hint: $heur" "$body" 15158332
+        fi
+    done <<< "$out"
+    (( ok )) && alert_condition_sweep audit:rootkit: "$now"
     # No baseline to reset against, so a hint is stored once per retention window.
     history_write_audit rootkit 0 "$rows"
 
