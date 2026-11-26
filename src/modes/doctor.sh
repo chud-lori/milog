@@ -190,6 +190,14 @@ mode_doctor() {
             warn=$(( warn + 1 ))
         fi
     fi
+    local q held
+    for q in "$ALERT_STATE_DIR"/queue.*; do
+        [[ -s "$q" && "$q" != *.lock && "$q" != *.send.* ]] || continue
+        held=$(wc -l < "$q" | tr -d ' ')
+        _doc_warn "${held} alerts held for ${q##*/queue.} while it rate-limits" \
+                  "they go out as one summary when the backoff ends; see $q"
+        warn=$(( warn + 1 ))
+    done
 
     # History DB.
     _doc_head "history (SQLite)"

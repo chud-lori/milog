@@ -84,6 +84,7 @@ mode_daemon() {
         if (( cur_hour > last_hour )); then
             local write_hr_ts=$(( last_hour * 3600 ))
             history_write_hour "$write_hr_ts"
+            _alert_delivery_check
             last_hour=$cur_hour
         fi
         local cur_day=$(( now / 86400 ))

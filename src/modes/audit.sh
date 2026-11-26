@@ -1,5 +1,5 @@
 # milog audit: host integrity scanners (fim, persistence, ports, yara, accounts, rootkit).
-# Drift goes through alert_fire, so silence, cooldown and dedup apply.
+# Drift is tracked as conditions: one alert when it opens or changes, one when it clears; silences apply.
 # fim.baseline rows: path, sha256, mtime, size, recorded; sha256 MISSING means absent at baseline time.
 
 # Hex digest, or empty when unreadable.
@@ -90,6 +90,7 @@ _audit_fim_baseline() {
     done < <(_audit_fim_expand_paths)
 
     mv "$tmp" "$out"
+    alert_condition_close audit:fim:
     # One "<present> <missing> <path>" line so callers can `read` it; globals don't survive $(...).
     printf '%d %d %s\n' "$count" "$missing" "$out"
 }
@@ -159,11 +160,10 @@ _audit_fim_tick() {
         [[ -z "$change" ]] && continue
         rows+="$change"$'\t'"$path"$'\n'
         key="audit:fim:$change:$path"
-        if alert_should_fire "$key"; then
-            body="\`\`\`$change $path $detail\`\`\`"
-            alert_fire "FIM drift: $change $path" "$body" 15158332 "$key" &
-        fi
+        body="\`\`\`$change $path $detail\`\`\`"
+        alert_condition_open "$key" "FIM drift: $change $path" "$body" 15158332 "$detail"
     done < <(_audit_fim_diff)
+    alert_condition_sweep audit:fim: "$now"
     history_write_audit fim "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
@@ -331,6 +331,7 @@ _audit_persistence_baseline() {
     done < <(_audit_persistence_expand)
 
     mv "$tmp" "$out"
+    alert_condition_close audit:persistence:
     printf '%d %s\n' "$count" "$out"
 }
 
@@ -385,11 +386,10 @@ _audit_persistence_tick() {
             /etc/systemd/system/milog.service|/etc/systemd/system/milog-probe.service) continue ;;
         esac
         key="audit:persistence:APPEARED:$path"
-        if alert_should_fire "$key"; then
-            body="\`\`\`new file in re-entry surface: $path\`\`\`"
-            alert_fire "Persistence: new $path" "$body" 15158332 "$key" &
-        fi
+        body="\`\`\`new file in re-entry surface: $path\`\`\`"
+        alert_condition_open "$key" "Persistence: new $path" "$body" 15158332
     done < <(_audit_persistence_diff)
+    alert_condition_sweep audit:persistence: "$now"
     history_write_audit persistence "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
@@ -526,6 +526,7 @@ _audit_ports_baseline() {
     done < <(_audit_ports_capture)
 
     mv "$tmp" "$out"
+    alert_condition_close audit:ports:
     printf '%d %s\n' "$count" "$out"
 }
 
@@ -575,11 +576,10 @@ _audit_ports_tick() {
         [[ "$change" == "NEW" ]] || continue
         [[ -z "$proto" || -z "$port" ]] && continue
         key="audit:ports:NEW:$proto:$port"
-        if alert_should_fire "$key"; then
-            body="\`\`\`new listener: $proto $bind:$port\`\`\`"
-            alert_fire "Listener: new $proto $bind:$port" "$body" 15158332 "$key" &
-        fi
+        body="\`\`\`new listener: $proto $bind:$port\`\`\`"
+        alert_condition_open "$key" "Listener: new $proto $bind:$port" "$body" 15158332
     done < <(_audit_ports_diff)
+    alert_condition_sweep audit:ports: "$now"
     history_write_audit ports "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
@@ -1025,6 +1025,7 @@ _audit_accounts_baseline() {
         fi
     done < <(_audit_accounts_expand)
     : > "$dir/.encoded"
+    alert_condition_close audit:accounts:
     # Pruned last so paths dropped from AUDIT_ACCOUNTS_PATHS stop showing up.
     for f in "$dir"/*.baseline; do
         [[ -e "$f" && "$kept" != */"${f##*/}"/* ]] && rm -f "$f"
@@ -1112,11 +1113,9 @@ _audit_accounts_tick() {
                 [[ -n "$capped" ]] && body="${body}
 ${capped}"
                 key="audit:accounts:NEW:$prev_file"
-                if alert_should_fire "$key"; then
-                    b="\`\`\`new lines in $prev_file:
+                b="\`\`\`new lines in $prev_file:
 $body\`\`\`"
-                    alert_fire "Account drift: $prev_file" "$b" 15158332 "$key" &
-                fi
+                alert_condition_open "$key" "Account drift: $prev_file" "$b" 15158332 "$b"
             fi
             prev_file="$file"; body="$line"; lines_count=1; capped=""
         else
@@ -1133,12 +1132,11 @@ ${line}"
         [[ -n "$capped" ]] && body="${body}
 ${capped}"
         key="audit:accounts:NEW:$prev_file"
-        if alert_should_fire "$key"; then
-            b="\`\`\`new lines in $prev_file:
+        b="\`\`\`new lines in $prev_file:
 $body\`\`\`"
-            alert_fire "Account drift: $prev_file" "$b" 15158332 "$key" &
-        fi
+        alert_condition_open "$key" "Account drift: $prev_file" "$b" 15158332 "$b"
     fi
+    alert_condition_sweep audit:accounts: "$now"
     # Subject is the file only, so passwd and sudoers lines stay out of the DB.
     history_write_audit accounts "$(_audit_mtime "$dir/.encoded")" "$rows"
 
@@ -1334,11 +1332,10 @@ _audit_rootkit_tick() {
         [[ -z "$heur" ]] && continue
         rows+="hint"$'\t'"$heur"$'\n'
         key="audit:rootkit:$heur"
-        if alert_should_fire "$key"; then
-            body="\`\`\`$detail\`\`\`"
-            alert_fire "Rootkit hint: $heur" "$body" 15158332 "$key" &
-        fi
+        body="\`\`\`$detail\`\`\`"
+        alert_condition_open "$key" "Rootkit hint: $heur" "$body" 15158332
     done < <(_audit_rootkit_run_all)
+    alert_condition_sweep audit:rootkit: "$now"
     # No baseline to reset against, so a hint is stored once per retention window.
     history_write_audit rootkit 0 "$rows"
 
