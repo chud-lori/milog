@@ -240,6 +240,37 @@ If you put `/var/log/auth.log` or any actively-written file in
 `/var/lib/dpkg/` or package-manager state — these change on every
 `apt upgrade`. Keep the watchlist tight.
 
+## Accepting drift
+
+When a drift alert turns out to be a change you made, accept that one
+item instead of re-baselining the whole check:
+
+```bash
+milog audit accept                                   # what is drifting, and the command for each
+milog audit accept fim /home/ubuntu/.ssh/authorized_keys
+milog audit accept persistence /etc/systemd/system/backup.timer
+milog audit accept ports tcp:443
+```
+
+Only that item's baseline entry changes; everything else keeps drifting
+until you look at it. With `HISTORY_ENABLED=1` the accept is stored in
+`milog audit history` as kind `accepted`, with the user who ran it. Run it
+as the user the daemon runs as, since baselines live in that user's cache.
+
+## What an alert tells you
+
+- FIM: `+N -M lines` and the size change. For an `authorized_keys` file,
+  each added or removed key by fingerprint and comment (needs
+  `ssh-keygen`). File contents never reach the alert; shadow, sudoers and
+  key files report size only. The line and key summary needs the copy
+  milog keeps at baseline time under `audit/fim.snap/` (mode 600, text
+  files up to 256 KiB), so a baseline written by an older milog reports
+  size only until you re-baseline or accept.
+- Persistence: the new file's mtime, ctime and owner, so a unit that
+  appeared months ago reads differently from one that appeared minutes ago.
+- Ports: the listening process and its start time. `ss` shows other
+  users' processes only to root.
+
 ## Tuning
 
 ```bash

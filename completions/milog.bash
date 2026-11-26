@@ -17,6 +17,8 @@ _milog_complete() {
     local alert_subs="on off status test stats"
     local silence_subs="list clear"
     local web_subs="start stop status install-service uninstall-service rotate-token"
+    local audit_subs="fim persistence ports yara accounts rootkit history accept"
+    local audit_accept_checks="fim persistence ports accounts"
     local window_vals="today yesterday 1h 6h 12h 24h 7d 30d all"
     local digest_window_vals="day week 1h 6h 12h 24h 7d 30d"
 
@@ -53,6 +55,24 @@ _milog_complete() {
         web)
             case $cword in
                 2) COMPREPLY=($(compgen -W "$web_subs" -- "$cur")) ;;
+            esac
+            ;;
+        audit)
+            case $cword in
+                2) COMPREPLY=($(compgen -W "$audit_subs" -- "$cur")) ;;
+                3)
+                    case "${words[2]}" in
+                        fim|persistence|ports|accounts) COMPREPLY=($(compgen -W "baseline check status" -- "$cur")) ;;
+                        yara) COMPREPLY=($(compgen -W "init scan status" -- "$cur")) ;;
+                        rootkit) COMPREPLY=($(compgen -W "check status" -- "$cur")) ;;
+                        accept) COMPREPLY=($(compgen -W "$audit_accept_checks" -- "$cur")) ;;
+                    esac
+                    ;;
+                4)
+                    case "${words[2]}:${words[3]}" in
+                        accept:fim|accept:persistence|accept:accounts) COMPREPLY=($(compgen -f -- "$cur")) ;;
+                    esac
+                    ;;
             esac
             ;;
         alerts)
