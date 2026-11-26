@@ -38,10 +38,6 @@ _install_is_installed() {
     command -v "$check" >/dev/null 2>&1
 }
 
-_install_desc() {
-    _install_catalog | awk -F':' -v f="$1" '$1==f {print $6}'
-}
-
 mode_install() {
     local sub="${1:-list}"; shift 2>/dev/null || true
     case "$sub" in

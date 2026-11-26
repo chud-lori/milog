@@ -1,11 +1,6 @@
 # milog web: start/stop/status and the systemd user unit for the milog-web binary.
 _WEB_SYSTEMD_UNIT="${HOME}/.config/systemd/user/milog-web.service"
 
-_web_service_active() {
-    command -v systemctl >/dev/null 2>&1 || return 1
-    systemctl --user is-active --quiet milog-web.service 2>/dev/null
-}
-
 # Rewrites the unit from the current config, so re-running picks up a changed WEB_PORT.
 _web_service_install() {
     if ! command -v systemctl >/dev/null 2>&1; then

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.3-69-g759dd90
-# MILOG_BUILT=2026-11-26T10:09:26Z
+# MILOG_VERSION=v0.8.3-71-ga2eb685-dirty
+# MILOG_BUILT=2026-11-26T10:10:52Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -6991,10 +6991,6 @@ _install_is_installed() {
     command -v "$check" >/dev/null 2>&1
 }
 
-_install_desc() {
-    _install_catalog | awk -F':' -v f="$1" '$1==f {print $6}'
-}
-
 mode_install() {
     local sub="${1:-list}"; shift 2>/dev/null || true
     case "$sub" in
@@ -9485,11 +9481,6 @@ mode_version() {
 }
 # milog web: start/stop/status and the systemd user unit for the milog-web binary.
 _WEB_SYSTEMD_UNIT="${HOME}/.config/systemd/user/milog-web.service"
-
-_web_service_active() {
-    command -v systemctl >/dev/null 2>&1 || return 1
-    systemctl --user is-active --quiet milog-web.service 2>/dev/null
-}
 
 # Rewrites the unit from the current config, so re-running picks up a changed WEB_PORT.
 _web_service_install() {
