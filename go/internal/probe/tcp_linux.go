@@ -134,7 +134,7 @@ func RunNet(ctx context.Context, out chan<- NetEvent) error {
 }
 
 // lookupExeCgroup returns ("", "") for whatever is gone, which
-// isMilogDelivery treats as not milog's.
+// isMilogDelivery and isMilogSelfRead treat as not milog's.
 func lookupExeCgroup(pid uint32) (exe, cgroup string) {
 	dir := "/proc/" + strconv.FormatUint(uint64(pid), 10)
 	exe, _ = os.Readlink(dir + "/exe")
