@@ -65,7 +65,7 @@ mkdir -p "$tmp/bin"
 for d in /usr/local/bin /usr/bin /bin; do
     for f in "$d"/*; do
         name=${f##*/}
-        [[ "$name" == sqlite3 || -e "$tmp/bin/$name" ]] && continue
+        [[ "$name" == sqlite3 || -e "$tmp/bin/$name" || -L "$tmp/bin/$name" ]] && continue
         ln -s "$f" "$tmp/bin/$name"
     done
 done
