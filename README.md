@@ -22,8 +22,10 @@ host that serves nothing.
 Also included: TUI dashboard, read-only web UI with SSE live-tail, heuristic
 scanner and exploit detection, multi-destination alerts (Discord / Slack /
 Telegram / Matrix), headless daemon, and historical metrics with σ-based
-anomaly detection. Everything fires through one alert pipeline with per-rule
-cooldown and cross-rule dedup.
+anomaly detection. Everything fires through one alert pipeline: events get a
+per-rule cooldown and cross-rule dedup, audit drift alerts once when it opens
+and once when it clears, and alerts held during a webhook rate limit are sent
+as one summary.
 
 The shipping artifact is still a single file (`milog.sh` → `/usr/local/bin/milog`),
 but it's **built from modular source under [`src/`](src/README.md)** by

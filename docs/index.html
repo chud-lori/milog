@@ -428,7 +428,8 @@
     <p class="title">Six things it watches, one alert pipeline</p>
     <p class="intro">
       Everything below fires through one alert pipeline, with the same
-      per-rule cooldown, silences, routing and hooks. Request-log rules also
+      silences, routing and hooks. Events share a per-rule cooldown; audit
+      drift alerts once when it opens and once when it clears. Request-log rules also
       share a dedup keyed on (ip, path), so a line that matches two rules alerts
       once. Turning on a new surface does not mean a new place to configure
       alerts.
