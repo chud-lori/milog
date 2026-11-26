@@ -215,6 +215,24 @@ milog's units, such as a shell spawned from the daemon. A manual
 `milog alert test` from a login shell is not in either unit and still
 alerts once.
 
+### milog's own audit reads
+
+`milog audit` hashes and parses the files it watches (`sha256sum`,
+`awk`, `stat`, `find` over `/etc/sudoers`, `/etc/ssh/sshd_config` and
+the rest), so every hourly pass used to fire `file:sensitive_read`. The
+probe skips a read only when both hold:
+
+- the process is in `milog.service` or `milog-probe.service`
+- its executable sits directly in `/usr/bin` or `/bin`
+
+The same read from any other unit, a login shell, or a binary under
+`/tmp` still alerts. A reader that exits before the probe looks it up
+has no cgroup to check and alerts too, so a busy host can still show
+the odd one.
+
+The syscall-rate rule skips the probe by its process id, not its name,
+so another process named `milog-probe` is still measured.
+
 ## Foreground / dry-run modes
 
 Useful before flipping alerts on, or for ad-hoc debugging:
