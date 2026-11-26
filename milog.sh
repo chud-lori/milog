@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.2-9-g91b7fcb
-# MILOG_BUILT=2026-11-03T09:15:39Z
+# MILOG_VERSION=v0.8.3-6-ge90fd21
+# MILOG_BUILT=2026-11-26T09:02:56Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -143,19 +143,25 @@ WEB_TOKEN_FILE="$HOME/.config/milog/web.token"
 
 MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 
-# True when root owns the path and its directory and neither is group/other-writable.
+# True when root owns the path's directory and its resolved target (and that target's directory), none group/other-writable.
 _root_trusted_path() {
-    local p meta
-    for p in "$1" "$(dirname "$1")"; do
+    local p meta real
+    real=$(readlink -f -- "$1" 2>/dev/null) && [[ -n "$real" ]] || return 1
+    for p in "$(dirname "$1")" "$real" "$(dirname "$real")"; do
         meta=$(stat -c '%u %a' "$p" 2>/dev/null || stat -f '%u %Lp' "$p" 2>/dev/null) || return 1
         [[ "${meta%% *}" == 0 ]] && (( (8#${meta#* } & 8#022) == 0 )) || return 1
     done
 }
 
 if [[ -f "$MILOG_CONFIG" ]]; then
-    if [[ $EUID -ne 0 ]] || _root_trusted_path "$MILOG_CONFIG"; then
+    _milog_config_real=$(readlink -f -- "$MILOG_CONFIG" 2>/dev/null)
+    if [[ $EUID -ne 0 ]]; then
         # shellcheck disable=SC1090
         . "$MILOG_CONFIG"
+    elif [[ -n "$_milog_config_real" ]] && _root_trusted_path "$_milog_config_real"; then
+        # Root sources the resolved file so a symlink in the chain can't be swapped after the check.
+        # shellcheck disable=SC1090
+        . "$_milog_config_real"
     else
         echo "milog: running as root, refusing to source $MILOG_CONFIG (not root-owned or group/other-writable)" >&2
     fi
