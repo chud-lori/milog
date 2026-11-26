@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.3-4-g6bb3f28
-# MILOG_BUILT=2026-11-26T08:45:19Z
+# MILOG_VERSION=v0.8.3-12-g3fa48ab
+# MILOG_BUILT=2026-11-26T09:01:43Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -6919,7 +6919,7 @@ mode_patterns_list() {
 _PROBE_SYSTEMD_UNIT="/etc/systemd/system/milog-probe.service"
 
 # File-probe comm allowlist written into the unit; override with MILOG_PROBE_FILE_ALLOWLIST at install time.
-_PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sshd-socket-gen,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,milog,milog-probe,ps,runc,runc:[2:INIT],watchtower,whoami"
+_PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sshd-socket-gen,sudo,su,login,getty,agetty,cron,crond,anacron,systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-udevd,auditd,audisp-syslog,adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,pam_unix,nscd,nslcd,sssd,ps,runc,runc:[2:INIT],watchtower,whoami"
 
 # Net-probe destination allowlist (CIDR / :port / cidr:port) written into the unit; override with MILOG_PROBE_NET_ALLOWLIST at install time.
 # The env value replaces this default wholesale (it mirrors the probe binary's built-in), so re-list these entries when overriding.
