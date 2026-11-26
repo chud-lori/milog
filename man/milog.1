@@ -335,6 +335,37 @@ stored in the history database over the last
 .B HISTORY_ENABLED=1
 and
 .BR sqlite3 (1).
+.TP
+.B audit accept " [\fIcheck\fR [\fIitem\fR]]"
+Accepts one drifted item into its baseline and leaves the rest of the
+baseline as it was.
+.I check
+is
+.BR fim ,
+.BR persistence ,
+or
+.B accounts
+with a path as
+.IR item ,
+or
+.B ports
+with
+.IR proto : port
+(for example
+.BR tcp:443 ),
+which sets every bind address on that port to what listens now. Without
+an item it lists what is drifting in that check, or in every check when
+.I check
+is also omitted, each with the command that accepts it. With
+.B HISTORY_ENABLED=1
+the accepting user and time are stored in the history database as kind
+.BR accepted .
+.B report
+leaves those rows out of its drift table.
+Run it as the same user as
+.BR "milog daemon" ,
+since baselines live under that user's
+.BR ALERT_STATE_DIR .
 .PP
 When
 .B AUDIT_ENABLED=1
@@ -345,7 +376,19 @@ is running, each scanner runs on its
 timer and fires an
 .B audit:<scanner>:...
 alert on drift. The fim, persistence, ports, and accounts scanners
-record a baseline on their first run instead of alerting. With
+record a baseline on their first run instead of alerting. A fim alert
+counts added and removed lines, and for an
+.I authorized_keys
+file names added and removed keys by fingerprint and comment, up to 5
+each way. It never includes file contents. The comparison uses a copy
+taken at baseline time, and only world-readable files and
+.I authorized_keys*
+are copied; any other file, such as shadow or sudoers, reports only its
+size. A persistence alert carries the file's mtime, ctime, and owner, and
+a ports alert the process on that exact address and port and its start
+time, or says the owner is unknown when
+.B ss -p
+cannot see it. With
 .B HISTORY_ENABLED=1
 each finding is also stored in the history database (a finding that
 persists across checks is stored once), for

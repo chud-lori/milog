@@ -73,6 +73,8 @@ _milog() {
     alert_subs=(on off status test stats)
     silence_subs=(list clear)
     web_subs=(start stop status install-service uninstall-service rotate-token)
+    audit_subs=(fim persistence ports yara accounts rootkit history accept)
+    audit_accept_checks=(fim persistence ports accounts)
     window_vals=(today yesterday 1h 6h 12h 24h 7d 30d all)
     digest_window_vals=(day week 1h 6h 12h 24h 7d 30d)
 
@@ -93,6 +95,19 @@ _milog() {
         alert)    (( CURRENT == 3 )) && _describe 'alert subcommand' alert_subs ;;
         silence)  (( CURRENT == 3 )) && _describe 'silence subcommand' silence_subs ;;
         web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
+        audit)
+            if   (( CURRENT == 3 )); then _describe 'audit subcommand' audit_subs
+            elif (( CURRENT == 4 )); then
+                case "${words[3]}" in
+                    fim|persistence|ports|accounts) compadd -- baseline check status ;;
+                    yara) compadd -- init scan status ;;
+                    rootkit) compadd -- check status ;;
+                    accept) _describe 'check' audit_accept_checks ;;
+                esac
+            elif (( CURRENT == 5 )) && [[ "${words[3]}" == accept && "${words[4]}" != ports ]]; then
+                _files
+            fi
+            ;;
         alerts)   (( CURRENT == 3 )) && _describe 'window' window_vals ;;
         digest|report) (( CURRENT == 3 )) && _describe 'window' digest_window_vals ;;
         update|update-rules) (( CURRENT == 3 )) && compadd -- --check ;;

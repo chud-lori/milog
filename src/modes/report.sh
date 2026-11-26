@@ -149,7 +149,7 @@ _report_alerts() {
 }
 
 _report_audit() {
-    local cutoff="$1" rows total n=0 ts scanner kind subject
+    local cutoff="$1" rows total n=0 ts scanner kind subject accepted
     printf 'H\tAudit drift\n'
     if [[ "$HISTORY_ENABLED" != "1" ]]; then
         printf 'E\tHistory is off (HISTORY_ENABLED=0), so audit drift is not recorded.\n'
@@ -170,6 +170,11 @@ _report_audit() {
             printf 'E\tCould not read %s: %s\n' "$HISTORY_DB" "$(printf '%s' "$rows" | tr '\t\n' '  ')"
         fi
         return 0
+    fi
+    accepted=$(printf '%s\n' "$rows" | awk -F'\t' '$3 == "accepted"' | grep -c . || true)
+    rows=$(printf '%s\n' "$rows" | awk -F'\t' 'NF && $3 != "accepted"')
+    if (( accepted > 0 )); then
+        printf 'P\tAccepted into the baseline in this window, not shown: %s (see milog audit history).\n' "$accepted"
     fi
     if [[ -z "$rows" ]]; then
         printf 'E\tNo audit drift recorded in this window.\n'

@@ -79,6 +79,23 @@ for s in $web_subs
     complete -c milog -n "__milog_seen_cmd web" -a "$s"
 end
 
+function __milog_audit_at
+    set -l tokens (commandline -opc)
+    test (count $tokens) -eq (math (count $argv) + 2); and test $tokens[2] = audit; or return 1
+    for i in (seq (count $argv))
+        test $tokens[(math $i + 2)] = $argv[$i]; or return 1
+    end
+end
+
+complete -c milog -n "__milog_audit_at" -f -a "fim persistence ports yara accounts rootkit history accept"
+for s in fim persistence ports accounts
+    complete -c milog -n "__milog_audit_at $s" -f -a "baseline check status"
+end
+complete -c milog -n "__milog_audit_at yara" -f -a "init scan status"
+complete -c milog -n "__milog_audit_at rootkit" -f -a "check status"
+complete -c milog -n "__milog_audit_at accept" -f -a "fim persistence ports accounts"
+complete -c milog -n "__milog_audit_at accept fim; or __milog_audit_at accept persistence; or __milog_audit_at accept accounts" -F
+
 set -l window_vals today yesterday 1h 6h 12h 24h 7d 30d all
 for v in $window_vals
     complete -c milog -n "__milog_seen_cmd alerts" -a "$v"
