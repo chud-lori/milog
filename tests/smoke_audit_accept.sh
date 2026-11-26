@@ -41,9 +41,11 @@ ticks() {
     MILOG_AUDIT_ENABLED=1 MILOG_AUDIT_FIM_INTERVAL=0 MILOG_AUDIT_PERSISTENCE_INTERVAL=0 MILOG_AUDIT_PORTS_INTERVAL=0 \
     bash -c '
         . "$1" help >/dev/null
-        out="$2" listeners="$3"
+        alerts_file="$2" listeners="$3"
         alert_should_fire() { return 0; }
-        alert_fire() { printf "%s\t%s\0" "$1" "$2" >> "$out"; }
+        alert_fire() { printf "%s\t%s\0" "$1" "$2" >> "$alerts_file"; }
+        alert_condition_open() { alert_fire "$2" "$3"; }
+        alert_condition_sweep() { :; }
         _audit_ports_capture() { cat "$listeners"; }
         _audit_listener_owner() { printf "process demo pid 1"; }
         _dlog() { :; }
