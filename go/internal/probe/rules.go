@@ -522,6 +522,8 @@ type FileEvent struct {
 	ProcComm   string // process name; Comm is the thread's
 	ParentComm string
 	Filename   string
+	Exe        string // /proc/<pid>/exe target
+	Cgroup     string // systemd cgroup path, see cgroupPath
 }
 
 // MatchFile runs every file rule against e.
@@ -578,8 +580,6 @@ var defaultSensitiveCommAllowlist = []string{
 	"nscd",
 	"nslcd",
 	"sssd",
-	"milog",
-	"milog-probe",
 }
 
 // defaultSensitivePaths match exactly, or by prefix when they end in `/`.
@@ -684,6 +684,9 @@ func matchSensitiveRead(e FileEvent) (Hit, bool) {
 	if !rules.isSensitive(e.Filename) {
 		return Hit{}, false
 	}
+	if isMilogSelfRead(e) {
+		return Hit{}, false
+	}
 	// Every NSS lookup reads the world-readable /etc/passwd, so only writes alert.
 	if e.Filename == "/etc/passwd" && e.Flags&openWriteFlags == 0 {
 		return Hit{}, false
@@ -701,6 +704,28 @@ func matchSensitiveRead(e FileEvent) (Hit, bool) {
 			" flags=0x" + uhex(e.Flags) + "```",
 		Color: color,
 	}, true
+}
+
+// milogAuditExes are the binaries milog's own audit pass runs to hash and parse watched files.
+var milogAuditExes = map[string]struct{}{
+	"sha256sum": {}, "stat": {}, "find": {}, "awk": {}, "gawk": {}, "mawk": {}, "bash": {},
+}
+
+// isMilogSelfRead reports a non-root, read-only open by an audit binary inside one of milog's units.
+func isMilogSelfRead(e FileEvent) bool {
+	if e.UID == 0 || e.Flags&openWriteFlags != 0 {
+		return false
+	}
+	if _, ok := milogUnitCgroups[e.Cgroup]; !ok {
+		return false
+	}
+	for _, dir := range []string{"/usr/bin/", "/bin/", "/usr/lib/cargo/bin/coreutils/"} {
+		if name, ok := strings.CutPrefix(e.Exe, dir); ok {
+			_, audit := milogAuditExes[name]
+			return audit
+		}
+	}
+	return false
 }
 
 // procField names the process when a thread renamed itself, so the alert
@@ -1098,8 +1123,8 @@ func syscallBurnIn() uint64 {
 // matchSyscallBurst needs count > mean+3σ, the floor and the burn-in.
 // A reused PID can inherit an old baseline; the loader's age-out limits that.
 func matchSyscallBurst(e RateAnomalyEvent) (Hit, bool) {
-	// The probe is the busiest syscall source on the box, so skip itself.
-	if e.Comm == "milog-probe" {
+	// The probe is the busiest syscall source on the box; match its PID, since comm is settable.
+	if e.PID == uint32(os.Getpid()) {
 		return Hit{}, false
 	}
 	if e.Count < syscallFloor() {

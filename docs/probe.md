@@ -167,7 +167,6 @@ systemd,systemd-logind,systemd-userdb,systemd-tmpfile,systemd-resolve,systemd-ud
 auditd,audisp-syslog,
 adduser,useradd,usermod,userdel,chpasswd,passwd,chage,visudo,
 pam_unix,nscd,nslcd,sssd,
-milog,milog-probe,
 ps,runc,runc:[2:INIT],watchtower,whoami
 ```
 
@@ -226,6 +225,33 @@ Without this, every alert's delivery fired a new
 milog's units, such as a shell spawned from the daemon. A manual
 `milog alert test` from a login shell is not in either unit and still
 alerts once.
+
+### milog's own audit reads
+
+`milog audit` hashes and parses the files it watches (`sha256sum`,
+`awk`, `stat`, `find` over `/etc/sudoers`, `/etc/ssh/sshd_config` and
+the rest), so every hourly pass used to fire `file:sensitive_read`. The
+probe skips an open only when all of these hold:
+
+- the process is in `milog.service` or `milog-probe.service`
+- its executable is `sha256sum`, `stat`, `find`, `awk`, `gawk`, `mawk` or
+  `bash`, directly in `/usr/bin`, `/bin` or, on Ubuntu 26.04 and later,
+  `/usr/lib/cargo/bin/coreutils`
+- it runs as a non-root user
+- the open is read-only
+
+A write, a read through `sudo`, any other binary inside milog's units, and
+the same read from any other unit, a login shell, or a binary under `/tmp`
+all still alert. A reader that exits before the probe looks it up has no
+cgroup to check and alerts too, so a busy host can still show the odd one.
+
+`milog` and `milog-probe` are no longer in the default allowlist: a process
+name is easy to fake, and the checks above cover milog's own reads. A unit
+installed by an older version still lists them, so rerun
+`sudo milog probe install-service` after upgrading.
+
+The syscall-rate rule skips the probe by its process id, not its name,
+so another process named `milog-probe` is still measured.
 
 ## Foreground / dry-run modes
 
