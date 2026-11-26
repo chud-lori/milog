@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.3-17-g94bd95c-dirty
-# MILOG_BUILT=2026-11-26T09:06:36Z
+# MILOG_VERSION=v0.8.3-20-g1514373
+# MILOG_BUILT=2026-11-26T09:06:38Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
