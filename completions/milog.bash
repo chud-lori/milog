@@ -65,7 +65,7 @@ _milog_complete() {
                 2) COMPREPLY=($(compgen -W "$digest_window_vals" -- "$cur")) ;;
             esac
             ;;
-        update)
+        update|update-rules)
             case $cword in
                 2) COMPREPLY=($(compgen -W "--check" -- "$cur")) ;;
             esac

@@ -158,6 +158,9 @@ v2=$(sed '1s/.*/# version: 2/' "$ROOT/rules/milog-rules.tsv")
 publish "$v2"
 mode_update_rules > /dev/null || fail "update-rules failed on a good release"
 [[ "$(cat "$RULES_FILE")" == "$v2" ]] || fail "update-rules did not write the release file"
+rm "$RULES_FILE.checked"
+mode_update_rules > /dev/null || fail "update-rules failed when already current"
+[[ "$(cut -f2 "$RULES_FILE.checked")" == "$release_tag" ]] || fail "an up-to-date check did not stamp $RULES_FILE.checked"
 
 publish "$(sed '1s/.*/# version: 3/' "$ROOT/rules/milog-rules.tsv")"
 printf 'x' >> "$rel/milog-rules.tsv"
