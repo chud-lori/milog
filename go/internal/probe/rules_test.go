@@ -1192,10 +1192,77 @@ func TestMatchFile_DpkgPreconfigureSilent(t *testing.T) {
 
 func TestMatchRateAnomaly_ProbeExcludesItself(t *testing.T) {
 	ev := RateAnomalyEvent{
-		Comm: "milog-probe", Count: 1000000, Mean: 100, Stddev: 10,
+		PID: uint32(os.Getpid()), Comm: "milog-probe", Count: 1000000, Mean: 100, Stddev: 10,
 		Window: time.Minute, Samples: 1000,
 	}
 	if hits := MatchRateAnomaly(ev); len(hits) != 0 {
 		t.Errorf("milog-probe should not alert on itself, got %+v", hits)
+	}
+}
+
+func TestMatchRateAnomaly_SpoofedProbeCommFires(t *testing.T) {
+	ev := RateAnomalyEvent{
+		PID: uint32(os.Getpid()) + 1, Comm: "milog-probe", Count: 1000000, Mean: 100, Stddev: 10,
+		Window: time.Minute, Samples: 1000,
+	}
+	if hits := MatchRateAnomaly(ev); len(hits) != 1 {
+		t.Errorf("another process named milog-probe should alert, got %d hits", len(hits))
+	}
+}
+
+func TestMatchFile_MilogSelfReadSilent(t *testing.T) {
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	cases := []FileEvent{
+		{Comm: "sha256sum", Exe: "/usr/bin/sha256sum", Cgroup: "/system.slice/milog.service", Filename: "/etc/ssh/sshd_config"},
+		{Comm: "awk", Exe: "/usr/bin/gawk", Cgroup: "/system.slice/milog.service", Filename: "/etc/sudoers"},
+		{Comm: "bash", Exe: "/bin/bash", Cgroup: "/system.slice/milog.service", Filename: "/etc/sudoers.d/"},
+		{Comm: "stat", Exe: "/usr/bin/stat", Cgroup: "/system.slice/milog-probe.service", Filename: "/etc/shadow"},
+		{Comm: "find", Exe: "/usr/bin/find", Cgroup: "/system.slice/milog.service", Filename: "/root/.ssh/authorized_keys"},
+	}
+	for _, ev := range cases {
+		if hits := MatchFile(ev); len(hits) != 0 {
+			t.Errorf("milog's own audit read should be silent: %+v → %+v", ev, hits)
+		}
+	}
+}
+
+func TestMatchFile_MilogSelfReadLookalikesFire(t *testing.T) {
+	t.Setenv("MILOG_PROBE_FILE_SENSITIVE", "")
+	t.Setenv("MILOG_PROBE_FILE_ALLOWLIST", "")
+	resetFileRulesCache()
+
+	cases := []struct {
+		name string
+		ev   FileEvent
+	}{
+		{"same comm and exe from another unit", FileEvent{
+			Comm: "awk", Exe: "/usr/bin/gawk", Cgroup: "/system.slice/nginx.service", Filename: "/etc/sudoers",
+		}},
+		{"user-manager unit named milog.service", FileEvent{
+			Comm: "awk", Exe: "/usr/bin/gawk",
+			Cgroup: "/user.slice/user-1000.slice/user@1000.service/app.slice/milog.service", Filename: "/etc/sudoers",
+		}},
+		{"sub-cgroup of milog.service", FileEvent{
+			Comm: "awk", Exe: "/usr/bin/gawk", Cgroup: "/system.slice/milog.service/x", Filename: "/etc/sudoers",
+		}},
+		{"spoofed comm with exe under /tmp", FileEvent{
+			Comm: "sha256sum", Exe: "/tmp/sha256sum", Cgroup: "/system.slice/milog.service", Filename: "/etc/shadow",
+		}},
+		{"exe in a /usr/bin subdirectory", FileEvent{
+			Comm: "awk", Exe: "/usr/bin/x/awk", Cgroup: "/system.slice/milog.service", Filename: "/etc/shadow",
+		}},
+		{"process gone before /proc lookup", FileEvent{
+			Comm: "sha256sum", Filename: "/etc/ssh/sshd_config",
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if hits := MatchFile(c.ev); len(hits) != 1 {
+				t.Errorf("expected 1 hit, got %d: %+v", len(hits), hits)
+			}
+		})
 	}
 }
