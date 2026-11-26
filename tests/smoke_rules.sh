@@ -160,7 +160,7 @@ mode_update_rules > /dev/null || fail "update-rules failed on a good release"
 [[ "$(cat "$RULES_FILE")" == "$v2" ]] || fail "update-rules did not write the release file"
 rm "$RULES_FILE.checked"
 mode_update_rules > /dev/null || fail "update-rules failed when already current"
-[[ "$(cut -f2 "$RULES_FILE.checked")" == "$release_tag" ]] || fail "an up-to-date check did not stamp $RULES_FILE.checked"
+[[ "$(cut -f2- "$RULES_FILE.checked")" == "$release_tag"$'\t'2 ]] || fail "an up-to-date check did not stamp $RULES_FILE.checked"
 
 publish "$(sed '1s/.*/# version: 3/' "$ROOT/rules/milog-rules.tsv")"
 printf 'x' >> "$rel/milog-rules.tsv"
@@ -170,6 +170,7 @@ if out=$(mode_update_rules 2>&1); then fail "tampered rules accepted"; fi
 publish "$(cat "$ROOT/rules/milog-rules.tsv")"
 if out=$(mode_update_rules 2>&1); then fail "downgrade accepted"; fi
 [[ "$out" == *"not downgrading"* ]] || fail "unexpected downgrade error: $out"
+[[ "$(cut -f3 "$RULES_FILE.checked")" == 2 ]] || fail "a refused downgrade did not stamp the active version"
 
 publish "$(printf '# version: 4\nexploit\tx\t(\nprobe\tx\tb')"
 if out=$(mode_update_rules 2>&1); then fail "rules with a broken regex accepted"; fi

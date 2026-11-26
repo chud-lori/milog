@@ -35,7 +35,8 @@ touch -d '90 days ago' "$rules"
 if out=$("$ROOT/milog.sh" update-rules --check); then fail "90-day-old rules file passed: $out"; fi
 [[ "$out" == *"($rules), written 90d ago"* && "$out" == *"run: milog update-rules"* ]] || fail "unexpected stale-file report: $out"
 
-printf '%s\tv9.9.9\n' "$(( $(date +%s) - 61 * 86400 ))" > "$rules.checked"
+ver=$(sed -n '1s/^# version: //p' "$rules")
+printf '%s\tv9.9.9\t%s\n' "$(( $(date +%s) - 61 * 86400 ))" "$ver" > "$rules.checked"
 if out=$("$ROOT/milog.sh" update-rules --check); then fail "61-day-old stamp passed: $out"; fi
 [[ "$out" == *"last checked against a release 61d ago"* ]] || fail "stamp not preferred over mtime: $out"
 out=$(doctor)
@@ -46,9 +47,18 @@ printf 'RULES_MAX_AGE_DAYS=0\n' > "$MILOG_CONFIG"
 "$ROOT/milog.sh" update-rules --check >/dev/null || fail "RULES_MAX_AGE_DAYS=0 still warned"
 : > "$MILOG_CONFIG"
 
-printf '%s\tv9.9.9\n' "$(date +%s)" > "$rules.checked"
+printf '%s\tv9.9.9\t%s\n' "$(date +%s)" "$ver" > "$rules.checked"
 out=$("$ROOT/milog.sh" update-rules --check) || fail "fresh stamp reported stale: $out"
-[[ "$out" == *"0d ago"* ]] || fail "unexpected fresh report: $out"
+[[ "$out" == *"last checked against a release 0d ago"* ]] || fail "unexpected fresh report: $out"
+
+# A stamp for another version must not vouch for the rules now active.
+sed -i '1s/.*/# version: 999/' "$rules"
+out=$("$ROOT/milog.sh" update-rules --check) || true
+[[ "$out" == *"version 999"*"written"* ]] || fail "stamp for version $ver credited to version 999: $out"
+rm "$rules"
+printf '%s\tv9.9.9\t999\n' "$(date +%s)" > "$rules.checked"
+out=$("$ROOT/milog.sh" update-rules --check) || true
+[[ "$out" == *"(built-in), shipped with this milog"* ]] || fail "stamp credited to the built-in fallback: $out"
 if "$ROOT/milog.sh" update-rules --bogus >/dev/null 2>&1; then fail "unknown update-rules flag accepted"; fi
 
 # install-service must not write a unit when the probe cannot load anything.
