@@ -57,8 +57,8 @@ config_show() {
         "$([[ -f "$MMDB_PATH" ]] && echo "$MMDB_PATH" || echo "MISSING:$MMDB_PATH")"
     printf "  %-22s enabled=%s db=%s retain=%sd\n" "history" \
         "$HISTORY_ENABLED" "$HISTORY_DB" "$HISTORY_RETAIN_DAYS"
-    printf "  %-22s enabled=%s cooldown=%ss dedup=%ss\n" "alerts" \
-        "$ALERTS_ENABLED" "$ALERT_COOLDOWN" "${ALERT_DEDUP_WINDOW:-300}"
+    printf "  %-22s enabled=%s cooldown=%ss dedup=%ss reminder=%ss\n" "alerts" \
+        "$ALERTS_ENABLED" "$ALERT_COOLDOWN" "${ALERT_DEDUP_WINDOW:-300}" "${ALERT_REMINDER_INTERVAL:-86400}"
     # Process env view; `milog alert status` reads a target user's config under sudo.
     _alert_destinations_status \
         "${DISCORD_WEBHOOK:-}" \
@@ -123,6 +123,7 @@ config_init() {
 # DISCORD_WEBHOOK="https://discord.com/api/webhooks/ID/TOKEN"
 # ALERTS_ENABLED=0
 # ALERT_COOLDOWN=300
+# ALERT_REMINDER_INTERVAL=86400
 # ALERT_STATE_DIR="$HOME/.cache/milog"
 EOF
     echo -e "${G}Created${NC} $MILOG_CONFIG"
@@ -263,9 +264,9 @@ config_validate() {
         TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
         MATRIX_HOMESERVER MATRIX_TOKEN MATRIX_ROOM
         WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE
-        ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_STATE_DIR
+        ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_REMINDER_INTERVAL ALERT_STATE_DIR
         ALERT_LOG_MAX_BYTES ALERT_ROUTES
-        HOOKS_DIR ALERT_HOOK_TIMEOUT RULES_FILE
+        HOOKS_DIR ALERT_HOOK_TIMEOUT RULES_FILE RULES_MAX_AGE_DAYS
         P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
         GEOIP_ENABLED MMDB_PATH CROWDSEC_CTI_KEY
         HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS HISTORY_TOP_IP_N
@@ -327,6 +328,12 @@ config_validate() {
     _check_int REFRESH 1 60
     _check_int ALERT_COOLDOWN 1 3600
     _check_int ALERT_DEDUP_WINDOW 0 3600
+    _check_int ALERT_REMINDER_INTERVAL 0
+    # Cooldown-gated checks run every REFRESH, so a shorter cooldown re-alerts on every tick.
+    if [[ "${ALERT_COOLDOWN:-}" =~ ^[0-9]+$ && "${REFRESH:-}" =~ ^[0-9]+$ ]] && (( ALERT_COOLDOWN < REFRESH )); then
+        echo -e "  ${Y}warn${NC}  ALERT_COOLDOWN (${ALERT_COOLDOWN}s) < REFRESH (${REFRESH}s): a sustained CPU, memory, disk or 4xx/5xx condition alerts on every tick"
+        warnings=$((warnings+1))
+    fi
     _check_int WEB_PORT 1 65535
     _check_int THRESH_CPU_WARN  0 100
     _check_int THRESH_CPU_CRIT  0 100

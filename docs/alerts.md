@@ -164,7 +164,7 @@ the three Matrix vars — the alert would silently no-op otherwise.
 | Audit drift       | `audit:fim_drift:<path>`             | watched-file SHA256 changed                                                  |
 | Audit accounts    | `audit:accounts:<path>:<event>`      | passwd / sudoers / authorized_keys line-level diff                           |
 | Audit persistence | `audit:persistence:<path>`           | new entry under cron / systemd / rc.local re-entry surface                   |
-| Audit ports       | `audit:ports:<proto>:<port>`         | new TCP/UDP listener appeared                                                |
+| Audit ports       | `audit:ports:NEW:<proto>:<bind>:<port>` | new TCP/UDP listener appeared                                                |
 | Audit YARA        | `audit:yara:<rule>:<path>`           | YARA rule hit on a webroot file                                              |
 | Audit rootkit     | `audit:rootkit:<heuristic>`          | hidden-process / `ld.so.preload` / tmp-exec heuristic                        |
 | Probe — process   | `process:shell_from_web_worker:…` `process:exec_from_tmp:<comm>` `process:suid_escalation:…` `process:web_triggered_exec:…` | eBPF sidecar — see [`docs/probe.md`](probe.md)        |
@@ -212,6 +212,16 @@ the check catches a corrupted or truncated download. It is not a
 signature: anyone who can modify the release can also modify the
 checksum.
 
+Each run that reaches a release, whether it installs or finds the rules
+current or newer, writes the time and the active rules version to
+`RULES_FILE.checked`. `milog update-rules --check` and `milog doctor`
+read it and warn when that is more than `RULES_MAX_AGE_DAYS` (default
+60) days ago. The stamp counts only while that version is still the
+active one, so a broken or deleted `RULES_FILE` is not reported as
+freshly checked. Without a matching stamp the age
+comes from `RULES_FILE`'s mtime, or for the built-in rules from when
+milog itself was installed. milog never updates the rules on its own.
+
 You can also write `RULES_FILE` by hand. milog loads it when it passes
 the same checks; when it doesn't, milog prints a warning and uses the
 built-in rules.
@@ -231,6 +241,13 @@ Every alert passes through two gates before delivery:
 
 Both gates share no state; a burst across different rule keys and
 different `(ip, path)` fingerprints fires each alert as expected.
+
+Audit scanners other than YARA skip both gates. They re-detect the same drift every
+`AUDIT_*_INTERVAL`, so each finding is a condition in
+`alerts.conditions`: one alert when it opens or changes, a reminder per
+`ALERT_REMINDER_INTERVAL` (default 24h, `0` off), and a green
+`Resolved:` alert when it clears. YARA only reports matches it has not
+seen, so it stays on the cooldown. See [audit.md](audit.md).
 
 ## Routing — different rules to different destinations
 

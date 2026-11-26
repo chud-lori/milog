@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/user"
@@ -137,4 +139,24 @@ func TestFireAlert_runsAsAlertUser(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("alert child never ran")
+}
+
+func TestRunCheck(t *testing.T) {
+	alive := func(ctx context.Context) error { <-ctx.Done(); return nil }
+	dead := func(context.Context) error { return errors.New("map create: not supported") }
+
+	var out bytes.Buffer
+	if rc := runCheck(&out, []probeCheck{{"exec", alive}, {"tcp", dead}}, 10*time.Millisecond); rc != 0 {
+		t.Fatalf("one probe loaded, rc = %d, want 0", rc)
+	}
+	for _, want := range []string{"ok   exec\n", "FAIL tcp: map create: not supported\n", "1 of 2 probes loaded\n"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output missing %q:\n%s", want, out.String())
+		}
+	}
+
+	out.Reset()
+	if rc := runCheck(&out, []probeCheck{{"exec", dead}, {"tcp", dead}}, 10*time.Millisecond); rc != 1 {
+		t.Fatalf("no probe loaded, rc = %d, want 1", rc)
+	}
 }

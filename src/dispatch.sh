@@ -222,6 +222,7 @@ _cmd_help() {
             echo -e "  Checks the SHA-256 against the release's checksums.txt, then that every regex compiles."
             echo -e "  Refuses an older version than the active one; writes ${C}RULES_FILE${NC} atomically."
             echo -e "  ${D}checksums.txt is not a signature: it comes from the same release as the rules.${NC}"
+            echo -e "  ${C}--check${NC}  print the active rules' version and age, offline; exits 1 past ${C}RULES_MAX_AGE_DAYS${NC}"
             ;;
         audit)
             echo -e "${W}milog audit <sub>${NC} — point-in-time host integrity scans"
@@ -297,7 +298,7 @@ case "${1:-}" in
     completions) shift; mode_completions "$@" ;;
     bench)    shift; mode_bench "$@" ;;
     install)  shift; mode_install "$@" ;;
-    update-rules) mode_update_rules ;;
+    update-rules) shift; mode_update_rules "$@" ;;
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
     bottleneck) mode_bottleneck "${@:2}" ;;

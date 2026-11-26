@@ -35,7 +35,7 @@ done
 bash -c '
     alerts="$2"
     . "$1" help >/dev/null
-    alert_should_fire() { return 0; }
+    ALERTS_ENABLED=1
     alert_fire() { printf "%s\n" "$1" >> "$alerts"; }
     for _ in 1 2 3; do
         _audit_persistence_tick

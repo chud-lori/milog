@@ -70,6 +70,8 @@ jobs:
           bash tests/smoke_audit_accept.sh
           bash tests/smoke_alert_payloads.sh
           bash tests/smoke_alert_retry.sh
+          bash tests/smoke_alert_conditions.sh
+          bash tests/smoke_alert_backpressure.sh
           bash tests/smoke_docs_drift.sh
           bash tests/smoke_installer_checksums.sh
           bash tests/smoke_install_completions.sh
@@ -87,6 +89,7 @@ jobs:
           bash tests/smoke_no_apps.sh
           bash tests/smoke_bottleneck.sh
           bash tests/smoke_version_update.sh
+          bash tests/smoke_doctor_risks.sh
 
       - name: Go vet
         working-directory: go

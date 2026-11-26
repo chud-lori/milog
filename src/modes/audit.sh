@@ -1,5 +1,5 @@
 # milog audit: host integrity scanners (fim, persistence, ports, yara, accounts, rootkit).
-# Drift goes through alert_fire, so silence, cooldown and dedup apply.
+# Drift is tracked as conditions: one alert when it opens or changes, one when it clears; silences apply.
 # fim.baseline rows: path, sha256, mtime, size, recorded; sha256 MISSING means absent at baseline time.
 
 # Hex digest, or empty when unreadable.
@@ -225,6 +225,7 @@ _audit_fim_baseline() {
     done < <(_audit_fim_expand_paths)
 
     mv "$tmp" "$out"
+    alert_condition_close audit:fim:
     if [[ -n "$snapdir" ]]; then
         for f in "$snapdir"/*; do
             [[ -f "$f" && ! -L "$f" && -O "$f" && "$kept" != */"${f##*/}"/* ]] && rm -f "$f"
@@ -294,16 +295,17 @@ _audit_fim_tick() {
         return 0
     fi
 
-    local change path detail key body rows=""
+    local change path detail key body rows="" out ok=1
+    # A failed diff must not read as every condition clearing.
+    out=$(_audit_fim_diff) || ok=0
     while IFS=$'\t' read -r change path detail; do
         [[ -z "$change" ]] && continue
         rows+="$change"$'\t'"$path"$'\n'
         key="audit:fim:$change:$path"
-        if alert_should_fire "$key"; then
-            body="\`\`\`$change $path $detail"$'\n'"$(_audit_fim_detail "$change" "$path")\`\`\`"
-            alert_fire "FIM drift: $change $path" "$body" 15158332 "$key" &
-        fi
-    done < <(_audit_fim_diff)
+        body="\`\`\`$change $path $detail"$'\n'"$(_audit_fim_detail "$change" "$path")\`\`\`"
+        alert_condition_open "$key" "FIM drift: $change $path" "$body" 15158332 "$detail"
+    done <<< "$out"
+    (( ok )) && alert_condition_sweep audit:fim: "$now"
     history_write_audit fim "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
@@ -346,7 +348,7 @@ ${W}milog audit${NC} — point-in-time host integrity scans
 
 The watcher runs inside ${C}milog daemon${NC} when ${C}AUDIT_ENABLED=1${NC} —
 auto-baselines on first run, then fires ${C}audit:fim:<change>:<path>${NC},
-${C}audit:persistence:APPEARED:<path>${NC}, ${C}audit:ports:NEW:<proto>:<port>${NC},
+${C}audit:persistence:APPEARED:<path>${NC}, ${C}audit:ports:NEW:<proto>:<bind>:<port>${NC},
 ${C}audit:yara:<rule>:<path>${NC}, ${C}audit:accounts:NEW:<path>${NC}, or
 ${C}audit:rootkit:<heuristic>${NC} on every subsequent drift.
 
@@ -475,6 +477,7 @@ _audit_persistence_baseline() {
     done < <(_audit_persistence_expand)
 
     mv "$tmp" "$out"
+    alert_condition_close audit:persistence:
     printf '%d %s\n' "$count" "$out"
 }
 
@@ -519,8 +522,10 @@ _audit_persistence_tick() {
         return 0
     fi
 
-    local change path key body rows=""
+    local change path key body rows="" out ok=1
+    out=$(_audit_persistence_diff) || ok=0
     while IFS=$'\t' read -r change path; do
+        [[ -z "$change" ]] && continue
         rows+="$change"$'\t'"$path"$'\n'
         [[ "$change" == "APPEARED" ]] || continue
         [[ -z "$path" ]] && continue
@@ -529,11 +534,10 @@ _audit_persistence_tick() {
             /etc/systemd/system/milog.service|/etc/systemd/system/milog-probe.service) continue ;;
         esac
         key="audit:persistence:APPEARED:$path"
-        if alert_should_fire "$key"; then
-            body="\`\`\`new file in re-entry surface: $path"$'\n'"$(_audit_age_line "$path")\`\`\`"
-            alert_fire "Persistence: new $path" "$body" 15158332 "$key" &
-        fi
-    done < <(_audit_persistence_diff)
+        body="\`\`\`new file in re-entry surface: $path"$'\n'"$(_audit_age_line "$path")\`\`\`"
+        alert_condition_open "$key" "Persistence: new $path" "$body" 15158332
+    done <<< "$out"
+    (( ok )) && alert_condition_sweep audit:persistence: "$now"
     history_write_audit persistence "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
@@ -670,6 +674,7 @@ _audit_ports_baseline() {
     done < <(_audit_ports_capture)
 
     mv "$tmp" "$out"
+    alert_condition_close audit:ports:
     printf '%d %s\n' "$count" "$out"
 }
 
@@ -686,6 +691,8 @@ _audit_ports_diff() {
 
     _audit_ports_capture > "$current"
     awk -F'\t' '{print $1 "\t" $2 "\t" $3}' "$baseline" | sort -u > "$sorted_baseline"
+    # No listeners at all means ss/netstat failed, not that every port closed.
+    [[ -s "$current" || ! -s "$sorted_baseline" ]] || return 1
 
     comm -23 "$current" "$sorted_baseline" | awk -F'\t' '{print "NEW\t" $0}'
     comm -13 "$current" "$sorted_baseline" | awk -F'\t' '{print "GONE\t" $0}'
@@ -710,7 +717,8 @@ _audit_ports_tick() {
         return 0
     fi
 
-    local change proto bind port key body rows=""
+    local change proto bind port key body rows="" out ok=1
+    out=$(_audit_ports_diff) || ok=0
     while IFS=$'\t' read -r change proto bind port; do
         case "$change" in
             NEW)  rows+="appeared"$'\t'"$bind:$port/$proto"$'\n' ;;
@@ -718,12 +726,11 @@ _audit_ports_tick() {
         esac
         [[ "$change" == "NEW" ]] || continue
         [[ -z "$proto" || -z "$port" ]] && continue
-        key="audit:ports:NEW:$proto:$port"
-        if alert_should_fire "$key"; then
-            body="\`\`\`new listener: $proto $bind:$port"$'\n'"$(_audit_listener_owner "$proto" "$bind" "$port")\`\`\`"
-            alert_fire "Listener: new $proto $bind:$port" "$body" 15158332 "$key" &
-        fi
-    done < <(_audit_ports_diff)
+        key="audit:ports:NEW:$proto:$bind:$port"
+        body="\`\`\`new listener: $proto $bind:$port"$'\n'"$(_audit_listener_owner "$proto" "$bind" "$port")\`\`\`"
+        alert_condition_open "$key" "Listener: new $proto $bind:$port" "$body" 15158332
+    done <<< "$out"
+    (( ok )) && alert_condition_sweep audit:ports: "$now"
     history_write_audit ports "$(_audit_mtime "$baseline")" "$rows"
 
     printf '%s' "$now" > "$marker"
@@ -1171,6 +1178,7 @@ _audit_accounts_baseline() {
         fi
     done < <(_audit_accounts_expand)
     : > "$dir/.encoded"
+    alert_condition_close audit:accounts:
     # Pruned last so paths dropped from AUDIT_ACCOUNTS_PATHS stop showing up.
     for f in "$dir"/*.baseline; do
         [[ -e "$f" && "$kept" != */"${f##*/}"/* ]] && rm -f "$f"
@@ -1248,8 +1256,10 @@ _audit_accounts_tick() {
 
     # One alert per file, listing at most 5 new lines.
     local prev_file="" body="" capped=""
-    local change file line lines_count=0 key b rows=""
+    local change file line lines_count=0 key b rows="" out ok=1
+    out=$(_audit_accounts_diff | sort) || ok=0
     while IFS=$'\t' read -r change file line; do
+        [[ -z "$change" ]] && continue
         rows+="$change"$'\t'"$file"$'\n'
         [[ "$change" == "ADDED" ]] || continue
         [[ -z "$file" ]] && continue
@@ -1258,11 +1268,9 @@ _audit_accounts_tick() {
                 [[ -n "$capped" ]] && body="${body}
 ${capped}"
                 key="audit:accounts:NEW:$prev_file"
-                if alert_should_fire "$key"; then
-                    b="\`\`\`new lines in $prev_file:
+                b="\`\`\`new lines in $prev_file:
 $body\`\`\`"
-                    alert_fire "Account drift: $prev_file" "$b" 15158332 "$key" &
-                fi
+                alert_condition_open "$key" "Account drift: $prev_file" "$b" 15158332 "$b"
             fi
             prev_file="$file"; body="$line"; lines_count=1; capped=""
         else
@@ -1274,17 +1282,16 @@ ${line}"
                 capped="… (and $((lines_count - 5)) more)"
             fi
         fi
-    done < <(_audit_accounts_diff | sort)   # sort groups ADDED rows by file
+    done <<< "$out"   # sort groups ADDED rows by file
     if [[ -n "$prev_file" ]]; then
         [[ -n "$capped" ]] && body="${body}
 ${capped}"
         key="audit:accounts:NEW:$prev_file"
-        if alert_should_fire "$key"; then
-            b="\`\`\`new lines in $prev_file:
+        b="\`\`\`new lines in $prev_file:
 $body\`\`\`"
-            alert_fire "Account drift: $prev_file" "$b" 15158332 "$key" &
-        fi
+        alert_condition_open "$key" "Account drift: $prev_file" "$b" 15158332 "$b"
     fi
+    (( ok )) && alert_condition_sweep audit:accounts: "$now"
     # Subject is the file only, so passwd and sudoers lines stay out of the DB.
     history_write_audit accounts "$(_audit_mtime "$dir/.encoded")" "$rows"
 
@@ -1475,16 +1482,21 @@ _audit_rootkit_tick() {
         return 0
     fi
 
-    local heur detail key body rows=""
+    local heur detail key body rows="" out ok=1
+    out=$(_audit_rootkit_run_all) || ok=0
     while IFS=$'\t' read -r heur detail; do
         [[ -z "$heur" ]] && continue
         rows+="hint"$'\t'"$heur"$'\n'
         key="audit:rootkit:$heur"
-        if alert_should_fire "$key"; then
-            body="\`\`\`$detail\`\`\`"
-            alert_fire "Rootkit hint: $heur" "$body" 15158332 "$key" &
+        body="\`\`\`$detail\`\`\`"
+        # New ld.so.preload content is new information; the other hints carry pids or counts that churn.
+        if [[ "$heur" == ld_preload_present ]]; then
+            alert_condition_open "$key" "Rootkit hint: $heur" "$body" 15158332 "$detail"
+        else
+            alert_condition_open "$key" "Rootkit hint: $heur" "$body" 15158332
         fi
-    done < <(_audit_rootkit_run_all)
+    done <<< "$out"
+    (( ok )) && alert_condition_sweep audit:rootkit: "$now"
     # No baseline to reset against, so a hint is stored once per retention window.
     history_write_audit rootkit 0 "$rows"
 

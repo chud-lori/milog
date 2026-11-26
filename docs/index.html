@@ -631,7 +631,7 @@
           <div class="cmd"><dt>milog version</dt><dd>Version stamp of milog and of each companion binary found.</dd></div>
           <div class="cmd"><dt>milog update [--check]</dt><dd>Replace milog and its installed companion binaries with the latest GitHub release. <span class="hint">checksum-verified · --check exits 10 when an update exists</span></dd></div>
           <div class="cmd"><dt>milog install &lt;feature&gt;</dt><dd>Add an optional feature: geoip, web, history.</dd></div>
-          <div class="cmd"><dt>milog update-rules</dt><dd>Fetch newer exploit and probe rules from the latest release.</dd></div>
+          <div class="cmd"><dt>milog update-rules [--check]</dt><dd>Fetch newer exploit and probe rules from the latest release. <span class="hint">--check prints the rules' version and age offline and exits 1 past RULES_MAX_AGE_DAYS</span></dd></div>
           <div class="cmd"><dt>milog bench [--full]</dt><dd>Benchmark against synthetic fixtures.</dd></div>
           <div class="cmd"><dt>milog completions &lt;shell&gt;</dt><dd>Install or print bash, zsh or fish completions.</dd></div>
           <div class="cmd"><dt>milog help</dt><dd>Print the command list.</dd></div>
@@ -695,6 +695,7 @@ LOGS=(
         <pre class="block"><code>MILOG_CONFIG            MILOG_LOG_DIR           MILOG_REFRESH
 MILOG_ALERTS_ENABLED    MILOG_ALERT_ROUTES      MILOG_ALERT_COOLDOWN
 MILOG_ALERT_DEDUP_WINDOW  MILOG_ALERT_HOOK_TIMEOUT  MILOG_ALERT_LOG_MAX_BYTES
+MILOG_ALERT_REMINDER_INTERVAL
 MILOG_DISCORD_WEBHOOK   MILOG_SLACK_WEBHOOK     MILOG_TELEGRAM_BOT_TOKEN
 MILOG_TELEGRAM_CHAT_ID  MILOG_MATRIX_HOMESERVER MILOG_MATRIX_ROOM
 MILOG_MATRIX_TOKEN      MILOG_WEBHOOK_URL       MILOG_WEBHOOK_TEMPLATE
@@ -886,6 +887,8 @@ sudo journalctl -u milog-probe.service -f</code></pre>
       <li>
         <strong>Cooldown and dedup are not optional.</strong>
         Every rule has a cooldown key, and dedup runs across rules on (ip, path).
+        Audit drift is a condition instead: one alert when it opens, one when it
+        clears, and a reminder each <code>ALERT_REMINDER_INTERVAL</code> (24h).
         The day a scanner arrives should not be the day your Discord channel
         becomes unreadable.
       </li>
@@ -900,7 +903,9 @@ sudo journalctl -u milog-probe.service -f</code></pre>
         Every fire is written to <code>alerts.log</code> before any destination
         is tried, and <code>milog alerts</code> reads it back. A delivery that
         fails goes to <code>send_failures.log</code>, and
-        <code>milog doctor</code> reports the last 24 hours of them.
+        <code>milog doctor</code> reports the last 24 hours of them. A rate-limited
+        destination holds new alerts and sends them as one summary, and the daemon
+        alerts when that log grows.
       </li>
     </ul>
   </div>

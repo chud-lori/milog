@@ -85,14 +85,36 @@ _alert_record() {
 }
 
 # Log a failed delivery (network or HTTP >= 400) for `milog doctor`; status 000 means no HTTP response.
+# Rows are epoch, dest, status, plus the rule key as a fourth column when one is known.
 _alert_send_failed() {
-    local log_file="$ALERT_STATE_DIR/send_failures.log"
+    local log_file="$ALERT_STATE_DIR/send_failures.log" rule="${3:-}"
     mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 0
-    printf '%s\t%s\t%s\n' "$(date +%s)" "${1:-unknown}" "${2:-000}" >> "$log_file" 2>/dev/null || true
+    rule="${rule//[$'\t\r\n']/ }"
+    printf '%s\t%s\t%s%s\n' "$(date +%s)" "${1:-unknown}" "${2:-000}" "${rule:+$'\t'$rule}" >> "$log_file" 2>/dev/null || true
     _alert_rotate_if_big "$log_file"
 }
 
+# Prints the raw Retry-After or retry_after value from an HTTP response on stdin.
+_alert_retry_after() {
+    sed -n -E \
+        -e '/"retry_after": *[0-9]/{s/.*"retry_after": *([0-9][0-9.]*).*/\1/p;q;}' \
+        -e '/^[Rr]etry-[Aa]fter: *[0-9]/{s/^[^:]*: *([0-9][0-9.]*).*/\1/p;q;}'
+}
+
+# Seconds to hold a destination after a 429: the server's wait rounded up, 30 when absent, at most 300.
+_alert_backoff_secs() {
+    local raw="${1:-}" s=30
+    if [[ "$raw" =~ ^0*([0-9]{1,6})(\.[0-9]*)?$ ]]; then
+        s=$(( 10#${BASH_REMATCH[1]} + 1 ))
+    elif [[ "$raw" =~ ^[0-9] ]]; then
+        s=300
+    fi
+    (( s > 300 )) && s=300
+    printf '%s' "$s"
+}
+
 # _alert_post <dest> <curl args...>. A 429 is retried once when the server asks to wait 5s or less.
+# With _ALERT_HOLD_429=1 the caller logs failures: a final 429 sets backoff.<dest> and returns 2, any other failure returns 1.
 _alert_post() {
     local dest="$1"; shift
     local out code wait try
@@ -100,14 +122,132 @@ _alert_post() {
         out=$(curl -sS -m 5 -i -w '\n%{http_code}' "$@" 2>/dev/null) || :
         code="${out##*$'\n'}"
         [[ "$code" == 429 && "$try" == 1 ]] || break
-        wait=$(printf '%s\n' "$out" | sed -n -E \
-            -e '/"retry_after": *[0-9]/{s/.*"retry_after": *([0-9][0-9.]*).*/\1/p;q;}' \
-            -e '/^[Rr]etry-[Aa]fter: *[0-9]/{s/^[^:]*: *([0-9][0-9.]*).*/\1/p;q;}') || :
+        wait=$(printf '%s\n' "$out" | _alert_retry_after) || :
         # A string match, since arithmetic on a server-supplied number can overflow.
         [[ "$wait" =~ ^([0-4](\.[0-9]+)?|5(\.0+)?)$ ]] || break
         sleep "$wait" || break
     done
+    _ALERT_LAST_CODE="$code"
+    if [[ "${_ALERT_HOLD_429:-0}" == 1 ]]; then
+        if [[ "$code" == 429 ]]; then
+            wait=$(printf '%s\n' "$out" | _alert_retry_after) || :
+            _alert_state_write "$ALERT_STATE_DIR/backoff.$dest" \
+                "$(( $(date +%s) + $(_alert_backoff_secs "$wait") ))" || :
+            return 2
+        fi
+        [[ "$code" =~ ^[1-3][0-9][0-9]$ ]] && return 0
+        return 1
+    fi
     [[ "$code" =~ ^[1-3][0-9][0-9]$ ]] || _alert_send_failed "$dest" "$code"
+    return 0
+}
+
+# Replaces a small state file through a rename so readers never see it half-written.
+_alert_state_write() {
+    local f="$1" tmp
+    mkdir -p "${f%/*}" 2>/dev/null || return 1
+    tmp=$(mktemp "$f.tmp.XXXXXX" 2>/dev/null) || return 1
+    printf '%s\n' "$2" > "$tmp" && mv "$tmp" "$f" 2>/dev/null && return 0
+    rm -f "$tmp"
+    return 1
+}
+
+# Queue rows: epoch, color, rule_key, title. Past 1000 held alerts the rest count as lost.
+_alert_enqueue() {
+    local dest="$1" title="$2" color="${4:-15158332}" rule_key="${5:-}"
+    local q="$ALERT_STATE_DIR/queue.$dest" n=0
+    [[ -f "$q" ]] && n=$(wc -l < "$q" | tr -d ' ')
+    if (( n >= 1000 )); then
+        _alert_send_failed "$dest" 429 "$rule_key"
+        return 0
+    fi
+    title="${title//[$'\t\r\n']/ }"
+    title="${title:0:200}"
+    rule_key="${rule_key//[$'\t\r\n']/ }"
+    # One invalid UTF-8 title would get the whole coalesced summary rejected.
+    if command -v iconv >/dev/null 2>&1; then
+        title=$(printf '%s' "$title" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null) || :
+    else
+        title=$(printf '%s' "$title" | LC_ALL=C tr -cd '\40-\176') || :
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$color" "$rule_key" "$title" >> "$q" 2>/dev/null \
+        || _alert_send_failed "$dest" 429 "$rule_key"
+}
+
+# Logs one failure per queue row on stdin, keeping each row's rule key.
+_alert_fail_rows() {
+    local dest="$1" code="$2" rule
+    awk -F'\t' '{print $3}' | while IFS= read -r rule; do
+        _alert_send_failed "$dest" "$code" "$rule"
+    done
+}
+
+# Sends everything queued for $1 as one summary once its backoff ends; one flusher per destination.
+_alert_flush() {
+    local dest="$1"
+    local q="$ALERT_STATE_DIR/queue.$dest" lock="$ALERT_STATE_DIR/queue.$dest.lock"
+    local bo="$ALERT_STATE_DIR/backoff.$dest"
+    local tries retried hold now batch rc n color lines _ALERT_LAST_CODE=000
+    # A flusher killed mid-wait leaves its lock; the longest legitimate hold is 5 x 300s.
+    find "$lock" -maxdepth 0 -mmin +30 -exec rmdir {} \; 2>/dev/null || :
+    while [[ -s "$q" ]] && mkdir "$lock" 2>/dev/null; do
+        tries=0 retried=0
+        while [[ -s "$q" ]] && (( tries < 5 )); do
+            hold=$(cat "$bo" 2>/dev/null) || hold=0
+            [[ "$hold" =~ ^[0-9]{1,12}$ ]] || hold=0
+            now=$(date +%s)
+            (( hold > now + 300 )) && hold=$(( now + 300 ))
+            (( hold > now )) && sleep $(( hold - now ))
+            batch=$(mktemp "$q.send.XXXXXX" 2>/dev/null) || break
+            mv "$q" "$batch" 2>/dev/null || { rm -f "$batch"; break; }
+            n=$(wc -l < "$batch" | tr -d ' ')
+            color=$(awk -F'\t' '$2 == 15158332 || $2 == 16711680 {c = 1} END {print c ? 15158332 : 16753920}' "$batch")
+            lines=$(awk -F'\t' '{print $4}' "$batch" | sort | uniq -c | sort -rn \
+                | awk 'NR <= 15 {n = $1; sub(/^ *[0-9]+ /, ""); printf "%s x%d\n", $0, n} NR > 15 {more++} END {if (more) printf "and %d more distinct alerts\n", more}')
+            rc=0
+            _ALERT_HOLD_429=1 "_alert_send_$dest" "Rate limited: $n alerts held" \
+                "$(_alert_fence "$lines")" "$color" "milog:coalesced" || rc=$?
+            case "$rc" in
+                0)  rm -f "$bo" ;;
+                2)  cat "$batch" >> "$q"; (( tries++ )) || true ;;
+                *)  if (( retried )); then
+                        _alert_fail_rows "$dest" "$_ALERT_LAST_CODE" < "$batch"
+                    else
+                        retried=1
+                        cat "$batch" >> "$q"
+                    fi ;;
+            esac
+            rm -f "$batch"
+        done
+        # Renamed first so alerts queued during the dump are not deleted with it.
+        if [[ -s "$q" ]] && (( tries >= 5 )) && mv "$q" "$q.drop" 2>/dev/null; then
+            _alert_fail_rows "$dest" 429 < "$q.drop"
+            rm -f "$q.drop"
+        fi
+        rmdir "$lock" 2>/dev/null || :
+    done
+    return 0
+}
+
+# Per-destination send from alert_fire: while the destination is backing off, alerts queue for one summary.
+_alert_deliver() {
+    local dest="$1"; shift
+    local hold=0 rc=0 now _ALERT_LAST_CODE=000
+    now=$(date +%s)
+    hold=$(cat "$ALERT_STATE_DIR/backoff.$dest" 2>/dev/null) || hold=0
+    [[ "$hold" =~ ^[0-9]{1,12}$ ]] || hold=0
+    (( hold > now + 300 )) && hold=$(( now + 300 ))
+    if (( hold > now )); then
+        _alert_enqueue "$dest" "$@"
+    else
+        _ALERT_HOLD_429=1 "_alert_send_$dest" "$@" || rc=$?
+        case "$rc" in
+            2) _alert_enqueue "$dest" "$@" ;;
+            1) _alert_send_failed "$dest" "$_ALERT_LAST_CODE" "${4:-}" ;;
+        esac
+    fi
+    [[ -s "$ALERT_STATE_DIR/queue.$dest" ]] && _alert_flush "$dest"
+    return 0
 }
 
 # Senders return 0 when unconfigured and post through _alert_post, which records failures.
@@ -429,11 +569,11 @@ alert_fire() {
     route=$(_alert_route_for "$rule_key")
 
     if [[ -z "$route" ]]; then
-        _alert_send_discord  "$title" "$body" "$color" &
-        _alert_send_slack    "$title" "$body" "$color" &
-        _alert_send_telegram "$title" "$body" "$color" &
-        _alert_send_matrix   "$title" "$body" "$color" &
-        _alert_send_webhook  "$title" "$body" "$color" "$rule_key" &
+        _alert_deliver discord  "$title" "$body" "$color" "$rule_key" &
+        _alert_deliver slack    "$title" "$body" "$color" "$rule_key" &
+        _alert_deliver telegram "$title" "$body" "$color" "$rule_key" &
+        _alert_deliver matrix   "$title" "$body" "$color" "$rule_key" &
+        _alert_deliver webhook  "$title" "$body" "$color" "$rule_key" &
         return 0
     fi
 
@@ -441,11 +581,11 @@ alert_fire() {
     local dest
     for dest in $route; do
         case "$dest" in
-            discord)   _alert_send_discord  "$title" "$body" "$color" & ;;
-            slack)     _alert_send_slack    "$title" "$body" "$color" & ;;
-            telegram)  _alert_send_telegram "$title" "$body" "$color" & ;;
-            matrix)    _alert_send_matrix   "$title" "$body" "$color" & ;;
-            webhook)   _alert_send_webhook  "$title" "$body" "$color" "$rule_key" & ;;
+            discord)   _alert_deliver discord  "$title" "$body" "$color" "$rule_key" & ;;
+            slack)     _alert_deliver slack    "$title" "$body" "$color" "$rule_key" & ;;
+            telegram)  _alert_deliver telegram "$title" "$body" "$color" "$rule_key" & ;;
+            matrix)    _alert_deliver matrix   "$title" "$body" "$color" "$rule_key" & ;;
+            webhook)   _alert_deliver webhook  "$title" "$body" "$color" "$rule_key" & ;;
             skip|none) : ;;
             *)         : ;;   # unknown type — silently drop (forward-compat)
         esac
@@ -599,6 +739,113 @@ alert_fingerprint_fresh() {
     } > "$tmp" && mv "$tmp" "$state_file" 2>/dev/null
     [[ -f "$tmp" ]] && rm -f "$tmp"
     return 0
+}
+
+# Periodic checks re-detect the same state every tick, so they track it as a condition instead of a cooldown.
+# alerts.conditions rows: key, opened, notified, seen, fingerprint ("-" when none), color, title.
+
+# Drops the row for $1 and, given more args, writes them back as its new row.
+_alert_cond_put() {
+    local key="$1"; shift
+    local f="$ALERT_STATE_DIR/alerts.conditions" tmp
+    mkdir -p "$ALERT_STATE_DIR" 2>/dev/null || return 1
+    tmp=$(mktemp "$f.tmp.XXXXXX" 2>/dev/null) || return 1
+    {
+        MILOG_K="$key" awk -F'\t' 'BEGIN{OFS="\t"} $1 != ENVIRON["MILOG_K"]' "$f" 2>/dev/null
+        if (( $# )); then
+            local IFS=$'\t'
+            printf '%s\t%s\n' "$key" "$*"
+        fi
+    } > "$tmp" && mv "$tmp" "$f" 2>/dev/null && return 0
+    rm -f "$tmp"
+    return 1
+}
+
+# alert_condition_open <key> <title> <body> [color] [fingerprint]: fires on open or fingerprint change, else once per ALERT_REMINDER_INTERVAL.
+alert_condition_open() {
+    [[ "${ALERTS_ENABLED:-0}" == "1" ]] || return 0
+    # No row while silenced, so the condition still alerts once the silence ends.
+    if alert_is_silenced "${1:-}" >/dev/null; then return 0; fi
+    local key="${1//[$'\t\r\n']/ }" title="$2" body="$3" color="${4:-15158332}" fp="${5:-}"
+    local f="$ALERT_STATE_DIR/alerts.conditions" now row opened notified seen old_fp
+    local reminder="${ALERT_REMINDER_INTERVAL:-86400}"
+    [[ "$reminder" =~ ^[0-9]{1,9}$ ]] || reminder=86400
+    now=$(date +%s)
+    if [[ -n "$fp" ]]; then fp=$(printf '%s' "$fp" | cksum | awk '{print $1}'); else fp="-"; fi
+    row=$(MILOG_K="$key" awk -F'\t' '$1 == ENVIRON["MILOG_K"] {print; exit}' "$f" 2>/dev/null) || row=""
+    if [[ -z "$row" ]]; then
+        opened=$now notified=$now
+        alert_fire "$title" "$body" "$color" "$key" &
+    else
+        IFS=$'\t' read -r _ opened notified seen old_fp _ <<< "$row"
+        [[ "$opened" =~ ^[0-9]+$ ]] || opened=$now
+        [[ "$notified" =~ ^[0-9]+$ ]] || notified=$now
+        if [[ "$fp" != "$old_fp" ]]; then
+            notified=$now
+            alert_fire "$title" "$body" "$color" "$key" &
+        elif (( reminder > 0 && now - notified >= reminder )); then
+            notified=$now
+            alert_fire "Still open: $title" "$body
+open for $(( (now - opened) / 3600 ))h" "$color" "$key" &
+        fi
+    fi
+    _alert_cond_put "$key" "$opened" "$notified" "$now" "$fp" "$color" "${title//[$'\t\r\n']/ }" \
+        || echo "milog: cannot write $f; $key will alert again next check" >&2
+}
+
+# alert_condition_sweep <prefix> <since>: conditions under prefix not seen since the tick began have cleared.
+alert_condition_sweep() {
+    local prefix="$1" since="$2" f="$ALERT_STATE_DIR/alerts.conditions"
+    [[ -f "$f" ]] || return 0
+    local key opened notified seen fp color title now
+    now=$(date +%s)
+    while IFS=$'\t' read -r key opened notified seen fp color title; do
+        [[ -n "$key" ]] || continue
+        _alert_cond_put "$key" || continue
+        [[ "$opened" =~ ^[0-9]+$ ]] || opened=$now
+        alert_fire "Resolved: $title" "condition cleared after $(( (now - opened) / 60 ))m" 3066993 "$key" &
+    done < <(MILOG_P="$prefix" awk -F'\t' -v s="$since" 'index($1, ENVIRON["MILOG_P"]) == 1 && $4 + 0 < s + 0' "$f" 2>/dev/null)
+}
+
+# Forgets open conditions under prefix without alerting, for when the operator re-baselines.
+alert_condition_close() {
+    local f="$ALERT_STATE_DIR/alerts.conditions" tmp
+    [[ -f "$f" ]] || return 0
+    tmp=$(mktemp "$f.tmp.XXXXXX" 2>/dev/null) \
+        && MILOG_P="$1" awk -F'\t' 'index($1, ENVIRON["MILOG_P"]) != 1' "$f" > "$tmp" 2>/dev/null \
+        && mv "$tmp" "$f" 2>/dev/null && return 0
+    [[ -n "${tmp:-}" ]] && rm -f "$tmp"
+    echo "milog: cannot update $f; $1 conditions stay open until the next check clears them" >&2
+}
+
+# Logs and alerts when send_failures.log grew since the last call; send_failures.seen holds the line count.
+# Also requeues batches a dead flusher left mid-send and restarts flushing for anything still held.
+_alert_delivery_check() {
+    local flog="$ALERT_STATE_DIR/send_failures.log" seen_f="$ALERT_STATE_DIR/send_failures.seen"
+    local total=0 seen=0 new summary f dest
+    for f in "$ALERT_STATE_DIR"/queue.*.send.*; do
+        [[ -f "$f" && -n "$(find "$f" -mmin +5 2>/dev/null)" ]] || continue
+        dest="${f##*/queue.}"; dest="${dest%%.send.*}"
+        case "$dest" in discord|slack|telegram|matrix|webhook) ;; *) continue ;; esac
+        cat "$f" >> "$ALERT_STATE_DIR/queue.$dest" && rm -f "$f"
+    done
+    for dest in discord slack telegram matrix webhook; do
+        if [[ -s "$ALERT_STATE_DIR/queue.$dest" ]]; then _alert_flush "$dest" & fi
+    done
+    [[ -f "$flog" ]] && total=$(wc -l < "$flog" | tr -d ' ')
+    seen=$(cat "$seen_f" 2>/dev/null) || seen=0
+    [[ "$seen" =~ ^[0-9]+$ ]] || seen=0
+    # Rotation shrinks the log below the saved count.
+    (( total < seen )) && seen=0
+    (( total > seen )) || return 0
+    _alert_state_write "$seen_f" "$total" || return 0
+    # The delivery alert's own failures don't count, or a dead destination would re-alert every hour.
+    summary=$(tail -n "$(( total - seen ))" "$flog" | awk -F'\t' '$4 != "milog:delivery"')
+    [[ -n "$summary" ]] || return 0
+    new=$(printf '%s\n' "$summary" | wc -l | tr -d ' ')
+    summary=$(printf '%s\n' "$summary" | awk -F'\t' '{c[$2 " HTTP " ($3 == "" ? "000" : $3)]++} END {for (k in c) printf "%s x%d\n", k, c[k]}' | sort)
+    _dlog "WARNING: $new alert deliveries failed since the last check: ${summary//$'\n'/, }"
+    alert_fire "MiLog: $new alert deliveries failed" "$(_alert_fence "$summary")" 16753920 "milog:delivery"
 }
 
 # `<ip>:<path>` with the query string stripped; empty when the line doesn't parse.

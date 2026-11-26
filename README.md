@@ -202,6 +202,7 @@ milog audit accept [fim|persistence|ports|accounts] [path|proto:port]   # accept
 milog silence <rule_or_glob> <duration> [msg]
 milog config [init|add|rm|dir|set|edit]
 milog update-rules         # newer exploit/probe rules from the latest release
+milog update-rules --check # rules version and age; exits 1 past RULES_MAX_AGE_DAYS
 milog doctor               # diagnostic checklist
 milog bottleneck [--json]  # one-shot host-slowdown audit: saturated resource + culprits
 milog version              # milog + companion binary versions

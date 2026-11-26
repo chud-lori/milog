@@ -107,4 +107,5 @@ for v in $digest_window_vals
 end
 
 complete -c milog -n "__milog_seen_cmd update" -l check -d "report only; exit 10 when an update exists"
+complete -c milog -n "__milog_seen_cmd update-rules" -l check -d "print rules version and age; exit 1 when stale"
 complete -c milog -n "__milog_seen_cmd bottleneck" -l json -d "machine-readable output"

@@ -404,7 +404,10 @@ eBPF sidecar (Linux only) as the systemd unit
 .B status
 shows whether the unit is active.
 .B install-service
-needs root: it writes the unit, sets
+needs root. It first runs
+.BR "milog-probe --check" ,
+which loads and attaches every probe for a second, and refuses to write
+a unit when none loads. It writes the unit, sets
 .B HOME
 and
 .B MILOG_CONFIG
@@ -427,7 +430,7 @@ On-demand feature installer. Features:
 .B install list
 shows installed state.
 .TP
-.B update-rules
+.BR update-rules " [\fB--check\fR]"
 Download
 .B milog-rules.tsv
 from the latest release of
@@ -439,6 +442,12 @@ check that every regex compiles, and write it to
 atomically. Refuses a version lower than the active rules. The checksum
 file comes from the same release, so this detects corruption, not a
 compromised release; it is not a signature.
+.B --check
+downloads nothing: it prints the active rules' version and how many days
+ago update-rules last checked them against a release, and exits 1 when
+that is more than
+.B RULES_MAX_AGE_DAYS
+(default 60; 0 never warns). Nothing updates the rules on its own.
 .TP
 .B completions " <\fBinstall\fR | \fBbash\fR | \fBzsh\fR | \fBfish\fR>"
 Install / print shell completion script.

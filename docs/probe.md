@@ -42,9 +42,11 @@ own load — a verifier reject on one doesn't take the others down.
 | **syscall-rate** | `raw_tracepoint:sys_enter` (sampled, Welford σ) | `process:syscall_burst:<comm>`                                          |
 | **bpf-load**   | `syscalls:sys_enter_bpf` (filtered to `BPF_PROG_LOAD`) | `proc:bpf_load:<comm>`                                          |
 
-Each BPF program is embedded into the Go binary as a CO-RE
-relocatable object — one binary works across kernels ≥ 4.18 with BTF
-available.
+Each BPF program is embedded into the Go binary. None of them uses
+CO-RE relocations: they read tracepoint arguments at fixed offsets and
+get parent details from `/proc`, so the probe does not need kernel BTF
+(`/sys/kernel/btf/vmlinux`). A Go test fails if a CO-RE relocation is
+ever added.
 
 ## Web-triggered exec
 
@@ -109,22 +111,32 @@ that is not root-owned or is group/other-writable.
 
 ## Pre-flight checklist
 
-Run these before installing on a host you've never used the probe on:
+What the code needs from the kernel:
+
+- **BPF ring buffer maps.** Six of the eight probes stream events
+  through one. Mainline Linux added them in 5.8; some distro kernels
+  older than that carry a backport.
+- **The tracepoints in the table above**, which need tracefs. The
+  `syscalls:` ones also need `CONFIG_FTRACE_SYSCALLS`.
+- **Root, or `CAP_BPF` + `CAP_PERFMON`** (both added in 5.8). Below 5.8
+  the unit also gets `CAP_SYS_ADMIN`, since those kernels gate eBPF on it.
+
+Kernel BTF is not on this list. The probe has not been tested across a
+range of kernels, so check your own host rather than trusting a version
+number:
 
 ```bash
-uname -srm                                                   # need ≥ 5.8 for CAP_BPF without full root
-test -r /sys/kernel/btf/vmlinux && echo BTF_OK || echo MISS  # CO-RE needs BTF
-id                                                           # confirm sudo
+sudo milog-probe --check
 ```
 
-The eBPF features it relies on:
-
-| Need                          | Minimum kernel |
-| ----------------------------- | -------------- |
-| Tracepoint programs           | 4.18           |
-| Ring-buffer maps              | 5.8            |
-| `CAP_BPF` (no full root)      | 5.8            |
-| BTF (CO-RE)                   | most distros default-on since 5.10 |
+`--check` loads and attaches every probe for one second, prints `ok` or
+`FAIL <reason>` for each, and exits 1 when none loaded.
+`sudo milog probe install-service` runs it first and refuses to install
+the unit when nothing loads, because the probe exits once every program
+has failed and systemd would restart it every 5 seconds. One probe
+failing (say, a missing tracepoint) only loses that probe.
+`milog doctor` prints the kernel version and whether BTF is present.
+The probe is optional: everything else in milog works without it.
 
 ## Tuning the file allowlist
 
