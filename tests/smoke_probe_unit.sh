@@ -39,8 +39,8 @@ done
 : > "$tmp/user-owned"
 bash -c '. "$1" help >/dev/null; _root_trusted_path "$2"' _ "$ROOT/milog.sh" "$tmp/user-owned" \
     && [[ $EUID -ne 0 ]] && fail "user-owned file treated as root-trusted"
-bash -c '. "$1" help >/dev/null; _root_trusted_path /usr/bin/env' _ "$ROOT/milog.sh" \
-    || fail "/usr/bin/env not treated as root-trusted"
+bash -c '. "$1" help >/dev/null; _root_trusted_path /etc/passwd' _ "$ROOT/milog.sh" \
+    || fail "/etc/passwd not treated as root-trusted"
 
 if [[ $EUID -eq 0 ]]; then
     printf ': > %q\n' "$tmp/sourced" > "$MILOG_CONFIG"
