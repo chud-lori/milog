@@ -1,6 +1,6 @@
 # Maintainer: Lori <imlori000@gmail.com>
 pkgname=milog-bin
-pkgver=0.6.0
+pkgver=0.8.3
 pkgrel=1
 pkgdesc='Single-host nginx + system + app-error monitor with alerts'
 arch=('x86_64' 'aarch64')
@@ -15,9 +15,9 @@ _rel="$url/releases/download/v$pkgver"
 source=("milog-$pkgver-src.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 source_x86_64=("$_rel/milog_${pkgver}_linux_amd64.tar.gz")
 source_aarch64=("$_rel/milog_${pkgver}_linux_arm64.tar.gz")
-sha256sums=('75f6f9aaf198b033da12e6724d796df0a1388abd0b99f9a967b185c054824d22')
-sha256sums_x86_64=('63839179a8ce6a5c42966cc8353251eacdd44fea27800e0e7db849dfe2afe560')
-sha256sums_aarch64=('cba5c1a15cbad4790b686a2132e147c054ff5214ef87226c16dec9830878049d')
+sha256sums=('2967284db16c116f6549ac481aa21fcb57f698c836fa008caeba0d65da54216f')
+sha256sums_x86_64=('66151fa6d19f7c9f88b6a294b6647d05aede3c31c37ccae9bf9c8bf96e45f642')
+sha256sums_aarch64=('b2dbfd17ebe044e883de0f7d6d7867a40c0c1557d049f4e50d147c6671aa8811')
 
 package() {
   install -Dm755 milog.sh "$pkgdir/usr/bin/milog"
