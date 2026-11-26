@@ -232,6 +232,12 @@ Every alert passes through two gates before delivery:
 Both gates share no state; a burst across different rule keys and
 different `(ip, path)` fingerprints fires each alert as expected.
 
+Audit scanners skip both gates. They re-detect the same drift every
+`AUDIT_*_INTERVAL`, so each finding is a condition in
+`alerts.conditions`: one alert when it opens or changes, a reminder per
+`ALERT_REMINDER_INTERVAL` (default 24h, `0` off), and a green
+`Resolved:` alert when it clears. See [audit.md](audit.md).
+
 ## Routing — different rules to different destinations
 
 By default, every configured destination receives every fire. At any

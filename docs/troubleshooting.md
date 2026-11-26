@@ -113,8 +113,14 @@ deleted in Discord; regenerate.
 Failed deliveries land in `~/.cache/milog/send_failures.log` as
 `<epoch>\t<destination>\t<HTTP status>` (`000` = no response). A burst
 of `429` rows means the destination rate-limited a flood of alerts.
-MiLog retries a 429 once when the server asks to wait 5s or less;
-longer waits are dropped and logged.
+MiLog retries a 429 once when the server asks to wait 5s or less.
+After that it holds the destination for the server's `retry_after`
+(at most 300s), queues alerts that arrive meanwhile in
+`~/.cache/milog/queue.<dest>`, and sends them as one
+`Rate limited: N alerts held` summary. Only alerts still undelivered
+after five such rounds become `429` rows. Every hour the daemon checks
+whether this log grew, writes a `WARNING` to its log, and sends a
+`milog:delivery` alert through every destination.
 
 ### 3. Is a cooldown holding it?
 

@@ -46,9 +46,17 @@ audit:rootkit:<heuristic>
 audit:yara:<rule>:<path>
 ```
 
-These flow through the same `ALERT_ROUTES` / cooldown / silence /
-hooks plumbing as everything else (see [alerts.md](alerts.md)). You
-can route `audit:*` to a higher-severity channel, for instance.
+These flow through the same `ALERT_ROUTES` / silence / hooks plumbing
+as everything else (see [alerts.md](alerts.md)). You can route
+`audit:*` to a higher-severity channel, for instance.
+
+Each key is a condition, not a repeated event. It alerts once when the
+drift first shows up, again only if it changes (a FIM hash or the new
+account lines differ) or once per `ALERT_REMINDER_INTERVAL` (24h,
+`0` turns reminders off), and once more as `Resolved:` when a check no
+longer finds it. Re-running a scanner's `baseline` closes its open
+conditions without a resolved alert. Open conditions live in
+`~/.cache/milog/alerts.conditions`.
 
 ## Drift history
 
