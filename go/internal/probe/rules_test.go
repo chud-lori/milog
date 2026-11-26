@@ -365,7 +365,6 @@ func TestMatchFile_AllowlistedCommsSilent(t *testing.T) {
 		{Comm: "systemd", Filename: "/etc/shadow"},
 		{Comm: "sshd-socket-gen", Filename: "/etc/ssh/sshd_config.d/50-cloud-init.conf"},
 		{Comm: "auditd", Filename: "/etc/shadow"},
-		{Comm: "milog-probe", Filename: "/etc/shadow"},
 	}
 	for _, ev := range cases {
 		if hits := MatchFile(ev); len(hits) != 0 {
@@ -1216,12 +1215,12 @@ func TestMatchFile_MilogSelfReadSilent(t *testing.T) {
 	resetFileRulesCache()
 
 	cases := []FileEvent{
-		{Comm: "sha256sum", Exe: "/usr/bin/sha256sum", Cgroup: "/system.slice/milog.service", Filename: "/etc/ssh/sshd_config"},
-		{Comm: "awk", Exe: "/usr/bin/gawk", Cgroup: "/system.slice/milog.service", Filename: "/etc/sudoers"},
-		{Comm: "bash", Exe: "/bin/bash", Cgroup: "/system.slice/milog.service", Filename: "/etc/sudoers.d/"},
-		{Comm: "stat", Exe: "/usr/bin/stat", Cgroup: "/system.slice/milog-probe.service", Filename: "/etc/shadow"},
-		{Comm: "find", Exe: "/usr/bin/find", Cgroup: "/system.slice/milog.service", Filename: "/root/.ssh/authorized_keys"},
-		{Comm: "sha256sum", Exe: "/usr/lib/cargo/bin/coreutils/sha256sum", Cgroup: "/system.slice/milog.service", Filename: "/etc/ssh/sshd_config"},
+		{Comm: "sha256sum", Exe: "/usr/bin/sha256sum", UID: 1000, Cgroup: "/system.slice/milog.service", Filename: "/etc/ssh/sshd_config"},
+		{Comm: "awk", Exe: "/usr/bin/gawk", UID: 1000, Cgroup: "/system.slice/milog.service", Filename: "/etc/sudoers"},
+		{Comm: "bash", Exe: "/bin/bash", UID: 1000, Cgroup: "/system.slice/milog.service", Filename: "/etc/sudoers.d/"},
+		{Comm: "stat", Exe: "/usr/bin/stat", UID: 1000, Cgroup: "/system.slice/milog.service", Filename: "/etc/shadow"},
+		{Comm: "find", Exe: "/usr/bin/find", UID: 1000, Cgroup: "/system.slice/milog.service", Filename: "/root/.ssh/authorized_keys"},
+		{Comm: "sha256sum", Exe: "/usr/lib/cargo/bin/coreutils/sha256sum", UID: 1000, Cgroup: "/system.slice/milog.service", Filename: "/etc/ssh/sshd_config"},
 	}
 	for _, ev := range cases {
 		if hits := MatchFile(ev); len(hits) != 0 {
@@ -1257,6 +1256,21 @@ func TestMatchFile_MilogSelfReadLookalikesFire(t *testing.T) {
 		}},
 		{"process gone before /proc lookup", FileEvent{
 			Comm: "sha256sum", Filename: "/etc/ssh/sshd_config",
+		}},
+		{"write from inside milog.service", FileEvent{
+			Comm: "tee", Exe: "/usr/bin/tee", UID: 1000, Flags: 0x401, Cgroup: "/system.slice/milog.service", Filename: "/root/.ssh/authorized_keys",
+		}},
+		{"audit binary writing", FileEvent{
+			Comm: "bash", Exe: "/usr/bin/bash", UID: 1000, Flags: 0x241, Cgroup: "/system.slice/milog.service", Filename: "/etc/sudoers",
+		}},
+		{"root read via sudo from a hook", FileEvent{
+			Comm: "awk", Exe: "/usr/bin/gawk", UID: 0, Cgroup: "/system.slice/milog.service", Filename: "/etc/shadow",
+		}},
+		{"non-audit binary inside milog.service", FileEvent{
+			Comm: "cat", Exe: "/usr/bin/cat", UID: 1000, Cgroup: "/system.slice/milog.service", Filename: "/etc/shadow",
+		}},
+		{"binary renamed milog under /tmp", FileEvent{
+			Comm: "milog", Exe: "/tmp/milog", UID: 1000, Cgroup: "/user.slice/user-1000.slice/session-1.scope", Filename: "/etc/shadow",
 		}},
 	}
 	for _, c := range cases {

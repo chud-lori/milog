@@ -580,8 +580,6 @@ var defaultSensitiveCommAllowlist = []string{
 	"nscd",
 	"nslcd",
 	"sssd",
-	"milog",
-	"milog-probe",
 }
 
 // defaultSensitivePaths match exactly, or by prefix when they end in `/`.
@@ -708,15 +706,23 @@ func matchSensitiveRead(e FileEvent) (Hit, bool) {
 	}, true
 }
 
-// isMilogSelfRead reports milog's own audit passes: a system binary (including
-// the Rust coreutils that newer Ubuntu ships) running inside one of milog's units.
+// milogAuditExes are the binaries milog's own audit pass runs to hash and parse watched files.
+var milogAuditExes = map[string]struct{}{
+	"sha256sum": {}, "stat": {}, "find": {}, "awk": {}, "gawk": {}, "mawk": {}, "bash": {},
+}
+
+// isMilogSelfRead reports a non-root, read-only open by an audit binary inside one of milog's units.
 func isMilogSelfRead(e FileEvent) bool {
+	if e.UID == 0 || e.Flags&openWriteFlags != 0 {
+		return false
+	}
 	if _, ok := milogUnitCgroups[e.Cgroup]; !ok {
 		return false
 	}
 	for _, dir := range []string{"/usr/bin/", "/bin/", "/usr/lib/cargo/bin/coreutils/"} {
-		if name, ok := strings.CutPrefix(e.Exe, dir); ok && name != "" && !strings.Contains(name, "/") {
-			return true
+		if name, ok := strings.CutPrefix(e.Exe, dir); ok {
+			_, audit := milogAuditExes[name]
+			return audit
 		}
 	}
 	return false
