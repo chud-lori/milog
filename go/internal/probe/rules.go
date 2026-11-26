@@ -708,13 +708,13 @@ func matchSensitiveRead(e FileEvent) (Hit, bool) {
 	}, true
 }
 
-// isMilogSelfRead reports milog's own audit passes: a /usr/bin or /bin binary
-// running inside one of milog's systemd units.
+// isMilogSelfRead reports milog's own audit passes: a system binary (including
+// the Rust coreutils that newer Ubuntu ships) running inside one of milog's units.
 func isMilogSelfRead(e FileEvent) bool {
 	if _, ok := milogUnitCgroups[e.Cgroup]; !ok {
 		return false
 	}
-	for _, dir := range []string{"/usr/bin/", "/bin/"} {
+	for _, dir := range []string{"/usr/bin/", "/bin/", "/usr/lib/cargo/bin/coreutils/"} {
 		if name, ok := strings.CutPrefix(e.Exe, dir); ok && name != "" && !strings.Contains(name, "/") {
 			return true
 		}

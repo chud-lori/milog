@@ -223,7 +223,7 @@ the rest), so every hourly pass used to fire `file:sensitive_read`. The
 probe skips a read only when both hold:
 
 - the process is in `milog.service` or `milog-probe.service`
-- its executable sits directly in `/usr/bin` or `/bin`
+- its executable sits directly in `/usr/bin`, `/bin` or, on Ubuntu 26.04 and later, `/usr/lib/cargo/bin/coreutils`
 
 The same read from any other unit, a login shell, or a binary under
 `/tmp` still alerts. A reader that exits before the probe looks it up

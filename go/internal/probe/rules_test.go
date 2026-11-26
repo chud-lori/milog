@@ -1221,6 +1221,7 @@ func TestMatchFile_MilogSelfReadSilent(t *testing.T) {
 		{Comm: "bash", Exe: "/bin/bash", Cgroup: "/system.slice/milog.service", Filename: "/etc/sudoers.d/"},
 		{Comm: "stat", Exe: "/usr/bin/stat", Cgroup: "/system.slice/milog-probe.service", Filename: "/etc/shadow"},
 		{Comm: "find", Exe: "/usr/bin/find", Cgroup: "/system.slice/milog.service", Filename: "/root/.ssh/authorized_keys"},
+		{Comm: "sha256sum", Exe: "/usr/lib/cargo/bin/coreutils/sha256sum", Cgroup: "/system.slice/milog.service", Filename: "/etc/ssh/sshd_config"},
 	}
 	for _, ev := range cases {
 		if hits := MatchFile(ev); len(hits) != 0 {
