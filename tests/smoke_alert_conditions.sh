@@ -72,7 +72,9 @@ ALERT_REMINDER_INTERVAL=86400
 # Clearing gives one resolved alert, and nothing after.
 printf 'v1\n' > "$tmp/fim-target"
 rm -f "$tmp/watch/evil.timer"
+printf 'root:x:0:0\n' > "$tmp/acc/passwd"
 tick; tick; tick
+[[ "$(fires 'Resolved: Account drift:')" == 1 ]]      || fail "cleared accounts: want 1 resolved, got $(fires 'Resolved: Account drift')"
 [[ "$(fires 'Resolved: FIM drift: MODIFIED')" == 1 ]] || fail "cleared FIM: want 1 resolved, got $(fires 'Resolved: FIM drift')"
 [[ "$(fires 'Resolved: Persistence: new')" == 1 ]]    || fail "cleared persistence: want 1 resolved, got $(fires 'Resolved: Persistence')"
 awk -F'\t' '$4 ~ /^Resolved: FIM/ && $3 != 3066993 {bad = 1} END {exit bad}' "$alog" || fail "resolved alert is not low severity"
@@ -92,6 +94,50 @@ tick; tick
 printf 'v5\n' > "$tmp/fim-target"
 tick
 [[ "$(fires 'FIM drift: MODIFIED')" == 4 ]] || fail "after re-baseline: new drift did not alert"
+
+# A failed diff is not every condition clearing.
+printf 'v6\n' > "$tmp/fim-target"
+tick
+_audit_fim_diff() { return 1; }
+tick
+[[ "$(fires 'Resolved: FIM drift: MODIFIED')" == 1 ]] || fail "failed FIM diff sent a false resolved"
+grep -q '^audit:fim:' "$ALERT_STATE_DIR/alerts.conditions" || fail "failed FIM diff closed the condition"
+
+# A drift that opens while silenced alerts once the silence ends.
+alert_silence_add 'audit:silenced:*' 2 "maint" >/dev/null
+alert_condition_open "audit:silenced:x" "Silenced drift" "b" 15158332 "fp1"; wait
+[[ "$(fires 'Silenced drift')" == 0 ]] || fail "silenced condition alerted"
+sleep 3
+alert_condition_open "audit:silenced:x" "Silenced drift" "b" 15158332 "fp1"; wait
+[[ "$(fires 'Silenced drift')" == 1 ]] || fail "condition opened under a silence never alerted after it: $(fires 'Silenced drift')"
+
+# Rootkit: new ld.so.preload content re-alerts, a churning hidden-process count does not.
+AUDIT_ROOTKIT_INTERVAL=0
+_audit_rootkit_supported() { return 0; }
+rk_rows=""
+_audit_rootkit_run_all() { printf '%s' "$rk_rows"; }
+rk_tick() { rk_rows="$1"; sleep 1; _audit_rootkit_tick; wait; }
+rk_tick $'ld_preload_present\t/etc/ld.so.preload exists: libA.so\nhidden_process\tps_count=10 /proc_count=20\n'
+rk_tick $'ld_preload_present\t/etc/ld.so.preload exists: libA.so libEVIL.so\nhidden_process\tps_count=11 /proc_count=22\n'
+[[ "$(fires 'Rootkit hint: ld_preload_present')" == 2 ]] || fail "new ld.so.preload content: want 2 alerts, got $(fires 'Rootkit hint: ld_preload_present')"
+[[ "$(fires 'Rootkit hint: hidden_process')" == 1 ]] || fail "hidden_process count churn: want 1 alert, got $(fires 'Rootkit hint: hidden_process')"
+_audit_rootkit_run_all() { return 1; }
+rk_tick ""
+[[ "$(fires 'Resolved: Rootkit')" == 0 ]] || fail "failed rootkit scan sent a false resolved"
+
+# Ports: a listener moving from loopback to all interfaces is a new condition; a failed capture resolves nothing.
+AUDIT_PORTS_INTERVAL=0
+ports_rows=$'tcp\t127.0.0.1\t22\n'
+_audit_ports_capture() { printf '%s' "$ports_rows"; }
+_audit_ports_baseline >/dev/null
+p_tick() { ports_rows="$1"; sleep 1; _audit_ports_tick; wait; }
+p_tick $'tcp\t127.0.0.1\t22\ntcp\t127.0.0.1\t8080\n'
+p_tick $'tcp\t0.0.0.0\t8080\ntcp\t127.0.0.1\t22\n'
+[[ "$(fires 'Listener: new tcp 127.0.0.1:8080')" == 1 ]] || fail "loopback listener did not alert"
+[[ "$(fires 'Listener: new tcp 0.0.0.0:8080')" == 1 ]]   || fail "listener rebound to 0.0.0.0 did not alert"
+p_tick ""
+[[ "$(fires 'Resolved: Listener: new tcp 0.0.0.0')" == 0 ]] || fail "empty capture sent a false resolved"
+grep -q $'^audit:ports:NEW:tcp:0.0.0.0:8080\t' "$ALERT_STATE_DIR/alerts.conditions" || fail "empty capture closed the 0.0.0.0 listener"
 
 # Point-in-time rules keep the per-rule cooldown.
 ALERT_COOLDOWN=300
