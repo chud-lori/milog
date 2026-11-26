@@ -252,24 +252,31 @@ milog audit accept persistence /etc/systemd/system/backup.timer
 milog audit accept ports tcp:443
 ```
 
-Only that item's baseline entry changes; everything else keeps drifting
-until you look at it. With `HISTORY_ENABLED=1` the accept is stored in
-`milog audit history` as kind `accepted`, with the user who ran it. Run it
-as the user the daemon runs as, since baselines live in that user's cache.
+Only that item's baseline entry changes, except for ports: `tcp:443`
+resets every bind address on port 443 to what is listening now. Everything
+else keeps drifting until you look at it. With `HISTORY_ENABLED=1` the
+accept is stored in `milog audit history` as kind `accepted`, with the user
+who ran it; `milog report` leaves those rows out of its drift table and
+counts them instead. Run it as the user the daemon runs as, since baselines
+live in that user's cache.
 
 ## What an alert tells you
 
 - FIM: `+N -M lines` and the size change. For an `authorized_keys` file,
-  each added or removed key by fingerprint and comment (needs
-  `ssh-keygen`). File contents never reach the alert; shadow, sudoers and
-  key files report size only. The line and key summary needs the copy
-  milog keeps at baseline time under `audit/fim.snap/` (mode 600, text
-  files up to 256 KiB), so a baseline written by an older milog reports
-  size only until you re-baseline or accept.
+  added and removed keys by fingerprint and comment, up to 5 each way plus
+  a count of the rest (needs `ssh-keygen`). File contents never reach the
+  alert. The summary compares against a copy milog takes at baseline time
+  under `audit/fim.snap/` (mode 600, text files up to 256 KiB). Only
+  world-readable files and `authorized_keys*` are copied; any other file,
+  such as shadow, sudoers or a private key, reports its size only. A
+  baseline written by an older milog reports size only until you
+  re-baseline or accept.
 - Persistence: the new file's mtime, ctime and owner, so a unit that
   appeared months ago reads differently from one that appeared minutes ago.
-- Ports: the listening process and its start time. `ss` shows other
-  users' processes only to root.
+- Ports: the process listening on that exact address and port, and its
+  start time. When `ss -p` cannot see it (only root sees other users'
+  sockets) or more than one socket matches, the alert says the owner is
+  unknown.
 
 ## Tuning
 

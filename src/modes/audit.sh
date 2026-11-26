@@ -42,16 +42,11 @@ _audit_state_dir() {
 
 # Epoch -> "YYYY-MM-DD HH:MM (<age> ago)".
 _audit_when() {
-    local ts="$1" now d age
+    local ts="$1" age d
     [[ "$ts" =~ ^[0-9]+$ ]] || return 0
-    now=$(date +%s)
+    age=$(( $(date +%s) - ts )); (( age < 0 )) && age=0
     d=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null)
-    age=$(( now - ts )); (( age < 0 )) && age=0
-    if   (( age < 7200 ));   then age="$(( age / 60 ))m"
-    elif (( age < 172800 )); then age="$(( age / 3600 ))h"
-    else                          age="$(( age / 86400 ))d"
-    fi
-    printf '%s (%s ago)' "$d" "$age"
+    printf '%s (%s ago)' "$d" "$(_alert_fmt_dur "$age")"
 }
 
 # mtime is settable with touch, ctime is not, so both are shown.
@@ -62,20 +57,27 @@ _audit_age_line() {
     printf 'mtime %s, ctime %s, owner %s' "$(_audit_when "$m")" "$(_audit_when "$c")" "${o:-?}"
 }
 
-# Owning process and start time of a listener; ss only shows other users' sockets to root.
+# Owner of the exact proto/bind/port listener; none visible or several sockets means unknown.
 _audit_listener_owner() {
-    local proto="$1" port="$2" flag m comm pid et
-    case "$proto" in tcp) flag=-t ;; udp) flag=-u ;; *) return 0 ;; esac
-    [[ "$port" =~ ^[0-9]+$ ]] || return 0
-    command -v ss >/dev/null 2>&1 || { printf 'process unknown, ss is not installed'; return 0; }
-    m=$(ss -Hlnp "$flag" "sport = :$port" 2>/dev/null | grep -o 'users:(("[^"]*",pid=[0-9]*' | head -n 1 || true)
-    if [[ -z "$m" ]]; then
-        printf 'process not visible (ss -p needs root for other users)'
+    local proto="$1" bind="$2" port="$3" m comm pid et
+    [[ "$proto" =~ ^(tcp|udp)$ && "$port" =~ ^[0-9]+$ ]] || return 0
+    command -v ss >/dev/null 2>&1 || { printf 'owner unknown, ss is not installed'; return 0; }
+    m=$(ss -Htulnp "sport = :$port" 2>/dev/null | B="$bind" awk -v pr="$proto" -v po="$port" '
+        $1 == pr {
+            addr = $5; p = 0
+            for (i = length(addr); i > 0; i--) if (substr(addr, i, 1) == ":") { p = i; break }
+            if (p == 0) next
+            b = substr(addr, 1, p - 1); gsub(/^\[|\]$/, "", b)
+            if (b != ENVIRON["B"] || substr(addr, p + 1) != po) next
+            if (match($0, /users:\(\("[^"]*",pid=[0-9]+/)) print substr($0, RSTART, RLENGTH); else print "?"
+        }' | sort -u || true)
+    if [[ -z "$m" || "$m" == *$'\n'* || "$m" == "?" ]]; then
+        printf "owner unknown (ss -p shows other users' sockets only to root)"
         return 0
     fi
     pid="${m##*pid=}"
     comm="${m#users:((\"}"; comm="${comm%%\",pid=*}"
-    comm=$(printf '%s' "$comm" | tr -d '`[:cntrl:]' | cut -c1-32)
+    comm=$(printf '%s' "$comm" | LC_ALL=C tr -cd '\40-\176' | tr -d '`' | cut -c1-32)
     et=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
     if [[ "$et" =~ ^[0-9]+$ ]]; then
         printf 'process %s pid %s, started %s' "$comm" "$pid" "$(_audit_when $(( $(date +%s) - et )))"
@@ -84,26 +86,28 @@ _audit_listener_owner() {
     fi
 }
 
-# Files whose content is never snapshotted or summarised beyond size.
-_audit_fim_sensitive() {
-    case "$1" in
-        */shadow|*/shadow-|*/gshadow|*/gshadow-|*/sudoers|*/sudoers-|*/sudoers.d/*) return 0 ;;
-        *_key|*.key|*.pem|*.p12|*.pfx) return 0 ;;
-    esac
-    return 1
+# Only world-readable files and authorized_keys are copied, so a copy never holds what other users cannot read.
+_audit_fim_copyable() {
+    local mode
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    [[ "${1##*/}" == authorized_keys* ]] && return 0
+    mode=$(stat -c '%a' -- "$1" 2>/dev/null || stat -f '%Lp' -- "$1" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]+$ ]] && (( 8#$mode & 4 ))
 }
 
+# Refuses a symlinked or foreign-owned dir so copies and prunes cannot be redirected.
 _audit_fim_snap_dir() {
     local d; d=$(_audit_state_dir)/fim.snap
+    [[ -L "$d" ]] && return 1
     ( umask 077; mkdir -p "$d" ) 2>/dev/null
+    [[ -d "$d" && ! -L "$d" && -O "$d" ]] || return 1
     printf '%s' "$d"
 }
 
-# Copies a non-sensitive regular text file of at most 256 KiB to $2 without following symlinks or blocking on FIFOs.
+# Copies a copyable text file of at most 256 KiB to $2 without following symlinks or blocking on FIFOs.
 _audit_fim_read_capped() {
     local src="$1" dst="$2" max=262144 size text
-    _audit_fim_sensitive "$src" && return 1
-    [[ -f "$src" && ! -L "$src" ]] || return 1
+    _audit_fim_copyable "$src" || return 1
     if ! ( umask 077; dd if="$src" of="$dst" iflag=nofollow,nonblock,fullblock bs=$(( max + 1 )) count=1 status=none ) 2>/dev/null; then
         rm -f "$dst"; return 1
     fi
@@ -116,8 +120,9 @@ _audit_fim_read_capped() {
 
 # Keeps a private copy of a watched file so later drift can be summarised; stale copies are dropped.
 _audit_fim_snap_write() {
-    local path="$1" snap tmp
-    snap="$(_audit_fim_snap_dir)/$(_audit_accounts_sanitise "$path")"
+    local path="$1" snapdir snap tmp
+    snapdir=$(_audit_fim_snap_dir) || return 0
+    snap="$snapdir/$(_audit_accounts_sanitise "$path")"
     tmp=$(mktemp "$snap.tmp.XXXXXX") || return 0
     if _audit_fim_read_capped "$path" "$tmp"; then
         mv -f "$tmp" "$snap"
@@ -130,22 +135,23 @@ _audit_fim_snap_write() {
 _audit_fim_detail() {
     local change="$1" path="$2"
     local dir; dir=$(_audit_state_dir)
-    local row old_sha old_size new_size st snap old cur added removed out=""
+    local row old_sha old_size new_size st snapdir snap old cur added removed out=""
     case "$change" in MODIFIED|APPEARED) ;; *) return 0 ;; esac
     row=$(P="$path" awk -F'\t' '$1 == ENVIRON["P"] { print $2 "\t" $4; exit }' "$dir/fim.baseline" 2>/dev/null)
     old_sha="${row%%$'\t'*}"; old_size="${row#*$'\t'}"
     [[ "$old_sha" == MISSING || "$old_sha" == UNREADABLE ]] && old_size=0
     st=$(_audit_stat "$path"); new_size="${st##*	}"
     out="size ${old_size:-0} -> ${new_size:-0} bytes"
-    if _audit_fim_sensitive "$path"; then
+    if [[ -e "$path" ]] && ! _audit_fim_copyable "$path"; then
         printf '%s, contents withheld\n' "$out"
         return 0
     fi
-    snap="$(_audit_fim_snap_dir)/$(_audit_accounts_sanitise "$path")"
+    snap=""
+    snapdir=$(_audit_fim_snap_dir) && snap="$snapdir/$(_audit_accounts_sanitise "$path")"
     old=$(mktemp "$dir/fim.old.XXXXXX") || return 0
     cur=$(mktemp "$dir/fim.cur.XXXXXX") || { rm -f "$old"; return 0; }
     if [[ "$old_sha" == MISSING || "$old_sha" == UNREADABLE ]] \
-        || { [[ -f "$snap" ]] && [[ "$(_audit_sha256 "$snap")" == "$old_sha" ]] && cat "$snap" > "$old"; }; then
+        || { [[ -n "$snap" && -f "$snap" ]] && [[ "$(_audit_sha256 "$snap")" == "$old_sha" ]] && cat "$snap" > "$old"; }; then
         if _audit_fim_read_capped "$path" "$cur"; then
             added=$(comm -13 <(sort "$old") <(sort "$cur") | grep -c . || true)
             removed=$(comm -23 <(sort "$old") <(sort "$cur") | grep -c . || true)
@@ -154,7 +160,7 @@ _audit_fim_detail() {
                 out+=$'\n'$(
                     { comm -13 <(ssh-keygen -lf "$old" 2>/dev/null | sort -u) <(ssh-keygen -lf "$cur" 2>/dev/null | sort -u) | sed 's/^/+ key /'
                       comm -23 <(ssh-keygen -lf "$old" 2>/dev/null | sort -u) <(ssh-keygen -lf "$cur" 2>/dev/null | sort -u) | sed 's/^/- key /'
-                    } | awk '{ gsub(/[[:cntrl:]`]/, ""); s = substr($0, 1, 1); n[s]++; if (n[s] <= 5) print substr($0, 1, 160) }
+                    } | LC_ALL=C tr -cd '\n\40-\176' | LC_ALL=C awk '{ gsub(/`/, ""); s = substr($0, 1, 1); n[s]++; if (n[s] <= 5) print substr($0, 1, 160) }
                         END { if (n["+"] > 5) print "+ " n["+"] - 5 " more keys"; if (n["-"] > 5) print "- " n["-"] - 5 " more keys" }'
                 )
             fi
@@ -168,6 +174,8 @@ _audit_fim_detail() {
 _audit_fim_expand_paths() {
     local pat path
     local -a out=()
+    # Empty IFS keeps a path with spaces whole while still expanding its glob.
+    local IFS=
     shopt -s nullglob
     for pat in "${AUDIT_FIM_PATHS[@]}"; do
         local -a matches=( $pat )
@@ -196,7 +204,7 @@ _audit_fim_baseline() {
     local now; now=$(date +%s)
     local path sha mtime size st f snapdir kept="/"
     local count=0 missing=0
-    snapdir=$(_audit_fim_snap_dir)
+    snapdir=$(_audit_fim_snap_dir) || snapdir=""
 
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
@@ -217,9 +225,11 @@ _audit_fim_baseline() {
     done < <(_audit_fim_expand_paths)
 
     mv "$tmp" "$out"
-    for f in "$snapdir"/*; do
-        [[ -e "$f" && "$kept" != */"${f##*/}"/* ]] && rm -f "$f"
-    done
+    if [[ -n "$snapdir" ]]; then
+        for f in "$snapdir"/*; do
+            [[ -f "$f" && ! -L "$f" && -O "$f" && "$kept" != */"${f##*/}"/* ]] && rm -f "$f"
+        done
+    fi
     # One "<present> <missing> <path>" line so callers can `read` it; globals don't survive $(...).
     printf '%d %d %s\n' "$count" "$missing" "$out"
 }
@@ -426,6 +436,8 @@ _audit_fim_subcmd() {
 _audit_persistence_expand() {
     local pat path
     local -a out=()
+    # Empty IFS keeps a path with spaces whole while still expanding its glob.
+    local IFS=
     shopt -s nullglob
     for pat in "${AUDIT_PERSISTENCE_PATHS[@]}"; do
         local -a matches=( $pat )
@@ -708,7 +720,7 @@ _audit_ports_tick() {
         [[ -z "$proto" || -z "$port" ]] && continue
         key="audit:ports:NEW:$proto:$port"
         if alert_should_fire "$key"; then
-            body="\`\`\`new listener: $proto $bind:$port"$'\n'"$(_audit_listener_owner "$proto" "$port")\`\`\`"
+            body="\`\`\`new listener: $proto $bind:$port"$'\n'"$(_audit_listener_owner "$proto" "$bind" "$port")\`\`\`"
             alert_fire "Listener: new $proto $bind:$port" "$body" 15158332 "$key" &
         fi
     done < <(_audit_ports_diff)
@@ -1124,6 +1136,8 @@ _audit_accounts_legacy_name() {
 _audit_accounts_expand() {
     local pat path
     local -a out=()
+    # Empty IFS keeps a path with spaces whole while still expanding its glob.
+    local IFS=
     shopt -s nullglob
     for pat in "${AUDIT_ACCOUNTS_PATHS[@]}"; do
         local -a matches=( $pat )
@@ -1567,7 +1581,7 @@ _audit_fim_accept() {
     now=$(date +%s)
     tmp=$(mktemp "$dir/fim.baseline.tmp.XXXXXX") || return 1
     if [[ "$sha" == MISSING ]]; then
-        rm -f "$(_audit_fim_snap_dir)/$(_audit_accounts_sanitise "$path")"
+        local snapdir; snapdir=$(_audit_fim_snap_dir) && rm -f "$snapdir/$(_audit_accounts_sanitise "$path")"
     else
         _audit_fim_snap_write "$path"
     fi

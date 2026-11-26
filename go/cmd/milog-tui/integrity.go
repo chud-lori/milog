@@ -81,9 +81,9 @@ func (m model) renderIntegrityView() string {
 		subjW = integritySubjectCap
 	}
 	for _, e := range d.events {
-		// Removals are mostly housekeeping, so they stay dim.
+		// Removals are mostly housekeeping and accepts are operator actions, so both stay dim.
 		kindStyle := warnStyle
-		if e.Kind == "removed" {
+		if e.Kind == "removed" || e.Kind == "accepted" {
 			kindStyle = dimStyle
 		}
 		when := time.Unix(e.TS, 0).Format("Mon 02 Jan 15:04")
