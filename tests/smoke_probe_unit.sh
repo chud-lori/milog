@@ -58,6 +58,18 @@ if [[ $EUID -eq 0 ]]; then
     chmod 0644 "$rootcfg/config.sh"
     MILOG_CONFIG="$rootcfg/config.sh" "$ROOT/milog.sh" config path >/dev/null
     [[ -e "$tmp/sourced" ]] || fail "root did not source a root-owned config"
+
+    rm -f "$tmp/sourced"
+    ln -s "$rootcfg/config.sh" "$tmp/cfg-link"
+    MILOG_CONFIG="$tmp/cfg-link" "$ROOT/milog.sh" config path >/dev/null
+    [[ -e "$tmp/sourced" ]] || fail "root did not source a root-owned config through a symlink"
+
+    rm -f "$tmp/sourced"
+    printf ': > %q\n' "$tmp/sourced" > "$tmp/user-cfg.sh"
+    chown nobody "$tmp/user-cfg.sh"
+    ln -sfn "$tmp/user-cfg.sh" "$tmp/cfg-link"
+    MILOG_CONFIG="$tmp/cfg-link" "$ROOT/milog.sh" config path >/dev/null 2>&1 || true
+    [[ -e "$tmp/sourced" ]] && fail "root sourced a non-root-owned config through a symlink"
 fi
 
 printf 'smoke_probe_unit: ok\n'
