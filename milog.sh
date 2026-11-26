@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.3-3-g1b0c5c5
-# MILOG_BUILT=2026-11-26T08:37:49Z
+# MILOG_VERSION=v0.8.3-5-gd7eb7d4-dirty
+# MILOG_BUILT=2026-11-26T08:48:42Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -143,10 +143,11 @@ WEB_TOKEN_FILE="$HOME/.config/milog/web.token"
 
 MILOG_CONFIG="${MILOG_CONFIG:-$HOME/.config/milog/config.sh}"
 
-# True when root owns the path and its directory and neither is group/other-writable.
+# True when root owns the path's directory and its resolved target (and that target's directory), none group/other-writable.
 _root_trusted_path() {
-    local p meta
-    for p in "$1" "$(dirname "$1")"; do
+    local p meta real
+    real=$(readlink -f -- "$1" 2>/dev/null) && [[ -n "$real" ]] || return 1
+    for p in "$(dirname "$1")" "$real" "$(dirname "$real")"; do
         meta=$(stat -c '%u %a' "$p" 2>/dev/null || stat -f '%u %Lp' "$p" 2>/dev/null) || return 1
         [[ "${meta%% *}" == 0 ]] && (( (8#${meta#* } & 8#022) == 0 )) || return 1
     done
