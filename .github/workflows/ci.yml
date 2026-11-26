@@ -88,6 +88,7 @@ jobs:
           bash tests/smoke_no_apps.sh
           bash tests/smoke_bottleneck.sh
           bash tests/smoke_version_update.sh
+          bash tests/smoke_doctor_risks.sh
 
       - name: Go vet
         working-directory: go

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MILOG_VERSION=v0.8.3-34-g8a4c1cc
-# MILOG_BUILT=2026-11-26T10:02:08Z
+# MILOG_VERSION=v0.8.3-35-g61df272-dirty
+# MILOG_BUILT=2026-11-26T10:08:21Z
 # MiLog — nginx + system monitor.
 set -euo pipefail
 
@@ -95,6 +95,8 @@ ALERT_HOOK_TIMEOUT=10
 
 # Detection regexes for exploits/probes; `milog update-rules` writes this file, and without it the built-in copy applies.
 RULES_FILE="$HOME/.config/milog/rules.tsv"
+# doctor and `update-rules --check` warn once the rules are older than this many days; 0 never warns.
+RULES_MAX_AGE_DAYS=60
 
 # Per-rule destinations, one `key: dest ...` per line; lookup is exact rule, then prefix before `:`, then `default`.
 # Destinations: discord slack telegram matrix webhook, or `skip`; empty fans out to everything.
@@ -5533,7 +5535,7 @@ config_validate() {
         WEBHOOK_URL WEBHOOK_TEMPLATE WEBHOOK_CONTENT_TYPE
         ALERTS_ENABLED ALERT_COOLDOWN ALERT_DEDUP_WINDOW ALERT_REMINDER_INTERVAL ALERT_STATE_DIR
         ALERT_LOG_MAX_BYTES ALERT_ROUTES
-        HOOKS_DIR ALERT_HOOK_TIMEOUT RULES_FILE
+        HOOKS_DIR ALERT_HOOK_TIMEOUT RULES_FILE RULES_MAX_AGE_DAYS
         P95_WARN_MS P95_CRIT_MS SLOW_WINDOW SLOW_EXCLUDE_PATHS
         GEOIP_ENABLED MMDB_PATH CROWDSEC_CTI_KEY
         HISTORY_ENABLED HISTORY_DB HISTORY_RETAIN_DAYS HISTORY_TOP_IP_N
@@ -6296,6 +6298,27 @@ mode_doctor() {
         else
             _doc_warn "stale web pidfile (not running)" "milog web stop  # cleans it up"
             warn=$(( warn + 1 ))
+        fi
+    fi
+
+    _doc_head "detection rules"
+    local rules_line
+    if rules_line=$(_rules_freshness); then
+        _doc_ok "$rules_line"
+    else
+        _doc_warn "$rules_line" "older than RULES_MAX_AGE_DAYS=${RULES_MAX_AGE_DAYS:-60}; run: milog update-rules"
+        warn=$(( warn + 1 ))
+    fi
+
+    if [[ "$(uname -s 2>/dev/null)" == "Linux" ]]; then
+        _doc_head "ebpf probe (optional)"
+        local kern; kern=$(_probe_kernel_summary)
+        if _probe_kernel_before_5_8; then
+            _doc_warn "$kern" \
+                      "6 of the 8 probes need BPF ring buffers (5.8+, or a distro backport); check as root: milog-probe --check. Everything else in milog works without the probe"
+            warn=$(( warn + 1 ))
+        else
+            _doc_ok "$kern" "milog-probe does not need BTF: its programs use no CO-RE relocations"
         fi
     fi
 
@@ -7208,6 +7231,23 @@ _PROBE_DEFAULT_FILE_ALLOWLIST="sshd,sshd-session,sshd-socket-gen,sudo,su,login,g
 # The env value replaces this default wholesale (it mirrors the probe binary's built-in), so re-list these entries when overriding.
 _PROBE_DEFAULT_NET_ALLOWLIST="127.0.0.0/8,::1/128,:53,:123,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10"
 
+# MILOG_KERNEL_RELEASE and MILOG_BTF_PATH stand in for uname -r and /sys/kernel/btf/vmlinux in tests.
+_probe_kernel_release() { printf '%s' "${MILOG_KERNEL_RELEASE:-$(uname -r 2>/dev/null)}"; }
+
+_probe_kernel_summary() {
+    local state=absent
+    [[ -e "${MILOG_BTF_PATH:-/sys/kernel/btf/vmlinux}" ]] && state=present
+    printf 'kernel %s, BTF %s' "$(_probe_kernel_release)" "$state"
+}
+
+# True below 5.8, where mainline has neither CAP_BPF nor BPF ring buffers.
+_probe_kernel_before_5_8() {
+    local kver kmaj kmin
+    kver=$(_probe_kernel_release)
+    kmaj="${kver%%.*}"; kmin="${kver#*.}"; kmin="${kmin%%[!0-9]*}"
+    [[ "$kmaj" =~ ^[0-9]+$ && "$kmin" =~ ^[0-9]+$ ]] && (( kmaj < 5 || (kmaj == 5 && kmin < 8) ))
+}
+
 _probe_service_active() {
     command -v systemctl >/dev/null 2>&1 || return 1
     systemctl is-active --quiet milog-probe.service 2>/dev/null
@@ -7359,13 +7399,23 @@ _probe_service_install() {
     local net_allowlist="${MILOG_PROBE_NET_ALLOWLIST:-$_PROBE_DEFAULT_NET_ALLOWLIST}"
     [[ -n "${MILOG_PROBE_NET_ALLOWLIST_EXTRA:-}" ]] && net_allowlist="${net_allowlist},${MILOG_PROBE_NET_ALLOWLIST_EXTRA}"
 
+    # The probe exits once every program fails to load, so a unit here would only crash-loop.
+    local check_out check_rc=0
+    check_out=$("$probe_bin" --check 2>&1) || check_rc=$?
+    if (( check_rc == 2 )) && [[ "$check_out" == *"flag provided but not defined"* ]]; then
+        echo -e "${D}  ${probe_bin} predates --check; skipping the load check${NC}" >&2
+    elif (( check_rc != 0 )); then
+        echo -e "${R}milog-probe could not load any eBPF program ($(_probe_kernel_summary)); not installing the unit${NC}" >&2
+        printf '%s\n' "$check_out" | sed 's/^/  /' >&2
+        echo -e "${D}  the probe is optional: every other milog feature works without it${NC}" >&2
+        return 1
+    else
+        printf '%s\n' "$check_out" | sed 's/^/  /'
+    fi
+
     # CAP_BPF / CAP_PERFMON only exist from 5.8; older kernels gate eBPF on CAP_SYS_ADMIN.
     local caps="CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID"
-    local kver; kver=$(uname -r 2>/dev/null)
-    local kmaj="${kver%%.*}" kmin; kmin="${kver#*.}"; kmin="${kmin%%[!0-9]*}"
-    if [[ "$kmaj" =~ ^[0-9]+$ && "$kmin" =~ ^[0-9]+$ ]] && (( kmaj < 5 || (kmaj == 5 && kmin < 8) )); then
-        caps="$caps CAP_SYS_ADMIN"
-    fi
+    _probe_kernel_before_5_8 && caps="$caps CAP_SYS_ADMIN"
 
     _probe_unit "$probe_bin" "$target_user" "$target_home" "$target_config" "$allowlist" "$caps" "$net_allowlist" \
         > "$_PROBE_SYSTEMD_UNIT"
@@ -8699,6 +8749,11 @@ mode_trend() {
 # milog update-rules: installs the detection rules from the latest release as RULES_FILE.
 # checksums.txt comes from the same release, so it catches corruption, not a compromised release.
 mode_update_rules() {
+    case "${1:-}" in
+        "") ;;
+        --check) _rules_freshness_report; return ;;
+        *) echo -e "${R}usage: milog update-rules [--check]${NC}" >&2; return 1 ;;
+    esac
     local repo="${MILOG_RELEASE_REPO:-chud-lori/milog}" loc tag base tmp want got new cur dst_tmp
     # /releases/latest redirects to /releases/tag/<tag>.
     loc=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
@@ -8745,9 +8800,11 @@ mode_update_rules() {
     cur=$(_rules_check "$RULES_FILE" 2>/dev/null) || cur=$(_rules_default | _rules_version)
     if (( new < cur )); then
         echo -e "${R}update-rules: ${tag} ships rules version ${new}, older than the active version ${cur}; not downgrading${NC}" >&2
+        _rules_stamp_checked "$tag" "$cur"
         return 1
     fi
     if (( new == cur )); then
+        _rules_stamp_checked "$tag" "$cur"
         echo "Rules already at version ${cur}."
         return 0
     fi
@@ -8759,8 +8816,54 @@ mode_update_rules() {
         echo -e "${R}update-rules: could not write ${RULES_FILE}${NC}" >&2
         return 1
     fi
+    _rules_stamp_checked "$tag" "$new"
     echo -e "${G}✓${NC} rules version ${cur} → ${new} (${tag}) written to ${RULES_FILE}"
     echo "Running exploits/probes watchers and the daemon load rules at start; restart them to pick this up."
+}
+
+# Records when update-rules last confirmed rules version $2 against release $1.
+_rules_stamp_checked() {
+    mkdir -p "$(dirname "$RULES_FILE")" 2>/dev/null || true
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" > "${RULES_FILE}.checked" \
+        || echo -e "${Y}update-rules: could not write ${RULES_FILE}.checked; rules age will be misreported${NC}" >&2
+}
+
+# Prints the active rules' version, source and age; fails when older than RULES_MAX_AGE_DAYS (0 never warns).
+_rules_freshness() {
+    local version src since="" stamped="" what f days
+    if [[ -f "$RULES_FILE" ]] && version=$(_rules_check "$RULES_FILE" 2>/dev/null); then
+        src="$RULES_FILE"
+    else
+        version=$(_rules_default | _rules_version)
+        src="built-in"
+    fi
+    [[ -f "${RULES_FILE}.checked" ]] && { IFS=$'\t' read -r since _ stamped < "${RULES_FILE}.checked" || true; }
+    # The stamp only vouches for the version it checked, not for a later fallback to the built-in rules.
+    if [[ "$since" =~ ^[0-9]+$ && "$stamped" == "$version" ]]; then
+        what="last checked against a release"
+    else
+        f="$RULES_FILE" what="written"
+        [[ "$src" == built-in ]] && f="${BASH_SOURCE[0]}" what="shipped with this milog, installed"
+        since=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo "")
+    fi
+    if [[ ! "$since" =~ ^[0-9]+$ ]]; then
+        printf 'rules version %s (%s), age unknown' "$version" "$src"
+        return 0
+    fi
+    days=$(( ($(date +%s) - since) / 86400 ))
+    printf 'rules version %s (%s), %s %sd ago' "$version" "$src" "$what" "$days"
+    (( ${RULES_MAX_AGE_DAYS:-60} <= 0 || days <= ${RULES_MAX_AGE_DAYS:-60} ))
+}
+
+_rules_freshness_report() {
+    local line
+    if line=$(_rules_freshness); then
+        echo -e "${G}✓${NC} ${line}"
+        return 0
+    fi
+    echo -e "${Y}!${NC} ${line}"
+    echo -e "${D}  older than RULES_MAX_AGE_DAYS=${RULES_MAX_AGE_DAYS:-60}; nothing updates on its own, run: milog update-rules${NC}"
+    return 1
 }
 # milog update: replaces milog and its installed companion binaries with the latest GitHub release.
 # checksums.txt comes from the same release, so it catches corruption, not a compromised release.
@@ -9599,7 +9702,7 @@ _milog_complete() {
                 2) COMPREPLY=($(compgen -W "$digest_window_vals" -- "$cur")) ;;
             esac
             ;;
-        update)
+        update|update-rules)
             case $cword in
                 2) COMPREPLY=($(compgen -W "--check" -- "$cur")) ;;
             esac
@@ -9715,7 +9818,7 @@ _milog() {
         web)      (( CURRENT == 3 )) && _describe 'web subcommand' web_subs ;;
         alerts)   (( CURRENT == 3 )) && _describe 'window' window_vals ;;
         digest|report) (( CURRENT == 3 )) && _describe 'window' digest_window_vals ;;
-        update)   (( CURRENT == 3 )) && compadd -- --check ;;
+        update|update-rules) (( CURRENT == 3 )) && compadd -- --check ;;
         bottleneck) (( CURRENT == 3 )) && compadd -- --json ;;
     esac
 }
@@ -9817,6 +9920,7 @@ for v in $digest_window_vals
 end
 
 complete -c milog -n "__milog_seen_cmd update" -l check -d "report only; exit 10 when an update exists"
+complete -c milog -n "__milog_seen_cmd update-rules" -l check -d "print rules version and age; exit 1 when stale"
 complete -c milog -n "__milog_seen_cmd bottleneck" -l json -d "machine-readable output"
 MILOG_COMPLETION_EOF
 }
@@ -10044,6 +10148,7 @@ _cmd_help() {
             echo -e "  Checks the SHA-256 against the release's checksums.txt, then that every regex compiles."
             echo -e "  Refuses an older version than the active one; writes ${C}RULES_FILE${NC} atomically."
             echo -e "  ${D}checksums.txt is not a signature: it comes from the same release as the rules.${NC}"
+            echo -e "  ${C}--check${NC}  print the active rules' version and age, offline; exits 1 past ${C}RULES_MAX_AGE_DAYS${NC}"
             ;;
         audit)
             echo -e "${W}milog audit <sub>${NC} — point-in-time host integrity scans"
@@ -10119,7 +10224,7 @@ case "${1:-}" in
     completions) shift; mode_completions "$@" ;;
     bench)    shift; mode_bench "$@" ;;
     install)  shift; mode_install "$@" ;;
-    update-rules) mode_update_rules ;;
+    update-rules) shift; mode_update_rules "$@" ;;
     audit)    shift; mode_audit   "$@" ;;
     doctor)   mode_doctor ;;
     bottleneck) mode_bottleneck "${@:2}" ;;

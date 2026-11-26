@@ -10,7 +10,7 @@ import (
 )
 
 // ErrUnsupported is returned by Run on non-Linux hosts.
-var ErrUnsupported = errors.New("probe: eBPF requires Linux (kernel 4.18+ with BTF)")
+var ErrUnsupported = errors.New("probe: eBPF requires Linux")
 
 func Run(ctx context.Context, out chan<- Event) error {
 	return ErrUnsupported

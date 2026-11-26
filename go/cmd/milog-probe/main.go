@@ -6,6 +6,7 @@
 //
 //	--json     print every event with its hits instead of alerting
 //	--dry-run  log hits without alerting
+//	--check    load and attach every probe, report each, exit 0 if any works
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -21,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,6 +45,7 @@ func main() {
 		flagDryRun  = flag.Bool("dry-run", false, "match rules but do NOT fire alerts (diagnostic)")
 		flagMilog   = flag.String("milog", "milog", "path to milog bash binary (used for shelling out to _internal_alert)")
 		flagVersion = flag.Bool("version", false, "print version + exit")
+		flagCheck   = flag.Bool("check", false, "load and attach every probe for a second, print which ones work, then exit (1 if none do)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "milog-probe — eBPF exec watcher\n\n"+
@@ -49,7 +53,7 @@ func main() {
 			"  milog-probe [flags]\n\n"+
 			"Flags:\n")
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nNote: requires Linux (kernel 4.18+) and CAP_BPF + CAP_PERFMON or root.\n")
+		fmt.Fprintf(os.Stderr, "\nNote: requires Linux with BPF ring buffers (5.8+, or a distro backport) and root or CAP_BPF + CAP_PERFMON. Kernel BTF is not required.\n")
 	}
 	flag.Parse()
 
@@ -61,6 +65,10 @@ func main() {
 	// Fail clearly on non-Linux instead of stalling inside probe.Run.
 	if runtime.GOOS != "linux" {
 		log.Fatalf("milog-probe needs Linux for eBPF; running on %s", runtime.GOOS)
+	}
+
+	if *flagCheck {
+		os.Exit(runCheck(os.Stdout, probeChecks, time.Second))
 	}
 
 	if name := os.Getenv("MILOG_PROBE_ALERT_USER"); name != "" {
@@ -200,6 +208,67 @@ func main() {
 			handleBpfLoadEvent(bev, *flagJSON, *flagDryRun, *flagMilog)
 		}
 	}
+}
+
+type probeCheck struct {
+	name string
+	run  func(context.Context) error
+}
+
+// probeChecks runs each probe with its events discarded.
+var probeChecks = []probeCheck{
+	{"exec", func(ctx context.Context) error { return probe.Run(ctx, discard[probe.Event](ctx)) }},
+	{"tcp", func(ctx context.Context) error { return probe.RunNet(ctx, discard[probe.NetEvent](ctx)) }},
+	{"file", func(ctx context.Context) error { return probe.RunFile(ctx, discard[probe.FileEvent](ctx)) }},
+	{"ptrace", func(ctx context.Context) error { return probe.RunPtrace(ctx, discard[probe.PtraceEvent](ctx)) }},
+	{"kmod", func(ctx context.Context) error { return probe.RunKmod(ctx, discard[probe.KmodEvent](ctx)) }},
+	{"retrans", func(ctx context.Context) error { return probe.RunRetrans(ctx, discard[probe.RetransEvent](ctx)) }},
+	{"syscall-rate", func(ctx context.Context) error { return probe.RunSyscallRate(ctx, discard[probe.RateAnomalyEvent](ctx)) }},
+	{"bpf-load", func(ctx context.Context) error { return probe.RunBpfLoad(ctx, discard[probe.BpfLoadEvent](ctx)) }},
+}
+
+func discard[T any](ctx context.Context) chan T {
+	ch := make(chan T)
+	go func() {
+		for {
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+// runCheck runs every probe for window; a probe still running when it ends loaded and attached.
+func runCheck(w io.Writer, checks []probeCheck, window time.Duration) int {
+	ctx, cancel := context.WithTimeout(context.Background(), window)
+	defer cancel()
+	errs := make([]error, len(checks))
+	var wg sync.WaitGroup
+	for i, c := range checks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = c.run(ctx)
+		}()
+	}
+	wg.Wait()
+	ok := 0
+	for i, c := range checks {
+		if errs[i] != nil {
+			fmt.Fprintf(w, "FAIL %s: %v\n", c.name, errs[i])
+			continue
+		}
+		ok++
+		fmt.Fprintf(w, "ok   %s\n", c.name)
+	}
+	fmt.Fprintf(w, "%d of %d probes loaded\n", ok, len(checks))
+	if ok == 0 {
+		return 1
+	}
+	return 0
 }
 
 // drainErrors logs any errors still pending after shutdown.

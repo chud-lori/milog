@@ -134,6 +134,7 @@ under `/proc/pressure/`; the rest use a direct signal.
 | `HOOKS_DIR`           | `~/.config/milog/hooks` | Parent of `on_alert.d/` — user hook scripts, see [alerts.md](alerts.md#hook-scripts--custom-integrations-without-a-pr) |
 | `ALERT_HOOK_TIMEOUT`  | `10`                | Per-hook run time cap in seconds                |
 | `RULES_FILE`          | `~/.config/milog/rules.tsv` | Exploit/probe detection rules written by `milog update-rules`; see [alerts.md](alerts.md#detection-rules) |
+| `RULES_MAX_AGE_DAYS`  | `60`                        | `milog doctor` and `milog update-rules --check` warn when the rules are older than this; `0` never warns |
 | `ALERT_ROUTES`        | (empty — fan out)   | Per-rule destination mapping; see [alerts.md](alerts.md#routing--different-rules-to-different-destinations) |
 | `DISCORD_WEBHOOK`     | (empty)             | Set to enable Discord                     |
 | `SLACK_WEBHOOK`       | (empty)             | Set to enable Slack                       |

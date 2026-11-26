@@ -144,7 +144,7 @@ line numbers):
 | `mode_alert` / `mode_alerts` / `mode_silence` | Alert lifecycle, fire history, mute  |
 | `mode_audit`              | FIM / persistence / ports / YARA / accounts / rootkit |
 | `mode_web`                | Launcher for `milog-web` Go daemon (token + lifecycle) |
-| `mode_probe`              | `status` / `install-service` / `uninstall-service` for `milog-probe` (Linux only) |
+| `mode_probe`              | `status` / `install-service` / `uninstall-service` for `milog-probe` (Linux only); install refuses when `milog-probe --check` loads nothing |
 | `mode_doctor`             | Runtime health/config checklist                   |
 | `mode_config`             | Config-file subcommand router                     |
 | `color_prefix`            | Default merged log tail                           |
