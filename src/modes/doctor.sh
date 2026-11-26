@@ -275,6 +275,27 @@ mode_doctor() {
         fi
     fi
 
+    _doc_head "detection rules"
+    local rules_line
+    if rules_line=$(_rules_freshness); then
+        _doc_ok "$rules_line"
+    else
+        _doc_warn "$rules_line" "older than RULES_MAX_AGE_DAYS=${RULES_MAX_AGE_DAYS:-60}; run: milog update-rules"
+        warn=$(( warn + 1 ))
+    fi
+
+    if [[ "$(uname -s 2>/dev/null)" == "Linux" ]]; then
+        _doc_head "ebpf probe (optional)"
+        local kern; kern=$(_probe_kernel_summary)
+        if _probe_kernel_before_5_8; then
+            _doc_warn "$kern" \
+                      "6 of the 8 probes need BPF ring buffers (5.8+, or a distro backport); check as root: milog-probe --check. Everything else in milog works without the probe"
+            warn=$(( warn + 1 ))
+        else
+            _doc_ok "$kern" "milog-probe does not need BTF: its programs use no CO-RE relocations"
+        fi
+    fi
+
     # systemd units.
     if command -v systemctl >/dev/null 2>&1; then
         _doc_head "systemd"
