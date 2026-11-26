@@ -95,6 +95,7 @@ func RunFile(ctx context.Context, out chan<- FileEvent) error {
 			Comm:     trimNul(raw.Comm[:]),
 			Filename: trimNul(raw.Filename[:]),
 		}
+		ev.Exe, ev.Cgroup = lookupExeCgroup(raw.PID)
 		ev.PPID, ev.ParentComm, ev.ProcComm = lookupProc(raw.PID)
 
 		select {
