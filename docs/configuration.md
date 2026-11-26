@@ -128,6 +128,7 @@ under `/proc/pressure/`; the rest use a direct signal.
 | `ALERTS_ENABLED`      | `0`                 | Master switch                              |
 | `ALERT_COOLDOWN`      | `300` (5 min)       | Per-rule fire interval                    |
 | `ALERT_DEDUP_WINDOW`  | `300` (5 min)       | Cross-rule `(ip, path)` dedup TTL         |
+| `ALERT_REMINDER_INTERVAL` | `86400` (24 h)  | Re-alert a still-open audit condition this often; `0` never |
 | `ALERT_STATE_DIR`     | `~/.cache/milog`    | Where cooldown/dedup state + alerts.log live |
 | `ALERT_LOG_MAX_BYTES` | `10485760` (10 MB)  | In-place rotate alerts.log past this size; `0` disables |
 | `HOOKS_DIR`           | `~/.config/milog/hooks` | Parent of `on_alert.d/` — user hook scripts, see [alerts.md](alerts.md#hook-scripts--custom-integrations-without-a-pr) |
@@ -191,6 +192,7 @@ systemd units, one-shot runs, or CI:
 | `MILOG_ALERTS_ENABLED`        | `ALERTS_ENABLED`        |
 | `MILOG_ALERT_COOLDOWN`        | `ALERT_COOLDOWN`        |
 | `MILOG_ALERT_DEDUP_WINDOW`    | `ALERT_DEDUP_WINDOW`    |
+| `MILOG_ALERT_REMINDER_INTERVAL` | `ALERT_REMINDER_INTERVAL` |
 | `MILOG_ALERT_LOG_MAX_BYTES`   | `ALERT_LOG_MAX_BYTES`   |
 | `MILOG_HOOKS_DIR`             | `HOOKS_DIR`             |
 | `MILOG_ALERT_HOOK_TIMEOUT`    | `ALERT_HOOK_TIMEOUT`    |

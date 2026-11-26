@@ -80,6 +80,8 @@ AUDIT_ROOTKIT_INTERVAL=3600
 ALERT_COOLDOWN=300
 # How long one (ip, path) event stays "already reported" across different rules.
 ALERT_DEDUP_WINDOW=300
+# Audit drift alerts once when it opens and once when it clears; a still-open condition re-alerts this often, 0 never.
+ALERT_REMINDER_INTERVAL=86400
 ALERT_STATE_DIR="$HOME/.cache/milog"
 # alerts.log is truncated in place to about its newest half past this size; 0 disables rotation.
 ALERT_LOG_MAX_BYTES=10485760  # 10 MB
@@ -186,6 +188,7 @@ fi
 [[ -n "${MILOG_AUDIT_ROOTKIT_INTERVAL:-}"  ]] && AUDIT_ROOTKIT_INTERVAL="$MILOG_AUDIT_ROOTKIT_INTERVAL"
 [[ -n "${MILOG_ALERT_COOLDOWN:-}"  ]] && ALERT_COOLDOWN="$MILOG_ALERT_COOLDOWN"
 [[ -n "${MILOG_ALERT_DEDUP_WINDOW:-}" ]] && ALERT_DEDUP_WINDOW="$MILOG_ALERT_DEDUP_WINDOW"
+[[ -n "${MILOG_ALERT_REMINDER_INTERVAL:-}" ]] && ALERT_REMINDER_INTERVAL="$MILOG_ALERT_REMINDER_INTERVAL"
 [[ -n "${MILOG_ALERT_LOG_MAX_BYTES:-}" ]] && ALERT_LOG_MAX_BYTES="$MILOG_ALERT_LOG_MAX_BYTES"
 [[ -n "${MILOG_HOOKS_DIR:-}"           ]] && HOOKS_DIR="$MILOG_HOOKS_DIR"
 [[ -n "${MILOG_ALERT_HOOK_TIMEOUT:-}"  ]] && ALERT_HOOK_TIMEOUT="$MILOG_ALERT_HOOK_TIMEOUT"

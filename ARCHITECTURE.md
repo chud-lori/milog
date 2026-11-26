@@ -248,6 +248,41 @@ headers). Each destination applies the right encoding:
 Discord's server-side rate limit is ~30 req/min per webhook. The cooldown
 + dedup gates keep us well under in normal operation.
 
+### Backpressure
+
+`alert_fire` sends each destination through `_alert_deliver`. When a
+429 survives the one in-place retry, `_alert_post` writes
+`backoff.<dest>` (the server's `retry_after` rounded up, at most 300s)
+and returns 2. Alerts for that destination then append to
+`queue.<dest>` (`<epoch>\t<color>\t<rule_key>\t<title>`, capped at
+1000 rows), and one `_alert_flush` per destination (a `queue.<dest>.lock`
+directory) sleeps out the backoff and posts a single
+`Rate limited: N alerts held` summary with repeats counted. After five
+rate-limited rounds the remaining rows become `429` lines in
+`send_failures.log`; any other summary failure is retried once, then
+logged per row. Rows keep their three columns and gain the rule key as
+an optional fourth. A backoff file is capped at now+300s when read and
+removed after a successful flush. Every hour the daemon runs
+`_alert_delivery_check`, which requeues `queue.<dest>.send.*` batches
+older than 5 min, restarts a flusher for each non-empty queue, compares
+the log's line count with `send_failures.seen` and, when rows other than
+`milog:delivery` were added, logs a `WARNING` and fires
+`milog:delivery`.
+
+### Conditions
+
+Audit scanners re-detect the same drift every interval, so they call
+`alert_condition_open <key> <title> <body> [color] [fingerprint]`
+instead of `alert_should_fire`. `$ALERT_STATE_DIR/alerts.conditions`
+holds `key, opened, notified, seen, fingerprint, color, title`. A new
+key or a changed fingerprint fires; an unchanged one fires again only
+after `ALERT_REMINDER_INTERVAL`. At the end of a tick
+`alert_condition_sweep <prefix> <tick_start>` fires `Resolved:` for keys
+the tick did not see, and each `_audit_*_baseline` calls
+`alert_condition_close <prefix>` so a re-baseline closes without a
+resolved alert. Point-in-time rules (YARA, exploits, probes, patterns, sys and
+HTTP thresholds) stay on the cooldown.
+
 ### Cooldown state
 
 `$ALERT_STATE_DIR/alerts.state` is a flat file:
@@ -350,7 +385,7 @@ Stable, grep-friendly strings used by the cooldown gate:
 | Audit FIM              | `audit:fim_drift:<path>`                                                  |
 | Audit accounts         | `audit:accounts:<path>:<event>`                                           |
 | Audit persistence      | `audit:persistence:<path>`                                                |
-| Audit ports            | `audit:ports:<proto>:<port>`                                              |
+| Audit ports            | `audit:ports:NEW:<proto>:<bind>:<port>`                                   |
 | Audit YARA             | `audit:yara:<rule>:<path>`                                                |
 | Audit rootkit          | `audit:rootkit:<heuristic>`                                               |
 | Probe — process        | `process:shell_from_web_worker:<parent>:<child>`, `process:exec_from_tmp:<comm>`, `process:suid_escalation:<parent>:<child>`, `process:web_triggered_exec:<parent>:<child>`, `process:syscall_burst:<comm>` |
